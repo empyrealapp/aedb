@@ -1,0 +1,94 @@
+name: aedb-tests
+
+on:
+  pull_request:
+    paths:
+      - "**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/aedb-tests.yml"
+  push:
+    branches:
+      - main
+      - "release/*"
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Unit and default integration tests
+        run: cargo test --lib
+
+  integration:
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Query integration
+        run: cargo test --test query_integration
+      - name: L1 balance conservation (must-pass smoke)
+        run: cargo test --test stress arcana_l1_balance_conservation_under_load
+
+  crash:
+    needs: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Crash matrix
+        run: cargo test --test crash_matrix -- --test-threads=1
+
+  crash_longrun:
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/')
+    needs: crash
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: A17a strict fail-closed restarts
+        run: cargo test --test crash_matrix crash_matrix_a17a_strict_restarts_fail_closed -- --ignored --test-threads=1
+      - name: A17b durability crash loop
+        run: cargo test --test crash_matrix crash_matrix_a17b_thousand_crash_cycles_preserve_state -- --ignored --test-threads=1
+
+  stress:
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/')
+    needs: crash_longrun
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Full ignored stress suite
+        run: cargo test --test stress -- --ignored --test-threads=1
+
+  benchmark:
+    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/')
+    needs: crash_longrun
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Criterion benches
+        run: cargo bench --bench perf
+      - name: Benchmark gate targets
+        env:
+          AEDB_ENFORCE_BENCH_GATES: "1"
+        run: |
+          cargo test --test benchmark_gate benchmark_gate_doc_matrix -- --ignored --test-threads=1
+          cargo test --test benchmark_gate benchmark_coordinator_vs_parallel_lanes -- --ignored --test-threads=1

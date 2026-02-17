@@ -1,0 +1,44 @@
+# Rust build artifacts
+/target
+
+# Executable binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# MacOS-specific
+.DS_Store
+
+# IDE/editor settings
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+.idea/
+.vscode/
+*.code-workspace
+
+# By default, ignore Cargo.lock for libraries, add if this is a binary
+# Cargo.lock
+
+# Dependency download cache
+/.cargo/
+
+# Coverage and profiling
+/coverage/
+profraw/
+*.profraw
+*.profdata
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Other common document/editor binary formats
+*.docx
+
+# Backup/temporary files
+*~
+
+artifacts/

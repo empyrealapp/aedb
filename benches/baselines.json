@@ -1,0 +1,41 @@
+{
+  "generated_at": "2026-02-16T06:38:00Z",
+  "environment": {
+    "cpu": "to-be-recorded",
+    "disk": "to-be-recorded",
+    "os": "Darwin 24.6.0 arm64",
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)"
+  },
+  "metrics": {
+    "hot_upsert_single_row_latency_ms_ci_low": 4.651,
+    "hot_upsert_single_row_latency_ms_ci_high": 5.0929,
+    "hot_upsert_single_row_full_latency_ms_ci_low": 8.0993,
+    "hot_upsert_single_row_full_latency_ms_ci_high": 8.6199,
+    "hot_upsert_single_row_batch_latency_ms_ci_low": 2.631,
+    "hot_upsert_single_row_batch_latency_ms_ci_high": 2.8239,
+    "hot_upsert_single_row_os_buffered_latency_ms_ci_low": 0.20917,
+    "hot_upsert_single_row_os_buffered_latency_ms_ci_high": 0.21788,
+    "point_query_by_primary_key_latency_ms_ci_low": 0.0012717,
+    "point_query_by_primary_key_latency_ms_ci_high": 0.0013736,
+    "index_equality_by_age_latency_us_ci_low": 40.335,
+    "index_equality_by_age_latency_us_ci_high": 44.444,
+    "kv_point_get_balance_latency_us_ci_low": 0.59434,
+    "kv_point_get_balance_latency_us_ci_high": 0.68222,
+    "kv_prefix_scan_10_latency_us_ci_low": 1.6223,
+    "kv_prefix_scan_10_latency_us_ci_high": 1.6376,
+    "scan_limit_100_latency_us_ci_low": 228.86,
+    "scan_limit_100_latency_us_ci_high": 265.2,
+    "e2e_bootstrap_commit_and_query_latency_ms_ci_low": 36.174,
+    "e2e_bootstrap_commit_and_query_latency_ms_ci_high": 38.504,
+    "checkpoint_write_ms_100mb": null,
+    "checkpoint_write_ms_500mb": null,
+    "checkpoint_write_ms_1gb": null,
+    "recovery_ms_1_uncheckpointed_segment": null,
+    "recovery_ms_2_uncheckpointed_segments": null
+  },
+  "notes": {
+    "seeded_rows_for_query_benches": 10000,
+    "method": "cargo bench --bench perf -- --sample-size=10",
+    "remarks": "Latency values are criterion reported confidence intervals, not exact percentiles. Heavy checkpoint/recovery baselines remain pending dedicated long-run measurement."
+  }
+}
