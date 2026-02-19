@@ -1,13 +1,13 @@
 use super::{
-    AedbInstance, CommitFinality, CommitTelemetryEvent, LifecycleEvent, LifecycleHook, QueryBatchItem,
-    QueryCommitTelemetryHook, QueryTelemetryEvent, ReadOnlySqlAdapter, RecoveryCache,
-    RemoteBackupAdapter, SYSTEM_CALLER_ID,
+    AedbInstance, CommitFinality, CommitTelemetryEvent, LifecycleEvent, LifecycleHook,
+    QueryBatchItem, QueryCommitTelemetryHook, QueryTelemetryEvent, ReadOnlySqlAdapter,
+    RecoveryCache, RemoteBackupAdapter, SYSTEM_CALLER_ID,
 };
 use crate::catalog::schema::ColumnDef;
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
-use crate::commit::validation::Mutation;
 use crate::commit::tx::{TransactionEnvelope, WriteClass, WriteIntent};
+use crate::commit::validation::Mutation;
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use crate::error::{AedbError, AedbErrorCode, ResourceType as ErrorResourceType};
 use crate::permission::{CallerContext, Permission};
@@ -309,6 +309,73 @@ async fn insert_rejects_duplicate_primary_key() {
     assert!(
         duplicate_text.contains("duplicate primary key"),
         "unexpected duplicate insert error: {duplicate:?}"
+    );
+}
+
+#[tokio::test]
+async fn insert_batch_rejects_duplicate_primary_key() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("table");
+
+    db.insert_batch(
+        "p",
+        "app",
+        "users",
+        vec![
+            Row {
+                values: vec![Value::Integer(1), Value::Text("alice".into())],
+            },
+            Row {
+                values: vec![Value::Integer(2), Value::Text("bob".into())],
+            },
+        ],
+    )
+    .await
+    .expect("seed batch");
+
+    let duplicate = db
+        .insert_batch(
+            "p",
+            "app",
+            "users",
+            vec![
+                Row {
+                    values: vec![Value::Integer(3), Value::Text("charlie".into())],
+                },
+                Row {
+                    values: vec![Value::Integer(1), Value::Text("alice-2".into())],
+                },
+            ],
+        )
+        .await
+        .expect_err("duplicate insert_batch must fail");
+    let duplicate_text = duplicate.to_string();
+    assert!(
+        duplicate_text.contains("duplicate primary key"),
+        "unexpected duplicate insert_batch error: {duplicate:?}"
     );
 }
 
@@ -3193,11 +3260,23 @@ async fn multi_update_transaction_envelope_updates_table_and_kv() {
         .await
         .expect("tx:last");
     let ledger = db
-        .kv_get("p", "app", b"ledger:1->2", ConsistencyMode::AtLatest, &caller)
+        .kv_get(
+            "p",
+            "app",
+            b"ledger:1->2",
+            ConsistencyMode::AtLatest,
+            &caller,
+        )
         .await
         .expect("ledger entry");
-    assert_eq!(tx_last.as_ref().map(|v| v.value.clone()), Some(b"t1".to_vec()));
-    assert_eq!(ledger.as_ref().map(|v| v.value.clone()), Some(b"10".to_vec()));
+    assert_eq!(
+        tx_last.as_ref().map(|v| v.value.clone()),
+        Some(b"t1".to_vec())
+    );
+    assert_eq!(
+        ledger.as_ref().map(|v| v.value.clone()),
+        Some(b"10".to_vec())
+    );
 }
 
 #[tokio::test]

@@ -740,6 +740,22 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn insert_batch(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        rows: Vec<crate::catalog::types::Row>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::InsertBatch {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            table_name: table_name.to_string(),
+            rows,
+        })
+        .await
+    }
+
     pub async fn commit_as(
         &self,
         caller: CallerContext,
@@ -844,7 +860,8 @@ impl AedbInstance {
         result: &mut CommitResult,
         finality: CommitFinality,
     ) -> Result<(), AedbError> {
-        if matches!(finality, CommitFinality::Durable) && result.durable_head_seq < result.commit_seq
+        if matches!(finality, CommitFinality::Durable)
+            && result.durable_head_seq < result.commit_seq
         {
             self.wait_for_durable(result.commit_seq).await?;
             result.durable_head_seq = self.executor.durable_head_seq().await;

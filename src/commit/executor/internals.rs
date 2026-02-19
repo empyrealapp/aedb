@@ -56,6 +56,12 @@ pub(super) fn scope_shard_key(mutations: &[Mutation]) -> String {
             table_name,
             ..
         }
+        | Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
         | Mutation::Upsert {
             project_id,
             scope_id,
@@ -994,6 +1000,11 @@ pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<
             scope_id,
             ..
         }
+        | Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            ..
+        }
         | Mutation::Upsert {
             project_id,
             scope_id,
@@ -1030,6 +1041,12 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         | Mutation::KvIncU256 { .. }
         | Mutation::KvDecU256 { .. } => true,
         Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::InsertBatch {
             project_id,
             scope_id,
             table_name,
@@ -1118,6 +1135,12 @@ pub(super) fn mutation_requires_coordinator(catalog: &Catalog, mutation: &Mutati
         Mutation::Ddl(_) => true,
         Mutation::UpsertOnConflict { .. } | Mutation::UpsertBatchOnConflict { .. } => true,
         Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::InsertBatch {
             project_id,
             scope_id,
             table_name,
@@ -1227,6 +1250,21 @@ pub(super) fn enforce_global_unique_scope_invariants(
             )
         }
         Mutation::UpsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            rows,
+        } => {
+            let schema = table_schema_for(catalog, project_id, scope_id, table_name)?;
+            for row in rows {
+                let pk = extract_pk_from_row(&schema, row)?;
+                enforce_global_unique_for_row(
+                    catalog, keyspace, project_id, scope_id, table_name, &pk, row,
+                )?;
+            }
+            Ok(())
+        }
+        Mutation::InsertBatch {
             project_id,
             scope_id,
             table_name,
@@ -1587,6 +1625,12 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
     for mutation in mutations {
         match mutation {
             Mutation::Insert {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::InsertBatch {
                 project_id,
                 scope_id,
                 table_name,
@@ -2511,6 +2555,20 @@ pub(super) fn apply_projection_delta(
             if namespace_key(project_id, scope_id) == ns && mutation_table == table_name {
                 let projected = project_row(row, schema, projected_columns)?;
                 projection_rows.insert(EncodedKey::from_values(primary_key), projected);
+            }
+        }
+        Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name: mutation_table,
+            rows,
+        } => {
+            if namespace_key(project_id, scope_id) == ns && mutation_table == table_name {
+                for row in rows {
+                    let pk = extract_pk_from_row(schema, row)?;
+                    let projected = project_row(row, schema, projected_columns)?;
+                    projection_rows.insert(EncodedKey::from_values(&pk), projected);
+                }
             }
         }
         Mutation::Delete {

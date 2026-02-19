@@ -8,6 +8,7 @@ use crate::error::AedbError;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
 use primitive_types::U256;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreflightResult {
@@ -48,6 +49,60 @@ pub fn preflight(
                 };
             }
             PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            rows,
+        } => {
+            let ns = crate::catalog::namespace_key(project_id, scope_id);
+            let Some(schema) = catalog.tables.get(&(ns, table_name.clone())) else {
+                return PreflightResult::Err {
+                    reason: AedbError::Validation("table missing".into()).to_string(),
+                };
+            };
+            let mut seen = HashSet::with_capacity(rows.len());
+            for row in rows {
+                let mut primary_key = Vec::with_capacity(schema.primary_key.len());
+                for pk_name in &schema.primary_key {
+                    let Some(idx) = schema.columns.iter().position(|c| c.name == *pk_name) else {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(format!(
+                                "primary key column missing: {pk_name}"
+                            ))
+                            .to_string(),
+                        };
+                    };
+                    let Some(value) = row.values.get(idx) else {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(format!(
+                                "primary key column value missing from row: {pk_name}"
+                            ))
+                            .to_string(),
+                        };
+                    };
+                    primary_key.push(value.clone());
+                }
+                let encoded = EncodedKey::from_values(&primary_key);
+                if !seen.insert(encoded.clone())
+                    || snapshot
+                        .table(project_id, scope_id, table_name)
+                        .and_then(|t| t.rows.get(&encoded))
+                        .is_some()
+                {
+                    return PreflightResult::Err {
+                        reason: AedbError::DuplicatePK {
+                            table: table_name.clone(),
+                            key: format!("{primary_key:?}"),
+                        }
+                        .to_string(),
+                    };
+                }
+            }
+            PreflightResult::Ok {
+                affected_rows: rows.len() as u64,
+            }
         }
         Mutation::UpsertBatch { rows, .. } | Mutation::UpsertBatchOnConflict { rows, .. } => {
             PreflightResult::Ok {
@@ -172,9 +227,9 @@ pub fn preflight_plan(
         errors.push(e.to_string());
     }
     let estimated_affected_rows = match mutation {
-        Mutation::UpsertBatch { rows, .. } | Mutation::UpsertBatchOnConflict { rows, .. } => {
-            rows.len()
-        }
+        Mutation::InsertBatch { rows, .. }
+        | Mutation::UpsertBatch { rows, .. }
+        | Mutation::UpsertBatchOnConflict { rows, .. } => rows.len(),
         Mutation::DeleteWhere { limit, .. }
         | Mutation::UpdateWhere { limit, .. }
         | Mutation::UpdateWhereExpr { limit, .. } => limit.unwrap_or(1),
@@ -220,7 +275,13 @@ pub fn preflight_plan(
                 version_at_read: version,
             });
         }
-        Mutation::UpsertBatch {
+        Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            rows,
+        }
+        | Mutation::UpsertBatch {
             project_id,
             scope_id,
             table_name,
@@ -701,6 +762,52 @@ mod tests {
                 row: Row {
                     values: vec![Value::Integer(1), Value::Text("second".into())],
                 },
+            },
+        );
+        assert!(matches!(duplicate, PreflightResult::Err { .. }));
+    }
+
+    #[test]
+    fn preflight_insert_batch_reports_duplicate_primary_key() {
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog.create_project("p").expect("project");
+        catalog
+            .create_table(
+                "p",
+                "app",
+                "users",
+                vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "name".into(),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                vec!["id".into()],
+            )
+            .expect("table");
+
+        let snapshot = Keyspace::default().snapshot();
+        let duplicate = preflight(
+            &snapshot,
+            &catalog,
+            &Mutation::InsertBatch {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "users".into(),
+                rows: vec![
+                    Row {
+                        values: vec![Value::Integer(1), Value::Text("alice".into())],
+                    },
+                    Row {
+                        values: vec![Value::Integer(1), Value::Text("alice-dup".into())],
+                    },
+                ],
             },
         );
         assert!(matches!(duplicate, PreflightResult::Err { .. }));
