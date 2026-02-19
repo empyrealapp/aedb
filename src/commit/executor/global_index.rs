@@ -72,6 +72,23 @@ impl GlobalUniqueIndexState {
         mutation: &Mutation,
     ) -> Result<(), AedbError> {
         match mutation {
+            Mutation::Insert {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                row,
+            } => self.enforce_for_row(
+                catalog,
+                keyspace,
+                RowEnforcementInput {
+                    project_id,
+                    scope_id,
+                    table_name,
+                    incoming_pk: primary_key,
+                    incoming_row: row,
+                },
+            ),
             Mutation::Upsert {
                 project_id,
                 scope_id,
@@ -111,6 +128,29 @@ impl GlobalUniqueIndexState {
                 )
             }
             Mutation::UpsertBatch {
+                project_id,
+                scope_id,
+                table_name,
+                rows,
+            } => {
+                let schema = table_schema_for(catalog, project_id, scope_id, table_name)?;
+                for row in rows {
+                    let pk = extract_pk_from_row(&schema, row)?;
+                    self.enforce_for_row(
+                        catalog,
+                        keyspace,
+                        RowEnforcementInput {
+                            project_id,
+                            scope_id,
+                            table_name,
+                            incoming_pk: &pk,
+                            incoming_row: row,
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+            Mutation::InsertBatch {
                 project_id,
                 scope_id,
                 table_name,

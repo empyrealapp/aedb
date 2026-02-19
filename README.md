@@ -68,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }))
     .await?;
 
-    db.commit_with_preflight(Mutation::Upsert {
+    db.commit_with_preflight(Mutation::Insert {
         project_id: "demo".into(),
         scope_id: "app".into(),
         table_name: "users".into(),
@@ -127,6 +127,17 @@ println!("snapshot seq = {}", result.snapshot_seq);
 - `preflight` and `preflight_plan` are advisory
 - state may change before commit
 - use `commit_with_preflight` / `commit_as_with_preflight` for lowest TOCTOU risk
+- use `commit_with_finality(..., CommitFinality::Visible)` for low-latency user ack
+- use `CommitFinality::Durable` for flows that must wait for WAL durability
+
+Low-latency profile example:
+
+```rust
+use aedb::config::AedbConfig;
+
+let config = AedbConfig::low_latency([7u8; 32]);
+let db = aedb::AedbInstance::open(config, dir.path())?;
+```
 
 ## Security and Permissions
 
