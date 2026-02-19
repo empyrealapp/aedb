@@ -74,7 +74,8 @@ pub enum Permission {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CallerContext {
     pub caller_id: String,
-    #[serde(default)]
+    // Reserved internal flag: never deserialize from untrusted input.
+    #[serde(default, skip_deserializing)]
     internal_system: bool,
 }
 

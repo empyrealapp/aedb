@@ -2,16 +2,37 @@ use crate::catalog::types::{Row, Value};
 use crate::query::error::QueryError;
 use crate::query::plan::{Aggregate, Expr, Order};
 use lru::LruCache;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BinaryHeap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::Arc;
+
+const EXPR_CACHE_SHARDS: usize = 16;
+const EXPR_CACHE_TOTAL_CAPACITY: usize = 256;
+const EXPR_CACHE_PER_SHARD: usize = EXPR_CACHE_TOTAL_CAPACITY / EXPR_CACHE_SHARDS;
 
 /// Global cache for compiled expressions to avoid recompiling identical predicates.
 /// Key is (expr_debug_string, column_names, table) to ensure correct schema context.
 /// This provides 50-100μs savings for repeated queries with the same predicates.
-type ExprCompileCache = Mutex<LruCache<(String, Vec<String>, String), CompiledExpr>>;
+type ExprCacheKey = (String, Vec<String>, String);
+type ExprCompileCacheShard = parking_lot::Mutex<LruCache<ExprCacheKey, CompiledExpr>>;
+type ExprCompileCache = [ExprCompileCacheShard; EXPR_CACHE_SHARDS];
+
 static EXPR_COMPILE_CACHE: once_cell::sync::Lazy<ExprCompileCache> =
-    once_cell::sync::Lazy::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(100).unwrap())));
+    once_cell::sync::Lazy::new(|| {
+        std::array::from_fn(|_| {
+            let cap = NonZeroUsize::new(EXPR_CACHE_PER_SHARD).unwrap_or(NonZeroUsize::MIN);
+            parking_lot::Mutex::new(LruCache::new(cap))
+        })
+    });
+
+fn expr_cache_shard_idx(cache_key: &ExprCacheKey) -> usize {
+    let mut hasher = DefaultHasher::new();
+    cache_key.hash(&mut hasher);
+    (hasher.finish() as usize) % EXPR_CACHE_SHARDS
+}
 
 pub trait Operator {
     fn next(&mut self) -> Option<Row>;
@@ -101,10 +122,10 @@ pub fn compile_expr(
 ) -> Result<CompiledExpr, QueryError> {
     // Try cache first - use debug representation as key (includes expr structure)
     let cache_key = (format!("{:?}", expr), columns.to_vec(), table.to_string());
+    let shard_idx = expr_cache_shard_idx(&cache_key);
+    let cache_shard = &EXPR_COMPILE_CACHE[shard_idx];
 
-    if let Ok(mut cache) = EXPR_COMPILE_CACHE.lock()
-        && let Some(compiled) = cache.get(&cache_key)
-    {
+    if let Some(compiled) = cache_shard.lock().get(&cache_key) {
         // Cache hit - return cloned compiled expression
         return Ok(compiled.clone());
     }
@@ -113,9 +134,7 @@ pub fn compile_expr(
     let compiled = compile_expr_uncached(expr, columns, table)?;
 
     // Store in cache
-    if let Ok(mut cache) = EXPR_COMPILE_CACHE.lock() {
-        cache.put(cache_key, compiled.clone());
-    }
+    cache_shard.lock().put(cache_key, compiled.clone());
 
     Ok(compiled)
 }
@@ -213,13 +232,16 @@ pub struct SortOperator {
 }
 
 impl SortOperator {
-    pub fn new(mut child: Box<dyn Operator + Send>, order_by: Vec<(usize, Order)>) -> Self {
-        let mut rows = Vec::new();
-        while let Some(row) = child.next() {
-            rows.push(row);
-        }
-        let examined = child.rows_examined();
-        rows.sort_by(|a, b| {
+    pub fn new(child: Box<dyn Operator + Send>, order_by: Vec<(usize, Order)>) -> Self {
+        Self::new_with_limit(child, order_by, None)
+    }
+
+    pub fn new_with_limit(
+        mut child: Box<dyn Operator + Send>,
+        order_by: Vec<(usize, Order)>,
+        limit: Option<usize>,
+    ) -> Self {
+        let compare_rows = |a: &Row, b: &Row| {
             for (column_idx, order) in &order_by {
                 let cmp = a.values[*column_idx].cmp(&b.values[*column_idx]);
                 let ord = match order {
@@ -231,7 +253,100 @@ impl SortOperator {
                 }
             }
             std::cmp::Ordering::Equal
-        });
+        };
+
+        if let Some(limit) = limit {
+            if limit == 0 {
+                return Self {
+                    rows: Vec::new(),
+                    idx: 0,
+                    examined: 0,
+                };
+            }
+            #[derive(Clone)]
+            struct TopKRow {
+                row: Row,
+                sort_key: Vec<Value>,
+                orders: Arc<Vec<Order>>,
+            }
+
+            impl Ord for TopKRow {
+                fn cmp(&self, other: &Self) -> Ordering {
+                    for ((lhs, rhs), order) in self
+                        .sort_key
+                        .iter()
+                        .zip(other.sort_key.iter())
+                        .zip(self.orders.iter())
+                    {
+                        let cmp = lhs.cmp(rhs);
+                        let ord = match order {
+                            Order::Asc => cmp,
+                            Order::Desc => cmp.reverse(),
+                        };
+                        if !ord.is_eq() {
+                            return ord;
+                        }
+                    }
+                    Ordering::Equal
+                }
+            }
+
+            impl PartialOrd for TopKRow {
+                fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                    Some(self.cmp(other))
+                }
+            }
+
+            impl PartialEq for TopKRow {
+                fn eq(&self, other: &Self) -> bool {
+                    self.cmp(other).is_eq()
+                }
+            }
+
+            impl Eq for TopKRow {}
+
+            let sort_key_columns: Vec<usize> = order_by.iter().map(|(idx, _)| *idx).collect();
+            let sort_orders =
+                Arc::new(order_by.iter().map(|(_, order)| *order).collect::<Vec<_>>());
+            let mut heap: BinaryHeap<TopKRow> = BinaryHeap::with_capacity(limit);
+            while let Some(row) = child.next() {
+                let candidate = TopKRow {
+                    sort_key: sort_key_columns
+                        .iter()
+                        .map(|idx| row.values[*idx].clone())
+                        .collect(),
+                    row,
+                    orders: Arc::clone(&sort_orders),
+                };
+                if heap.len() < limit {
+                    heap.push(candidate);
+                    continue;
+                }
+                // Keep only the best N rows under the requested ORDER BY.
+                if heap
+                    .peek()
+                    .is_some_and(|worst_of_best| candidate < *worst_of_best)
+                {
+                    let _ = heap.pop();
+                    heap.push(candidate);
+                }
+            }
+            let examined = child.rows_examined();
+            let mut rows = heap.into_iter().map(|entry| entry.row).collect::<Vec<_>>();
+            rows.sort_by(compare_rows);
+            return Self {
+                rows,
+                idx: 0,
+                examined,
+            };
+        }
+
+        let mut rows = Vec::new();
+        while let Some(row) = child.next() {
+            rows.push(row);
+        }
+        let examined = child.rows_examined();
+        rows.sort_by(compare_rows);
         Self {
             rows,
             idx: 0,
@@ -290,6 +405,83 @@ pub struct AggregateOperator {
     examined: usize,
 }
 
+#[derive(Debug, Clone)]
+enum AggregateState {
+    Count(i64),
+    Sum(i64),
+    Min(Option<Value>),
+    Max(Option<Value>),
+    Avg { total: i64, count: i64 },
+}
+
+impl AggregateState {
+    fn from_aggregate(aggregate: &Aggregate) -> Self {
+        match aggregate {
+            Aggregate::Count => AggregateState::Count(0),
+            Aggregate::Sum(_) => AggregateState::Sum(0),
+            Aggregate::Min(_) => AggregateState::Min(None),
+            Aggregate::Max(_) => AggregateState::Max(None),
+            Aggregate::Avg(_) => AggregateState::Avg { total: 0, count: 0 },
+        }
+    }
+
+    fn update(&mut self, aggregate: &Aggregate, row: &Row, col_idx: Option<usize>) {
+        match (self, aggregate) {
+            (AggregateState::Count(v), Aggregate::Count) => {
+                *v = v.saturating_add(1);
+            }
+            (AggregateState::Sum(sum), Aggregate::Sum(_)) => {
+                if let Some(idx) = col_idx
+                    && let Value::Integer(v) = &row.values[idx]
+                {
+                    *sum = sum.saturating_add(*v);
+                }
+            }
+            (AggregateState::Min(state), Aggregate::Min(_)) => {
+                if let Some(idx) = col_idx {
+                    let value = row.values[idx].clone();
+                    if state.as_ref().is_none_or(|current| value < *current) {
+                        *state = Some(value);
+                    }
+                }
+            }
+            (AggregateState::Max(state), Aggregate::Max(_)) => {
+                if let Some(idx) = col_idx {
+                    let value = row.values[idx].clone();
+                    if state.as_ref().is_none_or(|current| value > *current) {
+                        *state = Some(value);
+                    }
+                }
+            }
+            (AggregateState::Avg { total, count }, Aggregate::Avg(_)) => {
+                if let Some(idx) = col_idx
+                    && let Value::Integer(v) = &row.values[idx]
+                {
+                    *total = total.saturating_add(*v);
+                    *count = count.saturating_add(1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize(self) -> Value {
+        match self {
+            AggregateState::Count(v) => Value::Integer(v),
+            AggregateState::Sum(v) => Value::Integer(v),
+            AggregateState::Min(v) => v.unwrap_or(Value::Null),
+            AggregateState::Max(v) => v.unwrap_or(Value::Null),
+            AggregateState::Avg { total, count } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(total as f64 / count as f64)
+                }
+            }
+        }
+    }
+}
+
 impl AggregateOperator {
     pub fn new(
         mut child: Box<dyn Operator + Send>,
@@ -297,30 +489,35 @@ impl AggregateOperator {
         group_by_idx: Vec<usize>,
         aggregate_col_idx: Vec<Option<usize>>,
     ) -> Self {
-        let mut input = Vec::new();
+        let aggregates = Arc::new(aggregates);
+        let aggregate_col_idx = Arc::new(aggregate_col_idx);
+        let mut buckets: BTreeMap<Vec<Value>, Vec<AggregateState>> = BTreeMap::new();
         while let Some(row) = child.next() {
-            input.push(row);
+            let key: Vec<Value> = if group_by_idx.is_empty() {
+                Vec::new()
+            } else {
+                group_by_idx
+                    .iter()
+                    .map(|i| row.values[*i].clone())
+                    .collect()
+            };
+            let states = buckets.entry(key).or_insert_with(|| {
+                aggregates
+                    .iter()
+                    .map(AggregateState::from_aggregate)
+                    .collect::<Vec<_>>()
+            });
+            for (idx, state) in states.iter_mut().enumerate() {
+                state.update(&aggregates[idx], &row, aggregate_col_idx[idx]);
+            }
         }
         let examined = child.rows_examined();
 
-        let mut buckets: BTreeMap<Vec<Value>, Vec<Row>> = BTreeMap::new();
-        if group_by_idx.is_empty() {
-            buckets.insert(Vec::new(), input);
-        } else {
-            for row in input {
-                let key = group_by_idx
-                    .iter()
-                    .map(|i| row.values[*i].clone())
-                    .collect();
-                buckets.entry(key).or_default().push(row);
-            }
-        }
-
         let mut rows = Vec::new();
-        for (group_key, group_rows) in buckets {
+        for (group_key, group_states) in buckets {
             let mut values = group_key;
-            for (agg, col_idx) in aggregates.iter().zip(aggregate_col_idx.iter()) {
-                values.push(apply_aggregate(agg, &group_rows, *col_idx));
+            for state in group_states {
+                values.push(state.finalize());
             }
             rows.push(Row { values });
         }
@@ -345,53 +542,6 @@ impl Operator for AggregateOperator {
 
     fn rows_examined(&self) -> usize {
         self.examined
-    }
-}
-
-fn apply_aggregate(aggregate: &Aggregate, rows: &[Row], col_idx: Option<usize>) -> Value {
-    match aggregate {
-        Aggregate::Count => Value::Integer(rows.len() as i64),
-        Aggregate::Sum(_) => {
-            let idx = col_idx.expect("sum requires column");
-            let sum = rows
-                .iter()
-                .filter_map(|r| match &r.values[idx] {
-                    Value::Integer(v) => Some(*v),
-                    _ => None,
-                })
-                .sum();
-            Value::Integer(sum)
-        }
-        Aggregate::Min(_) => {
-            let idx = col_idx.expect("min requires column");
-            rows.iter()
-                .map(|r| r.values[idx].clone())
-                .min()
-                .unwrap_or(Value::Null)
-        }
-        Aggregate::Max(_) => {
-            let idx = col_idx.expect("max requires column");
-            rows.iter()
-                .map(|r| r.values[idx].clone())
-                .max()
-                .unwrap_or(Value::Null)
-        }
-        Aggregate::Avg(_) => {
-            let idx = col_idx.expect("avg requires column");
-            let mut total = 0i64;
-            let mut count = 0i64;
-            for row in rows {
-                if let Value::Integer(v) = &row.values[idx] {
-                    total += *v;
-                    count += 1;
-                }
-            }
-            if count == 0 {
-                Value::Null
-            } else {
-                Value::Float(total as f64 / count as f64)
-            }
-        }
     }
 }
 

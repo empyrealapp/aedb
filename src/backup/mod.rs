@@ -200,7 +200,11 @@ pub fn extract_backup_archive(
         reader.read_exact(&mut payload)?;
 
         let compressed = if encrypted {
-            let key = encryption_key.expect("checked above");
+            let Some(key) = encryption_key else {
+                return Err(AedbError::Validation(
+                    "backup archive missing encryption key".into(),
+                ));
+            };
             let expected_nonce = derive_archive_nonce(&salt, idx, &rel);
             decrypt_archive_payload(&payload, key, &expected_nonce)?
         } else {

@@ -2192,6 +2192,53 @@ async fn secure_mode_requires_authenticated_apis() {
 }
 
 #[tokio::test]
+async fn query_with_options_as_rejects_reserved_system_caller() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([8u8; 32]), dir.path())
+        .expect("open secure");
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+
+    let caller = CallerContext::new("system");
+    let err = db
+        .query_with_options_as(
+            Some(&caller),
+            "p",
+            "app",
+            Query::select(&["*"]).from("__system_authz"),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("reserved system caller should be rejected");
+    assert!(matches!(err, QueryError::PermissionDenied { .. }));
+}
+
+#[tokio::test]
+async fn query_no_auth_in_secure_mode_returns_structured_error() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([6u8; 32]), dir.path())
+        .expect("open secure");
+    let err = db
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["*"]).from("__system_authz"),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("secure mode should reject query_no_auth");
+    assert!(matches!(err, QueryError::PermissionDenied { .. }));
+}
+
+#[tokio::test]
 async fn existence_and_introspection_apis_report_catalog_state() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -3304,6 +3351,43 @@ async fn checkpoint_now_waits_for_active_writes() {
 }
 
 #[tokio::test]
+async fn checkpoint_now_returns_structured_error_when_gate_closed() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.checkpoint_gate.close();
+    let err = db
+        .checkpoint_now()
+        .await
+        .expect_err("closed gate should return error");
+    assert!(matches!(err, AedbError::Unavailable { .. }));
+    assert!(
+        !db.checkpoint_in_progress.load(Ordering::Acquire),
+        "checkpoint flag should be reset on error"
+    );
+}
+
+#[tokio::test]
+async fn commit_returns_structured_error_when_gate_closed() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.checkpoint_gate.close();
+    let err = db
+        .commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })
+        .await
+        .expect_err("closed gate should fail commit");
+    assert!(matches!(err, AedbError::Unavailable { .. }));
+}
+
+#[tokio::test]
 async fn backup_lock_blocks_new_write_submissions() {
     let dir = tempdir().expect("temp");
     let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
@@ -3311,7 +3395,11 @@ async fn backup_lock_blocks_new_write_submissions() {
 
     // Simulate a checkpoint/backup in progress
     db.checkpoint_in_progress.store(true, Ordering::Release);
-    let _all_permits = db.checkpoint_gate.acquire_many(1000).await.unwrap();
+    let _all_permits = db
+        .checkpoint_gate
+        .acquire_many(super::CHECKPOINT_GATE_PERMITS)
+        .await
+        .unwrap();
 
     // Commit should fail fast with checkpoint error (better than blocking)
     let result = db

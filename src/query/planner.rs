@@ -103,7 +103,6 @@ pub fn build_physical_plan(
             limit,
             child: Box::new(node),
         };
-        let _ = limit;
         stages.push(ExecutionStage::Limit);
     }
 

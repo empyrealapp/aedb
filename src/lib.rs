@@ -68,8 +68,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::{info, warn};
+
+const CHECKPOINT_GATE_PERMITS: u32 = 1000;
 
 /// Creates a directory with restrictive permissions (0o700 on Unix) to prevent
 /// unauthorized access to database files on multi-user systems.
@@ -640,7 +642,7 @@ impl AedbInstance {
             dir: dir.to_path_buf(),
             executor,
             checkpoint_in_progress: Arc::new(AtomicBool::new(false)),
-            checkpoint_gate: Arc::new(Semaphore::new(1000)),
+            checkpoint_gate: Arc::new(Semaphore::new(CHECKPOINT_GATE_PERMITS as usize)),
             snapshot_manager: Arc::new(Mutex::new(SnapshotManager::default())),
             recovery_cache: Arc::new(Mutex::new(RecoveryCache::default())),
             lifecycle_hooks: Arc::new(Mutex::new(Vec::new())),
@@ -648,6 +650,15 @@ impl AedbInstance {
             startup_recovery_micros,
             startup_recovered_seq,
         })
+    }
+
+    async fn acquire_checkpoint_permit(&self) -> Result<SemaphorePermit<'_>, AedbError> {
+        self.checkpoint_gate
+            .acquire()
+            .await
+            .map_err(|_| AedbError::Unavailable {
+                message: "checkpoint gate is closed".into(),
+            })
     }
 
     pub async fn commit(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
@@ -664,11 +675,7 @@ impl AedbInstance {
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return Err(AedbError::CheckpointInProgress);
         }
-        let _permit = self
-            .checkpoint_gate
-            .acquire()
-            .await
-            .expect("checkpoint gate semaphore should never be closed");
+        let _permit = self.acquire_checkpoint_permit().await?;
         let lifecycle_events = self
             .plan_lifecycle_events(std::slice::from_ref(&mutation))
             .await?;
@@ -769,11 +776,7 @@ impl AedbInstance {
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return Err(AedbError::CheckpointInProgress);
         }
-        let _permit = self
-            .checkpoint_gate
-            .acquire()
-            .await
-            .expect("checkpoint gate semaphore should never be closed");
+        let _permit = self.acquire_checkpoint_permit().await?;
         let lifecycle_events = self
             .plan_lifecycle_events(std::slice::from_ref(&mutation))
             .await?;
@@ -830,11 +833,7 @@ impl AedbInstance {
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return Err(AedbError::CheckpointInProgress);
         }
-        let _permit = self
-            .checkpoint_gate
-            .acquire()
-            .await
-            .expect("checkpoint gate semaphore should never be closed");
+        let _permit = self.acquire_checkpoint_permit().await?;
         let lifecycle_events = self
             .plan_lifecycle_events(&envelope.write_intent.mutations)
             .await?;
@@ -1009,10 +1008,12 @@ impl AedbInstance {
         query: Query,
         options: QueryOptions,
     ) -> Result<QueryResult, QueryError> {
-        assert!(
-            !self.require_authenticated_calls,
-            "query_no_auth called in secure/authenticated mode"
-        );
+        if self.require_authenticated_calls {
+            return Err(QueryError::PermissionDenied {
+                permission: "query_no_auth is unavailable in secure mode".into(),
+                scope: "anonymous".into(),
+            });
+        }
         self.query_unchecked(project_id, scope_id, query, options)
             .await
     }
@@ -1047,6 +1048,9 @@ impl AedbInstance {
                 permission: "authenticated caller required in secure mode".into(),
                 scope: "anonymous".into(),
             });
+        }
+        if let Some(caller) = caller {
+            ensure_query_caller_allowed(caller)?;
         }
 
         if options.async_index.is_none() {
@@ -3695,7 +3699,6 @@ impl AedbInstance {
         // Set checkpoint flag to fast-fail new operations, then acquire all permits
         // to ensure exclusivity (wait for in-flight operations to complete)
         self.checkpoint_in_progress.store(true, Ordering::Release);
-        let _all_permits = self.checkpoint_gate.acquire_many(1000).await.unwrap();
 
         // Ensure flag is reset even if we return early with error
         struct ResetGuard<'a>(&'a AtomicBool);
@@ -3705,6 +3708,14 @@ impl AedbInstance {
             }
         }
         let _reset_guard = ResetGuard(&self.checkpoint_in_progress);
+
+        let _all_permits = self
+            .checkpoint_gate
+            .acquire_many(CHECKPOINT_GATE_PERMITS)
+            .await
+            .map_err(|_| AedbError::Unavailable {
+                message: "checkpoint gate is closed".into(),
+            })?;
 
         let _ = self.executor.force_fsync().await?;
         let (snapshot, catalog, seq) = self.executor.snapshot_state().await;
@@ -4160,6 +4171,15 @@ impl AedbInstance {
             startup_recovery_micros: self.startup_recovery_micros,
             startup_recovered_seq: self.startup_recovered_seq,
         }
+    }
+
+    /// Returns an in-memory footprint estimate (bytes) for current keyspace state.
+    ///
+    /// This is an estimate based on row/KV/index payload sizes and is intended for
+    /// policy and safety heuristics (for example, retention memory-pressure offload).
+    pub async fn estimated_memory_bytes(&self) -> usize {
+        let (snapshot, _, _) = self.executor.snapshot_state().await;
+        snapshot.estimate_memory_bytes()
     }
 
     pub async fn wait_for_durable(&self, seq: u64) -> Result<(), AedbError> {
