@@ -4,14 +4,15 @@ use crate::catalog::schema::TableSchema;
 use crate::catalog::types::{Row, Value};
 use crate::query::error::QueryError;
 use crate::query::operators::{
-    AggregateOperator, FilterOperator, Operator, ScanOperator, SortOperator, compile_expr,
+    AggregateOperator, FilterOperator, LimitOperator, Operator, ScanOperator, SortOperator,
+    compile_expr,
 };
 use crate::query::plan::{Aggregate, Expr, JoinType, Query, QueryOptions};
 use crate::query::planner::{ExecutionStage, build_physical_plan};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 
 type IndexBounds = (Bound<EncodedKey>, Bound<EncodedKey>);
@@ -43,12 +44,9 @@ pub fn execute_query(
         project_id,
         scope_id,
         query,
-        &QueryOptions {
-            allow_full_scan: true,
-            ..QueryOptions::default()
-        },
+        &QueryOptions::default(),
         0,
-        usize::MAX,
+        10_000,
     )
 }
 
@@ -202,7 +200,17 @@ pub fn execute_query_with_options(
     let mut row_columns = columns.clone();
     for stage in &physical_plan.stages {
         match stage {
-            ExecutionStage::Scan | ExecutionStage::Limit => {}
+            ExecutionStage::Scan => {}
+            ExecutionStage::Limit => {
+                if cursor_state.is_none()
+                    && query.order_by.is_empty()
+                    && query.aggregates.is_empty()
+                    && query.having.is_none()
+                    && let Some(limit) = query.limit
+                {
+                    root = Box::new(LimitOperator::new(root, limit.saturating_add(1)));
+                }
+            }
             ExecutionStage::Filter => {
                 if let Some(predicate) = query.predicate.clone() {
                     let compiled = compile_expr(&predicate, &columns, &query.table)?;
@@ -224,7 +232,12 @@ pub fn execute_query_with_options(
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                root = Box::new(SortOperator::new(root, order_by));
+                let top_k_limit = if cursor_state.is_none() {
+                    query.limit.map(|limit| limit.saturating_add(1))
+                } else {
+                    None
+                };
+                root = Box::new(SortOperator::new_with_limit(root, order_by, top_k_limit));
             }
             ExecutionStage::Aggregate => {
                 let group_by_idx = query
@@ -372,11 +385,6 @@ fn execute_join_query(
     max_scan_rows: usize,
     cursor_state: Option<CursorToken>,
 ) -> Result<QueryResult, QueryError> {
-    if cursor_state.is_some() {
-        return Err(QueryError::InvalidQuery {
-            reason: "cursor pagination is not supported for join queries".into(),
-        });
-    }
     let (base_ns_project, base_ns_scope, base_table) =
         resolve_table_ref(project_id, scope_id, &query.table);
     let base_schema = catalog
@@ -420,9 +428,9 @@ fn execute_join_query(
                 table: jt.clone(),
             })?;
         let join_alias = join.alias.clone().unwrap_or(jt.clone());
-        let join_rows: Vec<Row> = snapshot
+        let join_rows: Vec<&Row> = snapshot
             .table(&jp, &js, &jt)
-            .map(|t| t.rows.values().cloned().collect())
+            .map(|t| t.rows.values().collect())
             .unwrap_or_default();
         if !options.allow_full_scan
             && rows.len().saturating_mul(join_rows.len().max(1)) > max_scan_rows
@@ -485,17 +493,22 @@ fn execute_join_query(
                 }
             }
             JoinType::Inner | JoinType::Left => {
+                let right_idx = right_idx.ok_or_else(|| QueryError::InvalidQuery {
+                    reason: "join requires right join key".into(),
+                })?;
+                let left_idx = left_idx.ok_or_else(|| QueryError::InvalidQuery {
+                    reason: "join requires left join key".into(),
+                })?;
                 // Hash join for equality predicates.
-                let mut right_map: std::collections::BTreeMap<Value, Vec<&Row>> =
-                    std::collections::BTreeMap::new();
+                let mut right_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                 for right in &join_rows {
                     right_map
-                        .entry(right.values[right_idx.expect("right idx")].clone())
+                        .entry(right.values[right_idx].clone())
                         .or_default()
                         .push(right);
                 }
                 for left in &rows {
-                    let key = left.values[left_idx.expect("left idx")].clone();
+                    let key = left.values[left_idx].clone();
                     if let Some(matches) = right_map.get(&key) {
                         for right in matches {
                             let mut values = left.values.clone();
@@ -510,16 +523,21 @@ fn execute_join_query(
                 }
             }
             JoinType::Right => {
-                let mut left_map: std::collections::BTreeMap<Value, Vec<&Row>> =
-                    std::collections::BTreeMap::new();
+                let left_idx = left_idx.ok_or_else(|| QueryError::InvalidQuery {
+                    reason: "join requires left join key".into(),
+                })?;
+                let right_idx = right_idx.ok_or_else(|| QueryError::InvalidQuery {
+                    reason: "join requires right join key".into(),
+                })?;
+                let mut left_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                 for left in &rows {
                     left_map
-                        .entry(left.values[left_idx.expect("left idx")].clone())
+                        .entry(left.values[left_idx].clone())
                         .or_default()
                         .push(left);
                 }
                 for right in &join_rows {
-                    let key = right.values[right_idx.expect("right idx")].clone();
+                    let key = right.values[right_idx].clone();
                     if let Some(matches) = left_map.get(&key) {
                         for left in matches {
                             let mut values = left.values.clone();
@@ -580,6 +598,42 @@ fn execute_join_query(
         });
     }
 
+    let rows_examined = rows.len();
+    let page_size = query.limit.unwrap_or_else(|| {
+        cursor_state
+            .as_ref()
+            .map(|c| c.page_size)
+            .unwrap_or(max_scan_rows.min(100))
+    });
+    let effective_page_size = page_size.min(max_scan_rows);
+    let sort_indices: Vec<(usize, crate::query::plan::Order)> = if !query.order_by.is_empty() {
+        query
+            .order_by
+            .iter()
+            .filter_map(|(name, ord)| columns.iter().position(|c| c == name).map(|i| (i, *ord)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let pk_indices: Vec<usize> = (0..columns.len()).collect();
+    let mut sliced = Vec::new();
+    for row in rows {
+        if let Some(cursor) = &cursor_state
+            && !row_after_cursor(&row, cursor, &sort_indices, &pk_indices)
+        {
+            continue;
+        }
+        sliced.push(row);
+        if sliced.len() > effective_page_size {
+            break;
+        }
+    }
+    let has_more = sliced.len() > effective_page_size;
+    if has_more {
+        sliced.truncate(effective_page_size);
+    }
+    let cursor_last_row = sliced.last().cloned();
+
     if !query.select.is_empty() && query.select[0] != "*" {
         let idxs: Vec<usize> = query
             .select
@@ -594,7 +648,7 @@ fn execute_join_query(
                     })
             })
             .collect::<Result<_, _>>()?;
-        rows = rows
+        sliced = sliced
             .into_iter()
             .map(|r| Row {
                 values: idxs.iter().map(|i| r.values[*i].clone()).collect(),
@@ -602,15 +656,24 @@ fn execute_join_query(
             .collect();
     }
 
-    let hard_limit = query.limit.unwrap_or(max_scan_rows).min(max_scan_rows);
-    if rows.len() > hard_limit {
-        rows.truncate(hard_limit);
-    }
-    let _ = options;
+    let cursor = if has_more {
+        let last_row = cursor_last_row.ok_or_else(|| QueryError::InvalidQuery {
+            reason: "invalid cursor state".into(),
+        })?;
+        Some(encode_cursor(&CursorToken {
+            snapshot_seq,
+            last_sort_key: extract_sort_key(&last_row, &sort_indices),
+            last_pk: extract_pk_key(&last_row, &pk_indices),
+            page_size,
+            remaining_limit: None,
+        })?)
+    } else {
+        None
+    };
     Ok(QueryResult {
-        rows_examined: rows.len(),
-        rows,
-        cursor: None,
+        rows_examined,
+        rows: sliced,
+        cursor,
         snapshot_seq,
         materialized_seq: None,
     })
@@ -657,7 +720,9 @@ fn try_primary_key_point_query(
         }));
     }
 
-    let predicate = query.predicate.as_ref().expect("checked is_some");
+    let Some(predicate) = query.predicate.as_ref() else {
+        return Ok(None);
+    };
     let Some(primary_key) = extract_primary_key_values(predicate, &schema.primary_key) else {
         return Ok(None);
     };
@@ -938,17 +1003,28 @@ fn decode_cursor(encoded: &str) -> Result<CursorToken, QueryError> {
         });
     }
     let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    let chars: Vec<char> = encoded.chars().collect();
-    for i in (0..chars.len()).step_by(2) {
-        let pair = [chars[i], chars[i + 1]].iter().collect::<String>();
-        let b = u8::from_str_radix(&pair, 16).map_err(|_| QueryError::InvalidQuery {
+    let raw = encoded.as_bytes();
+    for i in (0..raw.len()).step_by(2) {
+        let hi = decode_hex_nibble(raw[i]).ok_or_else(|| QueryError::InvalidQuery {
             reason: "invalid cursor".into(),
         })?;
-        bytes.push(b);
+        let lo = decode_hex_nibble(raw[i + 1]).ok_or_else(|| QueryError::InvalidQuery {
+            reason: "invalid cursor".into(),
+        })?;
+        bytes.push((hi << 4) | lo);
     }
     rmp_serde::from_slice(&bytes).map_err(|e| QueryError::InvalidQuery {
         reason: e.to_string(),
     })
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn aggregate_col_idx(agg: &Aggregate, columns: &[String]) -> Result<Option<usize>, QueryError> {
@@ -985,6 +1061,34 @@ fn indexed_pks_for_predicate(
     table: &crate::storage::keyspace::TableData,
     predicate: &crate::query::plan::Expr,
 ) -> Result<Option<Vec<EncodedKey>>, QueryError> {
+    use crate::query::plan::Expr;
+
+    match predicate {
+        Expr::And(lhs, rhs) => {
+            let left =
+                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, lhs)?;
+            let right =
+                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, rhs)?;
+            return Ok(match (left, right) {
+                (Some(left), Some(right)) => Some(intersect_pks(left, right)),
+                (Some(left), None) => Some(left),
+                (None, Some(right)) => Some(right),
+                (None, None) => None,
+            });
+        }
+        Expr::Or(lhs, rhs) => {
+            let left =
+                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, lhs)?;
+            let right =
+                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, rhs)?;
+            return Ok(match (left, right) {
+                (Some(left), Some(right)) => Some(union_pks(left, right)),
+                _ => None,
+            });
+        }
+        _ => {}
+    }
+
     let mut equalities = HashMap::new();
     let eq_only = collect_eq_constraints(predicate, &mut equalities);
     let Some(lookup) = extract_indexable_predicate(predicate) else {
@@ -1088,6 +1192,29 @@ fn indexed_pks_for_predicate(
     Ok(Some(pks))
 }
 
+fn intersect_pks(left: Vec<EncodedKey>, right: Vec<EncodedKey>) -> Vec<EncodedKey> {
+    let mut right_set: HashSet<EncodedKey> = HashSet::with_capacity(right.len());
+    right_set.extend(right);
+    let mut out = Vec::with_capacity(left.len().min(right_set.len()));
+    for pk in left {
+        if right_set.contains(&pk) {
+            out.push(pk);
+        }
+    }
+    out
+}
+
+fn union_pks(left: Vec<EncodedKey>, right: Vec<EncodedKey>) -> Vec<EncodedKey> {
+    let mut seen: HashSet<EncodedKey> = HashSet::with_capacity(left.len() + right.len());
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    for pk in left.into_iter().chain(right) {
+        if seen.insert(pk.clone()) {
+            out.push(pk);
+        }
+    }
+    out
+}
+
 fn expr_implied_by_eq_constraints(
     expr: &crate::query::plan::Expr,
     equalities: &HashMap<String, Value>,
@@ -1167,9 +1294,6 @@ fn extract_indexable_predicate(predicate: &crate::query::plan::Expr) -> Option<I
                 bounds: (start, end),
             })
         }
-        Expr::And(lhs, rhs) => {
-            extract_indexable_predicate(lhs).or_else(|| extract_indexable_predicate(rhs))
-        }
         _ => None,
     }
 }
@@ -1205,7 +1329,7 @@ fn next_prefix(prefix: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_query, execute_query_with_options};
+    use super::execute_query_with_options;
     use crate::catalog::Catalog;
     use crate::catalog::namespace_key;
     use crate::catalog::schema::{ColumnDef, IndexType};
@@ -1215,6 +1339,28 @@ mod tests {
     use crate::storage::encoded_key::EncodedKey;
     use crate::storage::index::extract_index_key_encoded;
     use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndex};
+
+    fn execute_query(
+        snapshot: &crate::storage::keyspace::KeyspaceSnapshot,
+        catalog: &Catalog,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+    ) -> Result<super::QueryResult, QueryError> {
+        execute_query_with_options(
+            snapshot,
+            catalog,
+            project_id,
+            scope_id,
+            query,
+            &QueryOptions {
+                allow_full_scan: true,
+                ..QueryOptions::default()
+            },
+            0,
+            usize::MAX,
+        )
+    }
 
     fn setup() -> (Keyspace, Catalog) {
         let mut keyspace = Keyspace::default();
@@ -1681,6 +1827,48 @@ mod tests {
     }
 
     #[test]
+    fn and_or_predicates_compose_index_row_sets() {
+        let (keyspace, catalog) = setup();
+        let snapshot = keyspace.snapshot();
+
+        let and_query = execute_query(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["id", "name", "age"]).from("users").where_(
+                Expr::Eq("age".into(), Value::Integer(40))
+                    .and(Expr::Like("name".into(), "u2%".into())),
+            ),
+        )
+        .expect("and query");
+        assert!(and_query.rows.iter().all(|r| {
+            matches!(r.values[2], Value::Integer(40))
+                && matches!(&r.values[1], Value::Text(name) if name.starts_with("u2"))
+        }));
+
+        let or_query = execute_query(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["id", "name"])
+                .from("users")
+                .where_(
+                    Expr::Eq("name".into(), Value::Text("u1".into()))
+                        .or(Expr::Like("name".into(), "u2%".into())),
+                )
+                .order_by("id", Order::Asc),
+        )
+        .expect("or query");
+        assert!(or_query.rows.iter().all(|r| match &r.values[1] {
+            Value::Text(name) => name == "u1" || name.starts_with("u2"),
+            _ => false,
+        }));
+        assert!(!or_query.rows.is_empty());
+    }
+
+    #[test]
     fn composite_index_respects_leftmost_prefix_rule() {
         let (mut keyspace, mut catalog) = setup();
         catalog
@@ -1819,6 +2007,21 @@ mod tests {
             10_000,
         )
         .expect_err("should reject full scan");
+        assert!(matches!(err, QueryError::InvalidQuery { .. }));
+    }
+
+    #[test]
+    fn default_execute_query_rejects_unbounded_full_scan() {
+        let (keyspace, catalog) = setup();
+        let snapshot = keyspace.snapshot();
+        let err = super::execute_query(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["*"]).from("users"),
+        )
+        .expect_err("default execute_query should reject unbounded full scan");
         assert!(matches!(err, QueryError::InvalidQuery { .. }));
     }
 
@@ -2054,6 +2257,49 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_hex_cursor_is_accepted() {
+        let (keyspace, catalog) = setup();
+        let snapshot = keyspace.snapshot();
+        let first = execute_query_with_options(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["*"])
+                .from("users")
+                .order_by("id", Order::Asc)
+                .limit(10),
+            &QueryOptions::default(),
+            42,
+            10_000,
+        )
+        .expect("first page");
+        let cursor = first
+            .cursor
+            .expect("first page should include cursor")
+            .to_ascii_uppercase();
+        let options = QueryOptions {
+            cursor: Some(cursor),
+            ..QueryOptions::default()
+        };
+        let second = execute_query_with_options(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["*"])
+                .from("users")
+                .order_by("id", Order::Asc)
+                .limit(10),
+            &options,
+            42,
+            10_000,
+        )
+        .expect("uppercase cursor should decode");
+        assert_eq!(second.rows.len(), 10);
+    }
+
+    #[test]
     fn cursor_snapshot_mismatch_is_rejected() {
         let (keyspace, catalog) = setup();
         let snapshot = keyspace.snapshot();
@@ -2093,8 +2339,8 @@ mod tests {
     }
 
     #[test]
-    fn join_query_rejects_cursor_pagination() {
-        let (keyspace, mut catalog) = setup();
+    fn join_query_supports_cursor_pagination() {
+        let (mut keyspace, mut catalog) = setup();
         catalog
             .create_table(
                 "A",
@@ -2115,6 +2361,16 @@ mod tests {
                 vec!["user_id".into()],
             )
             .expect("profiles table");
+        for i in 0..50 {
+            keyspace.upsert_row(
+                "A",
+                "app",
+                "profiles",
+                vec![Value::Integer(i)],
+                Row::from_values(vec![Value::Integer(i), Value::Text("US".into())]),
+                1,
+            );
+        }
         let snapshot = keyspace.snapshot();
 
         let first = execute_query_with_options(
@@ -2124,19 +2380,24 @@ mod tests {
             "app",
             Query::select(&["*"])
                 .from("users")
-                .order_by("id", Order::Asc)
+                .alias("u")
+                .inner_join("profiles", "u.id", "user_id")
+                .with_last_join_alias("p")
+                .order_by("u.id", Order::Asc)
                 .limit(5),
             &QueryOptions::default(),
             7,
             10_000,
         )
         .expect("first page");
+        assert_eq!(first.rows.len(), 5);
+        assert!(first.cursor.is_some());
 
         let options = QueryOptions {
             cursor: first.cursor,
             ..QueryOptions::default()
         };
-        let err = execute_query_with_options(
+        let second = execute_query_with_options(
             &snapshot,
             &catalog,
             "A",
@@ -2151,8 +2412,17 @@ mod tests {
             7,
             10_000,
         )
-        .expect_err("join cursor should fail");
-        assert!(matches!(err, QueryError::InvalidQuery { .. }));
+        .expect("join cursor page");
+        assert_eq!(second.rows.len(), 5);
+        assert!(second.cursor.is_some());
+
+        let first_ids: Vec<Value> = first.rows.iter().map(|r| r.values[0].clone()).collect();
+        let second_ids: Vec<Value> = second.rows.iter().map(|r| r.values[0].clone()).collect();
+        assert!(
+            first_ids
+                .iter()
+                .all(|id| !second_ids.iter().any(|other| other == id))
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
-use aedb::query::plan::{ConsistencyMode, Query, col, lit};
+use aedb::query::plan::{ConsistencyMode, Order, Query, QueryOptions, col, lit};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
@@ -299,6 +299,133 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
                     )
                     .await
                     .expect("scan query");
+            });
+        })
+    });
+
+    c.bench_function("order_by_age_limit_100", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = seed_db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "age"])
+                            .from(TABLE_NAME)
+                            .order_by("age", Order::Asc)
+                            .limit(100),
+                    )
+                    .await
+                    .expect("ordered query");
+            });
+        })
+    });
+
+    rt.block_on(async {
+        seed_db
+            .commit(Mutation::Ddl(DdlOperation::CreateTable {
+                project_id: PROJECT_ID.into(),
+                scope_id: SCOPE_ID.into(),
+                table_name: "profiles".into(),
+                owner_id: None,
+                if_not_exists: false,
+                columns: vec![
+                    ColumnDef {
+                        name: "user_id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "country".into(),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                primary_key: vec!["user_id".into()],
+            }))
+            .await
+            .expect("profiles table");
+        for i in 1..=SEEDED_ROWS {
+            seed_db
+                .commit(Mutation::Upsert {
+                    project_id: PROJECT_ID.into(),
+                    scope_id: SCOPE_ID.into(),
+                    table_name: "profiles".into(),
+                    primary_key: vec![Value::Integer(i)],
+                    row: Row {
+                        values: vec![Value::Integer(i), Value::Text("US".into())],
+                    },
+                })
+                .await
+                .expect("seed profile");
+        }
+    });
+
+    c.bench_function("inner_join_users_profiles_limit_100", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = seed_db
+                    .query_with_options(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["u.id", "p.country"])
+                            .from(TABLE_NAME)
+                            .alias("u")
+                            .inner_join("profiles", "u.id", "user_id")
+                            .with_last_join_alias("p")
+                            .order_by("u.id", Order::Asc)
+                            .limit(100),
+                        QueryOptions {
+                            allow_full_scan: true,
+                            ..QueryOptions::default()
+                        },
+                    )
+                    .await
+                    .expect("join query");
+            });
+        })
+    });
+
+    c.bench_function("join_cursor_page_100", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let first = seed_db
+                    .query_with_options(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["u.id", "p.country"])
+                            .from(TABLE_NAME)
+                            .alias("u")
+                            .inner_join("profiles", "u.id", "user_id")
+                            .with_last_join_alias("p")
+                            .order_by("u.id", Order::Asc)
+                            .limit(100),
+                        QueryOptions {
+                            allow_full_scan: true,
+                            ..QueryOptions::default()
+                        },
+                    )
+                    .await
+                    .expect("first page");
+                let _ = seed_db
+                    .query_with_options(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["u.id", "p.country"])
+                            .from(TABLE_NAME)
+                            .alias("u")
+                            .inner_join("profiles", "u.id", "user_id")
+                            .with_last_join_alias("p")
+                            .order_by("u.id", Order::Asc)
+                            .limit(100),
+                        QueryOptions {
+                            cursor: first.cursor,
+                            allow_full_scan: true,
+                            ..QueryOptions::default()
+                        },
+                    )
+                    .await
+                    .expect("second page");
             });
         })
     });

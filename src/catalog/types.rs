@@ -3,6 +3,7 @@ use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ColumnType {
@@ -127,6 +128,24 @@ pub enum Value {
     Timestamp(i64),
     Json(CompactString),
     Null,
+}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kind_rank().hash(state);
+        match self {
+            Value::Text(v) => v.hash(state),
+            Value::Integer(v) => v.hash(state),
+            Value::Float(v) => v.to_bits().hash(state),
+            Value::Boolean(v) => v.hash(state),
+            Value::U256(v) => v.hash(state),
+            Value::I256(v) => v.hash(state),
+            Value::Blob(v) => v.hash(state),
+            Value::Timestamp(v) => v.hash(state),
+            Value::Json(v) => v.hash(state),
+            Value::Null => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

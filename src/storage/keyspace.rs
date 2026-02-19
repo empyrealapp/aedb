@@ -729,6 +729,38 @@ impl Keyspace {
 }
 
 impl KeyspaceSnapshot {
+    pub fn estimate_memory_bytes(&self) -> usize {
+        let row_bytes = self
+            .namespaces
+            .values()
+            .map(|ns| {
+                ns.tables
+                    .values()
+                    .map(|t| {
+                        t.rows.values().map(estimate_row_bytes).sum::<usize>() + t.rows.len() * 32
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        let kv_bytes = self
+            .namespaces
+            .values()
+            .map(|ns| {
+                ns.kv
+                    .entries
+                    .iter()
+                    .map(|(key, value)| key.len() + value.value.len() + 24)
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        let projection_bytes = self
+            .async_indexes
+            .values()
+            .map(|p| p.rows.values().map(estimate_row_bytes).sum::<usize>())
+            .sum::<usize>();
+        row_bytes + kv_bytes + projection_bytes
+    }
+
     pub fn table(&self, project_id: &str, scope_id: &str, table_name: &str) -> Option<&TableData> {
         self.namespaces
             .get(&NamespaceId::project_scope(project_id, scope_id))
