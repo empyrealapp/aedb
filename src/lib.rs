@@ -1930,10 +1930,12 @@ impl AedbInstance {
         key: &[u8],
         consistency: ConsistencyMode,
     ) -> Result<Option<KvEntry>, QueryError> {
-        assert!(
-            !self.require_authenticated_calls,
-            "kv_get_no_auth called in secure/authenticated mode"
-        );
+        if self.require_authenticated_calls {
+            return Err(QueryError::PermissionDenied {
+                permission: "kv_get_no_auth is unavailable in secure mode".into(),
+                scope: "anonymous".into(),
+            });
+        }
         self.kv_get_unchecked(project_id, scope_id, key, consistency)
             .await
     }
@@ -1977,10 +1979,12 @@ impl AedbInstance {
         limit: u64,
         consistency: ConsistencyMode,
     ) -> Result<Vec<(Vec<u8>, KvEntry)>, QueryError> {
-        assert!(
-            !self.require_authenticated_calls,
-            "kv_scan_prefix_no_auth called in secure/authenticated mode"
-        );
+        if self.require_authenticated_calls {
+            return Err(QueryError::PermissionDenied {
+                permission: "kv_scan_prefix_no_auth is unavailable in secure mode".into(),
+                scope: "anonymous".into(),
+            });
+        }
         self.kv_scan_prefix_unchecked(project_id, scope_id, prefix, limit, consistency)
             .await
     }

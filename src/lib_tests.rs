@@ -2239,6 +2239,25 @@ async fn query_no_auth_in_secure_mode_returns_structured_error() {
 }
 
 #[tokio::test]
+async fn kv_no_auth_apis_in_secure_mode_return_structured_error() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([4u8; 32]), dir.path())
+        .expect("open secure");
+
+    let get_err = db
+        .kv_get_no_auth("p", "app", b"k", ConsistencyMode::AtLatest)
+        .await
+        .expect_err("secure mode should reject kv_get_no_auth");
+    assert!(matches!(get_err, QueryError::PermissionDenied { .. }));
+
+    let scan_err = db
+        .kv_scan_prefix_no_auth("p", "app", b"k", 10, ConsistencyMode::AtLatest)
+        .await
+        .expect_err("secure mode should reject kv_scan_prefix_no_auth");
+    assert!(matches!(scan_err, QueryError::PermissionDenied { .. }));
+}
+
+#[tokio::test]
 async fn existence_and_introspection_apis_report_catalog_state() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");

@@ -132,7 +132,7 @@ pub fn execute_query_with_options(
             .map(|c| c.page_size)
             .unwrap_or(max_scan_rows.min(100))
     });
-    let effective_page_size = page_size;
+    let effective_page_size = page_size.min(max_scan_rows);
     if let Some(result) =
         try_primary_key_point_query(schema, table, &query, &cursor_state, snapshot_seq)?
     {
@@ -206,9 +206,11 @@ pub fn execute_query_with_options(
                     && query.order_by.is_empty()
                     && query.aggregates.is_empty()
                     && query.having.is_none()
-                    && let Some(limit) = query.limit
                 {
-                    root = Box::new(LimitOperator::new(root, limit.saturating_add(1)));
+                    root = Box::new(LimitOperator::new(
+                        root,
+                        effective_page_size.saturating_add(1),
+                    ));
                 }
             }
             ExecutionStage::Filter => {
@@ -233,7 +235,7 @@ pub fn execute_query_with_options(
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let top_k_limit = if cursor_state.is_none() {
-                    query.limit.map(|limit| limit.saturating_add(1))
+                    Some(effective_page_size.saturating_add(1))
                 } else {
                     None
                 };
@@ -565,6 +567,51 @@ fn execute_join_query(
 
     if let Some(predicate) = &query.predicate {
         let compiled = compile_expr(predicate, &columns, "join")?;
+        rows.retain(|r| crate::query::operators::eval_compiled_expr_public(&compiled, r));
+    }
+
+    if !query.aggregates.is_empty() {
+        let group_by_idx = query
+            .group_by
+            .iter()
+            .map(|name| {
+                columns
+                    .iter()
+                    .position(|c| c == name)
+                    .ok_or_else(|| QueryError::ColumnNotFound {
+                        table: "join".into(),
+                        column: name.clone(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let agg_col_idx = query
+            .aggregates
+            .iter()
+            .map(|agg| aggregate_col_idx(agg, &columns))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut aggregate = AggregateOperator::new(
+            Box::new(ScanOperator::new(rows)),
+            query.aggregates.clone(),
+            group_by_idx,
+            agg_col_idx,
+        );
+        let mut aggregated_rows = Vec::new();
+        while let Some(row) = aggregate.next() {
+            aggregated_rows.push(row);
+        }
+        rows = aggregated_rows;
+        columns = query.group_by.clone();
+        columns.extend(query.aggregates.iter().map(aggregate_output_name));
+    }
+
+    if let Some(having) = &query.having {
+        if query.aggregates.is_empty() {
+            return Err(QueryError::InvalidQuery {
+                reason: "having requires aggregate or group_by".into(),
+            });
+        }
+        let compiled = compile_expr(having, &columns, "join")?;
         rows.retain(|r| crate::query::operators::eval_compiled_expr_public(&compiled, r));
     }
 
@@ -2026,6 +2073,29 @@ mod tests {
     }
 
     #[test]
+    fn non_join_page_size_is_capped_by_max_scan_rows() {
+        let (keyspace, catalog) = setup();
+        let snapshot = keyspace.snapshot();
+        let result = execute_query_with_options(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["*"])
+                .from("users")
+                .order_by("id", Order::Asc)
+                .limit(50),
+            &QueryOptions::default(),
+            9,
+            10,
+        )
+        .expect("bounded page");
+        assert_eq!(result.rows.len(), 10);
+        assert!(result.cursor.is_some());
+        assert!(result.rows_examined <= 100);
+    }
+
+    #[test]
     fn join_scan_bound_is_enforced_when_full_scan_not_allowed() {
         let (keyspace, mut catalog) = setup();
         catalog
@@ -2179,6 +2249,67 @@ mod tests {
         )
         .expect("join query");
         assert_eq!(result.rows.len(), 50);
+    }
+
+    #[test]
+    fn join_aggregate_count_and_having_are_applied() {
+        let (mut keyspace, mut catalog) = setup();
+        catalog
+            .create_table(
+                "A",
+                "app",
+                "profiles",
+                vec![
+                    ColumnDef {
+                        name: "user_id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "country".into(),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                vec!["user_id".into()],
+            )
+            .expect("profiles table");
+        for i in 0..50 {
+            keyspace.upsert_row(
+                "A",
+                "app",
+                "profiles",
+                vec![Value::Integer(i)],
+                Row::from_values(vec![
+                    Value::Integer(i),
+                    Value::Text(if i % 2 == 0 { "US" } else { "CA" }.into()),
+                ]),
+                1,
+            );
+        }
+        let snapshot = keyspace.snapshot();
+        let result = execute_query(
+            &snapshot,
+            &catalog,
+            "A",
+            "app",
+            Query::select(&["p.country", "count_star"])
+                .from("users")
+                .alias("u")
+                .inner_join("profiles", "u.id", "user_id")
+                .with_last_join_alias("p")
+                .group_by(&["p.country"])
+                .aggregate(Aggregate::Count)
+                .having(Expr::Gt("count_star".into(), Value::Integer(20)))
+                .order_by("count_star", Order::Desc)
+                .limit(10),
+        )
+        .expect("join aggregate query");
+
+        assert_eq!(result.rows.len(), 2);
+        for row in result.rows {
+            assert!(matches!(row.values[1], Value::Integer(25)));
+        }
     }
 
     #[test]
