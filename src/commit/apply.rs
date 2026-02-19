@@ -21,6 +21,52 @@ pub fn apply_mutation(
     commit_seq: u64,
 ) -> Result<(), AedbError> {
     match mutation {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        } => {
+            ensure_internal_audit_schema_for_upsert(catalog, &project_id, &scope_id, &table_name)?;
+            apply_insert_once(
+                catalog,
+                keyspace,
+                &project_id,
+                &scope_id,
+                &table_name,
+                primary_key,
+                row,
+                commit_seq,
+            )?
+        }
+        Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            rows,
+        } => {
+            ensure_internal_audit_schema_for_upsert(catalog, &project_id, &scope_id, &table_name)?;
+            let ns = namespace_key(&project_id, &scope_id);
+            let schema = catalog
+                .tables
+                .get(&(ns.clone(), table_name.clone()))
+                .ok_or_else(|| AedbError::Validation("table missing".into()))?
+                .clone();
+            for row in rows {
+                let primary_key = extract_primary_key_from_row(&schema, &row)?;
+                apply_insert_once(
+                    catalog,
+                    keyspace,
+                    &project_id,
+                    &scope_id,
+                    &table_name,
+                    primary_key,
+                    row,
+                    commit_seq,
+                )?;
+            }
+        }
         Mutation::Upsert {
             project_id,
             scope_id,
@@ -579,6 +625,58 @@ pub fn apply_mutation_trusted_if_eligible(
         return None;
     }
     match mutation {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        } => Some(apply_insert_once(
+            catalog,
+            keyspace,
+            &project_id,
+            &scope_id,
+            &table_name,
+            primary_key,
+            row,
+            commit_seq,
+        )),
+        Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            rows,
+        } => {
+            let ns = namespace_key(&project_id, &scope_id);
+            let schema = match catalog.tables.get(&(ns, table_name.clone())) {
+                Some(schema) => schema.clone(),
+                None => return Some(Err(AedbError::Validation("table missing".into()))),
+            };
+            let mut result = Ok(());
+            for row in rows {
+                let primary_key = match extract_primary_key_from_row(&schema, &row) {
+                    Ok(pk) => pk,
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                };
+                if let Err(err) = apply_insert_once(
+                    catalog,
+                    keyspace,
+                    &project_id,
+                    &scope_id,
+                    &table_name,
+                    primary_key,
+                    row,
+                    commit_seq,
+                ) {
+                    result = Err(err);
+                    break;
+                }
+            }
+            Some(result)
+        }
         Mutation::Upsert {
             project_id,
             scope_id,
@@ -1080,6 +1178,38 @@ fn table_allows_trusted_fast_upsert(
             )
     });
     !has_unique_index
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_insert_once(
+    catalog: &mut Catalog,
+    keyspace: &mut Keyspace,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: Vec<Value>,
+    row: Row,
+    commit_seq: u64,
+) -> Result<(), AedbError> {
+    if keyspace
+        .get_row(project_id, scope_id, table_name, &primary_key)
+        .is_some()
+    {
+        return Err(AedbError::DuplicatePK {
+            table: table_name.to_string(),
+            key: format!("{primary_key:?}"),
+        });
+    }
+    apply_upsert_once(
+        catalog,
+        keyspace,
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+        row,
+        commit_seq,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

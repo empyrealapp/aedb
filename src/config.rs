@@ -143,6 +143,28 @@ impl AedbConfig {
         }
     }
 
+    /// Low-latency profile tuned for user-facing commit acknowledgements.
+    ///
+    /// This profile intentionally uses batched durability so commits can
+    /// finalize at visible-head latency while WAL fsync is coalesced in short
+    /// intervals. It keeps strict recovery + hash-chain + manifest HMAC.
+    ///
+    /// Use `AedbInstance::commit_with_finality(..., CommitFinality::Durable)`
+    /// for flows that must wait for durability.
+    pub fn low_latency(hmac_key: [u8; 32]) -> Self {
+        Self {
+            manifest_hmac_key: Some(Arc::new(Zeroizing::new(hmac_key.to_vec()))),
+            recovery_mode: RecoveryMode::Strict,
+            durability_mode: DurabilityMode::Batch,
+            hash_chain_required: true,
+            batch_interval_ms: 2,
+            batch_max_bytes: 512 * 1024,
+            epoch_max_wait_us: 50,
+            adaptive_epoch_target_latency_us: 1_000,
+            ..Self::default()
+        }
+    }
+
     pub fn strict_recovery(&self) -> bool {
         matches!(self.recovery_mode, RecoveryMode::Strict)
     }

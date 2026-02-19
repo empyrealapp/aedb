@@ -123,6 +123,14 @@ pub struct AedbInstance {
     startup_recovered_seq: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFinality {
+    /// Return as soon as commit is visible at the snapshot head.
+    Visible,
+    /// Return only after commit sequence is durable in WAL.
+    Durable,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OperationalMetrics {
     pub commits_total: u64,
@@ -671,6 +679,16 @@ impl AedbInstance {
         Ok(result)
     }
 
+    pub async fn commit_with_finality(
+        &self,
+        mutation: Mutation,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let mut result = self.commit(mutation).await?;
+        self.enforce_finality(&mut result, finality).await?;
+        Ok(result)
+    }
+
     pub async fn commit_with_preflight(
         &self,
         mutation: Mutation,
@@ -704,6 +722,24 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn insert(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        primary_key: Vec<crate::catalog::types::Value>,
+        row: crate::catalog::types::Row,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::Insert {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            table_name: table_name.to_string(),
+            primary_key,
+            row,
+        })
+        .await
+    }
+
     pub async fn commit_as(
         &self,
         caller: CallerContext,
@@ -729,6 +765,17 @@ impl AedbInstance {
         self.emit_commit_telemetry("commit_as", started, &result);
         let result = result?;
         self.dispatch_lifecycle_events(lifecycle_events, result.commit_seq);
+        Ok(result)
+    }
+
+    pub async fn commit_as_with_finality(
+        &self,
+        caller: CallerContext,
+        mutation: Mutation,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let mut result = self.commit_as(caller, mutation).await?;
+        self.enforce_finality(&mut result, finality).await?;
         Ok(result)
     }
 
@@ -780,6 +827,29 @@ impl AedbInstance {
         let result = result?;
         self.dispatch_lifecycle_events(lifecycle_events, result.commit_seq);
         Ok(result)
+    }
+
+    pub async fn commit_envelope_with_finality(
+        &self,
+        envelope: TransactionEnvelope,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let mut result = self.commit_envelope(envelope).await?;
+        self.enforce_finality(&mut result, finality).await?;
+        Ok(result)
+    }
+
+    async fn enforce_finality(
+        &self,
+        result: &mut CommitResult,
+        finality: CommitFinality,
+    ) -> Result<(), AedbError> {
+        if matches!(finality, CommitFinality::Durable) && result.durable_head_seq < result.commit_seq
+        {
+            self.wait_for_durable(result.commit_seq).await?;
+            result.durable_head_seq = self.executor.durable_head_seq().await;
+        }
+        Ok(())
     }
 
     async fn plan_lifecycle_events(

@@ -1,6 +1,5 @@
-
 use super::{
-    AedbInstance, CommitTelemetryEvent, LifecycleEvent, LifecycleHook, QueryBatchItem,
+    AedbInstance, CommitFinality, CommitTelemetryEvent, LifecycleEvent, LifecycleHook, QueryBatchItem,
     QueryCommitTelemetryHook, QueryTelemetryEvent, ReadOnlySqlAdapter, RecoveryCache,
     RemoteBackupAdapter, SYSTEM_CALLER_ID,
 };
@@ -8,6 +7,7 @@ use crate::catalog::schema::ColumnDef;
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
 use crate::commit::validation::Mutation;
+use crate::commit::tx::{TransactionEnvelope, WriteClass, WriteIntent};
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use crate::error::{AedbError, AedbErrorCode, ResourceType as ErrorResourceType};
 use crate::permission::{CallerContext, Permission};
@@ -251,6 +251,65 @@ async fn permissions_enforced_at_preflight_commit_and_query() {
         .await
         .expect("query with read perm");
     assert_eq!(q.rows.len(), 1);
+}
+
+#[tokio::test]
+async fn insert_rejects_duplicate_primary_key() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("table");
+
+    db.insert(
+        "p",
+        "app",
+        "users",
+        vec![Value::Integer(1)],
+        Row {
+            values: vec![Value::Integer(1), Value::Text("alice".into())],
+        },
+    )
+    .await
+    .expect("first insert");
+
+    let duplicate = db
+        .insert(
+            "p",
+            "app",
+            "users",
+            vec![Value::Integer(1)],
+            Row {
+                values: vec![Value::Integer(1), Value::Text("alice-2".into())],
+            },
+        )
+        .await
+        .expect_err("duplicate insert must fail");
+    let duplicate_text = duplicate.to_string();
+    assert!(
+        duplicate_text.contains("duplicate primary key"),
+        "unexpected duplicate insert error: {duplicate:?}"
+    );
 }
 
 #[tokio::test]
@@ -1983,6 +2042,17 @@ async fn secure_profile_requires_hardened_storage_settings() {
     AedbInstance::open_secure(hardened, dir.path()).expect("open secure");
 }
 
+#[test]
+fn low_latency_profile_uses_batch_durability_with_strict_recovery() {
+    let cfg = AedbConfig::low_latency([5u8; 32]);
+    assert_eq!(cfg.durability_mode, DurabilityMode::Batch);
+    assert_eq!(cfg.recovery_mode, RecoveryMode::Strict);
+    assert!(cfg.hash_chain_required);
+    assert!(cfg.batch_interval_ms > 0);
+    assert!(cfg.batch_max_bytes > 0);
+    assert!(cfg.manifest_hmac_key.is_some());
+}
+
 #[tokio::test]
 async fn secure_mode_requires_authenticated_apis() {
     let dir = tempdir().expect("temp");
@@ -2890,6 +2960,244 @@ async fn checkpoint_now_in_batch_mode_flushes_wal_and_recovers_tail() {
         .kv_get("p", "app", b"tail")
         .expect("tail recovered");
     assert_eq!(tail.value, b"v1".to_vec());
+}
+
+#[tokio::test]
+async fn commit_with_visible_finality_can_return_before_durable_head_in_batch_mode() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let result = db
+        .commit_with_finality(
+            Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"fast-visible".to_vec(),
+                value: b"v".to_vec(),
+            },
+            CommitFinality::Visible,
+        )
+        .await
+        .expect("commit");
+
+    assert!(
+        result.durable_head_seq < result.commit_seq,
+        "visible finality should not require durable head in batch mode"
+    );
+}
+
+#[tokio::test]
+async fn commit_with_durable_finality_waits_until_durable_head_catches_up() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        ..AedbConfig::default()
+    };
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let fsync_db = Arc::clone(&db);
+    let fsync_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fsync_db.force_fsync().await.expect("force fsync");
+    });
+
+    let started = Instant::now();
+    let result = db
+        .commit_with_finality(
+            Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"fast-durable".to_vec(),
+                value: b"v".to_vec(),
+            },
+            CommitFinality::Durable,
+        )
+        .await
+        .expect("commit");
+    fsync_task.await.expect("join fsync");
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(15),
+        "durable finality should wait for WAL durability in batch mode"
+    );
+    assert!(
+        result.durable_head_seq >= result.commit_seq,
+        "durable finality must report durable head at or beyond commit sequence"
+    );
+}
+
+#[tokio::test]
+async fn multi_update_transaction_envelope_updates_table_and_kv() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "accounts".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "balance".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("accounts table");
+
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "accounts".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row {
+            values: vec![Value::Integer(1), Value::Integer(100)],
+        },
+    })
+    .await
+    .expect("seed account 1");
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "accounts".into(),
+        primary_key: vec![Value::Integer(2)],
+        row: Row {
+            values: vec![Value::Integer(2), Value::Integer(80)],
+        },
+    })
+    .await
+    .expect("seed account 2");
+
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        actor_id: None,
+        delegable: false,
+        caller_id: "reader".into(),
+        permission: Permission::KvRead {
+            project_id: "p".into(),
+            scope_id: Some("app".into()),
+            prefix: None,
+        },
+    }))
+    .await
+    .expect("grant kv read");
+    let caller = CallerContext::new("reader");
+
+    let result = db
+        .commit_envelope_with_finality(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![
+                        Mutation::Upsert {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            table_name: "accounts".into(),
+                            primary_key: vec![Value::Integer(1)],
+                            row: Row {
+                                values: vec![Value::Integer(1), Value::Integer(90)],
+                            },
+                        },
+                        Mutation::Upsert {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            table_name: "accounts".into(),
+                            primary_key: vec![Value::Integer(2)],
+                            row: Row {
+                                values: vec![Value::Integer(2), Value::Integer(90)],
+                            },
+                        },
+                        Mutation::KvSet {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            key: b"tx:last".to_vec(),
+                            value: b"t1".to_vec(),
+                        },
+                        Mutation::KvSet {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            key: b"ledger:1->2".to_vec(),
+                            value: b"10".to_vec(),
+                        },
+                    ],
+                },
+                base_seq: db.head_state().await.visible_head_seq,
+            },
+            CommitFinality::Visible,
+        )
+        .await
+        .expect("multi-update tx");
+
+    assert!(
+        result.durable_head_seq < result.commit_seq,
+        "visible finality should return before durable head in batch mode"
+    );
+
+    let acct1 = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["balance"])
+                .from("accounts")
+                .where_(Expr::Eq("id".into(), Value::Integer(1)))
+                .limit(1),
+        )
+        .await
+        .expect("query account1");
+    let acct2 = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["balance"])
+                .from("accounts")
+                .where_(Expr::Eq("id".into(), Value::Integer(2)))
+                .limit(1),
+        )
+        .await
+        .expect("query account2");
+    assert_eq!(acct1.rows.len(), 1);
+    assert_eq!(acct2.rows.len(), 1);
+    assert_eq!(acct1.rows[0].values[0], Value::Integer(90));
+    assert_eq!(acct2.rows[0].values[0], Value::Integer(90));
+
+    let tx_last = db
+        .kv_get("p", "app", b"tx:last", ConsistencyMode::AtLatest, &caller)
+        .await
+        .expect("tx:last");
+    let ledger = db
+        .kv_get("p", "app", b"ledger:1->2", ConsistencyMode::AtLatest, &caller)
+        .await
+        .expect("ledger entry");
+    assert_eq!(tx_last.as_ref().map(|v| v.value.clone()), Some(b"t1".to_vec()));
+    assert_eq!(ledger.as_ref().map(|v| v.value.clone()), Some(b"10".to_vec()));
 }
 
 #[tokio::test]

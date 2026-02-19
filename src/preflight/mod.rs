@@ -27,6 +27,28 @@ pub fn preflight(
     }
 
     match mutation {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            ..
+        } => {
+            let exists = snapshot
+                .table(project_id, scope_id, table_name)
+                .and_then(|t| t.rows.get(&EncodedKey::from_values(primary_key)))
+                .is_some();
+            if exists {
+                return PreflightResult::Err {
+                    reason: AedbError::DuplicatePK {
+                        table: table_name.clone(),
+                        key: format!("{primary_key:?}"),
+                    }
+                    .to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
         Mutation::UpsertBatch { rows, .. } | Mutation::UpsertBatchOnConflict { rows, .. } => {
             PreflightResult::Ok {
                 affected_rows: rows.len() as u64,
@@ -160,7 +182,14 @@ pub fn preflight_plan(
     };
     let mut read_set = ReadSet::default();
     match mutation {
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            ..
+        }
+        | Mutation::Upsert {
             project_id,
             scope_id,
             table_name,
@@ -621,5 +650,59 @@ mod tests {
             bad,
             PreflightResult::Err { ref reason } if reason.contains("invalid u256 bytes length")
         ));
+    }
+
+    #[test]
+    fn preflight_insert_reports_duplicate_primary_key() {
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog.create_project("p").expect("project");
+        catalog
+            .create_table(
+                "p",
+                "app",
+                "users",
+                vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "name".into(),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                vec!["id".into()],
+            )
+            .expect("table");
+
+        let mut keyspace = Keyspace::default();
+        keyspace.upsert_row(
+            "p",
+            "app",
+            "users",
+            vec![Value::Integer(1)],
+            Row {
+                values: vec![Value::Integer(1), Value::Text("alice".into())],
+            },
+            1,
+        );
+        let snapshot = keyspace.snapshot();
+
+        let duplicate = preflight(
+            &snapshot,
+            &catalog,
+            &Mutation::Insert {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "users".into(),
+                primary_key: vec![Value::Integer(1)],
+                row: Row {
+                    values: vec![Value::Integer(1), Value::Text("second".into())],
+                },
+            },
+        );
+        assert!(matches!(duplicate, PreflightResult::Err { .. }));
     }
 }

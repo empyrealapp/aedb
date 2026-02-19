@@ -55,6 +55,19 @@ pub enum CompareOp {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Mutation {
+    Insert {
+        project_id: String,
+        scope_id: String,
+        table_name: String,
+        primary_key: Vec<Value>,
+        row: Row,
+    },
+    InsertBatch {
+        project_id: String,
+        scope_id: String,
+        table_name: String,
+        rows: Vec<Row>,
+    },
     Upsert {
         project_id: String,
         scope_id: String,
@@ -203,7 +216,14 @@ pub fn validate_mutation_with_config(
     config: &AedbConfig,
 ) -> Result<(), AedbError> {
     match mutation {
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        }
+        | Mutation::Upsert {
             project_id,
             scope_id,
             table_name,
@@ -213,7 +233,13 @@ pub fn validate_mutation_with_config(
             ensure_not_managed_table(table_name)?;
             validate_upsert_row(catalog, project_id, scope_id, table_name, primary_key, row)
         }
-        Mutation::UpsertBatch {
+        Mutation::InsertBatch {
+            project_id,
+            scope_id,
+            table_name,
+            rows,
+        }
+        | Mutation::UpsertBatch {
             project_id,
             scope_id,
             table_name,
@@ -683,7 +709,19 @@ fn kv_write_target(mutation: &Mutation) -> Option<(&str, &str, &[u8])> {
 
 pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError> {
     match mutation {
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::Upsert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::InsertBatch {
             project_id,
             scope_id,
             table_name,

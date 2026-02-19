@@ -50,7 +50,13 @@ pub(super) fn scope_shard_key(mutations: &[Mutation]) -> String {
         return "empty".into();
     };
     match mutation {
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::Upsert {
             project_id,
             scope_id,
             table_name,
@@ -983,6 +989,11 @@ pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<
             scope_id,
             ..
         }
+        | Mutation::Insert {
+            project_id,
+            scope_id,
+            ..
+        }
         | Mutation::Upsert {
             project_id,
             scope_id,
@@ -1018,7 +1029,13 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         | Mutation::KvDel { .. }
         | Mutation::KvIncU256 { .. }
         | Mutation::KvDecU256 { .. } => true,
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::Upsert {
             project_id,
             scope_id,
             table_name,
@@ -1100,7 +1117,13 @@ pub(super) fn mutation_requires_coordinator(catalog: &Catalog, mutation: &Mutati
     match mutation {
         Mutation::Ddl(_) => true,
         Mutation::UpsertOnConflict { .. } | Mutation::UpsertBatchOnConflict { .. } => true,
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::Upsert {
             project_id,
             scope_id,
             table_name,
@@ -1160,6 +1183,21 @@ pub(super) fn enforce_global_unique_scope_invariants(
     mutation: &Mutation,
 ) -> Result<(), AedbError> {
     match mutation {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        } => enforce_global_unique_for_row(
+            catalog,
+            keyspace,
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        ),
         Mutation::Upsert {
             project_id,
             scope_id,
@@ -1548,7 +1586,13 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
     let mut touched_tables = HashSet::new();
     for mutation in mutations {
         match mutation {
-            Mutation::Upsert {
+            Mutation::Insert {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::Upsert {
                 project_id,
                 scope_id,
                 table_name,
@@ -2450,7 +2494,14 @@ pub(super) fn apply_projection_delta(
     projection_rows: &mut im::OrdMap<EncodedKey, crate::catalog::types::Row>,
 ) -> Result<(), AedbError> {
     match mutation {
-        Mutation::Upsert {
+        Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name: mutation_table,
+            primary_key,
+            row,
+        }
+        | Mutation::Upsert {
             project_id,
             scope_id,
             table_name: mutation_table,
