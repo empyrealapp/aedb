@@ -1902,7 +1902,12 @@ fn now_micros() -> u64 {
 }
 
 pub fn namespace_key(project_id: &str, scope_id: &str) -> String {
-    format!("{project_id}{NAMESPACE_KEY_SEPARATOR}{scope_id}")
+    let mut key =
+        String::with_capacity(project_id.len() + NAMESPACE_KEY_SEPARATOR.len() + scope_id.len());
+    key.push_str(project_id);
+    key.push_str(NAMESPACE_KEY_SEPARATOR);
+    key.push_str(scope_id);
+    key
 }
 
 pub const DEFAULT_SCOPE_ID: &str = "app";

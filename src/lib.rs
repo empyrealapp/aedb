@@ -11,6 +11,7 @@ mod lib_tests;
 pub mod manifest;
 pub mod migration;
 pub mod offline;
+pub mod order_book;
 pub mod permission;
 pub mod preflight;
 pub mod query;
@@ -43,6 +44,11 @@ use crate::manifest::atomic::write_manifest_atomic_signed;
 use crate::manifest::schema::{Manifest, SegmentMeta};
 use crate::migration::{
     Migration, MigrationRecord, checksum_hex, decode_record, encode_record, migration_key,
+};
+use crate::order_book::{
+    ExecInstruction, FillSpec, InstrumentConfig, OrderBookDepth, OrderBookTableMode, OrderRecord,
+    OrderRequest, OrderSide, Spread, TimeInForce, read_last_execution_report, read_open_orders,
+    read_order_status, read_recent_trades, read_spread, read_top_n, scoped_instrument,
 };
 use crate::permission::{CallerContext, Permission};
 use crate::preflight::{PreflightResult, preflight, preflight_plan};
@@ -697,6 +703,27 @@ impl AedbInstance {
         let result = result?;
         self.dispatch_lifecycle_events(lifecycle_events, result.commit_seq);
         Ok(result)
+    }
+
+    async fn commit_prevalidated_internal(
+        &self,
+        op_name: &'static str,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        let started = Instant::now();
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required; use commit_as in secure mode".into(),
+            ));
+        }
+        crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
+        if self.checkpoint_in_progress.load(Ordering::Acquire) {
+            return Err(AedbError::CheckpointInProgress);
+        }
+        let _permit = self.acquire_checkpoint_permit().await?;
+        let result = self.executor.submit_prevalidated(mutation).await;
+        self.emit_commit_telemetry(op_name, started, &result);
+        result
     }
 
     pub async fn commit_with_finality(
@@ -2738,6 +2765,487 @@ impl AedbInstance {
             amount_be,
         })
         .await
+    }
+
+    pub async fn order_book_new(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        request: OrderRequest,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_new",
+            Mutation::OrderBookNew {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                request,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_define_table(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_id: &str,
+        mode: OrderBookTableMode,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_define_table",
+            Mutation::OrderBookDefineTable {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                table_id: table_id.to_string(),
+                mode,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_drop_table(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_id: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_drop_table",
+            Mutation::OrderBookDropTable {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                table_id: table_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_set_instrument_config(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        config: InstrumentConfig,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_set_instrument_config",
+            Mutation::OrderBookSetInstrumentConfig {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                config,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_set_instrument_halted(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        halted: bool,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_set_instrument_halted",
+            Mutation::OrderBookSetInstrumentHalted {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                halted,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_new_in_table(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_id: &str,
+        asset_id: &str,
+        mut request: OrderRequest,
+    ) -> Result<CommitResult, AedbError> {
+        request.instrument = scoped_instrument(table_id, asset_id);
+        self.order_book_new(project_id, scope_id, request).await
+    }
+
+    pub async fn order_book_new_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        request: OrderRequest,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookNew {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                request,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_cancel",
+            Mutation::OrderBookCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                client_order_id: None,
+                owner: owner.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_by_client_id(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        client_order_id: &str,
+        owner: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_cancel_by_client_id",
+            Mutation::OrderBookCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id: 0,
+                client_order_id: Some(client_order_id.to_string()),
+                owner: owner.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_replace(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        new_price_ticks: Option<i64>,
+        new_qty_be: Option<[u8; 32]>,
+        new_time_in_force: Option<TimeInForce>,
+        new_exec_instructions: Option<ExecInstruction>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_cancel_replace",
+            Mutation::OrderBookCancelReplace {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                owner: owner.to_string(),
+                new_price_ticks,
+                new_qty_be,
+                new_time_in_force,
+                new_exec_instructions,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_mass_cancel(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        owner: &str,
+        side: Option<OrderSide>,
+        owner_filter: Option<String>,
+        price_range_ticks: Option<(i64, i64)>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_mass_cancel",
+            Mutation::OrderBookMassCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                owner: owner.to_string(),
+                side,
+                owner_filter,
+                price_range_ticks,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_reduce(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        reduce_by_be: [u8; 32],
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_reduce",
+            Mutation::OrderBookReduce {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                owner: owner.to_string(),
+                reduce_by_be,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_match_internal(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        fills: Vec<FillSpec>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal(
+            "order_book_match_internal",
+            Mutation::OrderBookMatch {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                fills,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_top_n(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        depth: u32,
+        consistency: ConsistencyMode,
+        caller: &CallerContext,
+    ) -> Result<OrderBookDepth, QueryError> {
+        ensure_query_caller_allowed(caller)?;
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let prefix = format!("ob:{instrument}:");
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            prefix.as_bytes(),
+        ) {
+            return Err(QueryError::PermissionDenied {
+                permission: format!("KvRead({project_id}.{scope_id})"),
+                scope: caller.caller_id.clone(),
+            });
+        }
+        read_top_n(
+            &lease.view.keyspace,
+            project_id,
+            scope_id,
+            instrument,
+            depth as usize,
+            lease.view.seq,
+        )
+        .map_err(QueryError::from)
+    }
+
+    pub async fn order_status(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        consistency: ConsistencyMode,
+        caller: &CallerContext,
+    ) -> Result<Option<OrderRecord>, QueryError> {
+        ensure_query_caller_allowed(caller)?;
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let prefix = format!("ob:{instrument}:");
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            prefix.as_bytes(),
+        ) {
+            return Err(QueryError::PermissionDenied {
+                permission: format!("KvRead({project_id}.{scope_id})"),
+                scope: caller.caller_id.clone(),
+            });
+        }
+        let order = read_order_status(
+            &lease.view.keyspace,
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+        )
+        .map_err(QueryError::from)?;
+        if let Some(order) = &order {
+            let admin = lease
+                .view
+                .catalog
+                .has_permission(&caller.caller_id, &Permission::GlobalAdmin);
+            if !admin && order.owner != caller.caller_id {
+                return Err(QueryError::PermissionDenied {
+                    permission: "order_status(owner match)".into(),
+                    scope: caller.caller_id.clone(),
+                });
+            }
+        }
+        Ok(order)
+    }
+
+    pub async fn open_orders(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        owner: &str,
+        consistency: ConsistencyMode,
+        caller: &CallerContext,
+    ) -> Result<Vec<OrderRecord>, QueryError> {
+        ensure_query_caller_allowed(caller)?;
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let admin = lease
+            .view
+            .catalog
+            .has_permission(&caller.caller_id, &Permission::GlobalAdmin);
+        if !admin && owner != caller.caller_id {
+            return Err(QueryError::PermissionDenied {
+                permission: "open_orders(owner match)".into(),
+                scope: caller.caller_id.clone(),
+            });
+        }
+        read_open_orders(
+            &lease.view.keyspace,
+            project_id,
+            scope_id,
+            instrument,
+            owner,
+        )
+        .map_err(QueryError::from)
+    }
+
+    pub async fn recent_trades(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        limit: u32,
+        consistency: ConsistencyMode,
+        caller: &CallerContext,
+    ) -> Result<Vec<crate::order_book::FillRecord>, QueryError> {
+        ensure_query_caller_allowed(caller)?;
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let prefix = format!("ob:{instrument}:");
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            prefix.as_bytes(),
+        ) {
+            return Err(QueryError::PermissionDenied {
+                permission: format!("KvRead({project_id}.{scope_id})"),
+                scope: caller.caller_id.clone(),
+            });
+        }
+        read_recent_trades(
+            &lease.view.keyspace,
+            project_id,
+            scope_id,
+            instrument,
+            limit as usize,
+        )
+        .map_err(QueryError::from)
+    }
+
+    pub async fn spread(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        consistency: ConsistencyMode,
+        caller: &CallerContext,
+    ) -> Result<Spread, QueryError> {
+        ensure_query_caller_allowed(caller)?;
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let prefix = format!("ob:{instrument}:");
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            prefix.as_bytes(),
+        ) {
+            return Err(QueryError::PermissionDenied {
+                permission: format!("KvRead({project_id}.{scope_id})"),
+                scope: caller.caller_id.clone(),
+            });
+        }
+        read_spread(
+            &lease.view.keyspace,
+            project_id,
+            scope_id,
+            instrument,
+            lease.view.seq,
+        )
+        .map_err(QueryError::from)
+    }
+
+    pub async fn order_book_last_execution_report(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        consistency: ConsistencyMode,
+        caller: &CallerContext,
+    ) -> Result<Option<crate::order_book::ExecutionReport>, QueryError> {
+        ensure_query_caller_allowed(caller)?;
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let prefix = format!("ob:{instrument}:");
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            prefix.as_bytes(),
+        ) {
+            return Err(QueryError::PermissionDenied {
+                permission: format!("KvRead({project_id}.{scope_id})"),
+                scope: caller.caller_id.clone(),
+            });
+        }
+        read_last_execution_report(&lease.view.keyspace, project_id, scope_id, instrument)
+            .map_err(QueryError::from)
     }
 
     pub async fn compare_and_swap(

@@ -97,6 +97,7 @@ struct EpochProcessResult {
     coordinator_apply_attempts: u64,
     coordinator_apply_micros: u64,
     read_set_conflicts: u64,
+    catalog_changed: bool,
 }
 
 struct ExecutorState {
@@ -116,6 +117,7 @@ struct ExecutorState {
     idempotency: HashMap<IdempotencyKey, IdempotencyRecord>,
     version_store: VersionStore,
     last_full_snapshot_micros: u64,
+    last_memory_estimate_micros: u64,
 }
 
 #[derive(Clone)]
@@ -244,6 +246,7 @@ impl CommitExecutor {
             idempotency,
             version_store,
             last_full_snapshot_micros: now_micros(),
+            last_memory_estimate_micros: 0,
         }));
         let (apply_tx, mut rx) = tokio_mpsc::channel::<CommitRequest>(max_inflight_commits);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -323,6 +326,7 @@ impl CommitExecutor {
                 let mut s = loop_state.lock().await;
                 let epoch_started = Instant::now();
                 let epoch_result = process_commit_epoch(&mut s, epoch_requests);
+                let catalog_changed = epoch_result.catalog_changed;
                 let outcomes = epoch_result.outcomes;
                 let had_error = outcomes.iter().any(|o| o.result.is_err());
                 s.adaptive_epoch.observe_epoch(
@@ -359,7 +363,9 @@ impl CommitExecutor {
                         .epoch_failures
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                *loop_validation_catalog.write() = s.catalog.clone();
+                if catalog_changed {
+                    *loop_validation_catalog.write() = s.catalog.clone();
+                }
                 drop(s);
 
                 for outcome in outcomes {
@@ -433,14 +439,22 @@ impl CommitExecutor {
             let handle = tokio::spawn(async move {
                 while let Some(mut req) = ingress_rx.recv().await {
                     let (write_partitions, read_partitions) = if req.prevalidated {
-                        let catalog = pre_validation_catalog.read().snapshot();
-                        (
+                        let write_partitions = if req
+                            .envelope
+                            .write_intent
+                            .mutations
+                            .iter()
+                            .any(mutation_requires_fk_expansion)
+                        {
+                            let catalog = pre_validation_catalog.read().snapshot();
                             derive_write_partitions_with_fk_expansion(
                                 &catalog,
                                 &req.envelope.write_intent.mutations,
-                            ),
-                            derive_read_partitions(&req.envelope),
-                        )
+                            )
+                        } else {
+                            derive_write_partitions(&req.envelope.write_intent.mutations)
+                        };
+                        (write_partitions, derive_read_partitions(&req.envelope))
                     } else {
                         match pre_stage_validate(&pre_validation_catalog, &req.envelope).await {
                             Ok(partitions) => partitions,
@@ -535,12 +549,33 @@ impl CommitExecutor {
         self.submit_as(None, mutation).await
     }
 
+    pub(crate) async fn submit_prevalidated(
+        &self,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        self.submit_envelope_with_mode(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![mutation],
+                },
+                base_seq: 0,
+            },
+            true,
+            false,
+        )
+        .await
+    }
+
     pub async fn submit_as(
         &self,
         caller: Option<CallerContext>,
         mutation: Mutation,
     ) -> Result<CommitResult, AedbError> {
-        let base_seq = self.current_seq().await;
         self.submit_envelope(TransactionEnvelope {
             caller,
             idempotency_key: None,
@@ -550,7 +585,9 @@ impl CommitExecutor {
             write_intent: WriteIntent {
                 mutations: vec![mutation],
             },
-            base_seq,
+            // No read set/assertions in single-mutation submit path.
+            // A fixed base_seq avoids an extra state lock on the hot write path.
+            base_seq: 0,
         })
         .await
     }
@@ -706,12 +743,23 @@ impl CommitExecutor {
 
     pub async fn snapshot_state(&self) -> (KeyspaceSnapshot, Catalog, u64) {
         let mut state = self.state.lock().await;
-        let view = state
-            .version_store
-            .acquire_latest()
-            .expect("version store should always have a latest view")
-            .into_view();
-        ((*view.keyspace).clone(), (*view.catalog).clone(), view.seq)
+        match state.version_store.acquire_latest() {
+            Ok(view) => {
+                let view = view.into_view();
+                ((*view.keyspace).clone(), (*view.catalog).clone(), view.seq)
+            }
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    "version store latest view unavailable; falling back to executor state snapshot"
+                );
+                (
+                    state.keyspace.snapshot(),
+                    state.catalog.snapshot(),
+                    state.visible_head_seq,
+                )
+            }
+        }
     }
 
     pub async fn snapshot_at_seq(&self, seq: u64) -> Result<SnapshotReadView, AedbError> {

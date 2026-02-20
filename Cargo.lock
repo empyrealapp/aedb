@@ -49,6 +49,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aedb-orderbook"
+version = "0.1.0"
+dependencies = [
+ "aedb",
+ "primitive-types",
+ "rand 0.8.5",
+ "rmp-serde",
+ "serde",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

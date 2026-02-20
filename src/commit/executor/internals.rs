@@ -7,6 +7,8 @@ use primitive_types::U256;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
+const MEMORY_ESTIMATE_INTERVAL_MICROS: u64 = 250_000;
+
 pub(super) fn pre_stage_validate(
     validation_catalog: &Arc<RwLock<Catalog>>,
     envelope: &TransactionEnvelope,
@@ -18,16 +20,23 @@ pub(super) fn pre_stage_validate(
     async move {
         let catalog = validation_catalog.read().snapshot();
         validate_assertions(&catalog, &envelope.assertions)?;
-        let mut staged_catalog = catalog.clone();
+        let mut staged_catalog: Option<Catalog> = None;
         for mutation in &envelope.write_intent.mutations {
-            validate_permissions(&staged_catalog, envelope.caller.as_ref(), mutation)?;
-            validate_mutation(&staged_catalog, mutation)?;
+            let active_catalog = staged_catalog.as_ref().unwrap_or(&catalog);
+            validate_permissions(active_catalog, envelope.caller.as_ref(), mutation)?;
+            validate_mutation(active_catalog, mutation)?;
             if let Mutation::Ddl(ddl) = mutation {
-                staged_catalog.apply_ddl(ddl.clone())?;
+                if staged_catalog.is_none() {
+                    staged_catalog = Some(catalog.clone());
+                }
+                if let Some(next) = staged_catalog.as_mut() {
+                    next.apply_ddl(ddl.clone())?;
+                }
             }
         }
+        let partition_catalog = staged_catalog.as_ref().unwrap_or(&catalog);
         let write_partitions = derive_write_partitions_with_fk_expansion(
-            &staged_catalog,
+            partition_catalog,
             &envelope.write_intent.mutations,
         );
         let read_partitions = derive_read_partitions(&envelope);
@@ -142,6 +151,64 @@ pub(super) fn scope_shard_key(mutations: &[Mutation]) -> String {
             scope_id,
             ..
         } => format!("k:{project_id}:{scope_id}"),
+        Mutation::OrderBookNew {
+            project_id,
+            scope_id,
+            request,
+        } => format!("ob:{project_id}:{scope_id}:{}", request.instrument),
+        Mutation::OrderBookCancel {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookCancelReplace {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookMassCancel {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookReduce {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookMatch {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        } => format!("ob:{project_id}:{scope_id}:{instrument}"),
+        Mutation::OrderBookDefineTable {
+            project_id,
+            scope_id,
+            table_id,
+            ..
+        }
+        | Mutation::OrderBookDropTable {
+            project_id,
+            scope_id,
+            table_id,
+        } => format!("obdef:{project_id}:{scope_id}:{table_id}"),
+        Mutation::OrderBookSetInstrumentConfig {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookSetInstrumentHalted {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        } => format!("obcfg:{project_id}:{scope_id}:{instrument}"),
         Mutation::Ddl(ddl) => format!("ddl:{ddl:?}"),
     }
 }
@@ -276,6 +343,7 @@ pub(super) fn process_commit_epoch(
     let mut deferred_parallel_commits = Vec::new();
     let mut deferred_parallel_namespaces = HashSet::new();
     let mut next_seq = state.current_seq;
+    let mut catalog_changed = false;
 
     for request in requests {
         if request.envelope.write_intent.mutations.is_empty() {
@@ -495,6 +563,9 @@ pub(super) fn process_commit_epoch(
             seq: commit_seq,
             mutations: mutations.clone(),
         };
+        if !catalog_changed && mutations.iter().any(|m| matches!(m, Mutation::Ddl(_))) {
+            catalog_changed = true;
+        }
         sequenced.push(SequencedCommit {
             request,
             seq: commit_seq,
@@ -517,6 +588,7 @@ pub(super) fn process_commit_epoch(
             coordinator_apply_attempts,
             coordinator_apply_micros,
             read_set_conflicts,
+            catalog_changed,
         };
     }
 
@@ -549,6 +621,7 @@ pub(super) fn process_commit_epoch(
             coordinator_apply_attempts,
             coordinator_apply_micros,
             read_set_conflicts,
+            catalog_changed,
         };
     }
 
@@ -603,6 +676,7 @@ pub(super) fn process_commit_epoch(
                 coordinator_apply_attempts,
                 coordinator_apply_micros,
                 read_set_conflicts,
+                catalog_changed,
             };
         }
     }
@@ -627,6 +701,7 @@ pub(super) fn process_commit_epoch(
             coordinator_apply_attempts,
             coordinator_apply_micros,
             read_set_conflicts,
+            catalog_changed,
         };
     }
 
@@ -690,13 +765,19 @@ pub(super) fn process_commit_epoch(
         state.last_full_snapshot_micros = now_micros();
     }
 
-    let mem_estimate = state.keyspace.estimate_memory_bytes();
-    if mem_estimate > state.config.max_memory_estimate_bytes {
-        warn!(
-            mem_estimate,
-            max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
-            "aedb memory estimate exceeded threshold"
-        );
+    let now_micros = now_micros();
+    if now_micros.saturating_sub(state.last_memory_estimate_micros)
+        >= MEMORY_ESTIMATE_INTERVAL_MICROS
+    {
+        state.last_memory_estimate_micros = now_micros;
+        let mem_estimate = state.keyspace.estimate_memory_bytes();
+        if mem_estimate > state.config.max_memory_estimate_bytes {
+            warn!(
+                mem_estimate,
+                max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
+                "aedb memory estimate exceeded threshold"
+            );
+        }
     }
     if state.wal.should_rotate().is_some() {
         let _ = state
@@ -721,6 +802,7 @@ pub(super) fn process_commit_epoch(
         coordinator_apply_attempts,
         coordinator_apply_micros,
         read_set_conflicts,
+        catalog_changed,
     }
 }
 
@@ -1029,6 +1111,46 @@ pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<
             project_id,
             scope_id,
             ..
+        }
+        | Mutation::OrderBookNew {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookCancel {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookCancelReplace {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookMassCancel {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookReduce {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookMatch {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookDefineTable {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookDropTable {
+            project_id,
+            scope_id,
+            ..
         } => Some(NamespaceId::project_scope(project_id, scope_id)),
         _ => None,
     }
@@ -1039,7 +1161,15 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         Mutation::KvSet { .. }
         | Mutation::KvDel { .. }
         | Mutation::KvIncU256 { .. }
-        | Mutation::KvDecU256 { .. } => true,
+        | Mutation::KvDecU256 { .. }
+        | Mutation::OrderBookNew { .. }
+        | Mutation::OrderBookCancel { .. }
+        | Mutation::OrderBookCancelReplace { .. }
+        | Mutation::OrderBookMassCancel { .. }
+        | Mutation::OrderBookReduce { .. }
+        | Mutation::OrderBookMatch { .. }
+        | Mutation::OrderBookDefineTable { .. }
+        | Mutation::OrderBookDropTable { .. } => true,
         Mutation::Insert {
             project_id,
             scope_id,
@@ -1611,6 +1741,14 @@ pub(super) fn payload_type_for_mutations(mutations: &[Mutation]) -> u8 {
                 | Mutation::KvDel { .. }
                 | Mutation::KvIncU256 { .. }
                 | Mutation::KvDecU256 { .. }
+                | Mutation::OrderBookNew { .. }
+                | Mutation::OrderBookCancel { .. }
+                | Mutation::OrderBookCancelReplace { .. }
+                | Mutation::OrderBookMassCancel { .. }
+                | Mutation::OrderBookReduce { .. }
+                | Mutation::OrderBookMatch { .. }
+                | Mutation::OrderBookDefineTable { .. }
+                | Mutation::OrderBookDropTable { .. }
         )
     });
     if all_kv { 0x04 } else { 0x01 }
@@ -1727,6 +1865,76 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
                 let ns = namespace_key(project_id, scope_id);
                 out.insert(kv_key_partition_token(&ns, key));
             }
+            Mutation::OrderBookNew {
+                project_id,
+                scope_id,
+                request,
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(order_book_partition_token(&ns, &request.instrument));
+            }
+            Mutation::OrderBookCancel {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            }
+            | Mutation::OrderBookCancelReplace {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            }
+            | Mutation::OrderBookMassCancel {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            }
+            | Mutation::OrderBookReduce {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            }
+            | Mutation::OrderBookMatch {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(order_book_partition_token(&ns, instrument));
+            }
+            Mutation::OrderBookDefineTable {
+                project_id,
+                scope_id,
+                table_id,
+                ..
+            }
+            | Mutation::OrderBookDropTable {
+                project_id,
+                scope_id,
+                table_id,
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(order_book_meta_partition_token(&ns, "table", table_id));
+            }
+            Mutation::OrderBookSetInstrumentConfig {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            }
+            | Mutation::OrderBookSetInstrumentHalted {
+                project_id,
+                scope_id,
+                instrument,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(order_book_meta_partition_token(&ns, "cfg", instrument));
+            }
             Mutation::Ddl(_) => {
                 out.insert(GLOBAL_PARTITION_TOKEN.to_string());
             }
@@ -1749,9 +1957,26 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
     out
 }
 
-#[cfg(test)]
 pub(super) fn derive_write_partitions(mutations: &[Mutation]) -> HashSet<String> {
     derive_write_partitions_with_fk_expansion(&Catalog::default(), mutations)
+}
+
+pub(super) fn mutation_requires_fk_expansion(mutation: &Mutation) -> bool {
+    matches!(
+        mutation,
+        Mutation::Insert { .. }
+            | Mutation::InsertBatch { .. }
+            | Mutation::Upsert { .. }
+            | Mutation::UpsertBatch { .. }
+            | Mutation::UpsertOnConflict { .. }
+            | Mutation::UpsertBatchOnConflict { .. }
+            | Mutation::Delete { .. }
+            | Mutation::DeleteWhere { .. }
+            | Mutation::UpdateWhere { .. }
+            | Mutation::UpdateWhereExpr { .. }
+            | Mutation::TableIncU256 { .. }
+            | Mutation::TableDecU256 { .. }
+    )
 }
 
 pub(super) fn derive_read_partitions(envelope: &TransactionEnvelope) -> HashSet<String> {
@@ -1908,6 +2133,14 @@ fn kv_namespace_partition_token(namespace: &str) -> String {
     format!("kns:{namespace}")
 }
 
+fn order_book_partition_token(namespace: &str, instrument: &str) -> String {
+    format!("ob:{namespace}:{instrument}")
+}
+
+fn order_book_meta_partition_token(namespace: &str, kind: &str, id: &str) -> String {
+    format!("obm:{namespace}:{kind}:{id}")
+}
+
 fn is_cross_partition_write_set(write_set: &HashSet<String>) -> bool {
     if write_set.contains(GLOBAL_PARTITION_TOKEN) {
         return true;
@@ -1939,6 +2172,16 @@ fn token_namespace(token: &str) -> Option<&str> {
     }
     if let Some(rest) = token.strip_prefix("k:")
         && let Some((ns, _key)) = rest.rsplit_once(':')
+    {
+        return Some(ns);
+    }
+    if let Some(rest) = token.strip_prefix("ob:")
+        && let Some((ns, _instrument)) = rest.rsplit_once(':')
+    {
+        return Some(ns);
+    }
+    if let Some(rest) = token.strip_prefix("obm:")
+        && let Some((ns, _tail)) = rest.split_once(':')
     {
         return Some(ns);
     }
