@@ -146,6 +146,12 @@ AEDB supports permission-aware APIs via `CallerContext` and `Permission`.
 - `open_production` and `open_secure` require authenticated `*_as` calls
 - `open_secure` enforces hardened durability/recovery settings
 - table/KV/query access can be scoped per project/scope/resource
+- `authz_audit` and `assertion_audit` system tables provide built-in audit trails
+
+Security/operations docs:
+
+- `docs/SECURITY_ACCEPTANCE_CRITERIA.md`
+- `docs/SECURITY_OPERATIONS_RUNBOOK.md`
 
 ## Operational APIs
 
@@ -184,6 +190,12 @@ cargo test --test query_integration
 cargo test --test backup_restore
 cargo test --test crash_matrix
 cargo test --test stress
+```
+
+Security acceptance gate (mandatory profile):
+
+```bash
+./scripts/security_gate.sh
 ```
 
 ## License

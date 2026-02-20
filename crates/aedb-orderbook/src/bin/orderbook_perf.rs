@@ -211,15 +211,19 @@ async fn main() {
     }
 
     println!(
-        "scenario,attempted,accepted,rejected,elapsed_ms,attempted_ops_s,accepted_ops_s,rejected_ops_s,lat_avg_us,lat_p50_us,lat_p95_us,lat_p99_us,lat_max_us,max_finality_gap,visible_head,durable_head,zero_dropped,durability"
+        "scenario,attempted,accepted,rejected,elapsed_ms,attempted_ops_s,accepted_ops_s,rejected_ops_s,lat_avg_us,lat_p50_us,lat_p95_us,lat_p99_us,lat_max_us,max_finality_gap,visible_head,durable_head,zero_dropped,durability,lifecycle_attempted,lifecycle_accepted,lifecycle_rejected,primary_reject_conflict,primary_reject_post_only,primary_reject_fok,primary_reject_no_liquidity,primary_reject_nonce,primary_reject_duplicate_cid,primary_reject_other_validation,lifecycle_reject_conflict,lifecycle_reject_post_only,lifecycle_reject_fok,lifecycle_reject_no_liquidity,lifecycle_reject_nonce,lifecycle_reject_duplicate_cid,lifecycle_reject_other_validation"
     );
     for scenario in scenario_matrix(&scale) {
         let (sim_cfg, db_cfg) = cfg_for_scenario(&scenario);
-        let report = run_hft_simulation_with_config(sim_cfg, db_cfg)
-            .await
-            .unwrap_or_else(|e| panic!("scenario {} failed: {e}", scenario.name));
+        let report = match run_hft_simulation_with_config(sim_cfg, db_cfg).await {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("scenario {} failed: {e}", scenario.name);
+                std::process::exit(1);
+            }
+        };
         println!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             scenario.name,
             report.simulation.attempted_orders,
             report.simulation.accepted_orders,
@@ -238,6 +242,44 @@ async fn main() {
             report.simulation.durable_head_seq,
             report.zero_dropped_orders,
             report.durability_mode,
+            report.simulation.lifecycle_attempted_ops,
+            report.simulation.lifecycle_accepted_ops,
+            report.simulation.lifecycle_rejected_ops,
+            report.simulation.rejection_breakdown.conflict,
+            report.simulation.rejection_breakdown.post_only_would_cross,
+            report.simulation.rejection_breakdown.fok_cannot_fill,
+            report.simulation.rejection_breakdown.market_no_liquidity,
+            report.simulation.rejection_breakdown.nonce_too_low,
+            report
+                .simulation
+                .rejection_breakdown
+                .duplicate_client_order_id,
+            report.simulation.rejection_breakdown.other_validation,
+            report.simulation.lifecycle_rejection_breakdown.conflict,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .post_only_would_cross,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .fok_cannot_fill,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .market_no_liquidity,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .nonce_too_low,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .duplicate_client_order_id,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .other_validation,
         );
     }
 }

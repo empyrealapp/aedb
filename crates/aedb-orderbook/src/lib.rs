@@ -57,11 +57,31 @@ pub struct SimulationReport {
     pub attempted_orders: usize,
     pub accepted_orders: usize,
     pub rejected_orders: usize,
+    pub lifecycle_attempted_ops: usize,
+    pub lifecycle_accepted_ops: usize,
+    pub lifecycle_rejected_ops: usize,
+    pub lifecycle_rejection_breakdown: RejectionBreakdown,
+    pub rejection_breakdown: RejectionBreakdown,
     pub max_commit_seq: u64,
     pub visible_head_seq: u64,
     pub durable_head_seq: u64,
     pub flow_profile: OrderFlowProfile,
     pub table_profile: TableProfile,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RejectionBreakdown {
+    pub conflict: usize,
+    pub post_only_would_cross: usize,
+    pub fok_cannot_fill: usize,
+    pub market_no_liquidity: usize,
+    pub instrument_halted: usize,
+    pub nonce_too_low: usize,
+    pub duplicate_client_order_id: usize,
+    pub lot_size_violation: usize,
+    pub qty_non_positive: usize,
+    pub price_out_of_bounds: usize,
+    pub other_validation: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,11 +146,16 @@ fn decode_u256_u64(bytes: [u8; 32]) -> u64 {
     u64::from_be_bytes(out)
 }
 
-fn decode_u256_bytes_to_u64(bytes: &[u8]) -> u64 {
-    assert_eq!(bytes.len(), 32);
+fn decode_u256_bytes_to_u64(bytes: &[u8]) -> Result<u64, AedbError> {
+    if bytes.len() != 32 {
+        return Err(AedbError::Validation(format!(
+            "invalid u256 byte length: {}",
+            bytes.len()
+        )));
+    }
     let mut out = [0u8; 8];
     out.copy_from_slice(&bytes[24..]);
-    u64::from_be_bytes(out)
+    Ok(u64::from_be_bytes(out))
 }
 
 fn request(
@@ -171,7 +196,7 @@ async fn setup_books(
     assets: &[String],
     table_profile: &TableProfile,
 ) -> Result<Vec<String>, AedbError> {
-    db.create_project("p").await.expect("project");
+    db.create_project("p").await?;
     let mut instruments = Vec::with_capacity(assets.len());
     let multi_table_id = match table_profile {
         TableProfile::MultiAssetTable { table_id } => Some(table_id.clone()),
@@ -252,7 +277,10 @@ async fn setup_books(
     Ok(instruments)
 }
 
-async fn assert_book_invariants(db: &AedbInstance, instruments: &[String]) {
+async fn assert_book_invariants(
+    db: &AedbInstance,
+    instruments: &[String],
+) -> Result<(), AedbError> {
     for instrument in instruments {
         let mut from_orders: BTreeMap<(u8, i64), u64> = BTreeMap::new();
 
@@ -265,18 +293,19 @@ async fn assert_book_invariants(db: &AedbInstance, instruments: &[String]) {
                 ConsistencyMode::AtLatest,
             )
             .await
-            .expect("scan orders");
+            .map_err(|e| AedbError::Validation(e.to_string()))?;
 
         for (_, entry) in rows {
-            let order: aedb::order_book::OrderRecord =
-                rmp_serde::from_slice(&entry.value).expect("decode order");
+            let order: aedb::order_book::OrderRecord = rmp_serde::from_slice(&entry.value)
+                .map_err(|e| AedbError::Decode(e.to_string()))?;
             let original = decode_u256_u64(order.original_qty_be);
             let remaining = decode_u256_u64(order.remaining_qty_be);
             let filled = decode_u256_u64(order.filled_qty_be);
-            assert!(
-                remaining + filled <= original,
-                "quantity accounting invariant"
-            );
+            if remaining + filled > original {
+                return Err(AedbError::Validation(format!(
+                    "quantity accounting invariant violated for {instrument}"
+                )));
+            }
             if remaining > 0
                 && matches!(
                     order.status,
@@ -300,22 +329,28 @@ async fn assert_book_invariants(db: &AedbInstance, instruments: &[String]) {
                     ConsistencyMode::AtLatest,
                 )
                 .await
-                .expect("scan levels");
+                .map_err(|e| AedbError::Validation(e.to_string()))?;
             for (k, v) in levels {
-                let qty = decode_u256_bytes_to_u64(&v.value);
+                let qty = decode_u256_bytes_to_u64(&v.value)?;
                 if qty == 0 {
                     continue;
                 }
-                let price = parse_plqty_price(side, &k).expect("parse level price");
+                let price = parse_plqty_price(side, &k).ok_or_else(|| {
+                    AedbError::Validation(format!(
+                        "failed to parse plqty price for instrument {instrument}"
+                    ))
+                })?;
                 from_levels.insert((side as u8, price), qty);
             }
         }
 
-        assert_eq!(
-            from_orders, from_levels,
-            "price-level aggregates must match open orders for {instrument}"
-        );
+        if from_orders != from_levels {
+            return Err(AedbError::Validation(format!(
+                "price-level aggregates mismatch for {instrument}"
+            )));
+        }
     }
+    Ok(())
 }
 
 pub async fn run_hft_simulation(cfg: SimulationConfig) -> Result<SimulationReport, AedbError> {
@@ -334,8 +369,8 @@ pub async fn run_hft_simulation_with_config(
         DurabilityMode::OsBuffered => "os_buffered",
     }
     .to_string();
-    let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(db_cfg, dir.path()).expect("open"));
+    let dir = tempdir().map_err(AedbError::Io)?;
+    let db = Arc::new(AedbInstance::open(db_cfg, dir.path())?);
     let instruments = setup_books(&db, &cfg.assets, &cfg.table_profile).await?;
     let run_started = Instant::now();
 
@@ -354,6 +389,11 @@ pub async fn run_hft_simulation_with_config(
             let mut rng = StdRng::seed_from_u64(seed + t as u64);
             let mut accepted = 0usize;
             let mut rejected = 0usize;
+            let mut lifecycle_attempted = 0usize;
+            let mut lifecycle_accepted = 0usize;
+            let mut lifecycle_rejected = 0usize;
+            let mut rejection_breakdown = RejectionBreakdown::default();
+            let mut lifecycle_rejection_breakdown = RejectionBreakdown::default();
             let mut max_commit_seq = 0u64;
             let mut max_finality_gap = 0u64;
             let mut latencies_us = if cfg.collect_latency {
@@ -438,19 +478,21 @@ pub async fn run_hft_simulation_with_config(
                         &mut latencies_us,
                         &mut accepted,
                         &mut rejected,
+                        &mut rejection_breakdown,
                         &mut max_commit_seq,
                         &mut max_finality_gap,
                     )
                     .await
                     {
-                        panic!("unexpected simulation error: {other:?}");
+                        return Err(other);
                     }
                 }
 
                 if cfg.lifecycle_every_ops > 0 && op % cfg.lifecycle_every_ops == 0 {
                     *nonce += 1;
                     let cid = format!("gtc-{owner}-{op}");
-                    let _ = db_clone
+                    lifecycle_attempted += 1;
+                    match db_clone
                         .order_book_new(
                             "p",
                             "app",
@@ -467,10 +509,25 @@ pub async fn run_hft_simulation_with_config(
                                 *nonce,
                             ),
                         )
-                        .await;
-                    let _ = db_clone
+                        .await
+                    {
+                        Ok(_) => lifecycle_accepted += 1,
+                        Err(err) => {
+                            lifecycle_rejected += 1;
+                            record_rejection_error(&mut lifecycle_rejection_breakdown, err, 1)?;
+                        }
+                    }
+                    lifecycle_attempted += 1;
+                    match db_clone
                         .order_book_cancel_by_client_id("p", "app", instrument, &cid, &owner)
-                        .await;
+                        .await
+                    {
+                        Ok(_) => lifecycle_accepted += 1,
+                        Err(err) => {
+                            lifecycle_rejected += 1;
+                            record_rejection_error(&mut lifecycle_rejection_breakdown, err, 1)?;
+                        }
+                    }
                 }
             }
             if let Err(other) = flush_pending_orders(
@@ -482,38 +539,58 @@ pub async fn run_hft_simulation_with_config(
                 &mut latencies_us,
                 &mut accepted,
                 &mut rejected,
+                &mut rejection_breakdown,
                 &mut max_commit_seq,
                 &mut max_finality_gap,
             )
             .await
             {
-                panic!("unexpected simulation error: {other:?}");
+                return Err(other);
             }
-            (
+            Ok((
                 accepted,
                 rejected,
+                lifecycle_attempted,
+                lifecycle_accepted,
+                lifecycle_rejected,
+                lifecycle_rejection_breakdown,
+                rejection_breakdown,
                 max_commit_seq,
                 max_finality_gap,
                 latencies_us,
-            )
+            ))
         }));
     }
 
     let mut accepted_orders = 0usize;
     let mut rejected_orders = 0usize;
+    let mut lifecycle_attempted_ops = 0usize;
+    let mut lifecycle_accepted_ops = 0usize;
+    let mut lifecycle_rejected_ops = 0usize;
+    let mut lifecycle_rejection_breakdown = RejectionBreakdown::default();
+    let mut rejection_breakdown = RejectionBreakdown::default();
     let mut max_commit_seq = 0u64;
     let mut max_commit_finality_gap = 0u64;
     let mut all_latencies_us = Vec::new();
     for task in tasks {
-        let (a, r, max_seq, max_gap, mut latencies) = task.await.expect("task join");
+        let task_output = task
+            .await
+            .map_err(|e| AedbError::Validation(format!("simulation task join failure: {e}")))?;
+        let (a, r, la, lac, lr, lbreakdown, breakdown, max_seq, max_gap, mut latencies) =
+            task_output?;
         accepted_orders += a;
         rejected_orders += r;
+        lifecycle_attempted_ops += la;
+        lifecycle_accepted_ops += lac;
+        lifecycle_rejected_ops += lr;
+        merge_rejection_breakdown(&mut lifecycle_rejection_breakdown, &lbreakdown);
+        merge_rejection_breakdown(&mut rejection_breakdown, &breakdown);
         max_commit_seq = max_commit_seq.max(max_seq);
         max_commit_finality_gap = max_commit_finality_gap.max(max_gap);
         all_latencies_us.append(&mut latencies);
     }
 
-    assert_book_invariants(&db, &instruments).await;
+    assert_book_invariants(&db, &instruments).await?;
     let elapsed_ms = run_started.elapsed().as_millis().max(1) as u64;
     db.force_fsync().await?;
     let heads = db.head_state().await;
@@ -532,6 +609,26 @@ pub async fn run_hft_simulation_with_config(
     let attempted_ops_per_sec = (attempted_orders as u64).saturating_mul(1000) / elapsed_ms;
     let accepted_ops_per_sec = (accepted_orders as u64).saturating_mul(1000) / elapsed_ms;
     let rejected_ops_per_sec = (rejected_orders as u64).saturating_mul(1000) / elapsed_ms;
+    assert_eq!(
+        total_rejections(&rejection_breakdown),
+        rejected_orders,
+        "primary rejection accounting mismatch"
+    );
+    assert_eq!(
+        total_rejections(&lifecycle_rejection_breakdown),
+        lifecycle_rejected_ops,
+        "lifecycle rejection accounting mismatch"
+    );
+    assert_eq!(
+        accepted_orders + rejected_orders,
+        attempted_orders,
+        "primary flow accounting mismatch"
+    );
+    assert_eq!(
+        lifecycle_accepted_ops + lifecycle_rejected_ops,
+        lifecycle_attempted_ops,
+        "lifecycle flow accounting mismatch"
+    );
 
     let simulation = SimulationReport {
         assets: cfg.assets,
@@ -541,6 +638,11 @@ pub async fn run_hft_simulation_with_config(
         attempted_orders,
         accepted_orders,
         rejected_orders,
+        lifecycle_attempted_ops,
+        lifecycle_accepted_ops,
+        lifecycle_rejected_ops,
+        lifecycle_rejection_breakdown,
+        rejection_breakdown,
         max_commit_seq,
         visible_head_seq: heads.visible_head_seq,
         durable_head_seq: heads.durable_head_seq,
@@ -597,6 +699,7 @@ async fn flush_pending_orders(
     latencies_us: &mut Vec<u64>,
     accepted: &mut usize,
     rejected: &mut usize,
+    rejection_breakdown: &mut RejectionBreakdown,
     max_commit_seq: &mut u64,
     max_finality_gap: &mut u64,
 ) -> Result<(), AedbError> {
@@ -621,10 +724,191 @@ async fn flush_pending_orders(
             *max_commit_seq = (*max_commit_seq).max(commit.commit_seq);
             *accepted += batch_len;
         }
-        Err(err) => match err {
-            AedbError::Validation(_) => *rejected += batch_len,
-            other => return Err(other),
-        },
+        Err(err) => {
+            *rejected += batch_len;
+            record_rejection_error(rejection_breakdown, err, batch_len)?;
+        }
     }
     Ok(())
+}
+
+fn record_rejection_error(
+    rejection_breakdown: &mut RejectionBreakdown,
+    err: AedbError,
+    count: usize,
+) -> Result<(), AedbError> {
+    match err {
+        AedbError::Validation(msg) => {
+            record_validation_rejection(rejection_breakdown, &msg, count);
+            Ok(())
+        }
+        AedbError::Conflict(_) => {
+            rejection_breakdown.conflict += count;
+            Ok(())
+        }
+        other => Err(other),
+    }
+}
+
+fn record_validation_rejection(
+    rejection_breakdown: &mut RejectionBreakdown,
+    msg: &str,
+    count: usize,
+) {
+    if msg.contains("conflict") {
+        rejection_breakdown.conflict += count;
+    } else if msg.contains("post_only would cross") {
+        rejection_breakdown.post_only_would_cross += count;
+    } else if msg.contains("fok cannot fill") {
+        rejection_breakdown.fok_cannot_fill += count;
+    } else if msg.contains("market order has no liquidity") {
+        rejection_breakdown.market_no_liquidity += count;
+    } else if msg.contains("instrument halted") {
+        rejection_breakdown.instrument_halted += count;
+    } else if msg.contains("nonce too low") {
+        rejection_breakdown.nonce_too_low += count;
+    } else if msg.contains("duplicate client_order_id") {
+        rejection_breakdown.duplicate_client_order_id += count;
+    } else if msg.contains("quantity violates lot size") {
+        rejection_breakdown.lot_size_violation += count;
+    } else if msg.contains("qty must be > 0") {
+        rejection_breakdown.qty_non_positive += count;
+    } else if msg.contains("price outside instrument bounds") {
+        rejection_breakdown.price_out_of_bounds += count;
+    } else {
+        rejection_breakdown.other_validation += count;
+    }
+}
+
+fn merge_rejection_breakdown(dst: &mut RejectionBreakdown, src: &RejectionBreakdown) {
+    dst.conflict += src.conflict;
+    dst.post_only_would_cross += src.post_only_would_cross;
+    dst.fok_cannot_fill += src.fok_cannot_fill;
+    dst.market_no_liquidity += src.market_no_liquidity;
+    dst.instrument_halted += src.instrument_halted;
+    dst.nonce_too_low += src.nonce_too_low;
+    dst.duplicate_client_order_id += src.duplicate_client_order_id;
+    dst.lot_size_violation += src.lot_size_violation;
+    dst.qty_non_positive += src.qty_non_positive;
+    dst.price_out_of_bounds += src.price_out_of_bounds;
+    dst.other_validation += src.other_validation;
+}
+
+fn total_rejections(b: &RejectionBreakdown) -> usize {
+    b.conflict
+        + b.post_only_would_cross
+        + b.fok_cannot_fill
+        + b.market_no_liquidity
+        + b.instrument_halted
+        + b.nonce_too_low
+        + b.duplicate_client_order_id
+        + b.lot_size_violation
+        + b.qty_non_positive
+        + b.price_out_of_bounds
+        + b.other_validation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_validation_rejection_reasons() {
+        let mut breakdown = RejectionBreakdown::default();
+        record_validation_rejection(&mut breakdown, "post_only would cross", 2);
+        record_validation_rejection(&mut breakdown, "fok cannot fill", 3);
+        record_validation_rejection(&mut breakdown, "market order has no liquidity", 4);
+        record_validation_rejection(&mut breakdown, "instrument halted", 5);
+        record_validation_rejection(&mut breakdown, "nonce too low", 6);
+        record_validation_rejection(&mut breakdown, "duplicate client_order_id", 7);
+        record_validation_rejection(&mut breakdown, "quantity violates lot size", 8);
+        record_validation_rejection(&mut breakdown, "qty must be > 0", 9);
+        record_validation_rejection(&mut breakdown, "price outside instrument bounds", 10);
+        record_validation_rejection(&mut breakdown, "some other validation", 11);
+
+        assert_eq!(breakdown.post_only_would_cross, 2);
+        assert_eq!(breakdown.fok_cannot_fill, 3);
+        assert_eq!(breakdown.market_no_liquidity, 4);
+        assert_eq!(breakdown.instrument_halted, 5);
+        assert_eq!(breakdown.nonce_too_low, 6);
+        assert_eq!(breakdown.duplicate_client_order_id, 7);
+        assert_eq!(breakdown.lot_size_violation, 8);
+        assert_eq!(breakdown.qty_non_positive, 9);
+        assert_eq!(breakdown.price_out_of_bounds, 10);
+        assert_eq!(breakdown.other_validation, 11);
+    }
+
+    #[test]
+    fn merge_rejection_breakdowns() {
+        let mut left = RejectionBreakdown {
+            conflict: 1,
+            post_only_would_cross: 2,
+            fok_cannot_fill: 3,
+            market_no_liquidity: 4,
+            instrument_halted: 5,
+            nonce_too_low: 6,
+            duplicate_client_order_id: 7,
+            lot_size_violation: 8,
+            qty_non_positive: 9,
+            price_out_of_bounds: 10,
+            other_validation: 11,
+        };
+        let right = RejectionBreakdown {
+            conflict: 10,
+            post_only_would_cross: 20,
+            fok_cannot_fill: 30,
+            market_no_liquidity: 40,
+            instrument_halted: 50,
+            nonce_too_low: 60,
+            duplicate_client_order_id: 70,
+            lot_size_violation: 80,
+            qty_non_positive: 90,
+            price_out_of_bounds: 100,
+            other_validation: 110,
+        };
+        merge_rejection_breakdown(&mut left, &right);
+        assert_eq!(
+            left,
+            RejectionBreakdown {
+                conflict: 11,
+                post_only_would_cross: 22,
+                fok_cannot_fill: 33,
+                market_no_liquidity: 44,
+                instrument_halted: 55,
+                nonce_too_low: 66,
+                duplicate_client_order_id: 77,
+                lot_size_violation: 88,
+                qty_non_positive: 99,
+                price_out_of_bounds: 110,
+                other_validation: 121,
+            }
+        );
+        assert_eq!(total_rejections(&left), 726);
+    }
+
+    #[test]
+    fn classify_conflict_wrapped_as_validation() {
+        let mut breakdown = RejectionBreakdown::default();
+        record_validation_rejection(
+            &mut breakdown,
+            "read set conflict: key changed under snapshot",
+            5,
+        );
+        assert_eq!(breakdown.conflict, 5);
+        assert_eq!(breakdown.other_validation, 0);
+    }
+
+    #[test]
+    fn classify_conflict_error_variant() {
+        let mut breakdown = RejectionBreakdown::default();
+        record_rejection_error(&mut breakdown, AedbError::Conflict("rw-conflict".into()), 3)
+            .expect("classification must succeed");
+        assert_eq!(breakdown.conflict, 3);
+    }
+
+    #[test]
+    fn decode_u256_bytes_rejects_invalid_length() {
+        let err = decode_u256_bytes_to_u64(&[1, 2, 3]).expect_err("must reject short u256");
+        assert!(matches!(err, AedbError::Validation(_)));
+    }
 }

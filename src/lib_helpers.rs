@@ -451,9 +451,14 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
 
 pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbError> {
     validate_config(config)?;
-    if config.manifest_hmac_key.is_none() {
+    let Some(hmac_key) = &config.manifest_hmac_key else {
         return Err(AedbError::InvalidConfig {
             message: "secure mode requires manifest_hmac_key".into(),
+        });
+    };
+    if hmac_key.len() < 32 {
+        return Err(AedbError::InvalidConfig {
+            message: "secure mode requires manifest_hmac_key length >= 32 bytes".into(),
         });
     }
     if !matches!(config.recovery_mode, RecoveryMode::Strict) {
@@ -476,9 +481,15 @@ pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbErro
 
 pub fn validate_arcana_config(config: &AedbConfig) -> Result<(), AedbError> {
     validate_config(config)?;
-    if config.manifest_hmac_key.is_none() {
+    let Some(hmac_key) = &config.manifest_hmac_key else {
         return Err(AedbError::InvalidConfig {
             message: "manifest_hmac_key is required for Arcana production profile".into(),
+        });
+    };
+    if hmac_key.len() < 32 {
+        return Err(AedbError::InvalidConfig {
+            message: "Arcana production profile requires manifest_hmac_key length >= 32 bytes"
+                .into(),
         });
     }
     if !matches!(config.recovery_mode, RecoveryMode::Strict) {
@@ -629,6 +640,11 @@ pub(crate) fn qualify_policy_columns(expr: &Expr, alias: &str) -> Expr {
 }
 
 pub(crate) fn ensure_external_caller_allowed(caller: &CallerContext) -> Result<(), AedbError> {
+    if caller.caller_id.trim().is_empty() {
+        return Err(AedbError::PermissionDenied(
+            "caller_id must be non-empty".into(),
+        ));
+    }
     if caller.caller_id == SYSTEM_CALLER_ID && !caller.is_internal_system() {
         return Err(AedbError::PermissionDenied(
             "caller_id 'system' is reserved for internal use".into(),
@@ -638,6 +654,12 @@ pub(crate) fn ensure_external_caller_allowed(caller: &CallerContext) -> Result<(
 }
 
 pub(crate) fn ensure_query_caller_allowed(caller: &CallerContext) -> Result<(), QueryError> {
+    if caller.caller_id.trim().is_empty() {
+        return Err(QueryError::PermissionDenied {
+            permission: "caller_id must be non-empty".into(),
+            scope: caller.caller_id.clone(),
+        });
+    }
     if caller.caller_id == SYSTEM_CALLER_ID && !caller.is_internal_system() {
         return Err(QueryError::PermissionDenied {
             permission: "caller_id 'system' is reserved for internal use".into(),

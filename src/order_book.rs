@@ -2,6 +2,7 @@ use crate::error::AedbError;
 use crate::storage::keyspace::{Keyspace, KeyspaceSnapshot};
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
+use std::ops::Bound;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -1412,21 +1413,23 @@ pub fn read_recent_trades(
     instrument: &str,
     limit: usize,
 ) -> Result<Vec<FillRecord>, AedbError> {
-    let mut trades = snapshot_scan_prefix(
-        project_id,
-        scope_id,
-        &trade_prefix(instrument),
-        usize::MAX,
-        snapshot,
-    );
-    if trades.len() > limit {
-        let start = trades.len() - limit;
-        trades = trades.split_off(start);
+    if limit == 0 {
+        return Ok(Vec::new());
     }
-    let mut out = Vec::with_capacity(trades.len());
-    for (_, entry) in trades {
+    let ns = crate::storage::keyspace::NamespaceId::project_scope(project_id, scope_id);
+    let Some(namespace) = snapshot.namespaces.get(&ns) else {
+        return Ok(Vec::new());
+    };
+    let prefix = trade_prefix(instrument);
+    let start = Bound::Included(prefix.clone());
+    let end = prefix_range_end(&prefix)
+        .map(Bound::Excluded)
+        .unwrap_or(Bound::Unbounded);
+    let mut out = Vec::with_capacity(limit);
+    for (_, entry) in namespace.kv.entries.range((start, end)).rev().take(limit) {
         out.push(deserialize::<FillRecord>(&entry.value)?);
     }
+    out.reverse();
     Ok(out)
 }
 
@@ -1633,14 +1636,29 @@ fn snapshot_scan_prefix(
     let Some(namespace) = snapshot.namespaces.get(&ns) else {
         return Vec::new();
     };
+    let start = Bound::Included(prefix.to_vec());
+    let end = prefix_range_end(prefix)
+        .map(Bound::Excluded)
+        .unwrap_or(Bound::Unbounded);
     namespace
         .kv
         .entries
-        .iter()
-        .filter(|(k, _)| k.starts_with(prefix))
+        .range((start, end))
         .take(limit)
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for idx in (0..end.len()).rev() {
+        if end[idx] != u8::MAX {
+            end[idx] = end[idx].saturating_add(1);
+            end.truncate(idx + 1);
+            return Some(end);
+        }
+    }
+    None
 }
 
 fn allocate_next_id(
@@ -2161,4 +2179,114 @@ fn effective_request_for_config(
         OrderSide::Ask => mid.saturating_sub(band),
     });
     Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::keyspace::Keyspace;
+
+    fn encode_fill(fill_id: u64, seq: u64) -> Vec<u8> {
+        rmp_serde::to_vec(&FillRecord {
+            fill_id,
+            instrument: "BTC-USD".to_string(),
+            price_ticks: 100 + fill_id as i64,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            aggressor_order_id: fill_id,
+            aggressor_owner: "agg".to_string(),
+            aggressor_side: OrderSide::Bid,
+            passive_order_id: fill_id + 10,
+            passive_owner: "pas".to_string(),
+            seq,
+        })
+        .expect("encode fill")
+    }
+
+    #[test]
+    fn read_recent_trades_returns_latest_n_in_order() {
+        let mut ks = Keyspace::default();
+        for i in 1..=5u64 {
+            ks.kv_set(
+                "p",
+                "app",
+                key_trade("BTC-USD", i),
+                encode_fill(i, 100 + i),
+                100 + i,
+            );
+        }
+        let snapshot = ks.snapshot();
+        let recent =
+            read_recent_trades(&snapshot, "p", "app", "BTC-USD", 3).expect("read recent trades");
+        let ids: Vec<u64> = recent.into_iter().map(|f| f.fill_id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn read_recent_trades_limit_zero_is_empty() {
+        let mut ks = Keyspace::default();
+        ks.kv_set(
+            "p",
+            "app",
+            key_trade("BTC-USD", 1),
+            encode_fill(1, 101),
+            101,
+        );
+        let snapshot = ks.snapshot();
+        let recent =
+            read_recent_trades(&snapshot, "p", "app", "BTC-USD", 0).expect("read recent trades");
+        assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn read_recent_trades_isolated_by_instrument_prefix() {
+        let mut ks = Keyspace::default();
+        for i in 1..=3u64 {
+            ks.kv_set(
+                "p",
+                "app",
+                key_trade("BTC-USD", i),
+                encode_fill(i, 100 + i),
+                100 + i,
+            );
+            ks.kv_set(
+                "p",
+                "app",
+                key_trade("ETH-USD", i),
+                encode_fill(100 + i, 200 + i),
+                200 + i,
+            );
+        }
+        let snapshot = ks.snapshot();
+        let recent =
+            read_recent_trades(&snapshot, "p", "app", "BTC-USD", 10).expect("read recent trades");
+        let ids: Vec<u64> = recent.into_iter().map(|f| f.fill_id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn read_recent_trades_rejects_malformed_trade_payload() {
+        let mut ks = Keyspace::default();
+        ks.kv_set("p", "app", key_trade("BTC-USD", 1), vec![0, 1, 2, 3], 101);
+        let snapshot = ks.snapshot();
+        let err = read_recent_trades(&snapshot, "p", "app", "BTC-USD", 1)
+            .expect_err("malformed payload should fail decode");
+        assert!(matches!(err, AedbError::Decode(_)));
+    }
+
+    #[test]
+    fn prefix_range_end_handles_regular_and_all_ff_prefixes() {
+        let regular = vec![0x6f, 0x62, 0x3a, 0x00, 0x7f];
+        let end = prefix_range_end(&regular).expect("regular prefix end");
+        assert!(end > regular);
+
+        let all_ff = vec![0xff, 0xff, 0xff];
+        assert!(
+            prefix_range_end(&all_ff).is_none(),
+            "all-0xff prefix has no finite upper bound"
+        );
+    }
 }

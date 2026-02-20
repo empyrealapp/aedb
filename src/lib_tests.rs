@@ -7,7 +7,7 @@ use crate::PredicateEvaluationPath;
 use crate::catalog::schema::{ColumnDef, IndexType};
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
-use crate::commit::tx::{TransactionEnvelope, WriteClass, WriteIntent};
+use crate::commit::tx::{IdempotencyKey, TransactionEnvelope, WriteClass, WriteIntent};
 use crate::commit::validation::Mutation;
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use crate::error::{AedbError, AedbErrorCode, ResourceType as ErrorResourceType};
@@ -2110,6 +2110,27 @@ async fn secure_profile_requires_hardened_storage_settings() {
     AedbInstance::open_secure(hardened, dir.path()).expect("open secure");
 }
 
+#[tokio::test]
+async fn secure_profile_rejects_short_hmac_key() {
+    let dir = tempdir().expect("temp");
+    let weak = AedbConfig::default()
+        .with_hmac_key(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        .with_checkpoint_key([3u8; 32]);
+    let err = AedbInstance::open_secure(weak, dir.path())
+        .err()
+        .expect("short hmac key must be rejected");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+}
+
+#[test]
+fn arcana_profile_rejects_short_hmac_key() {
+    let weak = AedbConfig::default().with_hmac_key(vec![9u8; 16]);
+    let err = crate::lib_helpers::validate_arcana_config(&weak)
+        .err()
+        .expect("short hmac key must be rejected");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+}
+
 #[test]
 fn low_latency_profile_uses_batch_durability_with_strict_recovery() {
     let cfg = AedbConfig::low_latency([5u8; 32]);
@@ -2190,6 +2211,43 @@ async fn secure_mode_requires_authenticated_apis() {
         .await
         .expect_err("anonymous explain_query_as must fail");
     assert!(matches!(explain_err, QueryError::PermissionDenied { .. }));
+}
+
+#[tokio::test]
+async fn commit_as_rejects_empty_caller_id() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let err = db
+        .commit_as(
+            CallerContext::new("   "),
+            Mutation::Ddl(DdlOperation::CreateProject {
+                owner_id: None,
+                if_not_exists: true,
+                project_id: "p".into(),
+            }),
+        )
+        .await
+        .expect_err("empty caller id should be rejected");
+    assert!(matches!(err, AedbError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn query_as_rejects_empty_caller_id() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    let caller = CallerContext::new("");
+    let err = db
+        .query_with_options_as(
+            Some(&caller),
+            "p",
+            "app",
+            Query::select(&["*"]).from("authz_audit").limit(1),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("empty caller id should be rejected");
+    assert!(matches!(err, QueryError::PermissionDenied { .. }));
 }
 
 #[tokio::test]
@@ -3000,6 +3058,7 @@ async fn metrics_surface_reflects_commits() {
     let op = db.operational_metrics().await;
     assert!(op.commits_total >= 1);
     assert!(op.read_set_conflicts <= op.conflict_rejections);
+    assert!(op.queue_depth >= op.inflight_commits);
     assert!(op.snapshot_age_micros <= u64::MAX / 2);
 }
 
@@ -3168,6 +3227,967 @@ async fn commit_with_durable_finality_waits_until_durable_head_catches_up() {
         result.durable_head_seq >= result.commit_seq,
         "durable finality must report durable head at or beyond commit sequence"
     );
+}
+
+#[tokio::test]
+async fn order_book_new_with_durable_finality_waits_until_durable_head_catches_up() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        ..AedbConfig::default()
+    };
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let fsync_db = Arc::clone(&db);
+    let fsync_task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        fsync_db.force_fsync().await.expect("force fsync");
+    });
+
+    let started = Instant::now();
+    let result = db
+        .order_book_new_with_finality(
+            "p",
+            "app",
+            crate::order_book::OrderRequest {
+                instrument: "BTC-USD".into(),
+                client_order_id: "oid-1".into(),
+                side: crate::order_book::OrderSide::Bid,
+                order_type: crate::order_book::OrderType::Limit,
+                time_in_force: crate::order_book::TimeInForce::Gtc,
+                exec_instructions: crate::order_book::ExecInstruction(0),
+                self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+                price_ticks: 100,
+                qty_be: {
+                    let mut out = [0u8; 32];
+                    out[31] = 1;
+                    out
+                },
+                owner: "alice".into(),
+                account: None,
+                nonce: 1,
+                price_limit_ticks: None,
+            },
+            CommitFinality::Durable,
+        )
+        .await
+        .expect("order");
+    fsync_task.await.expect("join fsync");
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(15),
+        "durable finality should wait for WAL durability in batch mode"
+    );
+    assert!(
+        result.durable_head_seq >= result.commit_seq,
+        "durable finality must report durable head at or beyond commit sequence"
+    );
+}
+
+#[tokio::test]
+async fn order_book_write_requires_authenticated_caller_in_secure_mode() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_secure(AedbConfig::production([9u8; 32]), dir.path())
+        .expect("open secure");
+    let err = db
+        .order_book_new(
+            "p",
+            "app",
+            crate::order_book::OrderRequest {
+                instrument: "BTC-USD".into(),
+                client_order_id: "oid-secure".into(),
+                side: crate::order_book::OrderSide::Bid,
+                order_type: crate::order_book::OrderType::Limit,
+                time_in_force: crate::order_book::TimeInForce::Gtc,
+                exec_instructions: crate::order_book::ExecInstruction(0),
+                self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+                price_ticks: 100,
+                qty_be: {
+                    let mut out = [0u8; 32];
+                    out[31] = 1;
+                    out
+                },
+                owner: "alice".into(),
+                account: None,
+                nonce: 1,
+                price_limit_ticks: None,
+            },
+        )
+        .await
+        .expect_err("secure mode should require authenticated caller");
+    assert!(matches!(err, AedbError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn secure_mode_supports_order_book_writes_via_authenticated_as_apis() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_secure(AedbConfig::production([5u8; 32]), dir.path())
+        .expect("open secure");
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::GrantPermission {
+            caller_id: "alice".into(),
+            permission: Permission::ProjectAdmin {
+                project_id: "p".into(),
+            },
+            actor_id: Some("system".into()),
+            delegable: false,
+        }),
+    )
+    .await
+    .expect("grant project admin");
+
+    let alice = CallerContext::new("alice");
+    db.order_book_new_as(
+        alice.clone(),
+        "p",
+        "app",
+        crate::order_book::OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "oid-secure-as".into(),
+            side: crate::order_book::OrderSide::Bid,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: crate::order_book::TimeInForce::Gtc,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 2;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    )
+    .await
+    .expect("place order");
+    db.order_book_cancel_as(alice.clone(), "p", "app", "BTC-USD", 1, "alice")
+        .await
+        .expect("cancel order");
+    let status = db
+        .order_status("p", "app", "BTC-USD", 1, ConsistencyMode::AtLatest, &alice)
+        .await
+        .expect("status query")
+        .expect("order exists");
+    assert_eq!(status.status, crate::order_book::OrderStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn secure_multi_agent_user_perspective_invariants_hold() {
+    fn u256_be(v: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..].copy_from_slice(&v.to_be_bytes());
+        out
+    }
+
+    fn req(
+        instrument: &str,
+        owner: &str,
+        cid: String,
+        side: crate::order_book::OrderSide,
+        tif: crate::order_book::TimeInForce,
+        price: i64,
+        qty: u64,
+        nonce: u64,
+    ) -> crate::order_book::OrderRequest {
+        crate::order_book::OrderRequest {
+            instrument: instrument.to_string(),
+            client_order_id: cid,
+            side,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: tif,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: price,
+            qty_be: u256_be(qty),
+            owner: owner.to_string(),
+            account: None,
+            nonce,
+            price_limit_ticks: None,
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct AgentMetrics {
+        primary_attempted: usize,
+        primary_accepted: usize,
+        primary_rejected: usize,
+        lifecycle_attempted: usize,
+        lifecycle_accepted: usize,
+        lifecycle_rejected: usize,
+        own_read_checks: usize,
+    }
+
+    let dir = tempdir().expect("temp");
+    let db = Arc::new(
+        AedbInstance::open_secure(AedbConfig::production([6u8; 32]), dir.path())
+            .expect("open secure"),
+    );
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+
+    let agents: Vec<String> = (0..8).map(|i| format!("agent_{i}")).collect();
+    for a in &agents {
+        db.commit_as(
+            system.clone(),
+            Mutation::Ddl(DdlOperation::GrantPermission {
+                caller_id: a.clone(),
+                permission: Permission::ProjectAdmin {
+                    project_id: "p".into(),
+                },
+                actor_id: Some("system".into()),
+                delegable: false,
+            }),
+        )
+        .await
+        .expect("grant project admin");
+    }
+
+    db.order_book_set_instrument_config_as(
+        system.clone(),
+        "p",
+        "app",
+        "BTC-USD",
+        crate::order_book::InstrumentConfig {
+            instrument: "BTC-USD".into(),
+            tick_size: 1,
+            lot_size_be: u256_be(1),
+            min_price_ticks: 1,
+            max_price_ticks: 1_000_000,
+            market_order_price_band: Some(50),
+            halted: false,
+            balance_config: None,
+        },
+    )
+    .await
+    .expect("instrument config");
+
+    for i in 0..16u64 {
+        db.order_book_new_as(
+            system.clone(),
+            "p",
+            "app",
+            req(
+                "BTC-USD",
+                &format!("seed_ask_{i}"),
+                format!("seed-ask-{i}"),
+                crate::order_book::OrderSide::Ask,
+                crate::order_book::TimeInForce::Gtc,
+                1_000 + i as i64,
+                10,
+                1,
+            ),
+        )
+        .await
+        .expect("seed ask");
+        db.order_book_new_as(
+            system.clone(),
+            "p",
+            "app",
+            req(
+                "BTC-USD",
+                &format!("seed_bid_{i}"),
+                format!("seed-bid-{i}"),
+                crate::order_book::OrderSide::Bid,
+                crate::order_book::TimeInForce::Gtc,
+                999 - i as i64,
+                10,
+                1,
+            ),
+        )
+        .await
+        .expect("seed bid");
+    }
+
+    let mut anchors: Vec<(String, u64)> = Vec::with_capacity(agents.len());
+    for (idx, agent_id) in agents.iter().enumerate() {
+        let caller = CallerContext::new(agent_id.clone());
+        let anchor_cid = format!("anchor-{agent_id}");
+        db.order_book_new_as(
+            caller.clone(),
+            "p",
+            "app",
+            req(
+                "BTC-USD",
+                agent_id,
+                anchor_cid.clone(),
+                if idx % 2 == 0 {
+                    crate::order_book::OrderSide::Bid
+                } else {
+                    crate::order_book::OrderSide::Ask
+                },
+                crate::order_book::TimeInForce::Gtc,
+                if idx % 2 == 0 { 980 } else { 1_020 },
+                2,
+                1,
+            ),
+        )
+        .await
+        .expect("anchor order");
+        let own_open = db
+            .open_orders(
+                "p",
+                "app",
+                "BTC-USD",
+                agent_id,
+                ConsistencyMode::AtLatest,
+                &caller,
+            )
+            .await
+            .expect("own open orders");
+        let anchor = own_open
+            .into_iter()
+            .find(|o| o.client_order_id == anchor_cid)
+            .expect("anchor order discoverable");
+        anchors.push((agent_id.clone(), anchor.order_id));
+    }
+
+    let mut tasks = Vec::with_capacity(agents.len());
+    for (idx, agent_id) in agents.iter().enumerate() {
+        let db_clone = Arc::clone(&db);
+        let caller = CallerContext::new(agent_id.clone());
+        let owner = agent_id.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut m = AgentMetrics::default();
+            let mut nonce = 10u64;
+            for op in 0..180usize {
+                let side = if (op + idx) % 2 == 0 {
+                    crate::order_book::OrderSide::Bid
+                } else {
+                    crate::order_book::OrderSide::Ask
+                };
+                let price = if matches!(side, crate::order_book::OrderSide::Bid) {
+                    1_001
+                } else {
+                    998
+                };
+                m.primary_attempted += 1;
+                let res = db_clone
+                    .order_book_new_as(
+                        caller.clone(),
+                        "p",
+                        "app",
+                        req(
+                            "BTC-USD",
+                            &owner,
+                            format!("{owner}-p-{op}"),
+                            side,
+                            crate::order_book::TimeInForce::Ioc,
+                            price,
+                            1 + (op % 4) as u64,
+                            nonce,
+                        ),
+                    )
+                    .await;
+                nonce += 1;
+                match res {
+                    Ok(_) => m.primary_accepted += 1,
+                    Err(AedbError::Validation(_)) | Err(AedbError::Conflict(_)) => {
+                        m.primary_rejected += 1
+                    }
+                    Err(other) => return Err(other),
+                }
+
+                if op % 30 == 0 {
+                    m.lifecycle_attempted += 1;
+                    let cid = format!("{owner}-l-{op}");
+                    let opened = db_clone
+                        .order_book_new_as(
+                            caller.clone(),
+                            "p",
+                            "app",
+                            req(
+                                "BTC-USD",
+                                &owner,
+                                cid.clone(),
+                                crate::order_book::OrderSide::Bid,
+                                crate::order_book::TimeInForce::Gtc,
+                                970,
+                                1,
+                                nonce,
+                            ),
+                        )
+                        .await;
+                    nonce += 1;
+                    match opened {
+                        Ok(_) => m.lifecycle_accepted += 1,
+                        Err(AedbError::Validation(_)) | Err(AedbError::Conflict(_)) => {
+                            m.lifecycle_rejected += 1
+                        }
+                        Err(other) => return Err(other),
+                    }
+
+                    m.lifecycle_attempted += 1;
+                    match db_clone
+                        .order_book_cancel_by_client_id_as(
+                            caller.clone(),
+                            "p",
+                            "app",
+                            "BTC-USD",
+                            &cid,
+                            &owner,
+                        )
+                        .await
+                    {
+                        Ok(_) => m.lifecycle_accepted += 1,
+                        Err(AedbError::Validation(_)) | Err(AedbError::Conflict(_)) => {
+                            m.lifecycle_rejected += 1
+                        }
+                        Err(other) => return Err(other),
+                    }
+                }
+
+                if op % 40 == 0 {
+                    let own = db_clone
+                        .open_orders(
+                            "p",
+                            "app",
+                            "BTC-USD",
+                            &owner,
+                            ConsistencyMode::AtLatest,
+                            &caller,
+                        )
+                        .await
+                        .map_err(|e| {
+                            AedbError::Validation(format!("own open_orders failed: {e}"))
+                        })?;
+                    assert!(
+                        own.iter().all(|o| o.owner == owner),
+                        "open_orders must only return owner rows"
+                    );
+                    m.own_read_checks += 1;
+                }
+            }
+            Ok::<_, AedbError>(m)
+        }));
+    }
+
+    let mut metrics = Vec::with_capacity(agents.len());
+    for task in tasks {
+        metrics.push(task.await.expect("join agent task").expect("agent run"));
+    }
+
+    for (idx, agent_id) in agents.iter().enumerate() {
+        let caller = CallerContext::new(agent_id.clone());
+        let (target_owner, target_order_id) = &anchors[(idx + 1) % anchors.len()];
+
+        let err = db
+            .order_status(
+                "p",
+                "app",
+                "BTC-USD",
+                *target_order_id,
+                ConsistencyMode::AtLatest,
+                &caller,
+            )
+            .await
+            .expect_err("cross-owner order_status must be denied");
+        assert!(
+            matches!(err, QueryError::PermissionDenied { .. }),
+            "expected permission denied, got {err:?}"
+        );
+
+        let err = db
+            .open_orders(
+                "p",
+                "app",
+                "BTC-USD",
+                target_owner,
+                ConsistencyMode::AtLatest,
+                &caller,
+            )
+            .await
+            .expect_err("cross-owner open_orders must be denied");
+        assert!(
+            matches!(err, QueryError::PermissionDenied { .. }),
+            "expected permission denied, got {err:?}"
+        );
+    }
+
+    for m in &metrics {
+        assert_eq!(
+            m.primary_accepted + m.primary_rejected,
+            m.primary_attempted,
+            "primary accounting mismatch"
+        );
+        assert_eq!(
+            m.lifecycle_accepted + m.lifecycle_rejected,
+            m.lifecycle_attempted,
+            "lifecycle accounting mismatch"
+        );
+        assert!(
+            m.own_read_checks > 0,
+            "agent should perform own-read checks"
+        );
+    }
+}
+
+#[tokio::test]
+async fn commit_success_is_observable_at_its_commit_seq() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let result = db
+        .commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"inclusion-proof".to_vec(),
+            value: b"ok".to_vec(),
+        })
+        .await
+        .expect("commit");
+
+    let at_seq = db
+        .kv_get_no_auth(
+            "p",
+            "app",
+            b"inclusion-proof",
+            ConsistencyMode::AtSeq(result.commit_seq),
+        )
+        .await
+        .expect("kv_get at seq")
+        .expect("value present at commit seq");
+    assert_eq!(at_seq.value, b"ok".to_vec());
+}
+
+#[tokio::test]
+async fn failed_multi_mutation_envelope_is_atomic_and_has_no_partial_effects() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let before = db.head_state().await.visible_head_seq;
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: Default::default(),
+            write_intent: WriteIntent {
+                mutations: vec![
+                    Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"atomic-a".to_vec(),
+                        value: b"1".to_vec(),
+                    },
+                    Mutation::KvDecU256 {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"missing-counter".to_vec(),
+                        amount_be: {
+                            let mut out = [0u8; 32];
+                            out[31] = 1;
+                            out
+                        },
+                    },
+                ],
+            },
+            base_seq: before,
+        })
+        .await
+        .expect_err("envelope should fail");
+    assert!(
+        matches!(
+            err,
+            AedbError::Underflow | AedbError::Validation(_) | AedbError::Conflict(_)
+        ),
+        "expected semantic failure, got: {err:?}"
+    );
+
+    let after = db.head_state().await.visible_head_seq;
+    assert_eq!(after, before, "failed envelope must not advance head");
+    let leaked = db
+        .kv_get_no_auth("p", "app", b"atomic-a", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv_get")
+        .is_some();
+    assert!(
+        !leaked,
+        "failed envelope must not partially apply mutations"
+    );
+}
+
+#[tokio::test]
+async fn idempotent_retry_does_not_double_apply_non_idempotent_mutation() {
+    let dir = tempdir().expect("temp");
+    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let key = IdempotencyKey([42u8; 16]);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let db = Arc::clone(&db);
+        let key = key.clone();
+        tasks.push(tokio::spawn(async move {
+            db.commit_envelope(TransactionEnvelope {
+                caller: None,
+                idempotency_key: Some(key),
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![Mutation::KvIncU256 {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"idem-counter".to_vec(),
+                        amount_be: {
+                            let mut out = [0u8; 32];
+                            out[31] = 1;
+                            out
+                        },
+                    }],
+                },
+                base_seq: 0,
+            })
+            .await
+            .expect("idempotent commit")
+        }));
+    }
+
+    let mut seqs = std::collections::BTreeSet::new();
+    for t in tasks {
+        let res = t.await.expect("join");
+        seqs.insert(res.commit_seq);
+    }
+    assert_eq!(seqs.len(), 1, "all retries must resolve to one commit_seq");
+
+    let entry = db
+        .kv_get_no_auth("p", "app", b"idem-counter", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv_get")
+        .expect("counter exists");
+    assert_eq!(
+        primitive_types::U256::from_big_endian(&entry.value),
+        primitive_types::U256::one(),
+        "idempotent retries must apply mutation exactly once"
+    );
+}
+
+#[tokio::test]
+async fn strict_cancel_rejects_missing_order() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let err = db
+        .order_book_cancel_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            999_999,
+            "alice",
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("strict cancel should fail when target is missing");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn strict_cancel_rejects_already_final_order() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.order_book_new(
+        "p",
+        "app",
+        crate::order_book::OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "strict-final".into(),
+            side: crate::order_book::OrderSide::Bid,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: crate::order_book::TimeInForce::Gtc,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    )
+    .await
+    .expect("place order");
+
+    db.order_book_cancel_strict("p", "app", "BTC-USD", 1, "alice", CommitFinality::Visible)
+        .await
+        .expect("first strict cancel");
+
+    let err = db
+        .order_book_cancel_strict("p", "app", "BTC-USD", 1, "alice", CommitFinality::Visible)
+        .await
+        .expect_err("second strict cancel should fail on already-cancelled order");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn strict_cancel_by_client_id_rejects_missing_mapping() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let err = db
+        .order_book_cancel_by_client_id_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            "missing-client-order-id",
+            "alice",
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("strict cancel by client id should fail when mapping is missing");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn strict_cancel_by_client_id_rejects_already_final_order() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.order_book_new(
+        "p",
+        "app",
+        crate::order_book::OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "strict-client-final".into(),
+            side: crate::order_book::OrderSide::Bid,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: crate::order_book::TimeInForce::Gtc,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    )
+    .await
+    .expect("place order");
+
+    db.order_book_cancel_by_client_id_strict(
+        "p",
+        "app",
+        "BTC-USD",
+        "strict-client-final",
+        "alice",
+        CommitFinality::Visible,
+    )
+    .await
+    .expect("first strict cancel by client id");
+
+    let err = db
+        .order_book_cancel_by_client_id_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            "strict-client-final",
+            "alice",
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("second strict cancel by client id should fail on finalized order");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn strict_cancel_by_client_id_rejects_invalid_mapping_encoding() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: crate::order_book::key_client_id("BTC-USD", "alice", "cid-corrupt"),
+        value: vec![1, 2, 3, 4],
+    })
+    .await
+    .expect("inject corrupted mapping");
+
+    let err = db
+        .order_book_cancel_by_client_id_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            "cid-corrupt",
+            "alice",
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("strict cancel by client id should reject malformed mapping");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn strict_cancel_by_client_id_detects_owner_mismatch_under_tampered_mapping() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.order_book_new(
+        "p",
+        "app",
+        crate::order_book::OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "cid-owner-a".into(),
+            side: crate::order_book::OrderSide::Bid,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: crate::order_book::TimeInForce::Gtc,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    )
+    .await
+    .expect("place order");
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: crate::order_book::key_client_id("BTC-USD", "bob", "cid-owner-b"),
+        value: 1u64.to_be_bytes().to_vec(),
+    })
+    .await
+    .expect("inject tampered mapping");
+
+    let err = db
+        .order_book_cancel_by_client_id_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            "cid-owner-b",
+            "bob",
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("strict cancel by client id should reject owner mismatch");
+    assert!(matches!(err, AedbError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn strict_reduce_rejects_missing_order() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    let mut one = [0u8; 32];
+    one[31] = 1;
+    let err = db
+        .order_book_reduce_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            777,
+            "alice",
+            one,
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("strict reduce should fail on missing order");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn strict_cancel_replace_rejects_already_final_order() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.order_book_new(
+        "p",
+        "app",
+        crate::order_book::OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "strict-cr-final".into(),
+            side: crate::order_book::OrderSide::Bid,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: crate::order_book::TimeInForce::Gtc,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    )
+    .await
+    .expect("place order");
+    db.order_book_cancel_strict("p", "app", "BTC-USD", 1, "alice", CommitFinality::Visible)
+        .await
+        .expect("cancel");
+
+    let err = db
+        .order_book_cancel_replace_strict(
+            "p",
+            "app",
+            "BTC-USD",
+            1,
+            "alice",
+            Some(101),
+            None,
+            None,
+            None,
+            CommitFinality::Visible,
+        )
+        .await
+        .expect_err("strict cancel-replace should fail on finalized order");
+    assert!(matches!(err, AedbError::Validation(_)));
 }
 
 #[tokio::test]

@@ -34,7 +34,9 @@ use crate::catalog::{DdlOperation, ResourceType};
 use crate::checkpoint::loader::load_checkpoint_with_key;
 use crate::checkpoint::writer::write_checkpoint_with_key;
 use crate::commit::executor::{CommitExecutor, CommitResult, ExecutorMetrics};
-use crate::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
+use crate::commit::tx::{
+    ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
+};
 use crate::commit::validation::{Mutation, TableUpdateExpr, validate_permissions};
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use crate::error::AedbError;
@@ -47,8 +49,9 @@ use crate::migration::{
 };
 use crate::order_book::{
     ExecInstruction, FillSpec, InstrumentConfig, OrderBookDepth, OrderBookTableMode, OrderRecord,
-    OrderRequest, OrderSide, Spread, TimeInForce, read_last_execution_report, read_open_orders,
-    read_order_status, read_recent_trades, read_spread, read_top_n, scoped_instrument,
+    OrderRequest, OrderSide, Spread, TimeInForce, key_client_id, key_order,
+    read_last_execution_report, read_open_orders, read_order_status, read_recent_trades,
+    read_spread, read_top_n, scoped_instrument, u256_from_be,
 };
 use crate::permission::{CallerContext, Permission};
 use crate::preflight::{PreflightResult, preflight, preflight_plan};
@@ -724,6 +727,17 @@ impl AedbInstance {
         let result = self.executor.submit_prevalidated(mutation).await;
         self.emit_commit_telemetry(op_name, started, &result);
         result
+    }
+
+    async fn commit_prevalidated_internal_with_finality(
+        &self,
+        op_name: &'static str,
+        mutation: Mutation,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let mut result = self.commit_prevalidated_internal(op_name, mutation).await?;
+        self.enforce_finality(&mut result, finality).await?;
+        Ok(result)
     }
 
     pub async fn commit_with_finality(
@@ -1644,7 +1658,9 @@ impl AedbInstance {
             assertions: Vec::new(),
             read_set: ReadSet::default(),
             write_intent: WriteIntent { mutations },
-            base_seq: self.snapshot_probe(ConsistencyMode::AtLatest).await?,
+            // No read set/assertions in this helper path.
+            // Keep hot-path parity with submit/submit_as and avoid snapshot acquisition.
+            base_seq: 0,
         })
         .await
     }
@@ -1666,7 +1682,9 @@ impl AedbInstance {
             assertions: Vec::new(),
             read_set: ReadSet::default(),
             write_intent: WriteIntent { mutations },
-            base_seq: self.snapshot_probe(ConsistencyMode::AtLatest).await?,
+            // No read set/assertions in this helper path.
+            // Keep hot-path parity with submit/submit_as and avoid snapshot acquisition.
+            base_seq: 0,
         })
         .await
     }
@@ -2784,6 +2802,25 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_new_with_finality(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        request: OrderRequest,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal_with_finality(
+            "order_book_new",
+            Mutation::OrderBookNew {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                request,
+            },
+            finality,
+        )
+        .await
+    }
+
     pub async fn order_book_define_table(
         &self,
         project_id: &str,
@@ -2803,6 +2840,26 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_define_table_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        table_id: &str,
+        mode: OrderBookTableMode,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookDefineTable {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                table_id: table_id.to_string(),
+                mode,
+            },
+        )
+        .await
+    }
+
     pub async fn order_book_drop_table(
         &self,
         project_id: &str,
@@ -2811,6 +2868,24 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         self.commit_prevalidated_internal(
             "order_book_drop_table",
+            Mutation::OrderBookDropTable {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                table_id: table_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_drop_table_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        table_id: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
             Mutation::OrderBookDropTable {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
@@ -2839,6 +2914,26 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_set_instrument_config_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        config: InstrumentConfig,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookSetInstrumentConfig {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                config,
+            },
+        )
+        .await
+    }
+
     pub async fn order_book_set_instrument_halted(
         &self,
         project_id: &str,
@@ -2848,6 +2943,26 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         self.commit_prevalidated_internal(
             "order_book_set_instrument_halted",
+            Mutation::OrderBookSetInstrumentHalted {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                halted,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_set_instrument_halted_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        halted: bool,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
             Mutation::OrderBookSetInstrumentHalted {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
@@ -2888,6 +3003,28 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_new_as_with_finality(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        request: OrderRequest,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let mut result = self
+            .commit_as(
+                caller,
+                Mutation::OrderBookNew {
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    request,
+                },
+            )
+            .await?;
+        self.enforce_finality(&mut result, finality).await?;
+        Ok(result)
+    }
+
     pub async fn order_book_cancel(
         &self,
         project_id: &str,
@@ -2908,6 +3045,175 @@ impl AedbInstance {
             },
         )
         .await
+    }
+
+    pub async fn order_book_cancel_with_finality(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_prevalidated_internal_with_finality(
+            "order_book_cancel",
+            Mutation::OrderBookCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                client_order_id: None,
+                owner: owner.to_string(),
+            },
+            finality,
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_strict(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_cancel_strict_as_internal(
+            None, project_id, scope_id, instrument, order_id, owner, finality,
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                client_order_id: None,
+                owner: owner.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_as_with_finality(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let mut result = self
+            .order_book_cancel_as(caller, project_id, scope_id, instrument, order_id, owner)
+            .await?;
+        self.enforce_finality(&mut result, finality).await?;
+        Ok(result)
+    }
+
+    pub async fn order_book_cancel_strict_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_cancel_strict_as_internal(
+            Some(caller),
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            owner,
+            finality,
+        )
+        .await
+    }
+
+    async fn order_book_cancel_strict_as_internal(
+        &self,
+        caller: Option<CallerContext>,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let lease = self
+            .acquire_snapshot(ConsistencyMode::AtLatest)
+            .await
+            .map_err(AedbError::from)?;
+        let order_key = key_order(instrument, order_id);
+        let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
+            return Err(AedbError::Validation(format!(
+                "strict cancel target not found: order_id={order_id}"
+            )));
+        };
+        let order: OrderRecord =
+            rmp_serde::from_slice(&entry.value).map_err(|e| AedbError::Decode(e.to_string()))?;
+        if order.owner != owner {
+            return Err(AedbError::PermissionDenied(
+                "order ownership mismatch".into(),
+            ));
+        }
+        if !matches!(
+            order.status,
+            crate::order_book::OrderStatus::Open | crate::order_book::OrderStatus::PartiallyFilled
+        ) || u256_from_be(order.remaining_qty_be).is_zero()
+        {
+            return Err(AedbError::Validation(format!(
+                "order not cancellable in current status: {:?}",
+                order.status
+            )));
+        }
+        let envelope = TransactionEnvelope {
+            caller,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet {
+                points: vec![ReadSetEntry {
+                    key: ReadKey::KvKey {
+                        project_id: project_id.to_string(),
+                        scope_id: scope_id.to_string(),
+                        key: order_key,
+                    },
+                    version_at_read: entry.version,
+                }],
+                ranges: Vec::new(),
+            },
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::OrderBookCancel {
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    instrument: instrument.to_string(),
+                    order_id,
+                    client_order_id: None,
+                    owner: owner.to_string(),
+                }],
+            },
+            base_seq: lease.view.seq,
+        };
+        self.commit_envelope_with_finality(envelope, finality).await
     }
 
     pub async fn order_book_cancel_by_client_id(
@@ -2932,6 +3238,417 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_cancel_by_client_id_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        client_order_id: &str,
+        owner: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id: 0,
+                client_order_id: Some(client_order_id.to_string()),
+                owner: owner.to_string(),
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_by_client_id_strict(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        client_order_id: &str,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_cancel_by_client_id_strict_as_internal(
+            None,
+            project_id,
+            scope_id,
+            instrument,
+            client_order_id,
+            owner,
+            finality,
+        )
+        .await
+    }
+
+    pub async fn order_book_cancel_by_client_id_strict_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        client_order_id: &str,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_cancel_by_client_id_strict_as_internal(
+            Some(caller),
+            project_id,
+            scope_id,
+            instrument,
+            client_order_id,
+            owner,
+            finality,
+        )
+        .await
+    }
+
+    async fn order_book_cancel_by_client_id_strict_as_internal(
+        &self,
+        caller: Option<CallerContext>,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        client_order_id: &str,
+        owner: &str,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let lease = self
+            .acquire_snapshot(ConsistencyMode::AtLatest)
+            .await
+            .map_err(AedbError::from)?;
+        let cid_key = key_client_id(instrument, owner, client_order_id);
+        let Some(cid_entry) = lease.view.keyspace.kv_get(project_id, scope_id, &cid_key) else {
+            return Err(AedbError::Validation(format!(
+                "strict cancel target not found: client_order_id={client_order_id}"
+            )));
+        };
+        if cid_entry.value.len() != 8 {
+            return Err(AedbError::Validation(
+                "invalid client-order mapping encoding".into(),
+            ));
+        }
+        let mut id_bytes = [0u8; 8];
+        id_bytes.copy_from_slice(&cid_entry.value);
+        let order_id = u64::from_be_bytes(id_bytes);
+        let order_key = key_order(instrument, order_id);
+        let Some(order_entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
+            return Err(AedbError::Validation(format!(
+                "strict cancel target not found: order_id={order_id}"
+            )));
+        };
+        let order: OrderRecord = rmp_serde::from_slice(&order_entry.value)
+            .map_err(|e| AedbError::Decode(e.to_string()))?;
+        if order.owner != owner {
+            return Err(AedbError::PermissionDenied(
+                "order ownership mismatch".into(),
+            ));
+        }
+        if !matches!(
+            order.status,
+            crate::order_book::OrderStatus::Open | crate::order_book::OrderStatus::PartiallyFilled
+        ) || u256_from_be(order.remaining_qty_be).is_zero()
+        {
+            return Err(AedbError::Validation(format!(
+                "order not cancellable in current status: {:?}",
+                order.status
+            )));
+        }
+        let envelope = TransactionEnvelope {
+            caller,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet {
+                points: vec![
+                    ReadSetEntry {
+                        key: ReadKey::KvKey {
+                            project_id: project_id.to_string(),
+                            scope_id: scope_id.to_string(),
+                            key: cid_key,
+                        },
+                        version_at_read: cid_entry.version,
+                    },
+                    ReadSetEntry {
+                        key: ReadKey::KvKey {
+                            project_id: project_id.to_string(),
+                            scope_id: scope_id.to_string(),
+                            key: order_key,
+                        },
+                        version_at_read: order_entry.version,
+                    },
+                ],
+                ranges: Vec::new(),
+            },
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::OrderBookCancel {
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    instrument: instrument.to_string(),
+                    order_id: 0,
+                    client_order_id: Some(client_order_id.to_string()),
+                    owner: owner.to_string(),
+                }],
+            },
+            base_seq: lease.view.seq,
+        };
+        self.commit_envelope_with_finality(envelope, finality).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn order_book_cancel_replace_strict(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        new_price_ticks: Option<i64>,
+        new_qty_be: Option<[u8; 32]>,
+        new_time_in_force: Option<TimeInForce>,
+        new_exec_instructions: Option<ExecInstruction>,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_cancel_replace_strict_as_internal(
+            None,
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            owner,
+            new_price_ticks,
+            new_qty_be,
+            new_time_in_force,
+            new_exec_instructions,
+            finality,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn order_book_cancel_replace_strict_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        new_price_ticks: Option<i64>,
+        new_qty_be: Option<[u8; 32]>,
+        new_time_in_force: Option<TimeInForce>,
+        new_exec_instructions: Option<ExecInstruction>,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_cancel_replace_strict_as_internal(
+            Some(caller),
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            owner,
+            new_price_ticks,
+            new_qty_be,
+            new_time_in_force,
+            new_exec_instructions,
+            finality,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn order_book_cancel_replace_strict_as_internal(
+        &self,
+        caller: Option<CallerContext>,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        new_price_ticks: Option<i64>,
+        new_qty_be: Option<[u8; 32]>,
+        new_time_in_force: Option<TimeInForce>,
+        new_exec_instructions: Option<ExecInstruction>,
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let (order_key, version, base_seq) = self
+            .order_book_strict_cancellable_version(
+                project_id, scope_id, instrument, order_id, owner,
+            )
+            .await?;
+        let envelope = TransactionEnvelope {
+            caller,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet {
+                points: vec![ReadSetEntry {
+                    key: ReadKey::KvKey {
+                        project_id: project_id.to_string(),
+                        scope_id: scope_id.to_string(),
+                        key: order_key,
+                    },
+                    version_at_read: version,
+                }],
+                ranges: Vec::new(),
+            },
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::OrderBookCancelReplace {
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    instrument: instrument.to_string(),
+                    order_id,
+                    owner: owner.to_string(),
+                    new_price_ticks,
+                    new_qty_be,
+                    new_time_in_force,
+                    new_exec_instructions,
+                }],
+            },
+            base_seq,
+        };
+        self.commit_envelope_with_finality(envelope, finality).await
+    }
+
+    pub async fn order_book_reduce_strict(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        reduce_by_be: [u8; 32],
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_reduce_strict_as_internal(
+            None,
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            owner,
+            reduce_by_be,
+            finality,
+        )
+        .await
+    }
+
+    pub async fn order_book_reduce_strict_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        reduce_by_be: [u8; 32],
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        self.order_book_reduce_strict_as_internal(
+            Some(caller),
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            owner,
+            reduce_by_be,
+            finality,
+        )
+        .await
+    }
+
+    async fn order_book_reduce_strict_as_internal(
+        &self,
+        caller: Option<CallerContext>,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        reduce_by_be: [u8; 32],
+        finality: CommitFinality,
+    ) -> Result<CommitResult, AedbError> {
+        let reduce_by = u256_from_be(reduce_by_be);
+        if reduce_by.is_zero() {
+            return Err(AedbError::Validation(
+                "strict reduce requires reduce_by > 0".into(),
+            ));
+        }
+        let (order_key, version, base_seq) = self
+            .order_book_strict_cancellable_version(
+                project_id, scope_id, instrument, order_id, owner,
+            )
+            .await?;
+        let envelope = TransactionEnvelope {
+            caller,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet {
+                points: vec![ReadSetEntry {
+                    key: ReadKey::KvKey {
+                        project_id: project_id.to_string(),
+                        scope_id: scope_id.to_string(),
+                        key: order_key,
+                    },
+                    version_at_read: version,
+                }],
+                ranges: Vec::new(),
+            },
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::OrderBookReduce {
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    instrument: instrument.to_string(),
+                    order_id,
+                    owner: owner.to_string(),
+                    reduce_by_be,
+                }],
+            },
+            base_seq,
+        };
+        self.commit_envelope_with_finality(envelope, finality).await
+    }
+
+    async fn order_book_strict_cancellable_version(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+    ) -> Result<(Vec<u8>, u64, u64), AedbError> {
+        let lease = self
+            .acquire_snapshot(ConsistencyMode::AtLatest)
+            .await
+            .map_err(AedbError::from)?;
+        let order_key = key_order(instrument, order_id);
+        let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
+            return Err(AedbError::Validation(format!(
+                "strict target not found: order_id={order_id}"
+            )));
+        };
+        let order: OrderRecord =
+            rmp_serde::from_slice(&entry.value).map_err(|e| AedbError::Decode(e.to_string()))?;
+        if order.owner != owner {
+            return Err(AedbError::PermissionDenied(
+                "order ownership mismatch".into(),
+            ));
+        }
+        if !matches!(
+            order.status,
+            crate::order_book::OrderStatus::Open | crate::order_book::OrderStatus::PartiallyFilled
+        ) || u256_from_be(order.remaining_qty_be).is_zero()
+        {
+            return Err(AedbError::Validation(format!(
+                "order not mutable in current status: {:?}",
+                order.status
+            )));
+        }
+        Ok((order_key, entry.version, lease.view.seq))
+    }
+
     pub async fn order_book_cancel_replace(
         &self,
         project_id: &str,
@@ -2946,6 +3663,37 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         self.commit_prevalidated_internal(
             "order_book_cancel_replace",
+            Mutation::OrderBookCancelReplace {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                owner: owner.to_string(),
+                new_price_ticks,
+                new_qty_be,
+                new_time_in_force,
+                new_exec_instructions,
+            },
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn order_book_cancel_replace_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        new_price_ticks: Option<i64>,
+        new_qty_be: Option<[u8; 32]>,
+        new_time_in_force: Option<TimeInForce>,
+        new_exec_instructions: Option<ExecInstruction>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
             Mutation::OrderBookCancelReplace {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
@@ -2986,6 +3734,32 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_mass_cancel_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        owner: &str,
+        side: Option<OrderSide>,
+        owner_filter: Option<String>,
+        price_range_ticks: Option<(i64, i64)>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookMassCancel {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                owner: owner.to_string(),
+                side,
+                owner_filter,
+                price_range_ticks,
+            },
+        )
+        .await
+    }
+
     pub async fn order_book_reduce(
         &self,
         project_id: &str,
@@ -3009,6 +3783,30 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn order_book_reduce_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        order_id: u64,
+        owner: &str,
+        reduce_by_be: [u8; 32],
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::OrderBookReduce {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                order_id,
+                owner: owner.to_string(),
+                reduce_by_be,
+            },
+        )
+        .await
+    }
+
     pub async fn order_book_match_internal(
         &self,
         project_id: &str,
@@ -3018,6 +3816,26 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         self.commit_prevalidated_internal(
             "order_book_match_internal",
+            Mutation::OrderBookMatch {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                instrument: instrument.to_string(),
+                fills,
+            },
+        )
+        .await
+    }
+
+    pub async fn order_book_match_internal_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        instrument: &str,
+        fills: Vec<FillSpec>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
             Mutation::OrderBookMatch {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
@@ -4685,7 +5503,7 @@ impl AedbInstance {
             coordinator_apply_attempts: core.coordinator_apply_attempts,
             avg_coordinator_apply_micros: core.avg_coordinator_apply_micros,
             inflight_commits: core.inflight_commits,
-            queue_depth: core.inflight_commits,
+            queue_depth: core.queued_commits,
             durable_head_lag: runtime
                 .visible_head_seq
                 .saturating_sub(runtime.durable_head_seq),

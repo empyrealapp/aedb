@@ -133,6 +133,7 @@ pub struct CommitExecutor {
 #[derive(Debug, Default)]
 struct ExecutorTelemetry {
     inflight_commits: AtomicUsize,
+    queued_commits: AtomicUsize,
     commits_total: AtomicU64,
     commit_errors: AtomicU64,
     queue_full_rejections: AtomicU64,
@@ -155,6 +156,7 @@ struct ExecutorTelemetry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutorMetrics {
     pub inflight_commits: usize,
+    pub queued_commits: usize,
     pub queued_bytes: usize,
     pub commits_total: u64,
     pub commit_errors: u64,
@@ -404,6 +406,9 @@ impl CommitExecutor {
                     }
                     queue_counter.fetch_sub(outcome.request.encoded_len, Ordering::Relaxed);
                     loop_telemetry
+                        .queued_commits
+                        .fetch_sub(1, Ordering::Relaxed);
+                    loop_telemetry
                         .inflight_commits
                         .fetch_sub(1, Ordering::Relaxed);
                     let _ = outcome.request.result_tx.send(outcome.result);
@@ -412,6 +417,9 @@ impl CommitExecutor {
 
             for req in pending {
                 queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                loop_telemetry
+                    .queued_commits
+                    .fetch_sub(1, Ordering::Relaxed);
                 loop_telemetry
                     .inflight_commits
                     .fetch_sub(1, Ordering::Relaxed);
@@ -461,6 +469,7 @@ impl CommitExecutor {
                             Err(e) => {
                                 pre_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
                                 pre_queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                                pre_telemetry.queued_commits.fetch_sub(1, Ordering::Relaxed);
                                 let _ = req.result_tx.send(Err(e));
                                 continue;
                             }
@@ -469,6 +478,7 @@ impl CommitExecutor {
                     if write_partitions.is_empty() {
                         pre_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
                         pre_queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                        pre_telemetry.queued_commits.fetch_sub(1, Ordering::Relaxed);
                         let _ = req.result_tx.send(Err(AedbError::Validation(
                             "transaction envelope has no mutations".into(),
                         )));
@@ -485,6 +495,7 @@ impl CommitExecutor {
                             .inflight_commits
                             .fetch_sub(1, Ordering::Relaxed);
                         pre_queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                        pre_telemetry.queued_commits.fetch_sub(1, Ordering::Relaxed);
                         let _ = req.result_tx.send(Err(AedbError::Validation(
                             "commit apply queue closed".into(),
                         )));
@@ -666,6 +677,9 @@ impl CommitExecutor {
                 Err(observed) => current = observed,
             }
         }
+        self.telemetry
+            .queued_commits
+            .fetch_add(1, Ordering::Relaxed);
         let (result_tx, result_rx) = oneshot::channel();
         let shard = shard_for_envelope(&envelope, self.ingress_txs.len());
         let ingress_tx = self
@@ -692,10 +706,16 @@ impl CommitExecutor {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.telemetry
+                    .queued_commits
+                    .fetch_sub(1, Ordering::Relaxed);
                 return Err(AedbError::Validation(format!("commit queue closed: {e}")));
             }
             Err(_) => {
                 self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.telemetry
+                    .queued_commits
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.telemetry
                     .timeout_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -816,6 +836,7 @@ impl CommitExecutor {
         };
         ExecutorMetrics {
             inflight_commits: self.telemetry.inflight_commits.load(Ordering::Relaxed),
+            queued_commits: self.telemetry.queued_commits.load(Ordering::Relaxed),
             queued_bytes: self.queued_bytes.load(Ordering::Relaxed),
             commits_total,
             commit_errors: self.telemetry.commit_errors.load(Ordering::Relaxed),

@@ -77,21 +77,63 @@ async fn main() {
     let mut failures = Vec::new();
 
     println!(
-        "scenario,attempted_tps,accepted_tps,rejected_tps,min_attempted_tps,zero_dropped,max_finality_gap"
+        "scenario,attempted_tps,accepted_tps,rejected_tps,min_attempted_tps,zero_dropped,max_finality_gap,lifecycle_attempted,lifecycle_accepted,lifecycle_rejected,primary_reject_conflict,primary_reject_post_only,primary_reject_fok,primary_reject_no_liquidity,primary_reject_nonce,primary_reject_duplicate_cid,primary_reject_other_validation,lifecycle_reject_conflict,lifecycle_reject_post_only,lifecycle_reject_fok,lifecycle_reject_no_liquidity,lifecycle_reject_nonce,lifecycle_reject_duplicate_cid,lifecycle_reject_other_validation"
     );
     for s in scenarios() {
-        let report = run_hft_simulation_with_config(s.cfg.clone(), db_cfg.clone())
-            .await
-            .unwrap_or_else(|e| panic!("scenario {} failed to run: {e}", s.name));
+        let report = match run_hft_simulation_with_config(s.cfg.clone(), db_cfg.clone()).await {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!("scenario {} failed to run: {e}", s.name);
+                std::process::exit(1);
+            }
+        };
         println!(
-            "{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             s.name,
             report.attempted_ops_per_sec,
             report.accepted_ops_per_sec,
             report.rejected_ops_per_sec,
             s.min_attempted_tps,
             report.zero_dropped_orders,
-            report.max_commit_finality_gap
+            report.max_commit_finality_gap,
+            report.simulation.lifecycle_attempted_ops,
+            report.simulation.lifecycle_accepted_ops,
+            report.simulation.lifecycle_rejected_ops,
+            report.simulation.rejection_breakdown.conflict,
+            report.simulation.rejection_breakdown.post_only_would_cross,
+            report.simulation.rejection_breakdown.fok_cannot_fill,
+            report.simulation.rejection_breakdown.market_no_liquidity,
+            report.simulation.rejection_breakdown.nonce_too_low,
+            report
+                .simulation
+                .rejection_breakdown
+                .duplicate_client_order_id,
+            report.simulation.rejection_breakdown.other_validation,
+            report.simulation.lifecycle_rejection_breakdown.conflict,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .post_only_would_cross,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .fok_cannot_fill,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .market_no_liquidity,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .nonce_too_low,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .duplicate_client_order_id,
+            report
+                .simulation
+                .lifecycle_rejection_breakdown
+                .other_validation
         );
         if report.attempted_ops_per_sec < s.min_attempted_tps || !report.zero_dropped_orders {
             failures.push(format!(

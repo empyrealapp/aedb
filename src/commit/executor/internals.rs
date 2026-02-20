@@ -336,7 +336,7 @@ pub(super) fn process_commit_epoch(
     let mut read_set_conflicts = 0u64;
     let mut working_keyspace = state.keyspace.clone();
     let mut working_catalog = state.catalog.clone();
-    let mut working_idempotency = state.idempotency.clone();
+    let mut working_idempotency: Option<HashMap<IdempotencyKey, IdempotencyRecord>> = None;
     let mut working_global_unique_index = state.global_unique_index.clone();
     let mut sequenced = Vec::new();
     let mut internal_sequenced = Vec::new();
@@ -357,18 +357,22 @@ pub(super) fn process_commit_epoch(
             continue;
         }
 
-        if let Some(key) = request.envelope.idempotency_key.clone()
-            && let Some(record) = working_idempotency.get(&key)
-        {
-            outcomes.push(EpochOutcome {
-                request,
-                result: Ok(CommitResult {
-                    commit_seq: record.commit_seq,
-                    durable_head_seq: state.durable_head_seq.max(record.commit_seq),
-                }),
-                post_apply_delta: None,
-            });
-            continue;
+        if let Some(key) = request.envelope.idempotency_key.clone() {
+            let record = working_idempotency
+                .as_ref()
+                .and_then(|map| map.get(&key))
+                .or_else(|| state.idempotency.get(&key));
+            if let Some(record) = record {
+                outcomes.push(EpochOutcome {
+                    request,
+                    result: Ok(CommitResult {
+                        commit_seq: record.commit_seq,
+                        durable_head_seq: state.durable_head_seq.max(record.commit_seq),
+                    }),
+                    post_apply_delta: None,
+                });
+                continue;
+            }
         }
 
         if let Err(err) = revalidate_read_set_for_keyspace(&working_keyspace, &request.envelope) {
@@ -550,13 +554,15 @@ pub(super) fn process_commit_epoch(
         let commit_ts_micros = now_micros();
 
         if let Some(key) = request.envelope.idempotency_key.clone() {
-            working_idempotency.insert(
-                key,
-                IdempotencyRecord {
-                    commit_seq,
-                    recorded_at_micros: commit_ts_micros,
-                },
-            );
+            working_idempotency
+                .get_or_insert_with(|| state.idempotency.clone())
+                .insert(
+                    key,
+                    IdempotencyRecord {
+                        commit_seq,
+                        recorded_at_micros: commit_ts_micros,
+                    },
+                );
         }
 
         let delta = CommitDelta {
@@ -714,7 +720,9 @@ pub(super) fn process_commit_epoch(
     state.keyspace = working_keyspace;
     state.catalog = working_catalog;
     state.global_unique_index = working_global_unique_index;
-    state.idempotency = working_idempotency;
+    if let Some(updated) = working_idempotency {
+        state.idempotency = updated;
+    }
     state.current_seq = last_seq;
     state.visible_head_seq = last_seq;
     match state.config.durability_mode {

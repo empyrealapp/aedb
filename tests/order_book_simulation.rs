@@ -23,11 +23,16 @@ fn decode_u256_u64(bytes: [u8; 32]) -> u64 {
     u64::from_be_bytes(out)
 }
 
-fn decode_u256_bytes_to_u64(bytes: &[u8]) -> u64 {
-    assert_eq!(bytes.len(), 32);
+fn decode_u256_bytes_to_u64(bytes: &[u8]) -> Result<u64, AedbError> {
+    if bytes.len() != 32 {
+        return Err(AedbError::Validation(format!(
+            "invalid u256 byte length: {}",
+            bytes.len()
+        )));
+    }
     let mut out = [0u8; 8];
     out.copy_from_slice(&bytes[24..]);
-    u64::from_be_bytes(out)
+    Ok(u64::from_be_bytes(out))
 }
 
 fn request(
@@ -63,8 +68,8 @@ fn request(
     }
 }
 
-async fn setup_books(db: &AedbInstance, assets: &[String]) {
-    db.create_project("p").await.expect("project");
+async fn setup_books(db: &AedbInstance, assets: &[String]) -> Result<(), AedbError> {
+    db.create_project("p").await?;
     for asset in assets {
         db.order_book_set_instrument_config(
             "p",
@@ -81,8 +86,7 @@ async fn setup_books(db: &AedbInstance, assets: &[String]) {
                 balance_config: None,
             },
         )
-        .await
-        .expect("config");
+        .await?;
 
         // Seed symmetric depth around 1_000 ticks.
         for i in 0..20_u64 {
@@ -103,8 +107,7 @@ async fn setup_books(db: &AedbInstance, assets: &[String]) {
                     1,
                 ),
             )
-            .await
-            .expect("seed ask");
+            .await?;
 
             let bid_owner = format!("seed_bid_{}_{}", asset, i);
             db.order_book_new(
@@ -123,20 +126,79 @@ async fn setup_books(db: &AedbInstance, assets: &[String]) {
                     1,
                 ),
             )
-            .await
-            .expect("seed bid");
+            .await?;
         }
     }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ChaosMetrics {
+    primary_attempted: usize,
+    primary_accepted: usize,
+    primary_rejected: usize,
+    lifecycle_attempted: usize,
+    lifecycle_accepted: usize,
+    lifecycle_rejected: usize,
+    reader_checks: usize,
+}
+
+async fn validate_asset_read_consistency(db: &AedbInstance, asset: &str) -> Result<(), AedbError> {
+    let rows = db
+        .kv_scan_prefix_no_auth(
+            "p",
+            "app",
+            format!("ob:{asset}:ord:").as_bytes(),
+            2_000_000,
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .map_err(|e| AedbError::Validation(e.to_string()))?;
+    for (_, entry) in rows {
+        let order: aedb::order_book::OrderRecord =
+            rmp_serde::from_slice(&entry.value).map_err(|e| AedbError::Decode(e.to_string()))?;
+        let original = decode_u256_u64(order.original_qty_be);
+        let remaining = decode_u256_u64(order.remaining_qty_be);
+        let filled = decode_u256_u64(order.filled_qty_be);
+        if remaining + filled > original {
+            return Err(AedbError::Validation(format!(
+                "quantity accounting violated in live read for {asset}"
+            )));
+        }
+    }
+
+    for side in [OrderSide::Bid, OrderSide::Ask] {
+        let levels = db
+            .kv_scan_prefix_no_auth(
+                "p",
+                "app",
+                format!("ob:{asset}:plqty:{}:", side as u8).as_bytes(),
+                2_000_000,
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .map_err(|e| AedbError::Validation(e.to_string()))?;
+        for (k, v) in levels {
+            let qty = decode_u256_bytes_to_u64(&v.value)?;
+            if qty == 0 {
+                continue;
+            }
+            parse_plqty_price(side, &k).ok_or_else(|| {
+                AedbError::Validation(format!("failed to parse level price for {asset}"))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 async fn run_simulation(
     assets: Vec<String>,
     traders: usize,
     ops_per_trader: usize,
-) -> Arc<AedbInstance> {
-    let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open"));
-    setup_books(&db, &assets).await;
+) -> Result<(Arc<AedbInstance>, ChaosMetrics), AedbError> {
+    let dir = tempdir().map_err(AedbError::Io)?;
+    let db = Arc::new(AedbInstance::open(Default::default(), dir.path())?);
+    setup_books(&db, &assets).await?;
 
     let mut tasks = Vec::with_capacity(traders);
     for t in 0..traders {
@@ -146,6 +208,12 @@ async fn run_simulation(
             let owner = format!("trader_{t}");
             let mut nonces: BTreeMap<String, u64> = BTreeMap::new();
             let mut rng = StdRng::seed_from_u64(42 + t as u64);
+            let mut primary_attempted = 0usize;
+            let mut primary_accepted = 0usize;
+            let mut primary_rejected = 0usize;
+            let mut lifecycle_attempted = 0usize;
+            let mut lifecycle_accepted = 0usize;
+            let mut lifecycle_rejected = 0usize;
 
             for op in 0..ops_per_trader {
                 let asset = &assets_clone[rng.gen_range(0..assets_clone.len())];
@@ -171,6 +239,7 @@ async fn run_simulation(
                 };
                 let post_only = order_type == OrderType::Limit && rng.gen_bool(0.05);
 
+                primary_attempted += 1;
                 let res = db_clone
                     .order_book_new(
                         "p",
@@ -190,11 +259,14 @@ async fn run_simulation(
                     )
                     .await;
 
-                if let Err(err) = res {
-                    // Expected rejects under stress: FOK, market no liquidity, post-only crossing.
-                    match err {
-                        AedbError::Validation(_) => {}
-                        other => panic!("unexpected simulation error: {other:?}"),
+                match res {
+                    Ok(_) => primary_accepted += 1,
+                    Err(err) => {
+                        // Expected rejects under stress: FOK, market no liquidity, post-only crossing.
+                        match err {
+                            AedbError::Validation(_) => primary_rejected += 1,
+                            other => return Err(other),
+                        }
                     }
                 }
 
@@ -202,7 +274,8 @@ async fn run_simulation(
                 if op % 100 == 0 {
                     *nonce += 1;
                     let cid = format!("gtc-{owner}-{op}");
-                    let _ = db_clone
+                    lifecycle_attempted += 1;
+                    match db_clone
                         .order_book_new(
                             "p",
                             "app",
@@ -219,23 +292,86 @@ async fn run_simulation(
                                 *nonce,
                             ),
                         )
-                        .await;
-                    let _ = db_clone
+                        .await
+                    {
+                        Ok(_) => lifecycle_accepted += 1,
+                        Err(AedbError::Validation(_)) => lifecycle_rejected += 1,
+                        Err(other) => return Err(other),
+                    }
+
+                    lifecycle_attempted += 1;
+                    match db_clone
                         .order_book_cancel_by_client_id("p", "app", asset, &cid, &owner)
-                        .await;
+                        .await
+                    {
+                        Ok(_) => lifecycle_accepted += 1,
+                        Err(AedbError::Validation(_)) => lifecycle_rejected += 1,
+                        Err(other) => return Err(other),
+                    }
                 }
             }
+            Ok(ChaosMetrics {
+                primary_attempted,
+                primary_accepted,
+                primary_rejected,
+                lifecycle_attempted,
+                lifecycle_accepted,
+                lifecycle_rejected,
+                reader_checks: 0,
+            })
         }));
     }
 
-    for task in tasks {
-        task.await.expect("task join");
+    let reader_workers = (traders / 2).max(4);
+    let reader_loops = (ops_per_trader / 2).max(200);
+    for r in 0..reader_workers {
+        let db_clone = Arc::clone(&db);
+        let assets_clone = assets.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut rng = StdRng::seed_from_u64(9_000 + r as u64);
+            let mut checks = 0usize;
+            for _ in 0..reader_loops {
+                let asset = &assets_clone[rng.gen_range(0..assets_clone.len())];
+                validate_asset_read_consistency(db_clone.as_ref(), asset).await?;
+                checks += 1;
+            }
+            Ok(ChaosMetrics {
+                reader_checks: checks,
+                ..Default::default()
+            })
+        }));
     }
 
-    db
+    let mut metrics = ChaosMetrics::default();
+    for task in tasks {
+        let worker = task
+            .await
+            .map_err(|e| AedbError::Validation(format!("simulation task join failure: {e}")))?;
+        let worker = worker?;
+        metrics.primary_attempted += worker.primary_attempted;
+        metrics.primary_accepted += worker.primary_accepted;
+        metrics.primary_rejected += worker.primary_rejected;
+        metrics.lifecycle_attempted += worker.lifecycle_attempted;
+        metrics.lifecycle_accepted += worker.lifecycle_accepted;
+        metrics.lifecycle_rejected += worker.lifecycle_rejected;
+        metrics.reader_checks += worker.reader_checks;
+    }
+
+    if metrics.primary_accepted + metrics.primary_rejected != metrics.primary_attempted {
+        return Err(AedbError::Validation(
+            "primary flow accounting mismatch".into(),
+        ));
+    }
+    if metrics.lifecycle_accepted + metrics.lifecycle_rejected != metrics.lifecycle_attempted {
+        return Err(AedbError::Validation(
+            "lifecycle flow accounting mismatch".into(),
+        ));
+    }
+
+    Ok((db, metrics))
 }
 
-async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) {
+async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) -> Result<(), AedbError> {
     for asset in assets {
         let mut from_orders: BTreeMap<(u8, i64), u64> = BTreeMap::new();
 
@@ -248,18 +384,19 @@ async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) {
                 ConsistencyMode::AtLatest,
             )
             .await
-            .expect("scan orders");
+            .map_err(|e| AedbError::Validation(e.to_string()))?;
 
         for (_, entry) in rows {
-            let order: aedb::order_book::OrderRecord =
-                rmp_serde::from_slice(&entry.value).expect("decode order");
+            let order: aedb::order_book::OrderRecord = rmp_serde::from_slice(&entry.value)
+                .map_err(|e| AedbError::Decode(e.to_string()))?;
             let original = decode_u256_u64(order.original_qty_be);
             let remaining = decode_u256_u64(order.remaining_qty_be);
             let filled = decode_u256_u64(order.filled_qty_be);
-            assert!(
-                remaining + filled <= original,
-                "quantity accounting invariant"
-            );
+            if remaining + filled > original {
+                return Err(AedbError::Validation(
+                    "quantity accounting invariant violated".into(),
+                ));
+            }
             if remaining > 0
                 && matches!(
                     order.status,
@@ -283,29 +420,61 @@ async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) {
                     ConsistencyMode::AtLatest,
                 )
                 .await
-                .expect("scan levels");
+                .map_err(|e| AedbError::Validation(e.to_string()))?;
             for (k, v) in levels {
-                let qty = decode_u256_bytes_to_u64(&v.value);
+                let qty = decode_u256_bytes_to_u64(&v.value)?;
                 if qty == 0 {
                     continue;
                 }
-                let price = parse_plqty_price(side, &k).expect("parse level price");
+                let price = parse_plqty_price(side, &k)
+                    .ok_or_else(|| AedbError::Validation("failed to parse level price".into()))?;
                 from_levels.insert((side as u8, price), qty);
             }
         }
 
-        assert_eq!(
-            from_orders, from_levels,
-            "price-level aggregates must match open orders for {asset}"
-        );
+        if from_orders != from_levels {
+            return Err(AedbError::Validation(format!(
+                "price-level aggregates mismatch for {asset}"
+            )));
+        }
     }
+    Ok(())
 }
 
 #[tokio::test]
 async fn order_book_simulation_smoke() {
     let assets = vec!["BTC-USD".to_string(), "ETH-USD".to_string()];
-    let db = run_simulation(assets.clone(), 6, 250).await;
-    assert_book_invariants(&db, &assets).await;
+    let (db, metrics) = run_simulation(assets.clone(), 6, 250)
+        .await
+        .expect("run simulation");
+    assert!(metrics.reader_checks > 0, "reader workers should execute");
+    assert_book_invariants(&db, &assets)
+        .await
+        .expect("final invariants");
+}
+
+#[tokio::test]
+async fn order_book_chaos_read_write_accuracy() {
+    let assets = vec![
+        "BTC-USD".to_string(),
+        "ETH-USD".to_string(),
+        "SOL-USD".to_string(),
+        "DOGE-USD".to_string(),
+    ];
+    let (db, metrics) = run_simulation(assets.clone(), 16, 800)
+        .await
+        .expect("chaos run");
+    assert!(
+        metrics.primary_attempted >= 16 * 800,
+        "writers should execute full primary load"
+    );
+    assert!(
+        metrics.reader_checks >= 1_000,
+        "read-side chaos checks should be substantial"
+    );
+    assert_book_invariants(&db, &assets)
+        .await
+        .expect("final invariants");
 }
 
 #[tokio::test]
@@ -317,6 +486,10 @@ async fn order_book_simulation_hft_soak() {
         "SOL-USD".to_string(),
         "DOGE-USD".to_string(),
     ];
-    let db = run_simulation(assets.clone(), 24, 2_000).await;
-    assert_book_invariants(&db, &assets).await;
+    let (db, _metrics) = run_simulation(assets.clone(), 24, 2_000)
+        .await
+        .expect("hft soak");
+    assert_book_invariants(&db, &assets)
+        .await
+        .expect("final invariants");
 }
