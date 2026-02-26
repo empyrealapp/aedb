@@ -5,6 +5,9 @@ use aedb::commit::validation::Mutation;
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::offline;
+use aedb::order_book::{
+    ExecInstruction, OrderRequest, OrderSide, OrderType, SelfTradePrevention, TimeInForce,
+};
 use aedb::query::plan::ConsistencyMode;
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -189,6 +192,64 @@ proptest! {
                 .await
                 .expect_err("secure mode must require authenticated caller");
             prop_assert!(matches!(err, AedbError::PermissionDenied(_)));
+            Ok(())
+        });
+        outcome?;
+    }
+
+    #[test]
+    fn prop_order_book_new_rejects_malformed_inputs(
+        instrument in prop_oneof![
+            Just(String::new()),
+            Just("   ".to_string()),
+            prop::collection::vec(any::<u8>(), 1025..1200)
+                .prop_map(|v| String::from_utf8_lossy(&v).into_owned()),
+        ],
+        owner in prop_oneof![
+            Just(String::new()),
+            Just("\n\t ".to_string()),
+            prop::collection::vec(any::<u8>(), 1025..1200)
+                .prop_map(|v| String::from_utf8_lossy(&v).into_owned()),
+        ],
+        client_order_id in prop_oneof![
+            Just(String::new()),
+            Just("   ".to_string()),
+            prop::collection::vec(any::<u8>(), 1025..1200)
+                .prop_map(|v| String::from_utf8_lossy(&v).into_owned()),
+        ],
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome: Result<(), TestCaseError> = rt.block_on(async move {
+            let dir = tempdir().expect("temp dir");
+            let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+            db.create_project("p").await.expect("project");
+
+            let err = db
+                .order_book_new(
+                    "p",
+                    "app",
+                    OrderRequest {
+                        instrument,
+                        client_order_id,
+                        side: OrderSide::Bid,
+                        order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::Gtc,
+                        exec_instructions: ExecInstruction(0),
+                        self_trade_prevention: SelfTradePrevention::None,
+                        price_ticks: 100,
+                        qty_be: one_u256(),
+                        owner,
+                        account: None,
+                        nonce: 1,
+                        price_limit_ticks: None,
+                    },
+                )
+                .await
+                .expect_err("malformed orderbook request must fail validation");
+            prop_assert!(matches!(err, AedbError::Validation(_)));
             Ok(())
         });
         outcome?;

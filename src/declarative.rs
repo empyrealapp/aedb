@@ -151,35 +151,35 @@ impl TableSpec {
             }
         }
 
-        for index in &self.indexes {
-            if index.columns.is_empty() {
+        for index_def in &self.indexes {
+            if index_def.columns.is_empty() {
                 return Err(AedbError::Validation(format!(
                     "index '{}' on table '{}' must define at least one column",
-                    index.index_name, self.table_name
+                    index_def.index_name, self.table_name
                 )));
             }
-            for col in &index.columns {
+            for col in &index_def.columns {
                 if !col_names.contains(col.as_str()) {
                     return Err(AedbError::Validation(format!(
                         "index '{}' on table '{}' references unknown column '{}'",
-                        index.index_name, self.table_name, col
+                        index_def.index_name, self.table_name, col
                     )));
                 }
             }
         }
 
-        for index in &self.async_indexes {
-            if index.projected_columns.is_empty() {
+        for index_def in &self.async_indexes {
+            if index_def.projected_columns.is_empty() {
                 return Err(AedbError::Validation(format!(
                     "async index '{}' on table '{}' must project at least one column",
-                    index.index_name, self.table_name
+                    index_def.index_name, self.table_name
                 )));
             }
-            for col in &index.projected_columns {
+            for col in &index_def.projected_columns {
                 if !col_names.contains(col.as_str()) {
                     return Err(AedbError::Validation(format!(
                         "async index '{}' on table '{}' references unknown column '{}'",
-                        index.index_name, self.table_name, col
+                        index_def.index_name, self.table_name, col
                     )));
                 }
             }
@@ -201,27 +201,27 @@ impl TableSpec {
             primary_key: self.primary_key.clone(),
         }];
 
-        for index in &self.indexes {
+        for index_def in &self.indexes {
             ops.push(DdlOperation::CreateIndex {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: self.table_name.clone(),
-                index_name: index.index_name.clone(),
-                if_not_exists: index.if_not_exists,
-                columns: index.columns.clone(),
-                index_type: index.index_type.clone(),
-                partial_filter: index.partial_filter.clone(),
+                index_name: index_def.index_name.clone(),
+                if_not_exists: index_def.if_not_exists,
+                columns: index_def.columns.clone(),
+                index_type: index_def.index_type.clone(),
+                partial_filter: index_def.partial_filter.clone(),
             });
         }
 
-        for index in &self.async_indexes {
+        for index_def in &self.async_indexes {
             ops.push(DdlOperation::CreateAsyncIndex {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: self.table_name.clone(),
-                index_name: index.index_name.clone(),
-                if_not_exists: index.if_not_exists,
-                projected_columns: index.projected_columns.clone(),
+                index_name: index_def.index_name.clone(),
+                if_not_exists: index_def.if_not_exists,
+                projected_columns: index_def.projected_columns.clone(),
             });
         }
 
@@ -231,22 +231,22 @@ impl TableSpec {
     pub fn drop_ops(&self, project_id: &str, scope_id: &str, if_exists: bool) -> Vec<DdlOperation> {
         let mut ops = Vec::with_capacity(1 + self.indexes.len() + self.async_indexes.len());
 
-        for index in &self.async_indexes {
+        for index_def in &self.async_indexes {
             ops.push(DdlOperation::DropAsyncIndex {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: self.table_name.clone(),
-                index_name: index.index_name.clone(),
+                index_name: index_def.index_name.clone(),
                 if_exists,
             });
         }
 
-        for index in &self.indexes {
+        for index_def in &self.indexes {
             ops.push(DdlOperation::DropIndex {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: self.table_name.clone(),
-                index_name: index.index_name.clone(),
+                index_name: index_def.index_name.clone(),
                 if_exists,
             });
         }

@@ -1,4 +1,5 @@
 use aedb::AedbInstance;
+use aedb::catalog::DdlOperation;
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode};
 use aedb::error::AedbError;
@@ -6,7 +7,8 @@ use aedb::order_book::{
     ExecInstruction, InstrumentConfig, OrderBookTableMode, OrderRequest, OrderSide, OrderStatus,
     OrderType, TimeInForce, parse_plqty_price, scoped_instrument,
 };
-use aedb::query::plan::ConsistencyMode;
+use aedb::permission::CallerContext;
+use aedb::query::{KvCursor, plan::ConsistencyMode};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -191,35 +193,247 @@ fn request(
     }
 }
 
+async fn ensure_namespace(
+    db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
+    caller: Option<&CallerContext>,
+) -> Result<(), AedbError> {
+    match caller {
+        Some(caller) => {
+            db.commit_as(
+                caller.clone(),
+                Mutation::Ddl(DdlOperation::CreateProject {
+                    owner_id: None,
+                    project_id: project_id.to_string(),
+                    if_not_exists: true,
+                }),
+            )
+            .await?;
+            db.commit_as(
+                caller.clone(),
+                Mutation::Ddl(DdlOperation::CreateScope {
+                    owner_id: None,
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    if_not_exists: true,
+                }),
+            )
+            .await?;
+        }
+        None => {
+            db.create_project(project_id).await?;
+            db.create_scope(project_id, scope_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn order_book_define_table(
+    db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
+    table_id: &str,
+    mode: OrderBookTableMode,
+    caller: Option<&CallerContext>,
+) -> Result<(), AedbError> {
+    match caller {
+        Some(caller) => {
+            db.order_book_define_table_as(caller.clone(), project_id, scope_id, table_id, mode)
+                .await?;
+        }
+        None => {
+            db.order_book_define_table(project_id, scope_id, table_id, mode)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn order_book_set_instrument_config(
+    db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
+    instrument: &str,
+    config: InstrumentConfig,
+    caller: Option<&CallerContext>,
+) -> Result<(), AedbError> {
+    match caller {
+        Some(caller) => {
+            db.order_book_set_instrument_config_as(
+                caller.clone(),
+                project_id,
+                scope_id,
+                instrument,
+                config,
+            )
+            .await?;
+        }
+        None => {
+            db.order_book_set_instrument_config(project_id, scope_id, instrument, config)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn order_book_new(
+    db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
+    request: OrderRequest,
+    caller: Option<&CallerContext>,
+) -> Result<(), AedbError> {
+    match caller {
+        Some(caller) => {
+            db.order_book_new_as(caller.clone(), project_id, scope_id, request)
+                .await?;
+        }
+        None => {
+            db.order_book_new(project_id, scope_id, request).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn order_book_cancel_by_client_id(
+    db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
+    instrument: &str,
+    client_order_id: &str,
+    owner: &str,
+    caller: Option<&CallerContext>,
+) -> Result<(), AedbError> {
+    match caller {
+        Some(caller) => {
+            db.order_book_cancel_by_client_id_as(
+                caller.clone(),
+                project_id,
+                scope_id,
+                instrument,
+                client_order_id,
+                owner,
+            )
+            .await?;
+        }
+        None => {
+            db.order_book_cancel_by_client_id(
+                project_id,
+                scope_id,
+                instrument,
+                client_order_id,
+                owner,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn commit_many_atomic(
+    db: &AedbInstance,
+    mutations: Vec<Mutation>,
+    caller: Option<&CallerContext>,
+) -> Result<aedb::commit::executor::CommitResult, AedbError> {
+    match caller {
+        Some(caller) => db.commit_many_atomic_as(caller.clone(), mutations).await,
+        None => db.commit_many_atomic(mutations).await,
+    }
+}
+
+async fn scan_prefix_all(
+    db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
+    prefix: &[u8],
+    caller: Option<&CallerContext>,
+) -> Result<Vec<(Vec<u8>, aedb::storage::keyspace::KvEntry)>, AedbError> {
+    match caller {
+        Some(caller) => {
+            let mut out = Vec::new();
+            let mut cursor: Option<KvCursor> = None;
+            loop {
+                let page = db
+                    .kv_scan_prefix(
+                        project_id,
+                        scope_id,
+                        prefix,
+                        10_000,
+                        cursor,
+                        ConsistencyMode::AtLatest,
+                        caller,
+                    )
+                    .await
+                    .map_err(|e| AedbError::Validation(e.to_string()))?;
+                out.extend(page.entries);
+                if !page.truncated {
+                    break;
+                }
+                cursor = page.cursor;
+            }
+            Ok(out)
+        }
+        None => db
+            .kv_scan_prefix_no_auth(
+                project_id,
+                scope_id,
+                prefix,
+                1_000_000,
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .map_err(|e| AedbError::Validation(e.to_string())),
+    }
+}
+
 async fn setup_books(
     db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
     assets: &[String],
     table_profile: &TableProfile,
+    caller: Option<&CallerContext>,
 ) -> Result<Vec<String>, AedbError> {
-    db.create_project("p").await?;
+    ensure_namespace(db, project_id, scope_id, caller).await?;
     let mut instruments = Vec::with_capacity(assets.len());
     let multi_table_id = match table_profile {
         TableProfile::MultiAssetTable { table_id } => Some(table_id.clone()),
         _ => None,
     };
     if let Some(table_id) = &multi_table_id {
-        db.order_book_define_table("p", "app", table_id, OrderBookTableMode::MultiAsset)
-            .await?;
+        order_book_define_table(
+            db,
+            project_id,
+            scope_id,
+            table_id,
+            OrderBookTableMode::MultiAsset,
+            caller,
+        )
+        .await?;
     }
     for asset in assets {
         let instrument = match table_profile {
             TableProfile::NativeInstrument => asset.clone(),
             TableProfile::PerAssetTable => {
-                db.order_book_define_table("p", "app", asset, OrderBookTableMode::PerAsset)
-                    .await?;
+                order_book_define_table(
+                    db,
+                    project_id,
+                    scope_id,
+                    asset,
+                    OrderBookTableMode::PerAsset,
+                    caller,
+                )
+                .await?;
                 scoped_instrument(asset, asset)
             }
             TableProfile::MultiAssetTable { table_id } => scoped_instrument(table_id, asset),
         };
         instruments.push(instrument.clone());
-        db.order_book_set_instrument_config(
-            "p",
-            "app",
+        order_book_set_instrument_config(
+            db,
+            project_id,
+            scope_id,
             &instrument,
             InstrumentConfig {
                 instrument: instrument.clone(),
@@ -231,14 +445,16 @@ async fn setup_books(
                 halted: false,
                 balance_config: None,
             },
+            caller,
         )
         .await?;
 
         for i in 0..20_u64 {
             let ask_owner = format!("seed_ask_{}_{}", instrument, i);
-            db.order_book_new(
-                "p",
-                "app",
+            order_book_new(
+                db,
+                project_id,
+                scope_id,
                 request(
                     &instrument,
                     &ask_owner,
@@ -251,13 +467,15 @@ async fn setup_books(
                     10,
                     1,
                 ),
+                caller,
             )
             .await?;
 
             let bid_owner = format!("seed_bid_{}_{}", instrument, i);
-            db.order_book_new(
-                "p",
-                "app",
+            order_book_new(
+                db,
+                project_id,
+                scope_id,
                 request(
                     &instrument,
                     &bid_owner,
@@ -270,6 +488,7 @@ async fn setup_books(
                     10,
                     1,
                 ),
+                caller,
             )
             .await?;
         }
@@ -279,21 +498,22 @@ async fn setup_books(
 
 async fn assert_book_invariants(
     db: &AedbInstance,
+    project_id: &str,
+    scope_id: &str,
     instruments: &[String],
+    caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
     for instrument in instruments {
         let mut from_orders: BTreeMap<(u8, i64), u64> = BTreeMap::new();
 
-        let rows = db
-            .kv_scan_prefix_no_auth(
-                "p",
-                "app",
-                format!("ob:{instrument}:ord:").as_bytes(),
-                1_000_000,
-                ConsistencyMode::AtLatest,
-            )
-            .await
-            .map_err(|e| AedbError::Validation(e.to_string()))?;
+        let rows = scan_prefix_all(
+            db,
+            project_id,
+            scope_id,
+            format!("ob:{instrument}:ord:").as_bytes(),
+            caller,
+        )
+        .await?;
 
         for (_, entry) in rows {
             let order: aedb::order_book::OrderRecord = rmp_serde::from_slice(&entry.value)
@@ -320,16 +540,14 @@ async fn assert_book_invariants(
 
         let mut from_levels: BTreeMap<(u8, i64), u64> = BTreeMap::new();
         for side in [OrderSide::Bid, OrderSide::Ask] {
-            let levels = db
-                .kv_scan_prefix_no_auth(
-                    "p",
-                    "app",
-                    format!("ob:{instrument}:plqty:{}:", side as u8).as_bytes(),
-                    1_000_000,
-                    ConsistencyMode::AtLatest,
-                )
-                .await
-                .map_err(|e| AedbError::Validation(e.to_string()))?;
+            let levels = scan_prefix_all(
+                db,
+                project_id,
+                scope_id,
+                format!("ob:{instrument}:plqty:{}:", side as u8).as_bytes(),
+                caller,
+            )
+            .await?;
             for (k, v) in levels {
                 let qty = decode_u256_bytes_to_u64(&v.value)?;
                 if qty == 0 {
@@ -359,6 +577,28 @@ pub async fn run_hft_simulation(cfg: SimulationConfig) -> Result<SimulationRepor
         .map(|r| r.simulation)
 }
 
+/// Runs the simulation against an existing AEDB instance.
+///
+/// This supports both non-secure mode (`caller=None`) and secure mode
+/// (`caller=Some(...)` with sufficient permissions).
+pub async fn run_hft_simulation_on_instance(
+    cfg: SimulationConfig,
+    db: Arc<AedbInstance>,
+    project_id: &str,
+    scope_id: &str,
+    caller: Option<CallerContext>,
+) -> Result<ProfiledSimulationReport, AedbError> {
+    run_hft_simulation_impl(
+        cfg,
+        db,
+        project_id,
+        scope_id,
+        caller,
+        "external".to_string(),
+    )
+    .await
+}
+
 pub async fn run_hft_simulation_with_config(
     cfg: SimulationConfig,
     db_cfg: AedbConfig,
@@ -371,7 +611,26 @@ pub async fn run_hft_simulation_with_config(
     .to_string();
     let dir = tempdir().map_err(AedbError::Io)?;
     let db = Arc::new(AedbInstance::open(db_cfg, dir.path())?);
-    let instruments = setup_books(&db, &cfg.assets, &cfg.table_profile).await?;
+    run_hft_simulation_impl(cfg, db, "p", "app", None, durability_mode_name).await
+}
+
+async fn run_hft_simulation_impl(
+    cfg: SimulationConfig,
+    db: Arc<AedbInstance>,
+    project_id: &str,
+    scope_id: &str,
+    caller: Option<CallerContext>,
+    durability_mode_name: String,
+) -> Result<ProfiledSimulationReport, AedbError> {
+    let instruments = setup_books(
+        &db,
+        project_id,
+        scope_id,
+        &cfg.assets,
+        &cfg.table_profile,
+        caller.as_ref(),
+    )
+    .await?;
     let run_started = Instant::now();
 
     let mut tasks = Vec::with_capacity(cfg.traders);
@@ -383,6 +642,9 @@ pub async fn run_hft_simulation_with_config(
         let seed = cfg.seed;
         let ops_per_trader = cfg.ops_per_trader;
         let orders_per_commit = cfg.orders_per_commit.max(1);
+        let project_id = project_id.to_string();
+        let scope_id = scope_id.to_string();
+        let caller = caller.clone();
         tasks.push(tokio::spawn(async move {
             let owner = format!("trader_{t}");
             let mut nonces: BTreeMap<String, u64> = BTreeMap::new();
@@ -452,8 +714,8 @@ pub async fn run_hft_simulation_with_config(
                     pending_started = Some(Instant::now());
                 }
                 pending_mutations.push(Mutation::OrderBookNew {
-                    project_id: "p".to_string(),
-                    scope_id: "app".to_string(),
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
                     request: request(
                         instrument,
                         &owner,
@@ -474,6 +736,7 @@ pub async fn run_hft_simulation_with_config(
                         &mut pending_mutations,
                         &mut pending_orders,
                         &mut pending_started,
+                        caller.as_ref(),
                         cfg.collect_latency,
                         &mut latencies_us,
                         &mut accepted,
@@ -492,24 +755,25 @@ pub async fn run_hft_simulation_with_config(
                     *nonce += 1;
                     let cid = format!("gtc-{owner}-{op}");
                     lifecycle_attempted += 1;
-                    match db_clone
-                        .order_book_new(
-                            "p",
-                            "app",
-                            request(
-                                instrument,
-                                &owner,
-                                cid.clone(),
-                                side,
-                                OrderType::Limit,
-                                TimeInForce::Gtc,
-                                false,
-                                price,
-                                qty,
-                                *nonce,
-                            ),
-                        )
-                        .await
+                    match order_book_new(
+                        db_clone.as_ref(),
+                        &project_id,
+                        &scope_id,
+                        request(
+                            instrument,
+                            &owner,
+                            cid.clone(),
+                            side,
+                            OrderType::Limit,
+                            TimeInForce::Gtc,
+                            false,
+                            price,
+                            qty,
+                            *nonce,
+                        ),
+                        caller.as_ref(),
+                    )
+                    .await
                     {
                         Ok(_) => lifecycle_accepted += 1,
                         Err(err) => {
@@ -518,9 +782,16 @@ pub async fn run_hft_simulation_with_config(
                         }
                     }
                     lifecycle_attempted += 1;
-                    match db_clone
-                        .order_book_cancel_by_client_id("p", "app", instrument, &cid, &owner)
-                        .await
+                    match order_book_cancel_by_client_id(
+                        db_clone.as_ref(),
+                        &project_id,
+                        &scope_id,
+                        instrument,
+                        &cid,
+                        &owner,
+                        caller.as_ref(),
+                    )
+                    .await
                     {
                         Ok(_) => lifecycle_accepted += 1,
                         Err(err) => {
@@ -535,6 +806,7 @@ pub async fn run_hft_simulation_with_config(
                 &mut pending_mutations,
                 &mut pending_orders,
                 &mut pending_started,
+                caller.as_ref(),
                 cfg.collect_latency,
                 &mut latencies_us,
                 &mut accepted,
@@ -590,7 +862,7 @@ pub async fn run_hft_simulation_with_config(
         all_latencies_us.append(&mut latencies);
     }
 
-    assert_book_invariants(&db, &instruments).await?;
+    assert_book_invariants(&db, project_id, scope_id, &instruments, caller.as_ref()).await?;
     let elapsed_ms = run_started.elapsed().as_millis().max(1) as u64;
     db.force_fsync().await?;
     let heads = db.head_state().await;
@@ -695,6 +967,7 @@ async fn flush_pending_orders(
     pending_mutations: &mut Vec<Mutation>,
     pending_orders: &mut usize,
     pending_started: &mut Option<Instant>,
+    caller: Option<&CallerContext>,
     collect_latency: bool,
     latencies_us: &mut Vec<u64>,
     accepted: &mut usize,
@@ -708,9 +981,7 @@ async fn flush_pending_orders(
     }
     let started = pending_started.take().unwrap_or_else(Instant::now);
     let batch_len = *pending_orders;
-    let res = db
-        .commit_many_atomic(std::mem::take(pending_mutations))
-        .await;
+    let res = commit_many_atomic(db, std::mem::take(pending_mutations), caller).await;
     let elapsed = started.elapsed().as_micros() as u64;
     if collect_latency && batch_len > 0 {
         let per_order = (elapsed / batch_len as u64).max(1);
@@ -811,6 +1082,7 @@ fn total_rejections(b: &RejectionBreakdown) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn classify_validation_rejection_reasons() {
@@ -910,5 +1182,35 @@ mod tests {
     fn decode_u256_bytes_rejects_invalid_length() {
         let err = decode_u256_bytes_to_u64(&[1, 2, 3]).expect_err("must reject short u256");
         assert!(matches!(err, AedbError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn simulation_can_run_on_existing_instance_without_tempdir_wrapper() {
+        let dir = tempdir().expect("temp dir");
+        let db = Arc::new(
+            AedbInstance::open(high_throughput_simulation_config(), dir.path()).expect("open db"),
+        );
+        let report = run_hft_simulation_on_instance(
+            SimulationConfig {
+                assets: vec!["BTC-USD".to_string()],
+                traders: 2,
+                ops_per_trader: 32,
+                seed: 42,
+                flow_profile: OrderFlowProfile::MixedMarketAndLimit,
+                table_profile: TableProfile::PerAssetTable,
+                collect_latency: true,
+                lifecycle_every_ops: 16,
+                orders_per_commit: 2,
+                match_workload: MatchWorkload::CrossingNearTouch,
+            },
+            db,
+            "sim",
+            "app",
+            None,
+        )
+        .await
+        .expect("simulation");
+        assert!(report.simulation.attempted_orders > 0);
+        assert!(report.zero_dropped_orders);
     }
 }

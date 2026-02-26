@@ -37,7 +37,9 @@ use crate::commit::executor::{CommitExecutor, CommitResult, ExecutorMetrics};
 use crate::commit::tx::{
     ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
 };
-use crate::commit::validation::{Mutation, TableUpdateExpr, validate_permissions};
+use crate::commit::validation::{
+    Mutation, TableUpdateExpr, validate_mutation_with_config, validate_permissions,
+};
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
@@ -49,7 +51,7 @@ use crate::migration::{
 };
 use crate::order_book::{
     ExecInstruction, FillSpec, InstrumentConfig, OrderBookDepth, OrderBookTableMode, OrderRecord,
-    OrderRequest, OrderSide, Spread, TimeInForce, key_client_id, key_order,
+    OrderRequest, OrderSide, OrderType, Spread, TimeInForce, key_client_id, key_order,
     read_last_execution_report, read_open_orders, read_order_status, read_recent_trades,
     read_spread, read_top_n, scoped_instrument, u256_from_be,
 };
@@ -64,10 +66,12 @@ use crate::recovery::replay::replay_segments;
 use crate::recovery::{recover_at_seq_with_config, recover_with_config};
 use crate::snapshot::gc::{SnapshotHandle, SnapshotManager};
 use crate::snapshot::reader::SnapshotReadView;
-use crate::storage::keyspace::{KvEntry, NamespaceId};
+use crate::storage::encoded_key::EncodedKey;
+use crate::storage::keyspace::{Keyspace, KvEntry, NamespaceId};
 use crate::wal::frame::{FrameError, FrameReader};
 use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::fs::File;
@@ -75,12 +79,67 @@ use std::io::{BufReader, Read};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, SemaphorePermit};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{info, warn};
 
-const CHECKPOINT_GATE_PERMITS: u32 = 1000;
+const TRUST_MODE_MARKER_FILE: &str = "trust_mode.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TrustModeMarker {
+    #[serde(default)]
+    ever_non_strict_recovery: bool,
+    #[serde(default)]
+    ever_hash_chain_disabled: bool,
+}
+
+fn trust_mode_marker_path(dir: &Path) -> PathBuf {
+    dir.join(TRUST_MODE_MARKER_FILE)
+}
+
+fn load_trust_mode_marker(dir: &Path) -> Result<Option<TrustModeMarker>, AedbError> {
+    let path = trust_mode_marker_path(dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)?;
+    let marker: TrustModeMarker =
+        serde_json::from_slice(&bytes).map_err(|e| AedbError::Validation(e.to_string()))?;
+    Ok(Some(marker))
+}
+
+fn persist_trust_mode_marker(dir: &Path, marker: &TrustModeMarker) -> Result<(), AedbError> {
+    let bytes = serde_json::to_vec(marker).map_err(|e| AedbError::Encode(e.to_string()))?;
+    fs::write(trust_mode_marker_path(dir), bytes)?;
+    Ok(())
+}
+
+fn enforce_and_record_trust_mode(dir: &Path, config: &AedbConfig) -> Result<(), AedbError> {
+    let mut marker = load_trust_mode_marker(dir)?.unwrap_or_default();
+    if config.strict_recovery()
+        && (marker.ever_non_strict_recovery || marker.ever_hash_chain_disabled)
+    {
+        return Err(AedbError::Validation(
+            "strict open denied: data directory was previously opened with non-strict recovery or hash-chain disabled"
+                .into(),
+        ));
+    }
+
+    let mut changed = false;
+    if !config.strict_recovery() && !marker.ever_non_strict_recovery {
+        marker.ever_non_strict_recovery = true;
+        changed = true;
+    }
+    if !config.hash_chain_required && !marker.ever_hash_chain_disabled {
+        marker.ever_hash_chain_disabled = true;
+        changed = true;
+    }
+    if changed {
+        persist_trust_mode_marker(dir, &marker)?;
+    }
+    Ok(())
+}
 
 /// Creates a directory with restrictive permissions (0o700 on Unix) to prevent
 /// unauthorized access to database files on multi-user systems.
@@ -120,16 +179,16 @@ pub struct AedbInstance {
     require_authenticated_calls: bool,
     dir: PathBuf,
     executor: CommitExecutor,
-    /// Fast-path shutdown check using atomic flag to avoid RwLock contention.
-    /// Set to true when checkpoint or shutdown is in progress.
-    checkpoint_in_progress: Arc<AtomicBool>,
-    /// Semaphore to control checkpoint exclusivity. Normal operations acquire
-    /// a permit in shared mode; checkpoint acquires all permits for exclusivity.
-    checkpoint_gate: Arc<Semaphore>,
+    /// Serializes checkpoint writers without blocking commit/query traffic.
+    checkpoint_lock: Arc<AsyncMutex<()>>,
     snapshot_manager: Arc<Mutex<SnapshotManager>>,
     recovery_cache: Arc<Mutex<RecoveryCache>>,
     lifecycle_hooks: Arc<Mutex<Vec<Arc<dyn LifecycleHook>>>>,
     telemetry_hooks: Arc<Mutex<Vec<Arc<dyn QueryCommitTelemetryHook>>>>,
+    upstream_validation_rejections: Arc<AtomicU64>,
+    durable_wait_ops: Arc<AtomicU64>,
+    durable_wait_micros: Arc<AtomicU64>,
+    durable_ack_fsync_leader: Arc<AtomicBool>,
     startup_recovery_micros: u64,
     startup_recovered_seq: u64,
 }
@@ -146,12 +205,27 @@ pub enum CommitFinality {
 pub struct OperationalMetrics {
     pub commits_total: u64,
     pub commit_errors: u64,
+    pub permission_rejections: u64,
+    pub validation_rejections: u64,
+    pub queue_full_rejections: u64,
+    pub timeout_rejections: u64,
     pub conflict_rejections: u64,
     pub read_set_conflicts: u64,
     pub conflict_rate: f64,
     pub avg_commit_latency_micros: u64,
     pub coordinator_apply_attempts: u64,
     pub avg_coordinator_apply_micros: u64,
+    pub wal_append_ops: u64,
+    pub wal_append_bytes: u64,
+    pub avg_wal_append_micros: u64,
+    pub wal_sync_ops: u64,
+    pub avg_wal_sync_micros: u64,
+    pub prestage_validate_ops: u64,
+    pub avg_prestage_validate_micros: u64,
+    pub epoch_process_ops: u64,
+    pub avg_epoch_process_micros: u64,
+    pub durable_wait_ops: u64,
+    pub avg_durable_wait_micros: u64,
     pub inflight_commits: usize,
     pub queue_depth: usize,
     pub durable_head_lag: u64,
@@ -219,7 +293,7 @@ pub struct MigrationReport {
     pub current_version: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LifecycleEvent {
     ProjectCreated {
         project_id: String,
@@ -580,10 +654,13 @@ impl AedbInstance {
             batch_interval_ms = config.batch_interval_ms,
             batch_max_bytes = config.batch_max_bytes,
             idempotency_window_seconds = config.idempotency_window_seconds,
+            idempotency_window_commits = config.idempotency_window_commits,
             max_inflight_commits = config.max_inflight_commits,
             max_commit_queue_bytes = config.max_commit_queue_bytes,
             max_transaction_bytes = config.max_transaction_bytes,
             commit_timeout_ms = config.commit_timeout_ms,
+            durable_ack_coalescing_enabled = config.durable_ack_coalescing_enabled,
+            durable_ack_coalesce_window_us = config.durable_ack_coalesce_window_us,
             max_snapshot_age_ms = config.max_snapshot_age_ms,
             max_concurrent_snapshots = config.max_concurrent_snapshots,
             max_scan_rows = config.max_scan_rows,
@@ -607,6 +684,7 @@ impl AedbInstance {
             epoch_apply_timeout_ms = config.epoch_apply_timeout_ms,
             checkpoint_encryption_enabled = config.checkpoint_encryption_key.is_some(),
             checkpoint_key_id = config.checkpoint_key_id.as_deref().unwrap_or(""),
+            checkpoint_compression_level = config.checkpoint_compression_level,
             manifest_hmac_enabled = config.manifest_hmac_key.is_some(),
             recovery_mode = ?config.recovery_mode,
             hash_chain_required = config.hash_chain_required,
@@ -614,6 +692,7 @@ impl AedbInstance {
             "aedb config"
         );
         create_private_dir_all(dir)?;
+        enforce_and_record_trust_mode(dir, &config)?;
         let has_existing = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".aedb"));
@@ -663,24 +742,18 @@ impl AedbInstance {
             require_authenticated_calls,
             dir: dir.to_path_buf(),
             executor,
-            checkpoint_in_progress: Arc::new(AtomicBool::new(false)),
-            checkpoint_gate: Arc::new(Semaphore::new(CHECKPOINT_GATE_PERMITS as usize)),
+            checkpoint_lock: Arc::new(AsyncMutex::new(())),
             snapshot_manager: Arc::new(Mutex::new(SnapshotManager::default())),
             recovery_cache: Arc::new(Mutex::new(RecoveryCache::default())),
             lifecycle_hooks: Arc::new(Mutex::new(Vec::new())),
             telemetry_hooks: Arc::new(Mutex::new(Vec::new())),
+            upstream_validation_rejections: Arc::new(AtomicU64::new(0)),
+            durable_wait_ops: Arc::new(AtomicU64::new(0)),
+            durable_wait_micros: Arc::new(AtomicU64::new(0)),
+            durable_ack_fsync_leader: Arc::new(AtomicBool::new(false)),
             startup_recovery_micros,
             startup_recovered_seq,
         })
-    }
-
-    async fn acquire_checkpoint_permit(&self) -> Result<SemaphorePermit<'_>, AedbError> {
-        self.checkpoint_gate
-            .acquire()
-            .await
-            .map_err(|_| AedbError::Unavailable {
-                message: "checkpoint gate is closed".into(),
-            })
     }
 
     pub async fn commit(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
@@ -693,18 +766,11 @@ impl AedbInstance {
         // Early size validation to prevent DoS via oversized keys/values
         crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
 
-        // Fast-path atomic check avoids semaphore contention during normal operation
-        if self.checkpoint_in_progress.load(Ordering::Acquire) {
-            return Err(AedbError::CheckpointInProgress);
-        }
-        let _permit = self.acquire_checkpoint_permit().await?;
-        let lifecycle_events = self
-            .plan_lifecycle_events(std::slice::from_ref(&mutation))
-            .await?;
         let result = self.executor.submit(mutation).await;
         self.emit_commit_telemetry("commit", started, &result);
         let result = result?;
-        self.dispatch_lifecycle_events(lifecycle_events, result.commit_seq);
+        self.dispatch_lifecycle_events_for_commit(result.commit_seq)
+            .await;
         Ok(result)
     }
 
@@ -720,10 +786,6 @@ impl AedbInstance {
             ));
         }
         crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
-        if self.checkpoint_in_progress.load(Ordering::Acquire) {
-            return Err(AedbError::CheckpointInProgress);
-        }
-        let _permit = self.acquire_checkpoint_permit().await?;
         let result = self.executor.submit_prevalidated(mutation).await;
         self.emit_commit_telemetry(op_name, started, &result);
         result
@@ -827,17 +889,11 @@ impl AedbInstance {
         // Early size validation to prevent DoS via oversized keys/values
         crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
 
-        if self.checkpoint_in_progress.load(Ordering::Acquire) {
-            return Err(AedbError::CheckpointInProgress);
-        }
-        let _permit = self.acquire_checkpoint_permit().await?;
-        let lifecycle_events = self
-            .plan_lifecycle_events(std::slice::from_ref(&mutation))
-            .await?;
         let result = self.executor.submit_as(Some(caller), mutation).await;
         self.emit_commit_telemetry("commit_as", started, &result);
         let result = result?;
-        self.dispatch_lifecycle_events(lifecycle_events, result.commit_seq);
+        self.dispatch_lifecycle_events_for_commit(result.commit_seq)
+            .await;
         Ok(result)
     }
 
@@ -884,17 +940,11 @@ impl AedbInstance {
             }
             ensure_external_caller_allowed(caller)?;
         }
-        if self.checkpoint_in_progress.load(Ordering::Acquire) {
-            return Err(AedbError::CheckpointInProgress);
-        }
-        let _permit = self.acquire_checkpoint_permit().await?;
-        let lifecycle_events = self
-            .plan_lifecycle_events(&envelope.write_intent.mutations)
-            .await?;
         let result = self.executor.submit_envelope(envelope).await;
         self.emit_commit_telemetry("commit_envelope", started, &result);
         let result = result?;
-        self.dispatch_lifecycle_events(lifecycle_events, result.commit_seq);
+        self.dispatch_lifecycle_events_for_commit(result.commit_seq)
+            .await;
         Ok(result)
     }
 
@@ -916,36 +966,119 @@ impl AedbInstance {
         if matches!(finality, CommitFinality::Durable)
             && result.durable_head_seq < result.commit_seq
         {
-            self.wait_for_durable(result.commit_seq).await?;
-            result.durable_head_seq = self.executor.durable_head_seq().await;
+            let wait_started = Instant::now();
+            if self._config.durable_ack_coalescing_enabled
+                && matches!(self._config.durability_mode, DurabilityMode::Batch)
+            {
+                let window_us = self._config.durable_ack_coalesce_window_us;
+                if window_us > 0 {
+                    tokio::time::sleep(Duration::from_micros(window_us)).await;
+                }
+                if self.executor.durable_head_seq_now() < result.commit_seq {
+                    // Give the periodic batch flusher a chance to satisfy durable
+                    // finality first; only force fsync if it misses this window.
+                    let grace_wait_us = window_us.max(
+                        self._config
+                            .batch_interval_ms
+                            .saturating_mul(1000)
+                            .saturating_mul(2),
+                    );
+                    if grace_wait_us > 0 {
+                        let _ = tokio::time::timeout(
+                            Duration::from_micros(grace_wait_us),
+                            self.wait_for_durable(result.commit_seq),
+                        )
+                        .await;
+                    }
+
+                    if self.executor.durable_head_seq_now() < result.commit_seq {
+                        let recently_synced = grace_wait_us > 0
+                            && self
+                                .executor
+                                .last_wal_sync_age_us()
+                                .is_some_and(|age| age < grace_wait_us);
+                        if recently_synced {
+                            let _ = tokio::time::timeout(
+                                Duration::from_micros(grace_wait_us),
+                                self.wait_for_durable(result.commit_seq),
+                            )
+                            .await;
+                        }
+                    }
+
+                    if self.executor.durable_head_seq_now() < result.commit_seq {
+                        if self
+                            .durable_ack_fsync_leader
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            struct LeaderGuard<'a>(&'a AtomicBool);
+                            impl Drop for LeaderGuard<'_> {
+                                fn drop(&mut self) {
+                                    self.0.store(false, Ordering::Release);
+                                }
+                            }
+                            let _guard = LeaderGuard(&self.durable_ack_fsync_leader);
+                            let _ = self.force_fsync().await?;
+                        } else {
+                            self.wait_for_durable(result.commit_seq).await?;
+                        }
+                    }
+                }
+            } else {
+                self.wait_for_durable(result.commit_seq).await?;
+            }
+            self.durable_wait_ops.fetch_add(1, Ordering::Relaxed);
+            self.durable_wait_micros
+                .fetch_add(wait_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            result.durable_head_seq = self.executor.durable_head_seq_now();
         }
         Ok(())
     }
 
-    async fn plan_lifecycle_events(
-        &self,
-        mutations: &[Mutation],
-    ) -> Result<Vec<LifecycleEventTemplate>, AedbError> {
-        if !mutations.iter().any(|m| matches!(m, Mutation::Ddl(_))) {
-            return Ok(Vec::new());
+    async fn dispatch_lifecycle_events_for_commit(&self, commit_seq: u64) {
+        if self.lifecycle_hooks.lock().is_empty() {
+            return;
         }
-        let (_, catalog, _) = self.executor.snapshot_state().await;
-        let mut planned_catalog = catalog;
-        let mut events = Vec::new();
-        for mutation in mutations {
-            let Mutation::Ddl(op) = mutation else {
-                continue;
-            };
-            let applied = ddl_would_apply(&planned_catalog, op);
-            planned_catalog.apply_ddl(op.clone())?;
-            if applied && let Some(event) = lifecycle_template_for_ddl(op) {
-                events.push(event);
+        let events = match self.read_lifecycle_events_for_commit(commit_seq).await {
+            Ok(events) => events,
+            Err(err) => {
+                warn!(commit_seq, error = ?err, "failed to read lifecycle outbox");
+                return;
             }
-        }
-        Ok(events)
+        };
+        self.dispatch_lifecycle_events(events);
     }
 
-    fn dispatch_lifecycle_events(&self, events: Vec<LifecycleEventTemplate>, seq: u64) {
+    async fn read_lifecycle_events_for_commit(
+        &self,
+        commit_seq: u64,
+    ) -> Result<Vec<LifecycleEvent>, AedbError> {
+        let ns = namespace_key(crate::catalog::SYSTEM_PROJECT_ID, "app");
+        let table_key = (ns.clone(), "lifecycle_outbox".to_string());
+        let (snapshot, catalog, _) = self.executor.snapshot_state().await;
+        let Some(schema) = catalog.tables.get(&table_key) else {
+            return Ok(Vec::new());
+        };
+        let Some(events_idx) = schema.columns.iter().position(|c| c.name == "events") else {
+            return Ok(Vec::new());
+        };
+        let Some(table) =
+            snapshot.table(crate::catalog::SYSTEM_PROJECT_ID, "app", "lifecycle_outbox")
+        else {
+            return Ok(Vec::new());
+        };
+        let encoded_pk = EncodedKey::from_values(&[Value::Integer(commit_seq as i64)]);
+        let Some(row) = table.rows.get(&encoded_pk) else {
+            return Ok(Vec::new());
+        };
+        let Some(Value::Json(events_json)) = row.values.get(events_idx) else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(events_json.as_str()).map_err(|e| AedbError::Decode(e.to_string()))
+    }
+
+    fn dispatch_lifecycle_events(&self, events: Vec<LifecycleEvent>) {
         if events.is_empty() {
             return;
         }
@@ -954,8 +1087,7 @@ impl AedbInstance {
             return;
         }
         tokio::spawn(async move {
-            for template in events {
-                let event = template.with_seq(seq);
+            for event in events {
                 for hook in &hooks {
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         hook.on_event(&event)
@@ -2791,15 +2923,17 @@ impl AedbInstance {
         scope_id: &str,
         request: OrderRequest,
     ) -> Result<CommitResult, AedbError> {
-        self.commit_prevalidated_internal(
-            "order_book_new",
-            Mutation::OrderBookNew {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                request,
-            },
-        )
-        .await
+        self.preflight_order_book_new_if_high_reject_risk(None, project_id, scope_id, &request)
+            .await?;
+        let mutation = Mutation::OrderBookNew {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            request,
+        };
+        let (_, catalog, _) = self.executor.snapshot_state().await;
+        validate_mutation_with_config(&catalog, &mutation, &self._config)?;
+        self.commit_prevalidated_internal("order_book_new", mutation)
+            .await
     }
 
     pub async fn order_book_new_with_finality(
@@ -2809,16 +2943,9 @@ impl AedbInstance {
         request: OrderRequest,
         finality: CommitFinality,
     ) -> Result<CommitResult, AedbError> {
-        self.commit_prevalidated_internal_with_finality(
-            "order_book_new",
-            Mutation::OrderBookNew {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                request,
-            },
-            finality,
-        )
-        .await
+        let mut result = self.order_book_new(project_id, scope_id, request).await?;
+        self.enforce_finality(&mut result, finality).await?;
+        Ok(result)
     }
 
     pub async fn order_book_define_table(
@@ -2992,6 +3119,13 @@ impl AedbInstance {
         scope_id: &str,
         request: OrderRequest,
     ) -> Result<CommitResult, AedbError> {
+        self.preflight_order_book_new_if_high_reject_risk(
+            Some(&caller),
+            project_id,
+            scope_id,
+            &request,
+        )
+        .await?;
         self.commit_as(
             caller,
             Mutation::OrderBookNew {
@@ -3012,17 +3146,44 @@ impl AedbInstance {
         finality: CommitFinality,
     ) -> Result<CommitResult, AedbError> {
         let mut result = self
-            .commit_as(
-                caller,
-                Mutation::OrderBookNew {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    request,
-                },
-            )
+            .order_book_new_as(caller, project_id, scope_id, request)
             .await?;
         self.enforce_finality(&mut result, finality).await?;
         Ok(result)
+    }
+
+    fn should_preflight_order_book_new(request: &OrderRequest) -> bool {
+        request.exec_instructions.post_only()
+            || matches!(request.time_in_force, TimeInForce::Fok)
+            || matches!(request.order_type, OrderType::Market)
+    }
+
+    async fn preflight_order_book_new_if_high_reject_risk(
+        &self,
+        caller: Option<&CallerContext>,
+        project_id: &str,
+        scope_id: &str,
+        request: &OrderRequest,
+    ) -> Result<(), AedbError> {
+        if !Self::should_preflight_order_book_new(request) {
+            return Ok(());
+        }
+        let mutation = Mutation::OrderBookNew {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            request: request.clone(),
+        };
+        let preflight_result = if let Some(caller) = caller {
+            self.preflight_as(caller, mutation).await?
+        } else {
+            self.preflight(mutation).await
+        };
+        if let PreflightResult::Err { reason } = preflight_result {
+            self.upstream_validation_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(AedbError::Validation(reason));
+        }
+        Ok(())
     }
 
     pub async fn order_book_cancel(
@@ -3946,6 +4107,18 @@ impl AedbInstance {
             .acquire_snapshot(consistency)
             .await
             .map_err(QueryError::from)?;
+        let prefix = format!("ob:{instrument}:");
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            prefix.as_bytes(),
+        ) {
+            return Err(QueryError::PermissionDenied {
+                permission: format!("KvRead({project_id}.{scope_id})"),
+                scope: caller.caller_id.clone(),
+            });
+        }
         let admin = lease
             .view
             .catalog
@@ -5034,54 +5207,46 @@ impl AedbInstance {
     }
 
     pub async fn shutdown(&self) -> Result<(), AedbError> {
+        // Ensure batch durability tails are flushed before checkpointing shutdown state.
+        let _ = self.force_fsync().await?;
         let _ = self.checkpoint_now().await?;
         Ok(())
     }
 
     pub async fn checkpoint_now(&self) -> Result<u64, AedbError> {
-        // Set checkpoint flag to fast-fail new operations, then acquire all permits
-        // to ensure exclusivity (wait for in-flight operations to complete)
-        self.checkpoint_in_progress.store(true, Ordering::Release);
+        // Serialize checkpoints while allowing normal commits/queries to continue.
+        let _checkpoint_guard = self.checkpoint_lock.lock().await;
 
-        // Ensure flag is reset even if we return early with error
-        struct ResetGuard<'a>(&'a AtomicBool);
-        impl Drop for ResetGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _reset_guard = ResetGuard(&self.checkpoint_in_progress);
+        // In batch durability mode, flush un-synced WAL tail so checkpoint captures a
+        // stable durable horizon and recovery does not lose committed tail entries.
+        let _ = self.force_fsync().await?;
 
-        let _all_permits = self
-            .checkpoint_gate
-            .acquire_many(CHECKPOINT_GATE_PERMITS)
-            .await
-            .map_err(|_| AedbError::Unavailable {
-                message: "checkpoint gate is closed".into(),
-            })?;
-
-        let _ = self.executor.force_fsync().await?;
-        let (snapshot, catalog, seq) = self.executor.snapshot_state().await;
-        let idempotency = self.executor.idempotency_snapshot().await;
-        let heads = self.executor.head_state().await;
+        // Anchor checkpoint to a stable committed horizon.
+        let seq = self.executor.durable_head_seq_now();
+        let lease = self.acquire_snapshot(ConsistencyMode::AtSeq(seq)).await?;
+        let snapshot = lease.view.keyspace.as_ref();
+        let catalog = lease.view.catalog.as_ref();
+        let mut idempotency = self.executor.idempotency_snapshot().await;
+        idempotency.retain(|_, record| record.commit_seq <= seq);
         let checkpoint = write_checkpoint_with_key(
-            &snapshot,
-            &catalog,
+            snapshot,
+            catalog,
             seq,
             &self.dir,
             self._config.checkpoint_key(),
             self._config.checkpoint_key_id.clone(),
             idempotency,
+            self._config.checkpoint_compression_level,
         )?;
 
-        let segments = read_segments(&self.dir)?;
+        let segments = read_segments_for_checkpoint(&self.dir, seq)?;
         let active_segment_seq = segments
             .last()
             .map(|segment| segment.segment_seq)
-            .unwrap_or(0);
+            .unwrap_or(seq.saturating_add(1));
         let manifest = Manifest {
-            durable_seq: heads.durable_head_seq,
-            visible_seq: heads.visible_head_seq,
+            durable_seq: seq,
+            visible_seq: seq,
             active_segment_seq,
             checkpoints: vec![checkpoint],
             segments,
@@ -5106,6 +5271,7 @@ impl AedbInstance {
             self._config.checkpoint_key(),
             self._config.checkpoint_key_id.clone(),
             idempotency,
+            self._config.checkpoint_compression_level,
         )?;
 
         let mut wal_segments = Vec::new();
@@ -5312,6 +5478,7 @@ impl AedbInstance {
             config.checkpoint_key(),
             config.checkpoint_key_id.clone(),
             idempotency,
+            config.checkpoint_compression_level,
         )?;
         let restored_manifest = Manifest {
             durable_seq: restored_seq,
@@ -5360,31 +5527,33 @@ impl AedbInstance {
         let ns_key = namespace_key(project_id, scope_id);
         let ns_id = NamespaceId::project_scope(project_id, scope_id);
 
-        let mut merged_keyspace = live.keyspace.clone();
-        match restored.keyspace.namespaces.get(&ns_id) {
-            Some(namespace) => {
-                Arc::make_mut(&mut merged_keyspace.namespaces)
-                    .insert(ns_id.clone(), namespace.clone());
-            }
-            None => {
-                Arc::make_mut(&mut merged_keyspace.namespaces).remove(&ns_id);
-            }
+        let mut merged_namespaces = live
+            .keyspace
+            .namespaces
+            .iter()
+            .filter(|(ns, _)| **ns != ns_id)
+            .map(|(ns, namespace)| (ns.clone(), namespace.clone()))
+            .collect::<HashMap<_, _>>();
+        if let Some(namespace) = restored.keyspace.namespaces.get(&ns_id) {
+            merged_namespaces.insert(ns_id.clone(), namespace.clone());
         }
-        let async_keys: Vec<(NamespaceId, String, String)> = merged_keyspace
+        let mut merged_async_indexes = live
+            .keyspace
             .async_indexes
-            .keys()
-            .filter(|(ns, _, _)| *ns == ns_id)
-            .cloned()
-            .collect();
-        for key in async_keys {
-            Arc::make_mut(&mut merged_keyspace.async_indexes).remove(&key);
-        }
+            .iter()
+            .filter(|(key, _)| key.0 != ns_id)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<HashMap<_, _>>();
         for (key, value) in restored.keyspace.async_indexes.iter() {
             if key.0 == ns_id {
-                Arc::make_mut(&mut merged_keyspace.async_indexes)
-                    .insert(key.clone(), value.clone());
+                merged_async_indexes.insert(key.clone(), value.clone());
             }
         }
+        let merged_keyspace = Keyspace {
+            primary_index_backend: live.keyspace.primary_index_backend,
+            namespaces: Arc::new(merged_namespaces.into()),
+            async_indexes: Arc::new(merged_async_indexes.into()),
+        };
 
         let mut merged_catalog = live.catalog.clone();
         if let Some(project) = restored.catalog.projects.get(project_id) {
@@ -5459,6 +5628,7 @@ impl AedbInstance {
             config.checkpoint_key(),
             config.checkpoint_key_id.clone(),
             live.idempotency,
+            config.checkpoint_compression_level,
         )?;
         let manifest = Manifest {
             durable_seq: merged_seq,
@@ -5493,15 +5663,41 @@ impl AedbInstance {
         } else {
             core.conflict_rejections as f64 / core.commits_total as f64
         };
+        let durable_wait_ops = self.durable_wait_ops.load(Ordering::Relaxed);
+        let durable_wait_micros = self.durable_wait_micros.load(Ordering::Relaxed);
+        let avg_durable_wait_micros = if durable_wait_ops == 0 {
+            0
+        } else {
+            durable_wait_micros / durable_wait_ops
+        };
+        let upstream_validation_rejections =
+            self.upstream_validation_rejections.load(Ordering::Relaxed);
         OperationalMetrics {
             commits_total: core.commits_total,
             commit_errors: core.commit_errors,
+            permission_rejections: core.permission_rejections,
+            validation_rejections: core
+                .validation_rejections
+                .saturating_add(upstream_validation_rejections),
+            queue_full_rejections: core.queue_full_rejections,
+            timeout_rejections: core.timeout_rejections,
             conflict_rejections: core.conflict_rejections,
             read_set_conflicts: core.read_set_conflicts,
             conflict_rate,
             avg_commit_latency_micros: core.avg_commit_latency_micros,
             coordinator_apply_attempts: core.coordinator_apply_attempts,
             avg_coordinator_apply_micros: core.avg_coordinator_apply_micros,
+            wal_append_ops: core.wal_append_ops,
+            wal_append_bytes: core.wal_append_bytes,
+            avg_wal_append_micros: core.avg_wal_append_micros,
+            wal_sync_ops: core.wal_sync_ops,
+            avg_wal_sync_micros: core.avg_wal_sync_micros,
+            prestage_validate_ops: core.prestage_validate_ops,
+            avg_prestage_validate_micros: core.avg_prestage_validate_micros,
+            epoch_process_ops: core.epoch_process_ops,
+            avg_epoch_process_micros: core.avg_epoch_process_micros,
+            durable_wait_ops,
+            avg_durable_wait_micros,
             inflight_commits: core.inflight_commits,
             queue_depth: core.queued_commits,
             durable_head_lag: runtime
@@ -5810,7 +6006,7 @@ impl AedbInstance {
                         .primary_key
                         .iter()
                         .map(|pk_name| {
-                            let idx = schema
+                            let column_index = schema
                                 .columns
                                 .iter()
                                 .position(|c| c.name == *pk_name)
@@ -5819,7 +6015,7 @@ impl AedbInstance {
                                         "primary key column missing: {pk_name}"
                                     ))
                                 })?;
-                            Ok(new_row.values[idx].clone())
+                            Ok(new_row.values[column_index].clone())
                         })
                         .collect::<Result<Vec<_>, AedbError>>()?;
                     self.commit(Mutation::Upsert {
@@ -5863,14 +6059,14 @@ impl AedbInstance {
             .unwrap_or(0);
         let mut updated = 0u64;
         let start_offset = start_offset.min(rows.len());
-        for (idx, chunk) in rows[start_offset..].chunks(batch_size).enumerate() {
+        for (chunk_index, chunk) in rows[start_offset..].chunks(batch_size).enumerate() {
             for row in chunk {
                 if let Some(new_row) = update(row) {
                     let primary_key = schema
                         .primary_key
                         .iter()
                         .map(|pk_name| {
-                            let idx = schema
+                            let column_index = schema
                                 .columns
                                 .iter()
                                 .position(|c| c.name == *pk_name)
@@ -5879,7 +6075,7 @@ impl AedbInstance {
                                         "primary key column missing: {pk_name}"
                                     ))
                                 })?;
-                            Ok(new_row.values[idx].clone())
+                            Ok(new_row.values[column_index].clone())
                         })
                         .collect::<Result<Vec<_>, AedbError>>()?;
                     self.commit(Mutation::Upsert {
@@ -5893,7 +6089,8 @@ impl AedbInstance {
                     updated += 1;
                 }
             }
-            let progressed = start_offset + ((idx + 1) * batch_size).min(rows.len() - start_offset);
+            let progressed =
+                start_offset + ((chunk_index + 1) * batch_size).min(rows.len() - start_offset);
             self.commit(Mutation::KvSet {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),

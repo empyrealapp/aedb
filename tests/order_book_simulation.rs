@@ -1,4 +1,5 @@
 use aedb::AedbInstance;
+use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::order_book::{
     ExecInstruction, InstrumentConfig, OrderRequest, OrderSide, OrderStatus, OrderType,
@@ -7,7 +8,7 @@ use aedb::order_book::{
 use aedb::query::plan::ConsistencyMode;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tempfile::tempdir;
 
@@ -141,6 +142,8 @@ struct ChaosMetrics {
     lifecycle_accepted: usize,
     lifecycle_rejected: usize,
     reader_checks: usize,
+    attempted_tps: u64,
+    accepted_tps: u64,
 }
 
 async fn validate_asset_read_consistency(db: &AedbInstance, asset: &str) -> Result<(), AedbError> {
@@ -192,12 +195,14 @@ async fn validate_asset_read_consistency(db: &AedbInstance, asset: &str) -> Resu
 }
 
 async fn run_simulation(
+    config: AedbConfig,
     assets: Vec<String>,
     traders: usize,
     ops_per_trader: usize,
 ) -> Result<(Arc<AedbInstance>, ChaosMetrics), AedbError> {
+    let started = std::time::Instant::now();
     let dir = tempdir().map_err(AedbError::Io)?;
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path())?);
+    let db = Arc::new(AedbInstance::open(config, dir.path())?);
     setup_books(&db, &assets).await?;
 
     let mut tasks = Vec::with_capacity(traders);
@@ -318,6 +323,7 @@ async fn run_simulation(
                 lifecycle_accepted,
                 lifecycle_rejected,
                 reader_checks: 0,
+                ..Default::default()
             })
         }));
     }
@@ -367,6 +373,29 @@ async fn run_simulation(
             "lifecycle flow accounting mismatch".into(),
         ));
     }
+
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let attempted_tps =
+        ((metrics.primary_attempted + metrics.lifecycle_attempted) as f64 / elapsed) as u64;
+    let accepted_tps =
+        ((metrics.primary_accepted + metrics.lifecycle_accepted) as f64 / elapsed) as u64;
+    metrics.attempted_tps = attempted_tps;
+    metrics.accepted_tps = accepted_tps;
+    eprintln!(
+        "order_book_simulation: assets={} traders={} ops_per_trader={} primary_attempted={} primary_accepted={} primary_rejected={} lifecycle_attempted={} lifecycle_accepted={} lifecycle_rejected={} reader_checks={} attempted_tps={} accepted_tps={}",
+        assets.len(),
+        traders,
+        ops_per_trader,
+        metrics.primary_attempted,
+        metrics.primary_accepted,
+        metrics.primary_rejected,
+        metrics.lifecycle_attempted,
+        metrics.lifecycle_accepted,
+        metrics.lifecycle_rejected,
+        metrics.reader_checks,
+        attempted_tps,
+        accepted_tps
+    );
 
     Ok((db, metrics))
 }
@@ -441,16 +470,134 @@ async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) -> Result<
     Ok(())
 }
 
+async fn assert_trade_and_report_parity(
+    db: &AedbInstance,
+    assets: &[String],
+) -> Result<(), AedbError> {
+    for asset in assets {
+        let mut orders_by_id: HashMap<u64, aedb::order_book::OrderRecord> = HashMap::new();
+        let order_rows = db
+            .kv_scan_prefix_no_auth(
+                "p",
+                "app",
+                format!("ob:{asset}:ord:").as_bytes(),
+                2_000_000,
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .map_err(|e| AedbError::Validation(e.to_string()))?;
+        for (_, entry) in order_rows {
+            let order: aedb::order_book::OrderRecord = rmp_serde::from_slice(&entry.value)
+                .map_err(|e| AedbError::Decode(e.to_string()))?;
+            orders_by_id.insert(order.order_id, order);
+        }
+
+        let trade_rows = db
+            .kv_scan_prefix_no_auth(
+                "p",
+                "app",
+                format!("ob:{asset}:trade:").as_bytes(),
+                2_000_000,
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .map_err(|e| AedbError::Validation(e.to_string()))?;
+        let mut trades_by_fill_id: HashMap<u64, aedb::order_book::FillRecord> = HashMap::new();
+        let mut filled_from_trades: HashMap<u64, u64> = HashMap::new();
+        for (_, entry) in trade_rows {
+            let fill: aedb::order_book::FillRecord = rmp_serde::from_slice(&entry.value)
+                .map_err(|e| AedbError::Decode(e.to_string()))?;
+            let fill_qty = decode_u256_u64(fill.qty_be);
+            *filled_from_trades
+                .entry(fill.aggressor_order_id)
+                .or_insert(0) += fill_qty;
+            *filled_from_trades.entry(fill.passive_order_id).or_insert(0) += fill_qty;
+            trades_by_fill_id.insert(fill.fill_id, fill);
+        }
+
+        for (order_id, order) in &orders_by_id {
+            let expected = decode_u256_u64(order.filled_qty_be);
+            let observed = *filled_from_trades.get(order_id).unwrap_or(&0);
+            if observed != expected {
+                return Err(AedbError::Validation(format!(
+                    "trade parity mismatch for {asset} order_id={order_id}: observed_filled={observed} expected_filled={expected}"
+                )));
+            }
+        }
+
+        let last_key = aedb::order_book::key_execution_report_last(asset);
+        let report_rows = db
+            .kv_scan_prefix_no_auth(
+                "p",
+                "app",
+                format!("ob:{asset}:report:").as_bytes(),
+                2_000_000,
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .map_err(|e| AedbError::Validation(e.to_string()))?;
+        for (key, entry) in report_rows {
+            if key == last_key {
+                continue;
+            }
+            let report: aedb::order_book::ExecutionReport = rmp_serde::from_slice(&entry.value)
+                .map_err(|e| AedbError::Decode(e.to_string()))?;
+            for fill in &report.fills {
+                let Some(persisted) = trades_by_fill_id.get(&fill.fill_id) else {
+                    return Err(AedbError::Validation(format!(
+                        "execution report references missing fill: asset={asset} order_id={} fill_id={}",
+                        report.order_id, fill.fill_id
+                    )));
+                };
+                if persisted != fill {
+                    return Err(AedbError::Validation(format!(
+                        "execution report fill mismatch: asset={asset} order_id={} fill_id={}",
+                        report.order_id, fill.fill_id
+                    )));
+                }
+            }
+            if report.order_id != 0 && !orders_by_id.contains_key(&report.order_id) {
+                return Err(AedbError::Validation(format!(
+                    "execution report references unknown order_id: asset={asset} order_id={}",
+                    report.order_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn order_book_simulation_smoke() {
     let assets = vec!["BTC-USD".to_string(), "ETH-USD".to_string()];
-    let (db, metrics) = run_simulation(assets.clone(), 6, 250)
+    let (db, metrics) = run_simulation(AedbConfig::default(), assets.clone(), 6, 250)
         .await
         .expect("run simulation");
     assert!(metrics.reader_checks > 0, "reader workers should execute");
     assert_book_invariants(&db, &assets)
         .await
         .expect("final invariants");
+    assert_trade_and_report_parity(&db, &assets)
+        .await
+        .expect("trade/report parity invariants");
+    let op = db.operational_metrics().await;
+    assert_eq!(
+        op.queue_full_rejections, 0,
+        "smoke load should not hit queue-full rejections"
+    );
+    assert_eq!(
+        op.timeout_rejections, 0,
+        "smoke load should not hit timeout rejections"
+    );
+    assert_eq!(
+        op.validation_rejections as usize,
+        metrics.primary_rejected + metrics.lifecycle_rejected,
+        "validation rejection accounting should match simulation-level rejects"
+    );
+    assert!(
+        op.wal_sync_ops > 0,
+        "full-durability smoke run should execute WAL sync operations"
+    );
 }
 
 #[tokio::test]
@@ -461,7 +608,7 @@ async fn order_book_chaos_read_write_accuracy() {
         "SOL-USD".to_string(),
         "DOGE-USD".to_string(),
     ];
-    let (db, metrics) = run_simulation(assets.clone(), 16, 800)
+    let (db, metrics) = run_simulation(AedbConfig::default(), assets.clone(), 16, 800)
         .await
         .expect("chaos run");
     assert!(
@@ -475,6 +622,45 @@ async fn order_book_chaos_read_write_accuracy() {
     assert_book_invariants(&db, &assets)
         .await
         .expect("final invariants");
+    assert_trade_and_report_parity(&db, &assets)
+        .await
+        .expect("trade/report parity invariants");
+    let op = db.operational_metrics().await;
+    eprintln!(
+        "order_book_chaos_metrics: commits_total={} commit_errors={} permission_rejections={} validation_rejections={} queue_full_rejections={} timeout_rejections={} conflict_rejections={} wal_append_ops={} wal_append_bytes={} avg_wal_append_micros={} wal_sync_ops={} avg_wal_sync_micros={} queue_depth={} inflight_commits={} durable_head_lag={}",
+        op.commits_total,
+        op.commit_errors,
+        op.permission_rejections,
+        op.validation_rejections,
+        op.queue_full_rejections,
+        op.timeout_rejections,
+        op.conflict_rejections,
+        op.wal_append_ops,
+        op.wal_append_bytes,
+        op.avg_wal_append_micros,
+        op.wal_sync_ops,
+        op.avg_wal_sync_micros,
+        op.queue_depth,
+        op.inflight_commits,
+        op.durable_head_lag
+    );
+    assert_eq!(
+        op.queue_full_rejections, 0,
+        "chaos baseline should not trigger queue-full rejections"
+    );
+    assert_eq!(
+        op.timeout_rejections, 0,
+        "chaos baseline should not trigger timeout rejections"
+    );
+    assert_eq!(
+        op.validation_rejections as usize,
+        metrics.primary_rejected + metrics.lifecycle_rejected,
+        "validation rejection accounting should match simulation-level rejects"
+    );
+    assert!(
+        op.wal_sync_ops > 0,
+        "full-durability chaos run should execute WAL sync operations"
+    );
 }
 
 #[tokio::test]
@@ -486,10 +672,53 @@ async fn order_book_simulation_hft_soak() {
         "SOL-USD".to_string(),
         "DOGE-USD".to_string(),
     ];
-    let (db, _metrics) = run_simulation(assets.clone(), 24, 2_000)
+    let (db, _metrics) = run_simulation(AedbConfig::default(), assets.clone(), 24, 2_000)
         .await
         .expect("hft soak");
     assert_book_invariants(&db, &assets)
         .await
         .expect("final invariants");
+    assert_trade_and_report_parity(&db, &assets)
+        .await
+        .expect("trade/report parity invariants");
+}
+
+#[tokio::test]
+#[ignore = "profiling comparison: full durability vs low-latency durability"]
+async fn order_book_durability_profile_compare() {
+    let assets = vec![
+        "BTC-USD".to_string(),
+        "ETH-USD".to_string(),
+        "SOL-USD".to_string(),
+        "DOGE-USD".to_string(),
+    ];
+    let (full_db, full_metrics) = run_simulation(AedbConfig::default(), assets.clone(), 12, 600)
+        .await
+        .expect("full profile run");
+    let full_op = full_db.operational_metrics().await;
+
+    let (low_db, low_metrics) =
+        run_simulation(AedbConfig::low_latency([7u8; 32]), assets.clone(), 12, 600)
+            .await
+            .expect("low-latency profile run");
+    let low_op = low_db.operational_metrics().await;
+
+    eprintln!(
+        "order_book_durability_compare: full_attempted_tps={} low_attempted_tps={} full_wal_append_ops={} low_wal_append_ops={} full_avg_wal_append_us={} low_avg_wal_append_us={} full_wal_sync_ops={} low_wal_sync_ops={} full_avg_wal_sync_us={} low_avg_wal_sync_us={}",
+        full_metrics.attempted_tps,
+        low_metrics.attempted_tps,
+        full_op.wal_append_ops,
+        low_op.wal_append_ops,
+        full_op.avg_wal_append_micros,
+        low_op.avg_wal_append_micros,
+        full_op.wal_sync_ops,
+        low_op.wal_sync_ops,
+        full_op.avg_wal_sync_micros,
+        low_op.avg_wal_sync_micros
+    );
+
+    assert!(
+        low_op.wal_sync_ops < full_op.wal_sync_ops,
+        "low-latency durability should reduce WAL sync operation count under identical workload"
+    );
 }

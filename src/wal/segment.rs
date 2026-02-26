@@ -194,9 +194,10 @@ impl SegmentManager {
                 .append(seq, timestamp_micros, payload_type, payload)
                 .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
             let frame = writer.into_inner();
+            let frame_size_bytes = frame.len() as u64;
             active.file.write_all(&frame)?;
             active.hasher.update(&frame);
-            active.size_bytes = active.size_bytes.saturating_add(frame.len() as u64);
+            active.size_bytes = active.size_bytes.saturating_add(frame_size_bytes);
         }
         if sync {
             active.file.flush()?;

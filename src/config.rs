@@ -30,10 +30,13 @@ pub struct AedbConfig {
     pub batch_interval_ms: u64,
     pub batch_max_bytes: usize,
     pub idempotency_window_seconds: u64,
+    pub idempotency_window_commits: u64,
     pub max_inflight_commits: usize,
     pub max_commit_queue_bytes: usize,
     pub max_transaction_bytes: usize,
     pub commit_timeout_ms: u64,
+    pub durable_ack_coalescing_enabled: bool,
+    pub durable_ack_coalesce_window_us: u64,
     pub max_snapshot_age_ms: u64,
     pub max_concurrent_snapshots: usize,
     pub max_scan_rows: usize,
@@ -64,6 +67,9 @@ pub struct AedbConfig {
     /// preventing key disclosure through core dumps or memory scanning.
     pub checkpoint_encryption_key: Option<Arc<Zeroizing<[u8; 32]>>>,
     pub checkpoint_key_id: Option<String>,
+    /// zstd compression level used for checkpoint payloads.
+    /// Typical useful range is 0..=19 where lower is faster and larger.
+    pub checkpoint_compression_level: i32,
     /// HMAC key for manifest integrity. Wrapped in Arc<Zeroizing<>> to ensure
     /// the key is securely zeroed from memory when the last reference is dropped.
     pub manifest_hmac_key: Option<Arc<Zeroizing<Vec<u8>>>>,
@@ -81,10 +87,13 @@ impl Default for AedbConfig {
             batch_interval_ms: 10,
             batch_max_bytes: 1024 * 1024,
             idempotency_window_seconds: 300,
+            idempotency_window_commits: 100_000,
             max_inflight_commits: 64,
             max_commit_queue_bytes: 64 * 1024 * 1024,
             max_transaction_bytes: 16 * 1024 * 1024,
             commit_timeout_ms: 5000,
+            durable_ack_coalescing_enabled: false,
+            durable_ack_coalesce_window_us: 0,
             max_snapshot_age_ms: 30_000,
             max_concurrent_snapshots: 128,
             max_scan_rows: 10_000,
@@ -114,6 +123,7 @@ impl Default for AedbConfig {
             version_gc_interval_ms: 1_000,
             checkpoint_encryption_key: None,
             checkpoint_key_id: None,
+            checkpoint_compression_level: 3,
             manifest_hmac_key: None,
             recovery_mode: RecoveryMode::Strict,
             hash_chain_required: true,
@@ -159,6 +169,8 @@ impl AedbConfig {
             hash_chain_required: true,
             batch_interval_ms: 2,
             batch_max_bytes: 512 * 1024,
+            durable_ack_coalescing_enabled: true,
+            durable_ack_coalesce_window_us: 500,
             epoch_max_wait_us: 50,
             adaptive_epoch_target_latency_us: 1_000,
             ..Self::default()
@@ -192,6 +204,12 @@ impl AedbConfig {
     /// secure memory handling.
     pub fn with_hmac_key(mut self, key: Vec<u8>) -> Self {
         self.manifest_hmac_key = Some(Arc::new(Zeroizing::new(key)));
+        self
+    }
+
+    /// Sets the zstd compression level used for checkpoints.
+    pub fn with_checkpoint_compression_level(mut self, level: i32) -> Self {
+        self.checkpoint_compression_level = level;
         self
     }
 }

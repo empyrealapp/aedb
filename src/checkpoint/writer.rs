@@ -37,7 +37,7 @@ pub fn write_checkpoint(
     seq: u64,
     dir: &Path,
 ) -> Result<CheckpointMeta, AedbError> {
-    write_checkpoint_with_key(snapshot, catalog, seq, dir, None, None, HashMap::new())
+    write_checkpoint_with_key(snapshot, catalog, seq, dir, None, None, HashMap::new(), 3)
 }
 
 pub fn write_checkpoint_with_key(
@@ -48,6 +48,7 @@ pub fn write_checkpoint_with_key(
     encryption_key: Option<&[u8; 32]>,
     key_id: Option<String>,
     idempotency: HashMap<IdempotencyKey, IdempotencyRecord>,
+    compression_level: i32,
 ) -> Result<CheckpointMeta, AedbError> {
     fs::create_dir_all(dir)?;
     let checkpoint = CheckpointData {
@@ -57,7 +58,7 @@ pub fn write_checkpoint_with_key(
         idempotency,
     };
     let encoded = rmp_serde::to_vec(&checkpoint).map_err(|e| AedbError::Encode(e.to_string()))?;
-    let compressed = zstd::stream::encode_all(encoded.as_slice(), 3)
+    let compressed = zstd::stream::encode_all(encoded.as_slice(), compression_level)
         .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
 
     let created_at_micros = now_micros();

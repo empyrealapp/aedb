@@ -11,6 +11,8 @@ use crate::order_book::{
 use crate::permission::{CallerContext, Permission};
 use crate::query::plan::Expr;
 use primitive_types::U256;
+
+const ORDER_BOOK_ID_MAX_LEN: usize = 1024;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -539,13 +541,22 @@ pub fn validate_mutation_with_config(
             if request.instrument.trim().is_empty() {
                 return Err(AedbError::Validation("instrument cannot be empty".into()));
             }
+            if request.instrument.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("instrument too long".into()));
+            }
             if request.client_order_id.trim().is_empty() {
                 return Err(AedbError::Validation(
                     "client_order_id cannot be empty".into(),
                 ));
             }
+            if request.client_order_id.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("client_order_id too long".into()));
+            }
             if request.owner.trim().is_empty() {
                 return Err(AedbError::Validation("owner cannot be empty".into()));
+            }
+            if request.owner.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("owner too long".into()));
             }
             if primitive_types::U256::from_big_endian(&request.qty_be).is_zero() {
                 return Err(AedbError::Validation("qty must be > 0".into()));
@@ -567,12 +578,24 @@ pub fn validate_mutation_with_config(
             Ok(())
         }
         Mutation::OrderBookCancel {
-            instrument, owner, ..
+            instrument,
+            owner,
+            client_order_id,
+            ..
         } => {
             if instrument.trim().is_empty() || owner.trim().is_empty() {
                 return Err(AedbError::Validation(
                     "instrument and owner cannot be empty".into(),
                 ));
+            }
+            if instrument.len() > ORDER_BOOK_ID_MAX_LEN || owner.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("instrument/owner too long".into()));
+            }
+            if client_order_id
+                .as_ref()
+                .is_some_and(|v| v.len() > ORDER_BOOK_ID_MAX_LEN)
+            {
+                return Err(AedbError::Validation("client_order_id too long".into()));
             }
             Ok(())
         }
@@ -1379,14 +1402,14 @@ fn validate_conflict_target(
         ConflictTarget::PrimaryKey => Ok(()),
         ConflictTarget::Index(index_name) => {
             let ns = namespace_key(project_id, scope_id);
-            let idx = catalog
+            let index_def = catalog
                 .indexes
                 .get(&(ns, table_name.to_string(), index_name.clone()))
                 .ok_or_else(|| {
                     AedbError::Validation(format!("conflict index does not exist: {index_name}"))
                 })?;
             if !matches!(
-                idx.index_type,
+                index_def.index_type,
                 crate::catalog::schema::IndexType::UniqueHash
             ) {
                 return Err(AedbError::Validation(format!(
@@ -1525,14 +1548,14 @@ fn validate_update_expr(schema: &TableSchema, expr: &UpdateExpr) -> Result<(), A
 fn extract_primary_key(schema: &TableSchema, row: &Row) -> Result<Vec<Value>, AedbError> {
     let mut primary_key = Vec::with_capacity(schema.primary_key.len());
     for pk_name in &schema.primary_key {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *pk_name)
             .ok_or_else(|| {
                 AedbError::Validation(format!("primary key column missing: {pk_name}"))
             })?;
-        let value = row.values.get(idx).ok_or_else(|| {
+        let value = row.values.get(column_index).ok_or_else(|| {
             AedbError::Validation(format!(
                 "primary key column value missing from row: {pk_name}"
             ))

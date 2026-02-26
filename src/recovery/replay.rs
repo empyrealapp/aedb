@@ -23,27 +23,28 @@ pub fn replay_segments(
     catalog: &mut Catalog,
     idempotency: &mut HashMap<IdempotencyKey, IdempotencyRecord>,
 ) -> Result<u64, AedbError> {
-    let valid_prefix_len =
+    let valid_segment_count =
         validated_hash_chain_prefix_len(segments, hash_chain_required, strict_recovery)?;
-    let replay_segments = &segments[..valid_prefix_len];
+    let replay_segments = &segments[..valid_segment_count];
 
     let mut max_seq = from_seq_exclusive;
     let mut last_applied_seq = from_seq_exclusive;
     for segment in replay_segments {
         let file = File::open(segment)?;
-        let file_size = file.metadata()?.len();
-        let replay_bytes = segment_replay_byte_limits
+        let segment_size_bytes = file.metadata()?.len();
+        let replay_size_bytes = segment_replay_byte_limits
             .and_then(|limits| limits.get(segment).copied())
-            .unwrap_or(file_size)
-            .min(file_size);
-        if replay_bytes <= SEGMENT_HEADER_SIZE as u64 {
+            .unwrap_or(segment_size_bytes)
+            .min(segment_size_bytes);
+        debug_assert!(replay_size_bytes <= segment_size_bytes);
+        if replay_size_bytes <= SEGMENT_HEADER_SIZE as u64 {
             continue;
         }
         let mut reader = BufReader::with_capacity(64 * 1024, file);
         let mut header = [0u8; SEGMENT_HEADER_SIZE];
         reader.read_exact(&mut header)?;
-        let payload_bytes = replay_bytes.saturating_sub(SEGMENT_HEADER_SIZE as u64);
-        let mut frame_reader = FrameReader::new(reader.take(payload_bytes));
+        let payload_size_bytes = replay_size_bytes.saturating_sub(SEGMENT_HEADER_SIZE as u64);
+        let mut frame_reader = FrameReader::new(reader.take(payload_size_bytes));
         loop {
             match frame_reader.next_frame() {
                 Ok(Some(frame)) => {

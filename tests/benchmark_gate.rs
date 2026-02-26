@@ -41,8 +41,8 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    let percentile_index = ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
+    sorted[percentile_index.min(sorted.len() - 1)]
 }
 
 async fn setup(config: AedbConfig, rows: i64) -> (tempfile::TempDir, AedbInstance) {

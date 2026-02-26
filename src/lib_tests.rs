@@ -19,7 +19,6 @@ use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -2079,6 +2078,371 @@ async fn read_policy_applies_to_joined_tables() {
 }
 
 #[tokio::test]
+async fn table_policy_bypass_permission_skips_row_policy_filtering() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("users");
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row {
+            values: vec![Value::Integer(1), Value::Text("reader".into())],
+        },
+    })
+    .await
+    .expect("seed user 1");
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        primary_key: vec![Value::Integer(2)],
+        row: Row {
+            values: vec![Value::Integer(2), Value::Text("bob".into())],
+        },
+    })
+    .await
+    .expect("seed user 2");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::TableRead {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant table read");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::PolicyBypass {
+            project_id: "p".into(),
+            table_name: Some("users".into()),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant policy bypass");
+    db.set_read_policy(
+        "p",
+        "app",
+        "users",
+        Expr::Eq("owner".into(), Value::Text("$caller_id".into())),
+    )
+    .await
+    .expect("set policy");
+
+    let reader = CallerContext::new("reader");
+    let result = db
+        .query_with_options_as(
+            Some(&reader),
+            "p",
+            "app",
+            Query::select(&["*"]).from("users").limit(10),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query with policy bypass");
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[tokio::test]
+async fn project_policy_bypass_permission_skips_joined_table_policies() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("users");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "profiles".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "user_id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".into()],
+    }))
+    .await
+    .expect("profiles");
+
+    for (id, owner) in [(1, "reader"), (2, "bob")] {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row {
+                values: vec![Value::Integer(id), Value::Text(owner.into())],
+            },
+        })
+        .await
+        .expect("seed user");
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "profiles".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row {
+                values: vec![Value::Integer(id), Value::Text(owner.into())],
+            },
+        })
+        .await
+        .expect("seed profile");
+    }
+
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::TableRead {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant users read");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::TableRead {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "profiles".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant profiles read");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::PolicyBypass {
+            project_id: "p".into(),
+            table_name: None,
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant project policy bypass");
+    db.set_read_policy(
+        "p",
+        "app",
+        "users",
+        Expr::Eq("owner".into(), Value::Text("$caller_id".into())),
+    )
+    .await
+    .expect("set users policy");
+    db.set_read_policy(
+        "p",
+        "app",
+        "profiles",
+        Expr::Eq("owner".into(), Value::Text("$caller_id".into())),
+    )
+    .await
+    .expect("set profiles policy");
+
+    let reader = CallerContext::new("reader");
+    let result = db
+        .query_with_options_as(
+            Some(&reader),
+            "p",
+            "app",
+            Query::select(&["*"])
+                .from("users")
+                .alias("u")
+                .inner_join("profiles", "u.id", "user_id")
+                .with_last_join_alias("pr")
+                .limit(10),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query with project policy bypass");
+    assert_eq!(result.rows.len(), 2);
+}
+
+#[tokio::test]
+async fn join_query_rejects_duplicate_aliases_to_prevent_policy_binding_ambiguity() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("users");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "profiles".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "user_id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["user_id".into()],
+    }))
+    .await
+    .expect("profiles");
+
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row {
+            values: vec![Value::Integer(1), Value::Text("reader".into())],
+        },
+    })
+    .await
+    .expect("seed user");
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "profiles".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row {
+            values: vec![Value::Integer(1), Value::Text("bob".into())],
+        },
+    })
+    .await
+    .expect("seed profile");
+
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::TableRead {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant users read");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::TableRead {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "profiles".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant profiles read");
+    db.set_read_policy(
+        "p",
+        "app",
+        "profiles",
+        Expr::Eq("owner".into(), Value::Text("$caller_id".into())),
+    )
+    .await
+    .expect("set policy");
+
+    let reader = CallerContext::new("reader");
+    let err = db
+        .query_with_options_as(
+            Some(&reader),
+            "p",
+            "app",
+            Query::select(&["*"])
+                .from("users")
+                .alias("u")
+                .inner_join("profiles", "u.id", "user_id")
+                .with_last_join_alias("u"),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("duplicate aliases should be rejected");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+}
+
+#[tokio::test]
 async fn production_profile_requires_hmac() {
     let dir = tempdir().expect("temp");
     let invalid = AedbConfig {
@@ -2111,6 +2475,28 @@ async fn secure_profile_requires_hardened_storage_settings() {
 }
 
 #[tokio::test]
+async fn secure_profile_rejects_batch_durability() {
+    let dir = tempdir().expect("temp");
+    let mut weak = AedbConfig::production([9u8; 32]);
+    weak.durability_mode = DurabilityMode::Batch;
+    let err = AedbInstance::open_secure(weak, dir.path())
+        .err()
+        .expect("secure profile must reject batch durability");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+}
+
+#[tokio::test]
+async fn production_profile_rejects_batch_durability() {
+    let dir = tempdir().expect("temp");
+    let mut weak = AedbConfig::production([7u8; 32]);
+    weak.durability_mode = DurabilityMode::Batch;
+    let err = AedbInstance::open_production(weak, dir.path())
+        .err()
+        .expect("production profile must reject batch durability");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+}
+
+#[tokio::test]
 async fn secure_profile_rejects_short_hmac_key() {
     let dir = tempdir().expect("temp");
     let weak = AedbConfig::default()
@@ -2140,6 +2526,19 @@ fn low_latency_profile_uses_batch_durability_with_strict_recovery() {
     assert!(cfg.batch_interval_ms > 0);
     assert!(cfg.batch_max_bytes > 0);
     assert!(cfg.manifest_hmac_key.is_some());
+}
+
+#[test]
+fn checkpoint_compression_level_is_validated() {
+    let mut cfg = AedbConfig::default();
+    cfg.checkpoint_compression_level = 23;
+    let err = crate::lib_helpers::validate_config(&cfg)
+        .err()
+        .expect("out-of-range compression level must be rejected");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+
+    cfg.checkpoint_compression_level = 1;
+    crate::lib_helpers::validate_config(&cfg).expect("valid compression level");
 }
 
 #[tokio::test]
@@ -2962,6 +3361,115 @@ async fn lifecycle_hooks_receive_post_commit_events_for_applied_ddl() {
     ));
 }
 
+#[tokio::test]
+async fn lifecycle_outbox_persists_applied_events() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let created = db
+        .commit_ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            project_id: "arcana".into(),
+            if_not_exists: true,
+        })
+        .await
+        .expect("create project");
+
+    let outbox = db
+        .query_no_auth(
+            "_system",
+            "app",
+            Query::select(&["event_count", "events"])
+                .from("lifecycle_outbox")
+                .where_(Expr::Eq(
+                    "commit_seq".into(),
+                    Value::Integer(created.seq as i64),
+                ))
+                .limit(1),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query lifecycle outbox");
+    assert_eq!(outbox.rows.len(), 1, "expected lifecycle outbox row");
+    assert_eq!(outbox.rows[0].values[0], Value::Integer(1));
+    let Value::Json(payload) = &outbox.rows[0].values[1] else {
+        panic!("expected json payload");
+    };
+    let events: Vec<LifecycleEvent> =
+        serde_json::from_str(payload.as_str()).expect("decode lifecycle payload");
+    assert!(matches!(
+        events.first(),
+        Some(LifecycleEvent::ProjectCreated { project_id, seq })
+            if project_id == "arcana" && *seq == created.seq
+    ));
+}
+
+#[tokio::test]
+async fn idempotency_prunes_by_commit_window() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(
+        AedbConfig {
+            idempotency_window_commits: 1,
+            ..AedbConfig::default()
+        },
+        dir.path(),
+    )
+    .expect("open");
+    db.create_project("p").await.expect("project");
+
+    let first = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: Some(IdempotencyKey([1u8; 16])),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"k".to_vec(),
+                    value: b"v1".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect("first commit");
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"other".to_vec(),
+        value: b"v2".to_vec(),
+    })
+    .await
+    .expect("advance seq");
+
+    let retried = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: Some(IdempotencyKey([1u8; 16])),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"k".to_vec(),
+                    value: b"v3".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect("retried commit");
+    assert!(
+        retried.commit_seq > first.commit_seq,
+        "idempotency record should expire by sequence window"
+    );
+}
+
 #[test]
 fn open_rejects_invalid_config() {
     let dir = tempdir().expect("temp");
@@ -3288,6 +3796,190 @@ async fn order_book_new_with_durable_finality_waits_until_durable_head_catches_u
 }
 
 #[tokio::test]
+async fn order_book_new_fok_reject_is_dropped_before_wal_append() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    let before = db.operational_metrics().await;
+
+    let err = db
+        .order_book_new(
+            "p",
+            "app",
+            crate::order_book::OrderRequest {
+                instrument: "BTC-USD".into(),
+                client_order_id: "fok-no-liq-1".into(),
+                side: crate::order_book::OrderSide::Bid,
+                order_type: crate::order_book::OrderType::Limit,
+                time_in_force: crate::order_book::TimeInForce::Fok,
+                exec_instructions: crate::order_book::ExecInstruction(0),
+                self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+                price_ticks: 100,
+                qty_be: {
+                    let mut out = [0u8; 32];
+                    out[31] = 1;
+                    out
+                },
+                owner: "alice".into(),
+                account: None,
+                nonce: 1,
+                price_limit_ticks: None,
+            },
+        )
+        .await
+        .expect_err("unfillable FOK should reject upstream");
+    let after = db.operational_metrics().await;
+
+    match err {
+        AedbError::Validation(msg) => assert!(
+            msg.contains("fok cannot fill"),
+            "unexpected validation message: {msg}"
+        ),
+        other => panic!("unexpected error variant: {other:?}"),
+    }
+    assert_eq!(
+        after.wal_append_ops, before.wal_append_ops,
+        "upstream dropped rejects should not append WAL frames"
+    );
+    assert_eq!(
+        after.wal_append_bytes, before.wal_append_bytes,
+        "upstream dropped rejects should not increase WAL append bytes"
+    );
+}
+
+#[tokio::test]
+#[ignore = "long-running finality latency profile"]
+async fn finality_profile_visible_vs_durable_low_latency_mode() {
+    async fn run_profile(
+        config: AedbConfig,
+        finality: CommitFinality,
+        ops: usize,
+    ) -> (u64, u64, u64, crate::OperationalMetrics) {
+        let dir = tempdir().expect("temp");
+        let db = AedbInstance::open(config, dir.path()).expect("open");
+        db.create_project("p").await.expect("project");
+        let started = Instant::now();
+        let mut lat_sum = 0u128;
+        let mut lat_max = 0u64;
+        for i in 0..ops {
+            let op_started = Instant::now();
+            db.commit_with_finality(
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: format!("finality:{finality:?}:{i}").into_bytes(),
+                    value: i.to_be_bytes().to_vec(),
+                },
+                finality,
+            )
+            .await
+            .expect("commit with finality");
+            let us = op_started.elapsed().as_micros() as u64;
+            lat_sum = lat_sum.saturating_add(us as u128);
+            lat_max = lat_max.max(us);
+        }
+        db.force_fsync().await.expect("flush");
+        let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        let tps = (ops as f64 / elapsed) as u64;
+        let avg_us = (lat_sum / ops.max(1) as u128) as u64;
+        let op = db.operational_metrics().await;
+        (tps, avg_us, lat_max, op)
+    }
+
+    let ops = std::env::var("AEDB_FINALITY_PROFILE_OPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(600)
+        .max(200);
+
+    let mut low_latency_no_coalesce = AedbConfig::low_latency([1u8; 32]);
+    low_latency_no_coalesce.durable_ack_coalescing_enabled = false;
+    low_latency_no_coalesce.durable_ack_coalesce_window_us = 0;
+    let low_latency_coalesce = AedbConfig::low_latency([1u8; 32]);
+
+    let (visible_tps, visible_avg_us, visible_max_us, visible_op) = run_profile(
+        low_latency_no_coalesce.clone(),
+        CommitFinality::Visible,
+        ops,
+    )
+    .await;
+    let (durable_base_tps, durable_base_avg_us, durable_base_max_us, durable_base_op) =
+        run_profile(low_latency_no_coalesce, CommitFinality::Durable, ops).await;
+    let (durable_tps, durable_avg_us, durable_max_us, durable_op) =
+        run_profile(low_latency_coalesce, CommitFinality::Durable, ops).await;
+
+    eprintln!(
+        "finality_profile: ops={} visible_tps={} durable_base_tps={} durable_coalesced_tps={} visible_avg_us={} durable_base_avg_us={} durable_coalesced_avg_us={} visible_max_us={} durable_base_max_us={} durable_coalesced_max_us={} visible_durable_wait_ops={} durable_base_wait_ops={} durable_coalesced_wait_ops={} visible_avg_durable_wait_us={} durable_base_avg_durable_wait_us={} durable_coalesced_avg_durable_wait_us={} visible_wal_sync_ops={} durable_base_wal_sync_ops={} durable_coalesced_wal_sync_ops={} visible_avg_wal_sync_us={} durable_base_avg_wal_sync_us={} durable_coalesced_avg_wal_sync_us={} visible_avg_wal_append_us={} durable_base_avg_wal_append_us={} durable_coalesced_avg_wal_append_us={}",
+        ops,
+        visible_tps,
+        durable_base_tps,
+        durable_tps,
+        visible_avg_us,
+        durable_base_avg_us,
+        durable_avg_us,
+        visible_max_us,
+        durable_base_max_us,
+        durable_max_us,
+        visible_op.durable_wait_ops,
+        durable_base_op.durable_wait_ops,
+        durable_op.durable_wait_ops,
+        visible_op.avg_durable_wait_micros,
+        durable_base_op.avg_durable_wait_micros,
+        durable_op.avg_durable_wait_micros,
+        visible_op.wal_sync_ops,
+        durable_base_op.wal_sync_ops,
+        durable_op.wal_sync_ops,
+        visible_op.avg_wal_sync_micros,
+        durable_base_op.avg_wal_sync_micros,
+        durable_op.avg_wal_sync_micros,
+        visible_op.avg_wal_append_micros,
+        durable_base_op.avg_wal_append_micros,
+        durable_op.avg_wal_append_micros
+    );
+
+    assert_eq!(
+        visible_op.queue_full_rejections, 0,
+        "visible finality profile should not saturate queue"
+    );
+    assert_eq!(
+        durable_base_op.queue_full_rejections, 0,
+        "durable baseline profile should not saturate queue"
+    );
+    assert_eq!(
+        durable_op.queue_full_rejections, 0,
+        "durable coalesced profile should not saturate queue"
+    );
+    assert_eq!(
+        visible_op.timeout_rejections, 0,
+        "visible finality profile should not timeout"
+    );
+    assert_eq!(
+        durable_base_op.timeout_rejections, 0,
+        "durable baseline profile should not timeout"
+    );
+    assert_eq!(
+        durable_op.timeout_rejections, 0,
+        "durable coalesced profile should not timeout"
+    );
+    assert_eq!(
+        visible_op.durable_wait_ops, 0,
+        "visible finality profile should not accumulate durable wait operations"
+    );
+    assert!(
+        durable_op.durable_wait_ops > 0,
+        "durable finality profile should accumulate durable wait operations"
+    );
+    assert!(
+        durable_tps >= durable_base_tps.saturating_div(2),
+        "coalesced durable finality regressed severely: base={durable_base_tps} coalesced={durable_tps}"
+    );
+    assert!(
+        durable_tps <= visible_tps.saturating_mul(2),
+        "durable finality profile produced implausible TPS vs visible: visible={visible_tps} durable={durable_tps}"
+    );
+}
+
+#[tokio::test]
 async fn order_book_write_requires_authenticated_caller_in_secure_mode() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open_secure(AedbConfig::production([9u8; 32]), dir.path())
@@ -3386,6 +4078,80 @@ async fn secure_mode_supports_order_book_writes_via_authenticated_as_apis() {
         .expect("status query")
         .expect("order exists");
     assert_eq!(status.status, crate::order_book::OrderStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn open_orders_requires_kv_read_permission() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.order_book_new(
+        "p",
+        "app",
+        crate::order_book::OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "cid-open-orders-1".into(),
+            side: crate::order_book::OrderSide::Bid,
+            order_type: crate::order_book::OrderType::Limit,
+            time_in_force: crate::order_book::TimeInForce::Gtc,
+            exec_instructions: crate::order_book::ExecInstruction(0),
+            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    )
+    .await
+    .expect("place order");
+
+    let alice = CallerContext::new("alice");
+    let denied = db
+        .open_orders(
+            "p",
+            "app",
+            "BTC-USD",
+            "alice",
+            ConsistencyMode::AtLatest,
+            &alice,
+        )
+        .await
+        .expect_err("missing KvRead should be denied");
+    assert!(matches!(denied, QueryError::PermissionDenied { .. }));
+
+    db.commit_ddl(DdlOperation::GrantPermission {
+        caller_id: "alice".into(),
+        permission: Permission::KvRead {
+            project_id: "p".into(),
+            scope_id: Some("app".into()),
+            prefix: Some(b"ob:BTC-USD:".to_vec()),
+        },
+        actor_id: None,
+        delegable: false,
+    })
+    .await
+    .expect("grant kv read");
+
+    let open = db
+        .open_orders(
+            "p",
+            "app",
+            "BTC-USD",
+            "alice",
+            ConsistencyMode::AtLatest,
+            &alice,
+        )
+        .await
+        .expect("open orders");
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].owner, "alice");
 }
 
 #[tokio::test]
@@ -3892,6 +4658,117 @@ async fn idempotent_retry_does_not_double_apply_non_idempotent_mutation() {
 }
 
 #[tokio::test]
+async fn retry_idempotency_is_exactly_once_under_commit_pressure() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        commit_timeout_ms: 1,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let key = IdempotencyKey([91u8; 16]);
+    let envelope = TransactionEnvelope {
+        caller: None,
+        idempotency_key: Some(key),
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: Default::default(),
+        write_intent: WriteIntent {
+            mutations: vec![
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"__slow_parallel_worker__".to_vec(),
+                    value: b"slow".to_vec(),
+                },
+                Mutation::KvIncU256 {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"timeout-idem-counter".to_vec(),
+                    amount_be: {
+                        let mut out = [0u8; 32];
+                        out[31] = 1;
+                        out
+                    },
+                },
+            ],
+        },
+        base_seq: 0,
+    };
+
+    let noisy_db = Arc::new(db);
+    let mut noise_tasks = Vec::new();
+    for worker in 0..8 {
+        let db_clone = Arc::clone(&noisy_db);
+        noise_tasks.push(tokio::spawn(async move {
+            for i in 0..200usize {
+                let _ = db_clone
+                    .commit(Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: format!("noise:{worker}:{i}").into_bytes(),
+                        value: b"n".to_vec(),
+                    })
+                    .await;
+            }
+        }));
+    }
+
+    let mut saw_timeout = false;
+    let second = loop {
+        match noisy_db.commit_envelope(envelope.clone()).await {
+            Ok(result) => break result,
+            Err(AedbError::Timeout) => {
+                saw_timeout = true;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            Err(other) => panic!("unexpected error during retry loop: {other:?}"),
+        }
+    };
+    for t in noise_tasks {
+        t.await.expect("join noise worker");
+    }
+    noisy_db
+        .wait_for_durable(second.commit_seq)
+        .await
+        .expect("durable ack");
+
+    let third = noisy_db
+        .commit_envelope(envelope)
+        .await
+        .expect("repeat idempotent retry");
+    assert_eq!(
+        third.commit_seq, second.commit_seq,
+        "all retries must resolve to one commit sequence"
+    );
+
+    let counter = noisy_db
+        .kv_get_no_auth(
+            "p",
+            "app",
+            b"timeout-idem-counter",
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect("kv counter")
+        .expect("counter exists");
+    assert_eq!(
+        primitive_types::U256::from_big_endian(&counter.value),
+        primitive_types::U256::one(),
+        "counter must be applied once"
+    );
+
+    let op = noisy_db.operational_metrics().await;
+    if saw_timeout {
+        assert!(
+            op.timeout_rejections >= 1,
+            "timeout path should be observable in operational metrics"
+        );
+    }
+}
+
+#[tokio::test]
 async fn strict_cancel_rejects_missing_order() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -4367,114 +5244,834 @@ async fn multi_update_transaction_envelope_updates_table_and_kv() {
 }
 
 #[tokio::test]
-async fn checkpoint_now_waits_for_active_writes() {
+async fn checkpoint_now_allows_commits_while_running() {
     let dir = tempdir().expect("temp");
     let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
-    // Simulate an active operation by holding a semaphore permit
-    let _permit = db.checkpoint_gate.acquire().await.unwrap();
+    // Build enough state to make checkpoint work measurable.
+    for i in 0..2_000u32 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("seed:{i:06}").into_bytes(),
+            value: vec![b'x'; 1024],
+        })
+        .await
+        .expect("seed write");
+    }
+
     let checkpoint_db = Arc::clone(&db);
     let checkpoint_task = tokio::spawn(async move { checkpoint_db.checkpoint_now().await });
 
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Wait briefly for checkpoint to begin.
+    for _ in 0..10 {
+        if !checkpoint_task.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
     assert!(
         !checkpoint_task.is_finished(),
-        "checkpoint should wait while operations are active"
+        "checkpoint should still be running"
     );
 
-    drop(_permit);
-    checkpoint_task
+    let commit = db
+        .commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"concurrent:write".to_vec(),
+            value: b"ok".to_vec(),
+        })
+        .await
+        .expect("commit should proceed during checkpoint");
+    let checkpoint_seq = checkpoint_task
         .await
         .expect("checkpoint join")
         .expect("checkpoint");
+    assert!(commit.commit_seq >= checkpoint_seq);
 }
 
 #[tokio::test]
-async fn checkpoint_now_returns_structured_error_when_gate_closed() {
-    let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
-    db.create_project("p").await.expect("project");
-
-    db.checkpoint_gate.close();
-    let err = db
-        .checkpoint_now()
-        .await
-        .expect_err("closed gate should return error");
-    assert!(matches!(err, AedbError::Unavailable { .. }));
-    assert!(
-        !db.checkpoint_in_progress.load(Ordering::Acquire),
-        "checkpoint flag should be reset on error"
-    );
-}
-
-#[tokio::test]
-async fn commit_returns_structured_error_when_gate_closed() {
-    let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
-    db.create_project("p").await.expect("project");
-
-    db.checkpoint_gate.close();
-    let err = db
-        .commit(Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-        })
-        .await
-        .expect_err("closed gate should fail commit");
-    assert!(matches!(err, AedbError::Unavailable { .. }));
-}
-
-#[tokio::test]
-async fn backup_lock_blocks_new_write_submissions() {
+async fn checkpoint_now_serializes_checkpoint_writers() {
     let dir = tempdir().expect("temp");
     let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
-
-    // Simulate a checkpoint/backup in progress
-    db.checkpoint_in_progress.store(true, Ordering::Release);
-    let _all_permits = db
-        .checkpoint_gate
-        .acquire_many(super::CHECKPOINT_GATE_PERMITS)
-        .await
-        .unwrap();
-
-    // Commit should fail fast with checkpoint error (better than blocking)
-    let result = db
-        .commit(Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: b"blocked".to_vec(),
-            value: b"1".to_vec(),
-        })
-        .await;
-
-    assert!(
-        result.is_err(),
-        "write should be rejected while checkpoint is in progress"
-    );
-    assert!(
-        result
-            .unwrap_err()
-            .to_string()
-            .contains("checkpoint in progress"),
-        "error should indicate checkpoint"
-    );
-
-    // Release checkpoint lock and verify commits now work
-    db.checkpoint_in_progress.store(false, Ordering::Release);
-    drop(_all_permits);
 
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
         scope_id: "app".into(),
-        key: b"success".to_vec(),
-        value: b"1".to_vec(),
+        key: b"k".to_vec(),
+        value: b"v".to_vec(),
     })
     .await
-    .expect("commit after checkpoint should succeed");
+    .expect("seed");
+
+    let db1 = Arc::clone(&db);
+    let db2 = Arc::clone(&db);
+    let t1 = tokio::spawn(async move { db1.checkpoint_now().await });
+    let t2 = tokio::spawn(async move { db2.checkpoint_now().await });
+
+    let s1 = t1.await.expect("checkpoint task 1").expect("checkpoint 1");
+    let s2 = t2.await.expect("checkpoint task 2").expect("checkpoint 2");
+    assert_eq!(s1, s2);
+}
+
+#[tokio::test]
+async fn checkpoint_captures_transaction_all_or_none() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig::default();
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let base_seq = db
+        .snapshot_probe(ConsistencyMode::AtLatest)
+        .await
+        .expect("base");
+    let commit = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: Default::default(),
+            write_intent: WriteIntent {
+                mutations: vec![
+                    Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"tx:part:a".to_vec(),
+                        value: b"1".to_vec(),
+                    },
+                    Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"tx:part:b".to_vec(),
+                        value: b"2".to_vec(),
+                    },
+                ],
+            },
+            base_seq,
+        })
+        .await
+        .expect("atomic multi-mutation commit");
+    let checkpoint_seq = db.checkpoint_now().await.expect("checkpoint");
+    assert!(checkpoint_seq >= commit.commit_seq);
+
+    let recovered_at_cp =
+        crate::recovery::recover_at_seq_with_config(dir.path(), checkpoint_seq, &config)
+            .expect("recover at checkpoint");
+    let snapshot_at_cp = recovered_at_cp.keyspace.snapshot();
+    assert_eq!(
+        snapshot_at_cp
+            .kv_get("p", "app", b"tx:part:a")
+            .map(|entry| entry.value.clone()),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(
+        snapshot_at_cp
+            .kv_get("p", "app", b"tx:part:b")
+            .map(|entry| entry.value.clone()),
+        Some(b"2".to_vec())
+    );
+
+    if commit.commit_seq > 0 {
+        let recovered_before =
+            crate::recovery::recover_at_seq_with_config(dir.path(), commit.commit_seq - 1, &config)
+                .expect("recover before commit seq");
+        let before_snapshot = recovered_before.keyspace.snapshot();
+        assert!(before_snapshot.kv_get("p", "app", b"tx:part:a").is_none());
+        assert!(before_snapshot.kv_get("p", "app", b"tx:part:b").is_none());
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_manifest_trims_fully_covered_segments() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_segment_bytes: 4096,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    for i in 0..400u32 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("seg:{i:04}").into_bytes(),
+            value: vec![b'x'; 256],
+        })
+        .await
+        .expect("seed");
+    }
+
+    let all_segments = crate::lib_helpers::read_segments(dir.path()).expect("all segments");
+    assert!(
+        all_segments.len() > 1,
+        "test must create multiple wal segments"
+    );
+
+    let checkpoint_seq = db.checkpoint_now().await.expect("checkpoint");
+    let manifest = crate::manifest::atomic::load_manifest_signed(dir.path(), config.hmac_key())
+        .expect("manifest");
+
+    assert!(
+        manifest.segments.len() < all_segments.len(),
+        "checkpoint manifest should drop fully covered historical segments"
+    );
+    for segment in &manifest.segments {
+        let path = dir.path().join(&segment.filename);
+        let range = crate::lib_helpers::scan_segment_seq_range(&path).expect("scan segment");
+        if let Some((_, max_seq)) = range {
+            assert!(
+                max_seq > checkpoint_seq || segment.segment_seq == manifest.active_segment_seq,
+                "manifest retained a segment fully covered by checkpoint"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual perf probe: commit latency with and without concurrent checkpoint"]
+async fn benchmark_commit_latency_during_checkpoint() {
+    fn percentile(sorted: &[u128], p: f64) -> u128 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let percentile_index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[percentile_index.min(sorted.len() - 1)]
+    }
+
+    async fn run_phase(
+        db: &Arc<AedbInstance>,
+        start: usize,
+        count: usize,
+        with_checkpoint: bool,
+    ) -> (f64, u128, u128) {
+        for i in 0..10_000usize {
+            db.commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("warmup:{i:05}").into_bytes(),
+                value: vec![b'w'; 256],
+            })
+            .await
+            .expect("warmup seed");
+        }
+
+        let checkpoint_task = if with_checkpoint {
+            Some(tokio::spawn({
+                let db = Arc::clone(db);
+                async move { db.checkpoint_now().await }
+            }))
+        } else {
+            None
+        };
+
+        let phase_started = Instant::now();
+        let mut latencies_us = Vec::with_capacity(count);
+        for i in 0..count {
+            let started = Instant::now();
+            db.commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!(
+                    "bench:{}:{:06}",
+                    if with_checkpoint { "cp" } else { "base" },
+                    start + i
+                )
+                .into_bytes(),
+                value: vec![b'x'; 512],
+            })
+            .await
+            .expect("bench commit");
+            latencies_us.push(started.elapsed().as_micros());
+        }
+
+        if let Some(task) = checkpoint_task {
+            let _ = task
+                .await
+                .expect("checkpoint task join")
+                .expect("checkpoint");
+        }
+
+        latencies_us.sort_unstable();
+        let elapsed_secs = phase_started.elapsed().as_secs_f64().max(0.000_001);
+        let tps = count as f64 / elapsed_secs;
+        let p50_us = percentile(&latencies_us, 0.50);
+        let p99_us = percentile(&latencies_us, 0.99);
+        (tps, p50_us, p99_us)
+    }
+
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig::default();
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let (base_tps, base_p50, base_p99) = run_phase(&db, 0, 800, false).await;
+    let (cp_tps, cp_p50, cp_p99) = run_phase(&db, 1_000_000, 800, true).await;
+
+    eprintln!(
+        "checkpoint_perf: base_tps={:.2} base_p50_us={} base_p99_us={} | cp_tps={:.2} cp_p50_us={} cp_p99_us={} | tps_ratio={:.3} p50_ratio={:.3} p99_ratio={:.3}",
+        base_tps,
+        base_p50,
+        base_p99,
+        cp_tps,
+        cp_p50,
+        cp_p99,
+        cp_tps / base_tps.max(0.000_001),
+        (cp_p50 as f64) / (base_p50.max(1) as f64),
+        (cp_p99 as f64) / (base_p99.max(1) as f64),
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual perf probe: parallel commit throughput with and without concurrent checkpoint"]
+async fn benchmark_parallel_commit_throughput_during_checkpoint() {
+    fn percentile(sorted: &[u128], p: f64) -> u128 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let percentile_index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[percentile_index.min(sorted.len() - 1)]
+    }
+
+    async fn run_parallel_phase(
+        db: &Arc<AedbInstance>,
+        workers: usize,
+        commits_per_worker: usize,
+        with_checkpoint: bool,
+        offset: usize,
+    ) -> (f64, u128, u128) {
+        let checkpoint_task = if with_checkpoint {
+            Some(tokio::spawn({
+                let db = Arc::clone(db);
+                async move { db.checkpoint_now().await }
+            }))
+        } else {
+            None
+        };
+
+        let phase_started = Instant::now();
+        let mut tasks = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let db = Arc::clone(db);
+            tasks.push(tokio::spawn(async move {
+                let mut latencies = Vec::with_capacity(commits_per_worker);
+                for i in 0..commits_per_worker {
+                    let started = Instant::now();
+                    db.commit(Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: format!(
+                            "par:{}:{:02}:{:06}",
+                            if with_checkpoint { "cp" } else { "base" },
+                            worker,
+                            offset + i
+                        )
+                        .into_bytes(),
+                        value: vec![b'p'; 256],
+                    })
+                    .await
+                    .expect("parallel bench commit");
+                    latencies.push(started.elapsed().as_micros());
+                }
+                latencies
+            }));
+        }
+
+        let mut all_latencies = Vec::with_capacity(workers * commits_per_worker);
+        for task in tasks {
+            let mut worker_latencies = task.await.expect("worker join");
+            all_latencies.append(&mut worker_latencies);
+        }
+
+        if let Some(task) = checkpoint_task {
+            let _ = task
+                .await
+                .expect("checkpoint task join")
+                .expect("checkpoint");
+        }
+
+        all_latencies.sort_unstable();
+        let elapsed_secs = phase_started.elapsed().as_secs_f64().max(0.000_001);
+        let total = workers * commits_per_worker;
+        let tps = total as f64 / elapsed_secs;
+        let p50_us = percentile(&all_latencies, 0.50);
+        let p99_us = percentile(&all_latencies, 0.99);
+        (tps, p50_us, p99_us)
+    }
+
+    let dir = tempdir().expect("temp");
+    let mut config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 10,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        ..AedbConfig::default()
+    };
+    config.manifest_hmac_key = None;
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    // Seed state so the checkpoint has meaningful work.
+    for i in 0..12_000usize {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("parallel-seed:{i:05}").into_bytes(),
+            value: vec![b's'; 256],
+        })
+        .await
+        .expect("seed");
+    }
+
+    let workers = 8usize;
+    let commits_per_worker = 300usize;
+    let (base_tps, base_p50, base_p99) =
+        run_parallel_phase(&db, workers, commits_per_worker, false, 0).await;
+    let (cp_tps, cp_p50, cp_p99) =
+        run_parallel_phase(&db, workers, commits_per_worker, true, 1_000_000).await;
+
+    eprintln!(
+        "checkpoint_parallel_perf: workers={} commits_per_worker={} | base_tps={:.2} base_p50_us={} base_p99_us={} | cp_tps={:.2} cp_p50_us={} cp_p99_us={} | tps_ratio={:.3} p50_ratio={:.3} p99_ratio={:.3}",
+        workers,
+        commits_per_worker,
+        base_tps,
+        base_p50,
+        base_p99,
+        cp_tps,
+        cp_p50,
+        cp_p99,
+        cp_tps / base_tps.max(0.000_001),
+        (cp_p50 as f64) / (base_p50.max(1) as f64),
+        (cp_p99 as f64) / (base_p99.max(1) as f64),
+    );
+}
+
+#[tokio::test]
+#[ignore = "manual perf probe: compare checkpoint compression levels under parallel load"]
+async fn benchmark_parallel_checkpoint_compression_levels() {
+    async fn seed(db: &Arc<AedbInstance>) {
+        for i in 0..12_000usize {
+            db.commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("parallel-seed:{i:05}").into_bytes(),
+                value: vec![b's'; 256],
+            })
+            .await
+            .expect("seed");
+        }
+    }
+
+    async fn run_parallel_phase(
+        db: &Arc<AedbInstance>,
+        workers: usize,
+        commits_per_worker: usize,
+        with_checkpoint: bool,
+        offset: usize,
+    ) -> f64 {
+        let checkpoint_task = if with_checkpoint {
+            Some(tokio::spawn({
+                let db = Arc::clone(db);
+                async move { db.checkpoint_now().await }
+            }))
+        } else {
+            None
+        };
+
+        let phase_started = Instant::now();
+        let mut tasks = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let db = Arc::clone(db);
+            tasks.push(tokio::spawn(async move {
+                for i in 0..commits_per_worker {
+                    db.commit(Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: format!(
+                            "cmp:{}:{:02}:{:06}",
+                            if with_checkpoint { "cp" } else { "base" },
+                            worker,
+                            offset + i
+                        )
+                        .into_bytes(),
+                        value: vec![b'c'; 256],
+                    })
+                    .await
+                    .expect("parallel bench commit");
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("worker join");
+        }
+        if let Some(task) = checkpoint_task {
+            let _ = task
+                .await
+                .expect("checkpoint task join")
+                .expect("checkpoint");
+        }
+
+        let elapsed_secs = phase_started.elapsed().as_secs_f64().max(0.000_001);
+        let total = workers * commits_per_worker;
+        total as f64 / elapsed_secs
+    }
+
+    let workers = 8usize;
+    let commits_per_worker = 300usize;
+    let levels = [3, 1, 0];
+
+    let mut baseline_tps = 0.0f64;
+    for (idx, level) in levels.iter().copied().enumerate() {
+        let dir = tempdir().expect("temp");
+        let mut config = AedbConfig {
+            durability_mode: DurabilityMode::Batch,
+            batch_interval_ms: 10,
+            batch_max_bytes: usize::MAX,
+            recovery_mode: RecoveryMode::Permissive,
+            hash_chain_required: false,
+            ..AedbConfig::default()
+        };
+        config.manifest_hmac_key = None;
+        config.checkpoint_compression_level = level;
+        let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+        db.create_project("p").await.expect("project");
+        seed(&db).await;
+
+        let base =
+            run_parallel_phase(&db, workers, commits_per_worker, false, idx * 1_000_000).await;
+        let cp = run_parallel_phase(
+            &db,
+            workers,
+            commits_per_worker,
+            true,
+            idx * 1_000_000 + 500_000,
+        )
+        .await;
+        if idx == 0 {
+            baseline_tps = base;
+        }
+
+        eprintln!(
+            "checkpoint_compression_perf: level={} workers={} commits_per_worker={} base_tps={:.2} cp_tps={:.2} cp_to_base={:.3} cp_to_level3_base={:.3}",
+            level,
+            workers,
+            commits_per_worker,
+            base,
+            cp,
+            cp / base.max(0.000_001),
+            cp / baseline_tps.max(0.000_001),
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual perf probe: durability knob sweep (batch/coalescing)"]
+async fn benchmark_durability_knob_sweep() {
+    fn percentile(sorted: &[u128], p: f64) -> u128 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let percentile_index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[percentile_index.min(sorted.len() - 1)]
+    }
+
+    #[derive(Clone)]
+    struct Profile {
+        name: &'static str,
+        batch_interval_ms: u64,
+        batch_max_bytes: usize,
+        coalesce_enabled: bool,
+        coalesce_window_us: u64,
+    }
+
+    async fn run_profile(profile: &Profile) -> (f64, u128, u128, u64, u64) {
+        let dir = tempdir().expect("temp");
+        let mut config = AedbConfig {
+            durability_mode: DurabilityMode::Batch,
+            batch_interval_ms: profile.batch_interval_ms,
+            batch_max_bytes: profile.batch_max_bytes,
+            recovery_mode: RecoveryMode::Permissive,
+            hash_chain_required: false,
+            durable_ack_coalescing_enabled: profile.coalesce_enabled,
+            durable_ack_coalesce_window_us: profile.coalesce_window_us,
+            ..AedbConfig::default()
+        };
+        config.manifest_hmac_key = None;
+        let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+        db.create_project("p").await.expect("project");
+
+        for i in 0..8_000usize {
+            db.commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("sweep-seed:{i:05}").into_bytes(),
+                value: vec![b's'; 128],
+            })
+            .await
+            .expect("seed");
+        }
+
+        let workers = 8usize;
+        let commits_per_worker = 500usize;
+        let started = Instant::now();
+        let mut tasks = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let db = Arc::clone(&db);
+            tasks.push(tokio::spawn(async move {
+                let mut lats = Vec::with_capacity(commits_per_worker);
+                for i in 0..commits_per_worker {
+                    let t0 = Instant::now();
+                    db.commit(Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: format!("sweep:{worker:02}:{i:06}").into_bytes(),
+                        value: vec![b'x'; 256],
+                    })
+                    .await
+                    .expect("commit");
+                    lats.push(t0.elapsed().as_micros());
+                }
+                lats
+            }));
+        }
+
+        let mut all_lat = Vec::with_capacity(workers * commits_per_worker);
+        for task in tasks {
+            let mut lats = task.await.expect("worker join");
+            all_lat.append(&mut lats);
+        }
+        all_lat.sort_unstable();
+
+        let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
+        let tps = (workers * commits_per_worker) as f64 / elapsed;
+        let p50 = percentile(&all_lat, 0.50);
+        let p99 = percentile(&all_lat, 0.99);
+        let op = db.operational_metrics().await;
+        (tps, p50, p99, op.wal_sync_ops, op.avg_wal_sync_micros)
+    }
+
+    let profiles = vec![
+        Profile {
+            name: "baseline_10ms_1mb_no_coalesce",
+            batch_interval_ms: 10,
+            batch_max_bytes: 1 * 1024 * 1024,
+            coalesce_enabled: false,
+            coalesce_window_us: 0,
+        },
+        Profile {
+            name: "trial_20ms_4mb_coalesce_1000us",
+            batch_interval_ms: 20,
+            batch_max_bytes: 4 * 1024 * 1024,
+            coalesce_enabled: true,
+            coalesce_window_us: 1000,
+        },
+        Profile {
+            name: "trial_20ms_8mb_coalesce_1500us",
+            batch_interval_ms: 20,
+            batch_max_bytes: 8 * 1024 * 1024,
+            coalesce_enabled: true,
+            coalesce_window_us: 1500,
+        },
+        Profile {
+            name: "trial_40ms_8mb_coalesce_1500us",
+            batch_interval_ms: 40,
+            batch_max_bytes: 8 * 1024 * 1024,
+            coalesce_enabled: true,
+            coalesce_window_us: 1500,
+        },
+    ];
+
+    for profile in &profiles {
+        let (tps, p50, p99, wal_sync_ops, avg_wal_sync_us) = run_profile(profile).await;
+        eprintln!(
+            "durability_sweep: profile={} tps={:.2} p50_us={} p99_us={} wal_sync_ops={} avg_wal_sync_us={}",
+            profile.name, tps, p50, p99, wal_sync_ops, avg_wal_sync_us
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "manual profiling: end-to-end pipeline breakdown (commit/checkpoint/recovery)"]
+async fn profile_end_to_end_pipeline_breakdown() {
+    fn percentile(sorted: &[u128], p: f64) -> u128 {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let percentile_index = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[percentile_index.min(sorted.len() - 1)]
+    }
+
+    let dir = tempdir().expect("temp");
+    let mut config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 10,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        ..AedbConfig::default()
+    };
+    config.manifest_hmac_key = None;
+    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    for i in 0..20_000usize {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("seed:{i:06}").into_bytes(),
+            value: vec![b's'; 256],
+        })
+        .await
+        .expect("seed");
+    }
+
+    let workers = 8usize;
+    let commits_per_worker = 500usize;
+    let commit_started = Instant::now();
+    let mut tasks = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            let mut latencies_us = Vec::with_capacity(commits_per_worker);
+            for i in 0..commits_per_worker {
+                let started = Instant::now();
+                db.commit(Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: format!("profile:commit:{worker:02}:{i:06}").into_bytes(),
+                    value: vec![b'c'; 256],
+                })
+                .await
+                .expect("commit");
+                latencies_us.push(started.elapsed().as_micros());
+            }
+            latencies_us
+        }));
+    }
+    let mut all_commit_latencies = Vec::with_capacity(workers * commits_per_worker);
+    for task in tasks {
+        let mut worker_latencies = task.await.expect("worker join");
+        all_commit_latencies.append(&mut worker_latencies);
+    }
+    let commit_elapsed = commit_started.elapsed();
+    all_commit_latencies.sort_unstable();
+    let commit_tps = (workers * commits_per_worker) as f64 / commit_elapsed.as_secs_f64();
+    let commit_p50 = percentile(&all_commit_latencies, 0.50);
+    let commit_p99 = percentile(&all_commit_latencies, 0.99);
+    let op_after_commits = db.operational_metrics().await;
+
+    let checkpoint_total_started = Instant::now();
+    let checkpoint_lock_started = Instant::now();
+    let _checkpoint_guard = db.checkpoint_lock.lock().await;
+    let checkpoint_lock_wait = checkpoint_lock_started.elapsed();
+
+    let snapshot_started = Instant::now();
+    let checkpoint_seq = db.executor.durable_head_seq_now();
+    let lease = db
+        .acquire_snapshot(ConsistencyMode::AtSeq(checkpoint_seq))
+        .await
+        .expect("checkpoint snapshot");
+    let snapshot_elapsed = snapshot_started.elapsed();
+
+    let idempotency_started = Instant::now();
+    let mut idempotency = db.executor.idempotency_snapshot().await;
+    idempotency.retain(|_, record| record.commit_seq <= checkpoint_seq);
+    let idempotency_elapsed = idempotency_started.elapsed();
+
+    let write_checkpoint_started = Instant::now();
+    let checkpoint = crate::checkpoint::writer::write_checkpoint_with_key(
+        lease.view.keyspace.as_ref(),
+        lease.view.catalog.as_ref(),
+        checkpoint_seq,
+        &db.dir,
+        db._config.checkpoint_key(),
+        db._config.checkpoint_key_id.clone(),
+        idempotency,
+        db._config.checkpoint_compression_level,
+    )
+    .expect("write checkpoint");
+    let write_checkpoint_elapsed = write_checkpoint_started.elapsed();
+
+    let segments_started = Instant::now();
+    let segments = crate::lib_helpers::read_segments_for_checkpoint(&db.dir, checkpoint_seq)
+        .expect("read segments for checkpoint");
+    let active_segment_seq = segments
+        .last()
+        .map(|segment| segment.segment_seq)
+        .unwrap_or(checkpoint_seq.saturating_add(1));
+    let segments_elapsed = segments_started.elapsed();
+
+    let manifest_started = Instant::now();
+    let manifest = crate::manifest::schema::Manifest {
+        durable_seq: checkpoint_seq,
+        visible_seq: checkpoint_seq,
+        active_segment_seq,
+        checkpoints: vec![checkpoint.clone()],
+        segments: segments.clone(),
+    };
+    crate::manifest::atomic::write_manifest_atomic_signed(
+        &manifest,
+        &db.dir,
+        db._config.hmac_key(),
+    )
+    .expect("write manifest");
+    let manifest_elapsed = manifest_started.elapsed();
+    let checkpoint_total_elapsed = checkpoint_total_started.elapsed();
+    drop(_checkpoint_guard);
+
+    let checkpoint_bytes = std::fs::metadata(db.dir.join(&checkpoint.filename))
+        .expect("checkpoint stat")
+        .len();
+
+    drop(db);
+    let reopen_started = Instant::now();
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopen_elapsed = reopen_started.elapsed();
+    let reopen_metrics = reopened.operational_metrics().await;
+
+    eprintln!(
+        "pipeline_profile commit_phase: workers={} commits_per_worker={} commits={} elapsed_ms={} tps={:.2} p50_us={} p99_us={} | prestage_validate_ops={} avg_prestage_validate_us={} epoch_process_ops={} avg_epoch_process_us={} avg_wal_append_us={} avg_wal_sync_us={} avg_coordinator_apply_us={}",
+        workers,
+        commits_per_worker,
+        workers * commits_per_worker,
+        commit_elapsed.as_millis(),
+        commit_tps,
+        commit_p50,
+        commit_p99,
+        op_after_commits.prestage_validate_ops,
+        op_after_commits.avg_prestage_validate_micros,
+        op_after_commits.epoch_process_ops,
+        op_after_commits.avg_epoch_process_micros,
+        op_after_commits.avg_wal_append_micros,
+        op_after_commits.avg_wal_sync_micros,
+        op_after_commits.avg_coordinator_apply_micros
+    );
+    eprintln!(
+        "pipeline_profile checkpoint_phase: seq={} total_ms={} lock_wait_ms={} snapshot_ms={} idempotency_ms={} write_checkpoint_ms={} segment_scan_ms={} manifest_ms={} checkpoint_bytes={} retained_segments={}",
+        checkpoint_seq,
+        checkpoint_total_elapsed.as_millis(),
+        checkpoint_lock_wait.as_millis(),
+        snapshot_elapsed.as_millis(),
+        idempotency_elapsed.as_millis(),
+        write_checkpoint_elapsed.as_millis(),
+        segments_elapsed.as_millis(),
+        manifest_elapsed.as_millis(),
+        checkpoint_bytes,
+        segments.len()
+    );
+    eprintln!(
+        "pipeline_profile recovery_phase: reopen_ms={} startup_recovery_micros={} startup_recovered_seq={} durable_head_seq={} visible_head_seq={}",
+        reopen_elapsed.as_millis(),
+        reopen_metrics.startup_recovery_micros,
+        reopen_metrics.startup_recovered_seq,
+        reopen_metrics.durable_head_seq,
+        reopen_metrics.visible_head_seq
+    );
 }
 
 #[tokio::test]
@@ -5617,4 +7214,364 @@ async fn sql_transaction_plan_helpers_commit() {
         .await
         .expect("exists");
     assert!(exists);
+}
+
+#[tokio::test]
+#[ignore = "long-running multi-agent user-perspective profile"]
+async fn secure_multi_agent_profile_identifies_core_shortcomings() {
+    fn u256_be(v: u64) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[24..].copy_from_slice(&v.to_be_bytes());
+        out
+    }
+    fn decode_u256_u64(bytes: [u8; 32]) -> u64 {
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&bytes[24..]);
+        u64::from_be_bytes(out)
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct WorkerStats {
+        attempted: usize,
+        accepted: usize,
+        rejected: usize,
+        unauthorized_attempted: usize,
+        unauthorized_denied: usize,
+        latency_sum_us: u128,
+        latency_max_us: u64,
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct RuntimePeaks {
+        queue_depth: usize,
+        inflight: usize,
+        durable_lag: u64,
+        conflict_rate: f64,
+        durable_wait_ops: u64,
+        durable_wait_avg_us: u64,
+        wal_append_ops: u64,
+        wal_append_bytes: u64,
+        wal_append_avg_us: u64,
+        wal_sync_ops: u64,
+        wal_sync_avg_us: u64,
+        commit_errors: u64,
+        permission_rejections: u64,
+        validation_rejections: u64,
+        queue_full_rejections: u64,
+        timeout_rejections: u64,
+        read_set_conflicts: u64,
+    }
+
+    let agents = std::env::var("AEDB_MULTI_AGENT_PROFILE_AGENTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(12)
+        .max(4);
+    let ops_per_agent = std::env::var("AEDB_MULTI_AGENT_PROFILE_OPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(800)
+        .max(100);
+
+    let dir = tempdir().expect("temp");
+    let db = Arc::new(
+        AedbInstance::open_secure(AedbConfig::production([3u8; 32]), dir.path())
+            .expect("open secure"),
+    );
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+
+    let agent_ids: Vec<String> = (0..agents).map(|i| format!("prof_agent_{i}")).collect();
+    for a in &agent_ids {
+        db.commit_as(
+            system.clone(),
+            Mutation::Ddl(DdlOperation::GrantPermission {
+                caller_id: a.clone(),
+                permission: Permission::KvRead {
+                    project_id: "p".into(),
+                    scope_id: Some("app".into()),
+                    prefix: Some(format!("agent:{a}:").into_bytes()),
+                },
+                actor_id: Some("system".into()),
+                delegable: false,
+            }),
+        )
+        .await
+        .expect("grant kv read");
+        db.commit_as(
+            system.clone(),
+            Mutation::Ddl(DdlOperation::GrantPermission {
+                caller_id: a.clone(),
+                permission: Permission::KvWrite {
+                    project_id: "p".into(),
+                    scope_id: Some("app".into()),
+                    prefix: Some(format!("agent:{a}:").into_bytes()),
+                },
+                actor_id: Some("system".into()),
+                delegable: false,
+            }),
+        )
+        .await
+        .expect("grant kv write");
+        db.commit_as(
+            system.clone(),
+            Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("agent:{a}:balance").into_bytes(),
+                value: u256_be(0).to_vec(),
+            },
+        )
+        .await
+        .expect("seed balance");
+    }
+
+    let done = Arc::new(tokio::sync::Notify::new());
+    let peaks = Arc::new(std::sync::Mutex::new(RuntimePeaks::default()));
+    let monitor_db = Arc::clone(&db);
+    let monitor_done = Arc::clone(&done);
+    let monitor_peaks = Arc::clone(&peaks);
+    let monitor = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = monitor_done.notified() => break,
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    let op = monitor_db.operational_metrics().await;
+                    let mut p = monitor_peaks.lock().expect("peaks lock");
+                    p.queue_depth = p.queue_depth.max(op.queue_depth);
+                    p.inflight = p.inflight.max(op.inflight_commits);
+                    p.durable_lag = p.durable_lag.max(op.durable_head_lag);
+                    p.conflict_rate = p.conflict_rate.max(op.conflict_rate);
+                    p.durable_wait_ops = p.durable_wait_ops.max(op.durable_wait_ops);
+                    p.durable_wait_avg_us = p.durable_wait_avg_us.max(op.avg_durable_wait_micros);
+                    p.wal_append_ops = p.wal_append_ops.max(op.wal_append_ops);
+                    p.wal_append_bytes = p.wal_append_bytes.max(op.wal_append_bytes);
+                    p.wal_append_avg_us = p.wal_append_avg_us.max(op.avg_wal_append_micros);
+                    p.wal_sync_ops = p.wal_sync_ops.max(op.wal_sync_ops);
+                    p.wal_sync_avg_us = p.wal_sync_avg_us.max(op.avg_wal_sync_micros);
+                    p.commit_errors = p.commit_errors.max(op.commit_errors);
+                    p.permission_rejections = p.permission_rejections.max(op.permission_rejections);
+                    p.validation_rejections = p.validation_rejections.max(op.validation_rejections);
+                    p.queue_full_rejections = p.queue_full_rejections.max(op.queue_full_rejections);
+                    p.timeout_rejections = p.timeout_rejections.max(op.timeout_rejections);
+                    p.read_set_conflicts = p.read_set_conflicts.max(op.read_set_conflicts);
+                }
+            }
+        }
+    });
+
+    let started = Instant::now();
+    let mut tasks = Vec::with_capacity(agent_ids.len());
+    for (idx, agent) in agent_ids.iter().enumerate() {
+        let db_clone = Arc::clone(&db);
+        let caller = CallerContext::new(agent.clone());
+        let own_key = format!("agent:{agent}:balance").into_bytes();
+        let neighbor = &agent_ids[(idx + 1) % agent_ids.len()];
+        let cross_key = format!("agent:{neighbor}:balance").into_bytes();
+        tasks.push(tokio::spawn(async move {
+            let mut stats = WorkerStats::default();
+            for op in 0..ops_per_agent {
+                stats.attempted += 1;
+                let now = Instant::now();
+                let res = db_clone
+                    .commit_as(
+                        caller.clone(),
+                        Mutation::KvIncU256 {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            key: own_key.clone(),
+                            amount_be: u256_be(1),
+                        },
+                    )
+                    .await;
+                let us = now.elapsed().as_micros() as u64;
+                stats.latency_sum_us += us as u128;
+                stats.latency_max_us = stats.latency_max_us.max(us);
+                match res {
+                    Ok(_) => stats.accepted += 1,
+                    Err(AedbError::Validation(_)) | Err(AedbError::Conflict(_)) => {
+                        stats.rejected += 1
+                    }
+                    Err(other) => return Err(other),
+                }
+
+                if op % 25 == 0 {
+                    stats.unauthorized_attempted += 1;
+                    let denied = db_clone
+                        .commit_as(
+                            caller.clone(),
+                            Mutation::KvIncU256 {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                key: cross_key.clone(),
+                                amount_be: u256_be(1),
+                            },
+                        )
+                        .await;
+                    if matches!(denied, Err(AedbError::PermissionDenied(_))) {
+                        stats.unauthorized_denied += 1;
+                    } else if let Err(other) = denied {
+                        return Err(other);
+                    }
+                }
+            }
+            Ok::<_, AedbError>(stats)
+        }));
+    }
+
+    let mut merged = WorkerStats::default();
+    for t in tasks {
+        let s = t.await.expect("join profile task").expect("profile run");
+        merged.attempted += s.attempted;
+        merged.accepted += s.accepted;
+        merged.rejected += s.rejected;
+        merged.unauthorized_attempted += s.unauthorized_attempted;
+        merged.unauthorized_denied += s.unauthorized_denied;
+        merged.latency_sum_us += s.latency_sum_us;
+        merged.latency_max_us = merged.latency_max_us.max(s.latency_max_us);
+    }
+
+    done.notify_waiters();
+    monitor.await.expect("join monitor");
+    db.force_fsync().await.expect("force fsync");
+
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let attempted_tps = (merged.attempted as f64 / elapsed) as u64;
+    let accepted_tps = (merged.accepted as f64 / elapsed) as u64;
+    let avg_lat_us = (merged.latency_sum_us / merged.attempted.max(1) as u128) as u64;
+    let peaks = *peaks.lock().expect("peaks lock");
+    let heads = db.head_state().await;
+
+    eprintln!(
+        "multi_agent_profile: agents={} ops_per_agent={} attempted={} accepted={} rejected={} unauthorized_denied={} attempted_tps={} accepted_tps={} avg_lat_us={} max_lat_us={} peak_queue_depth={} peak_inflight={} peak_durable_lag={} peak_conflict_rate={:.4} peak_durable_wait_ops={} peak_durable_wait_avg_us={} peak_wal_append_ops={} peak_wal_append_bytes={} peak_wal_append_avg_us={} peak_wal_sync_ops={} peak_wal_sync_avg_us={} peak_commit_errors={} peak_permission_rejections={} peak_validation_rejections={} peak_queue_full_rejections={} peak_timeout_rejections={} peak_read_set_conflicts={} heads(v={},d={})",
+        agents,
+        ops_per_agent,
+        merged.attempted,
+        merged.accepted,
+        merged.rejected,
+        merged.unauthorized_denied,
+        attempted_tps,
+        accepted_tps,
+        avg_lat_us,
+        merged.latency_max_us,
+        peaks.queue_depth,
+        peaks.inflight,
+        peaks.durable_lag,
+        peaks.conflict_rate,
+        peaks.durable_wait_ops,
+        peaks.durable_wait_avg_us,
+        peaks.wal_append_ops,
+        peaks.wal_append_bytes,
+        peaks.wal_append_avg_us,
+        peaks.wal_sync_ops,
+        peaks.wal_sync_avg_us,
+        peaks.commit_errors,
+        peaks.permission_rejections,
+        peaks.validation_rejections,
+        peaks.queue_full_rejections,
+        peaks.timeout_rejections,
+        peaks.read_set_conflicts,
+        heads.visible_head_seq,
+        heads.durable_head_seq
+    );
+
+    assert_eq!(
+        merged.accepted + merged.rejected,
+        merged.attempted,
+        "profile run must not drop operations"
+    );
+    assert_eq!(
+        merged.unauthorized_denied, merged.unauthorized_attempted,
+        "cross-agent unauthorized writes must always be denied"
+    );
+    assert!(
+        heads.visible_head_seq >= heads.durable_head_seq,
+        "visible head should be >= durable head"
+    );
+    assert!(
+        attempted_tps >= 200,
+        "profile indicates severe throughput regression: attempted_tps={attempted_tps}"
+    );
+    assert!(
+        peaks.commit_errors <= (merged.rejected + merged.unauthorized_denied) as u64,
+        "unexpected commit errors exceed rejected + unauthorized-denied operations"
+    );
+    assert_eq!(
+        peaks.permission_rejections, merged.unauthorized_denied as u64,
+        "permission rejection accounting must match denied unauthorized attempts"
+    );
+    assert_eq!(
+        peaks.validation_rejections, merged.rejected as u64,
+        "validation rejection accounting must match application-level rejected operations"
+    );
+    assert_eq!(
+        peaks.queue_full_rejections, 0,
+        "unexpected queue-full rejections under baseline profile load"
+    );
+    assert_eq!(
+        peaks.timeout_rejections, 0,
+        "unexpected timeout rejections under baseline profile load"
+    );
+    assert_eq!(
+        peaks.durable_wait_ops, 0,
+        "baseline non-durable profile should not accumulate durable wait operations"
+    );
+    assert!(
+        peaks.wal_sync_ops > 0,
+        "full-durability secure profile should execute WAL sync operations"
+    );
+
+    for agent in &agent_ids {
+        let caller = CallerContext::new(agent.clone());
+        let entry = db
+            .kv_get(
+                "p",
+                "app",
+                format!("agent:{agent}:balance").as_bytes(),
+                ConsistencyMode::AtLatest,
+                &caller,
+            )
+            .await
+            .expect("read own balance")
+            .expect("balance exists");
+        let mut bal = [0u8; 32];
+        bal.copy_from_slice(&entry.value);
+        assert!(
+            decode_u256_u64(bal) as usize <= ops_per_agent,
+            "agent balance must not exceed own attempts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn strict_open_rejects_directory_previously_opened_in_non_strict_mode() {
+    let dir = tempdir().expect("temp");
+    let mut permissive = AedbConfig::production([7u8; 32]);
+    permissive.recovery_mode = RecoveryMode::Permissive;
+    permissive.hash_chain_required = false;
+
+    let db = AedbInstance::open(permissive, dir.path()).expect("open permissive");
+    db.shutdown().await.expect("shutdown permissive");
+
+    let strict = AedbConfig::production([7u8; 32]);
+    let err = match AedbInstance::open(strict, dir.path()) {
+        Ok(db) => {
+            db.shutdown().await.expect("shutdown unexpected strict db");
+            panic!("strict open should fail closed");
+        }
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("strict open denied")),
+        "unexpected error: {err}"
+    );
 }

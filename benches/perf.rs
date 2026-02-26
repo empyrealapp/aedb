@@ -131,8 +131,8 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
                 if next_multi_commit_base > SEEDED_ROWS {
                     next_multi_commit_base = 1;
                 }
-                for offset in 0..BATCH_INSERT_ROWS {
-                    let id = ((base + offset - 1) % SEEDED_ROWS) + 1;
+                for row_offset in 0..BATCH_INSERT_ROWS {
+                    let id = ((base + row_offset - 1) % SEEDED_ROWS) + 1;
                     seed_db
                         .commit(Mutation::Upsert {
                             project_id: PROJECT_ID.into(),
@@ -164,8 +164,8 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
                     next_batch_commit_base = 1;
                 }
                 let mut rows = Vec::with_capacity(BATCH_INSERT_ROWS as usize);
-                for offset in 0..BATCH_INSERT_ROWS {
-                    let id = ((base + offset - 1) % SEEDED_ROWS) + 1;
+                for row_offset in 0..BATCH_INSERT_ROWS {
+                    let id = ((base + row_offset - 1) % SEEDED_ROWS) + 1;
                     rows.push(Row {
                         values: vec![
                             Value::Integer(id),

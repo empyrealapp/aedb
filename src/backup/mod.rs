@@ -116,14 +116,14 @@ pub fn write_backup_archive(
     writer.write_all(&[archive_flags])?;
     writer.write_all(&salt)?;
 
-    for (idx, rel) in rel_files.iter().enumerate() {
+    for (entry_index, rel) in rel_files.iter().enumerate() {
         let resolved = resolve_backup_path(dir, rel)?;
         let raw = fs::read(&resolved)?;
         let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
             .map_err(|e| AedbError::Encode(e.to_string()))?;
 
         let payload = if let Some(key) = encryption_key {
-            let nonce = derive_archive_nonce(&salt, idx as u64, rel);
+            let nonce = derive_archive_nonce(&salt, entry_index as u64, rel);
             encrypt_archive_payload(&compressed, key, &nonce)?
         } else {
             compressed
@@ -172,7 +172,7 @@ pub fn extract_backup_archive(
     let mut salt = [0u8; 16];
     reader.read_exact(&mut salt)?;
 
-    let mut idx = 0u64;
+    let mut entry_index = 0u64;
     loop {
         let entry = read_u8(&mut reader)?;
         if entry == BACKUP_ARCHIVE_ENTRY_END {
@@ -205,7 +205,7 @@ pub fn extract_backup_archive(
                     "backup archive missing encryption key".into(),
                 ));
             };
-            let expected_nonce = derive_archive_nonce(&salt, idx, &rel);
+            let expected_nonce = derive_archive_nonce(&salt, entry_index, &rel);
             decrypt_archive_payload(&payload, key, &expected_nonce)?
         } else {
             payload
@@ -216,7 +216,7 @@ pub fn extract_backup_archive(
 
         let out = resolve_backup_output_path(dir, &rel)?;
         fs::write(out, bytes)?;
-        idx = idx.saturating_add(1);
+        entry_index = entry_index.saturating_add(1);
     }
     Ok(())
 }

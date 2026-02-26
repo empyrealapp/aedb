@@ -890,10 +890,10 @@ fn default_primary_index_backend() -> PrimaryIndexBackend {
 
 fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
-    for idx in (0..end.len()).rev() {
-        if end[idx] != u8::MAX {
-            end[idx] = end[idx].saturating_add(1);
-            end.truncate(idx + 1);
+    for byte_index in (0..end.len()).rev() {
+        if end[byte_index] != u8::MAX {
+            end[byte_index] = end[byte_index].saturating_add(1);
+            end.truncate(byte_index + 1);
             return Some(end);
         }
     }
@@ -907,7 +907,8 @@ fn encode_u256(v: U256) -> Vec<u8> {
 }
 
 fn decode_u256(bytes: &[u8]) -> Result<U256, crate::error::AedbError> {
-    if bytes.len() != 32 {
+    let value_size_bytes = bytes.len();
+    if value_size_bytes != 32 {
         return Err(crate::error::AedbError::Validation(
             "invalid u256 bytes length".into(),
         ));

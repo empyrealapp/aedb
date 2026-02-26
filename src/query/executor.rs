@@ -933,7 +933,7 @@ fn resolve_selected_indices(
     }
     let mut indices = Vec::with_capacity(query.select.len());
     for col in &query.select {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *col)
@@ -941,7 +941,7 @@ fn resolve_selected_indices(
                 table: query.table.clone(),
                 column: col.clone(),
             })?;
-        indices.push(idx);
+        indices.push(column_index);
     }
     Ok(Some(indices))
 }
@@ -1181,23 +1181,28 @@ fn encode_cursor(cursor: &CursorToken) -> Result<String, QueryError> {
 }
 
 fn decode_cursor(encoded: &str) -> Result<CursorToken, QueryError> {
-    if !encoded.len().is_multiple_of(2) {
+    let encoded_size_bytes = encoded.len();
+    if !encoded_size_bytes.is_multiple_of(2) {
         return Err(QueryError::InvalidQuery {
             reason: "invalid cursor".into(),
         });
     }
-    let mut bytes = Vec::with_capacity(encoded.len() / 2);
-    let raw = encoded.as_bytes();
-    for i in (0..raw.len()).step_by(2) {
-        let hi = decode_hex_nibble(raw[i]).ok_or_else(|| QueryError::InvalidQuery {
-            reason: "invalid cursor".into(),
+    let mut decoded_bytes = Vec::with_capacity(encoded_size_bytes / 2);
+    let encoded_bytes = encoded.as_bytes();
+    for byte_offset in (0..encoded_bytes.len()).step_by(2) {
+        let hi = decode_hex_nibble(encoded_bytes[byte_offset]).ok_or_else(|| {
+            QueryError::InvalidQuery {
+                reason: "invalid cursor".into(),
+            }
         })?;
-        let lo = decode_hex_nibble(raw[i + 1]).ok_or_else(|| QueryError::InvalidQuery {
-            reason: "invalid cursor".into(),
+        let lo = decode_hex_nibble(encoded_bytes[byte_offset + 1]).ok_or_else(|| {
+            QueryError::InvalidQuery {
+                reason: "invalid cursor".into(),
+            }
         })?;
-        bytes.push((hi << 4) | lo);
+        decoded_bytes.push((hi << 4) | lo);
     }
-    rmp_serde::from_slice(&bytes).map_err(|e| QueryError::InvalidQuery {
+    rmp_serde::from_slice(&decoded_bytes).map_err(|e| QueryError::InvalidQuery {
         reason: e.to_string(),
     })
 }
@@ -1212,7 +1217,7 @@ fn decode_hex_nibble(byte: u8) -> Option<u8> {
 }
 
 fn aggregate_col_idx(agg: &Aggregate, columns: &[String]) -> Result<Option<usize>, QueryError> {
-    let idx = match agg {
+    let column_index = match agg {
         Aggregate::Count => return Ok(None),
         Aggregate::Sum(col) | Aggregate::Min(col) | Aggregate::Max(col) | Aggregate::Avg(col) => {
             columns
@@ -1224,7 +1229,7 @@ fn aggregate_col_idx(agg: &Aggregate, columns: &[String]) -> Result<Option<usize
                 })?
         }
     };
-    Ok(Some(idx))
+    Ok(Some(column_index))
 }
 
 fn aggregate_output_name(agg: &Aggregate) -> String {
@@ -1368,12 +1373,13 @@ fn indexed_pks_for_predicate_with_trace(
         let Some((idx_name, prefix_cols)) = best else {
             return Ok(None);
         };
-        let index = table
-            .indexes
-            .get(&idx_name)
-            .ok_or_else(|| QueryError::InvalidQuery {
-                reason: "index not found".into(),
-            })?;
+        let selected_index =
+            table
+                .indexes
+                .get(&idx_name)
+                .ok_or_else(|| QueryError::InvalidQuery {
+                    reason: "index not found".into(),
+                })?;
         let idx_def = catalog
             .indexes
             .get(&(ns, table_name.to_string(), idx_name.clone()))
@@ -1388,9 +1394,9 @@ fn indexed_pks_for_predicate_with_trace(
             .collect::<Vec<_>>();
         let encoded = EncodedKey::from_values(&prefix_values);
         let pks = if prefix_cols == idx_def.columns.len() {
-            index.scan_eq(&encoded)
+            selected_index.scan_eq(&encoded)
         } else {
-            index.scan_prefix(&encoded)
+            selected_index.scan_prefix(&encoded)
         };
         return Ok(Some(IndexLookupResult {
             pks,
@@ -1597,10 +1603,10 @@ fn like_prefix(pattern: &str) -> Option<String> {
 
 fn next_prefix(prefix: &str) -> Option<String> {
     let mut bytes = prefix.as_bytes().to_vec();
-    for i in (0..bytes.len()).rev() {
-        if bytes[i] != u8::MAX {
-            bytes[i] += 1;
-            bytes.truncate(i + 1);
+    for byte_index in (0..bytes.len()).rev() {
+        if bytes[byte_index] != u8::MAX {
+            bytes[byte_index] += 1;
+            bytes.truncate(byte_index + 1);
             return String::from_utf8(bytes).ok();
         }
     }
@@ -1747,13 +1753,13 @@ mod tests {
         let table = keyspace
             .table_by_namespace_key_mut(&namespace_key("A", "app"), "users")
             .expect("table");
-        let mut index = SecondaryIndex::default();
+        let mut secondary_index = SecondaryIndex::default();
         for (pk, row) in &table.rows {
             let age_key =
                 extract_index_key_encoded(row, &schema, &["age".into()]).expect("age index key");
-            index.insert(age_key, pk.clone());
+            secondary_index.insert(age_key, pk.clone());
         }
-        table.indexes.insert("by_age".into(), index);
+        table.indexes.insert("by_age".into(), secondary_index);
         let mut by_name = SecondaryIndex::default();
         for (pk, row) in &table.rows {
             let key =

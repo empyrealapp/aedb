@@ -5,7 +5,7 @@ use crate::error::AedbError;
 use crate::manifest::atomic::write_manifest_atomic_signed;
 use crate::manifest::schema::Manifest;
 use crate::recovery::{RecoveredState, recover_with_config};
-use crate::storage::keyspace::NamespaceId;
+use crate::storage::keyspace::{NamespaceId, SecondaryIndexStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -112,6 +112,7 @@ pub fn restore_snapshot_dump(
         config.checkpoint_key(),
         config.checkpoint_key_id.clone(),
         envelope.state.idempotency.clone(),
+        config.checkpoint_compression_level,
     )?;
     let manifest = Manifest {
         durable_seq: envelope.state.current_seq,
@@ -183,10 +184,186 @@ fn load_dump(path: &Path) -> Result<SnapshotDumpEnvelope, AedbError> {
 }
 
 fn checksum_state(state: &SnapshotDumpState) -> Result<String, AedbError> {
-    let bytes = rmp_serde::to_vec(state).map_err(|e| AedbError::Encode(e.to_string()))?;
     let mut h = Sha256::new();
-    h.update(&bytes);
+    hash_label(&mut h, "current_seq");
+    hash_encoded(&mut h, &state.current_seq)?;
+
+    hash_label(&mut h, "primary_index_backend");
+    hash_encoded(&mut h, &state.keyspace.primary_index_backend)?;
+
+    hash_label(&mut h, "namespaces");
+    let mut namespaces = state
+        .keyspace
+        .namespaces
+        .iter()
+        .map(|(ns_id, namespace)| -> Result<_, AedbError> {
+            Ok((encode(ns_id)?, ns_id, namespace))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    namespaces.sort_by(|a, b| a.0.cmp(&b.0));
+    for (ns_key_bytes, _, namespace) in namespaces {
+        hash_bytes(&mut h, &ns_key_bytes);
+
+        hash_label(&mut h, "kv_entries");
+        for (key, entry) in namespace.kv.entries.iter() {
+            hash_bytes(&mut h, key);
+            hash_encoded(&mut h, entry)?;
+        }
+
+        hash_label(&mut h, "tables");
+        let mut tables = namespace.tables.iter().collect::<Vec<_>>();
+        tables.sort_by(|a, b| a.0.cmp(b.0));
+        for (table_name, table) in tables {
+            hash_bytes(&mut h, table_name.as_bytes());
+            hash_encoded(&mut h, &table.structural_version)?;
+
+            hash_label(&mut h, "rows");
+            for (pk, row) in table.rows.iter() {
+                hash_bytes(&mut h, pk.as_slice());
+                hash_encoded(&mut h, row)?;
+            }
+
+            hash_label(&mut h, "row_versions");
+            for (pk, version) in table.row_versions.iter() {
+                hash_bytes(&mut h, pk.as_slice());
+                hash_encoded(&mut h, version)?;
+            }
+
+            hash_label(&mut h, "indexes");
+            let mut indexes = table.indexes.iter().collect::<Vec<_>>();
+            indexes.sort_by(|a, b| a.0.cmp(b.0));
+            for (index_name, index) in indexes {
+                hash_bytes(&mut h, index_name.as_bytes());
+                hash_encoded(&mut h, &index.columns_bitmask)?;
+                hash_encoded(&mut h, &index.partial_filter)?;
+                hash_secondary_index_store(&mut h, &index.store)?;
+            }
+        }
+    }
+
+    hash_label(&mut h, "async_indexes");
+    let mut async_indexes = state
+        .keyspace
+        .async_indexes
+        .iter()
+        .map(|(key, value)| -> Result<_, AedbError> { Ok((encode(key)?, key, value)) })
+        .collect::<Result<Vec<_>, _>>()?;
+    async_indexes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key_bytes, _, value) in async_indexes {
+        hash_bytes(&mut h, &key_bytes);
+        hash_encoded(&mut h, &value.materialized_seq)?;
+        for (pk, row) in value.rows.iter() {
+            hash_bytes(&mut h, pk.as_slice());
+            hash_encoded(&mut h, row)?;
+        }
+    }
+
+    hash_label(&mut h, "catalog");
+    hash_sorted_entries(&mut h, state.catalog.projects.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.scopes.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.tables.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.indexes.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.async_indexes.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.kv_projections.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.permissions.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.permission_grants.iter())?;
+    hash_sorted_entries(&mut h, state.catalog.read_policies.iter())?;
+
+    hash_label(&mut h, "idempotency");
+    hash_sorted_entries(&mut h, state.idempotency.iter())?;
+
     Ok(hex::encode(h.finalize()))
+}
+
+fn hash_secondary_index_store(
+    hasher: &mut Sha256,
+    store: &SecondaryIndexStore,
+) -> Result<(), AedbError> {
+    match store {
+        SecondaryIndexStore::BTree(entries) => {
+            hash_label(hasher, "btree");
+            for (index_key, encoded_pks) in entries.iter() {
+                hash_bytes(hasher, index_key.as_slice());
+                for pk in encoded_pks.iter() {
+                    hash_bytes(hasher, pk.as_slice());
+                }
+            }
+        }
+        SecondaryIndexStore::Hash(entries) => {
+            hash_label(hasher, "hash");
+            let mut ordered = entries
+                .iter()
+                .map(|(index_key, encoded_pks)| (index_key.as_slice().to_vec(), encoded_pks))
+                .collect::<Vec<_>>();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            for (index_key, encoded_pks) in ordered {
+                hash_bytes(hasher, &index_key);
+                let mut pks = encoded_pks
+                    .iter()
+                    .map(|pk| pk.as_slice().to_vec())
+                    .collect::<Vec<_>>();
+                pks.sort();
+                for pk in pks {
+                    hash_bytes(hasher, &pk);
+                }
+            }
+        }
+        SecondaryIndexStore::UniqueHash(entries) => {
+            hash_label(hasher, "unique_hash");
+            let mut ordered = entries
+                .iter()
+                .map(|(index_key, encoded_pk)| {
+                    (
+                        index_key.as_slice().to_vec(),
+                        encoded_pk.as_slice().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            for (index_key, encoded_pk) in ordered {
+                hash_bytes(hasher, &index_key);
+                hash_bytes(hasher, &encoded_pk);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hash_sorted_entries<'a, K, V, I>(hasher: &mut Sha256, entries: I) -> Result<(), AedbError>
+where
+    K: Serialize + 'a,
+    V: Serialize + 'a,
+    I: IntoIterator<Item = (&'a K, &'a V)>,
+{
+    let mut encoded = entries
+        .into_iter()
+        .map(|(key, value)| -> Result<_, AedbError> { Ok((encode(key)?, value)) })
+        .collect::<Result<Vec<_>, _>>()?;
+    encoded.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key_bytes, value) in encoded {
+        hash_bytes(hasher, &key_bytes);
+        hash_encoded(hasher, value)?;
+    }
+    Ok(())
+}
+
+fn hash_label(hasher: &mut Sha256, label: &str) {
+    hash_bytes(hasher, label.as_bytes());
+}
+
+fn hash_encoded<T: Serialize>(hasher: &mut Sha256, value: &T) -> Result<(), AedbError> {
+    let bytes = encode(value)?;
+    hash_bytes(hasher, &bytes);
+    Ok(())
+}
+
+fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AedbError> {
+    rmp_serde::to_vec(value).map_err(|e| AedbError::Encode(e.to_string()))
 }
 
 fn state_counts(state: &SnapshotDumpState) -> (u64, u64) {

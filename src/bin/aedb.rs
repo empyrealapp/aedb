@@ -162,9 +162,9 @@ fn cmd_check_invariants(args: &[String]) -> Result<(), String> {
 }
 
 fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
-    for idx in 0..args.len() {
-        if args[idx] == flag {
-            return args.get(idx + 1).cloned();
+    for arg_index in 0..args.len() {
+        if args[arg_index] == flag {
+            return args.get(arg_index + 1).cloned();
         }
     }
     None

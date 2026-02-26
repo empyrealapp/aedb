@@ -48,10 +48,9 @@ pub fn verify_hash_chain_if_required(paths: &[PathBuf], required: bool) -> Resul
     if !required {
         return Ok(());
     }
-    if paths
-        .iter()
-        .any(|path| fs::metadata(path).map_or(true, |m| m.len() < SEGMENT_HEADER_SIZE as u64))
-    {
+    if paths.iter().any(|path| {
+        fs::metadata(path).map_or(true, |metadata| metadata.len() < SEGMENT_HEADER_SIZE as u64)
+    }) {
         return Err(AedbError::Decode("segment too small".into()));
     }
     verify_hash_chain(paths)
@@ -73,11 +72,11 @@ pub fn validated_hash_chain_prefix_len(
     }
 
     let mut prev_hash = [0u8; 32];
-    let mut valid = 0usize;
+    let mut valid_segment_count = 0usize;
 
     for path in paths {
-        let meta = match fs::metadata(path) {
-            Ok(m) => m,
+        let segment_metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
             Err(e) => {
                 if strict {
                     return Err(AedbError::Io(e));
@@ -85,7 +84,8 @@ pub fn validated_hash_chain_prefix_len(
                 break;
             }
         };
-        if meta.len() < SEGMENT_HEADER_SIZE as u64 {
+        let segment_size_bytes = segment_metadata.len();
+        if segment_size_bytes < SEGMENT_HEADER_SIZE as u64 {
             if strict {
                 return Err(AedbError::Decode("segment too small".into()));
             }
@@ -137,15 +137,16 @@ pub fn validated_hash_chain_prefix_len(
                     if strict {
                         return Err(AedbError::Io(e));
                     }
-                    return Ok(valid);
+                    return Ok(valid_segment_count);
                 }
             }
         }
         prev_hash = *hasher.finalize().as_bytes();
-        valid += 1;
+        valid_segment_count += 1;
     }
 
-    Ok(valid)
+    debug_assert!(valid_segment_count <= paths.len());
+    Ok(valid_segment_count)
 }
 
 fn parse_seq(name: &str) -> Option<u64> {

@@ -2,7 +2,7 @@
 name = "aedb-orderbook"
 version = "0.1.0"
 edition = "2024"
-description = "Order book simulation and stress utilities for AEDB"
+description = "Order book workload toolkit and security validation harness for AEDB"
 license = "MIT OR Apache-2.0"
 
 [dependencies]

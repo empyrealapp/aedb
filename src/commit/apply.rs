@@ -889,6 +889,7 @@ pub fn apply_mutation_trusted_if_eligible(
 
 const AUTHZ_AUDIT_TABLE: &str = "authz_audit";
 const ASSERTION_AUDIT_TABLE: &str = "assertion_audit";
+const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
 const SYSTEM_SCOPE_ID: &str = "app";
 
 struct AuthzAuditContext<'a> {
@@ -997,6 +998,11 @@ fn ensure_internal_audit_schema_for_upsert(
         && table_name == ASSERTION_AUDIT_TABLE
     {
         ensure_assertion_audit_schema(catalog)?;
+    } else if project_id == crate::catalog::SYSTEM_PROJECT_ID
+        && scope_id == SYSTEM_SCOPE_ID
+        && table_name == LIFECYCLE_OUTBOX_TABLE
+    {
+        ensure_lifecycle_outbox_schema(catalog)?;
     }
     Ok(())
 }
@@ -1147,6 +1153,52 @@ fn ensure_assertion_audit_schema(catalog: &mut Catalog) -> Result<(), AedbError>
                 },
             ],
             primary_key: vec!["seq".to_string()],
+            constraints: vec![],
+            foreign_keys: vec![],
+        },
+    );
+    Ok(())
+}
+
+fn ensure_lifecycle_outbox_schema(catalog: &mut Catalog) -> Result<(), AedbError> {
+    ensure_system_project_scope(catalog);
+    let key = (
+        namespace_key(crate::catalog::SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID),
+        LIFECYCLE_OUTBOX_TABLE.to_string(),
+    );
+    if catalog.tables.contains_key(&key) {
+        return Ok(());
+    }
+    catalog.tables.insert(
+        key,
+        TableSchema {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            scope_id: SYSTEM_SCOPE_ID.to_string(),
+            table_name: LIFECYCLE_OUTBOX_TABLE.to_string(),
+            owner_id: Some("system".to_string()),
+            columns: vec![
+                ColumnDef {
+                    name: "commit_seq".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "ts_micros".to_string(),
+                    col_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "event_count".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "events".to_string(),
+                    col_type: ColumnType::Json,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["commit_seq".to_string()],
             constraints: vec![],
             foreign_keys: vec![],
         },
@@ -1419,14 +1471,14 @@ fn apply_upsert_once(
 fn extract_primary_key_from_row(schema: &TableSchema, row: &Row) -> Result<Vec<Value>, AedbError> {
     let mut primary_key = Vec::with_capacity(schema.primary_key.len());
     for pk_name in &schema.primary_key {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *pk_name)
             .ok_or_else(|| {
                 AedbError::Validation(format!("primary key column missing: {pk_name}"))
             })?;
-        let value = row.values.get(idx).ok_or_else(|| {
+        let value = row.values.get(column_index).ok_or_else(|| {
             AedbError::Validation(format!(
                 "primary key column value missing from row: {pk_name}"
             ))
@@ -1551,13 +1603,13 @@ fn lookup_existing_by_unique_index(
 fn apply_default_constraints(schema: &TableSchema, row: &mut Row) -> Result<(), AedbError> {
     for constraint in &schema.constraints {
         if let Constraint::Default { column, value } = constraint
-            && let Some(idx) = schema.columns.iter().position(|c| c.name == *column)
+            && let Some(column_index) = schema.columns.iter().position(|c| c.name == *column)
             && row
                 .values
-                .get(idx)
+                .get(column_index)
                 .is_some_and(|v| matches!(v, Value::Null))
         {
-            row.values[idx] = value.clone();
+            row.values[column_index] = value.clone();
         }
     }
     Ok(())
@@ -1578,7 +1630,7 @@ fn validate_row_constraints(
     for constraint in &schema.constraints {
         match constraint {
             Constraint::NotNull { column } => {
-                let idx = schema
+                let column_index = schema
                     .columns
                     .iter()
                     .position(|c| c.name == *column)
@@ -1586,7 +1638,7 @@ fn validate_row_constraints(
                         table: table_name.to_string(),
                         column: column.clone(),
                     })?;
-                if matches!(row.values.get(idx), Some(Value::Null) | None) {
+                if matches!(row.values.get(column_index), Some(Value::Null) | None) {
                     return Err(AedbError::NotNullViolation {
                         table: table_name.to_string(),
                         column: column.clone(),
@@ -1716,7 +1768,7 @@ fn validate_foreign_keys(
         let mut values = Vec::with_capacity(fk.columns.len());
         let mut any_null = false;
         for col in &fk.columns {
-            let idx = schema
+            let column_index = schema
                 .columns
                 .iter()
                 .position(|c| c.name == *col)
@@ -1724,7 +1776,7 @@ fn validate_foreign_keys(
                     table: schema.table_name.clone(),
                     column: col.clone(),
                 })?;
-            let value = row.values.get(idx).cloned().unwrap_or(Value::Null);
+            let value = row.values.get(column_index).cloned().unwrap_or(Value::Null);
             if matches!(value, Value::Null) {
                 any_null = true;
             }
@@ -1790,11 +1842,12 @@ fn validate_foreign_keys(
             let matched = ref_table.rows.iter().any(|(_pk, r)| {
                 let mut same = true;
                 for (i, ref_col) in fk.references_columns.iter().enumerate() {
-                    let Some(idx) = ref_schema.columns.iter().position(|c| c.name == *ref_col)
+                    let Some(reference_column_index) =
+                        ref_schema.columns.iter().position(|c| c.name == *ref_col)
                     else {
                         return false;
                     };
-                    if r.values.get(idx) != values.get(i) {
+                    if r.values.get(reference_column_index) != values.get(i) {
                         same = false;
                         break;
                     }
@@ -1927,13 +1980,13 @@ fn apply_update_where_internal(
         .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
     let mut update_indices = Vec::with_capacity(updates.len());
     for (column, value) in updates {
-        let Some(idx) = schema.columns.iter().position(|c| c.name == *column) else {
+        let Some(column_index) = schema.columns.iter().position(|c| c.name == *column) else {
             return Err(AedbError::UnknownColumn {
                 table: table_name.to_string(),
                 column: column.clone(),
             });
         };
-        update_indices.push((idx, value.clone()));
+        update_indices.push((column_index, value.clone()));
     }
     let mut staged = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
@@ -1943,8 +1996,8 @@ fn apply_update_where_internal(
             }
             let primary_key = extract_primary_key_from_row(&schema, row)?;
             let mut next_row = row.clone();
-            for (idx, value) in &update_indices {
-                next_row.values[*idx] = value.clone();
+            for (column_index, value) in &update_indices {
+                next_row.values[*column_index] = value.clone();
             }
             staged.push((primary_key, next_row));
             if limit.is_some_and(|max| staged.len() >= max) {
@@ -1993,7 +2046,7 @@ fn apply_update_where_expr_internal(
         .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
     let mut update_indices = Vec::with_capacity(updates.len());
     for (column, expr) in updates {
-        let Some(idx) = schema.columns.iter().position(|c| c.name == *column) else {
+        let Some(column_index) = schema.columns.iter().position(|c| c.name == *column) else {
             return Err(AedbError::UnknownColumn {
                 table: table_name.to_string(),
                 column: column.clone(),
@@ -2015,7 +2068,7 @@ fn apply_update_where_expr_internal(
                 ResolvedTableUpdateExpr::Coalesce(fallback.clone())
             }
         };
-        update_indices.push((idx, resolved));
+        update_indices.push((column_index, resolved));
     }
     let mut staged = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
@@ -2025,9 +2078,9 @@ fn apply_update_where_expr_internal(
             }
             let primary_key = extract_primary_key_from_row(&schema, row)?;
             let mut next_row = row.clone();
-            for (idx, expr) in &update_indices {
-                let next_value = evaluate_table_update_expr(expr, &next_row, *idx)?;
-                next_row.values[*idx] = next_value;
+            for (column_index, expr) in &update_indices {
+                let next_value = evaluate_table_update_expr(expr, &next_row, *column_index)?;
+                next_row.values[*column_index] = next_value;
             }
             staged.push((primary_key, next_row));
             if limit.is_some_and(|max| staged.len() >= max) {
@@ -2113,7 +2166,7 @@ fn handle_referencing_foreign_keys(
             }
             let mut referenced_vals = Vec::with_capacity(fk.references_columns.len());
             for ref_col in &fk.references_columns {
-                let idx = catalog
+                let reference_column_index = catalog
                     .tables
                     .get(&(target_ns.clone(), ref_table_name.to_string()))
                     .and_then(|s| s.columns.iter().position(|c| c.name == *ref_col))
@@ -2123,7 +2176,7 @@ fn handle_referencing_foreign_keys(
                             fk.name
                         ))
                     })?;
-                referenced_vals.push(ref_row.values[idx].clone());
+                referenced_vals.push(ref_row.values[reference_column_index].clone());
             }
             let Some(dep_table) = keyspace
                 .table_by_namespace_key(dep_ns, dep_table_name)
@@ -2197,11 +2250,13 @@ fn handle_referencing_foreign_keys(
                             .cloned()
                             .ok_or_else(|| AedbError::Validation("dependent row missing".into()))?;
                         for fk_col in &fk.columns {
-                            if let Some(idx) =
+                            if let Some(column_index) =
                                 dep_schema.columns.iter().position(|c| c.name == *fk_col)
                             {
                                 match fk.on_delete {
-                                    ForeignKeyAction::SetNull => row.values[idx] = Value::Null,
+                                    ForeignKeyAction::SetNull => {
+                                        row.values[column_index] = Value::Null
+                                    }
                                     ForeignKeyAction::SetDefault => {
                                         if let Some(default_value) =
                                             dep_schema.constraints.iter().find_map(|c| match c {
@@ -2213,9 +2268,9 @@ fn handle_referencing_foreign_keys(
                                                 _ => None,
                                             })
                                         {
-                                            row.values[idx] = default_value;
+                                            row.values[column_index] = default_value;
                                         } else {
-                                            row.values[idx] = Value::Null;
+                                            row.values[column_index] = Value::Null;
                                         }
                                     }
                                     _ => {}
@@ -2333,11 +2388,11 @@ fn apply_upsert_on_conflict_once(
         match conflict_action {
             ConflictAction::DoNothing => {}
             ConflictAction::DoMerge => {
-                for idx in 0..final_row.values.len() {
-                    if let Some(proposed) = row.values.get(idx)
+                for column_index in 0..final_row.values.len() {
+                    if let Some(proposed) = row.values.get(column_index)
                         && !matches!(proposed, Value::Null)
                     {
-                        final_row.values[idx] = proposed.clone();
+                        final_row.values[column_index] = proposed.clone();
                     }
                 }
             }
@@ -2445,20 +2500,20 @@ fn evaluate_update_expr(
     match expr {
         UpdateExpr::Value(v) => Ok(v),
         UpdateExpr::Existing(column) => {
-            let idx = schema
+            let column_index = schema
                 .columns
                 .iter()
                 .position(|c| c.name == column)
                 .ok_or_else(|| AedbError::Validation("update expr column missing".into()))?;
-            Ok(existing.values[idx].clone())
+            Ok(existing.values[column_index].clone())
         }
         UpdateExpr::Proposed(column) => {
-            let idx = schema
+            let column_index = schema
                 .columns
                 .iter()
                 .position(|c| c.name == column)
                 .ok_or_else(|| AedbError::Validation("update expr column missing".into()))?;
-            Ok(proposed.values[idx].clone())
+            Ok(proposed.values[column_index].clone())
         }
         UpdateExpr::AddI64 {
             existing_column,
@@ -2518,13 +2573,13 @@ fn handle_referencing_foreign_keys_on_update(
             let mut old_values = Vec::with_capacity(fk.references_columns.len());
             let mut new_values = Vec::with_capacity(fk.references_columns.len());
             for ref_col in &fk.references_columns {
-                let idx = ref_schema
+                let reference_column_index = ref_schema
                     .columns
                     .iter()
                     .position(|c| c.name == *ref_col)
                     .ok_or_else(|| AedbError::Validation("referenced column missing".into()))?;
-                old_values.push(old_row.values[idx].clone());
-                new_values.push(new_row.values[idx].clone());
+                old_values.push(old_row.values[reference_column_index].clone());
+                new_values.push(new_row.values[reference_column_index].clone());
             }
             if old_values == new_values {
                 continue;
@@ -2588,16 +2643,18 @@ fn handle_referencing_foreign_keys_on_update(
                             .cloned()
                             .ok_or_else(|| AedbError::Validation("dependent row missing".into()))?;
                         for (i, fk_col) in fk.columns.iter().enumerate() {
-                            if let Some(idx) =
+                            if let Some(column_index) =
                                 dep_schema.columns.iter().position(|c| c.name == *fk_col)
                             {
                                 match fk.on_update {
                                     ForeignKeyAction::Cascade => {
-                                        row.values[idx] = new_values[i].clone()
+                                        row.values[column_index] = new_values[i].clone()
                                     }
-                                    ForeignKeyAction::SetNull => row.values[idx] = Value::Null,
+                                    ForeignKeyAction::SetNull => {
+                                        row.values[column_index] = Value::Null
+                                    }
                                     ForeignKeyAction::SetDefault => {
-                                        row.values[idx] = dep_schema
+                                        row.values[column_index] = dep_schema
                                             .constraints
                                             .iter()
                                             .find_map(|c| match c {
@@ -2835,33 +2892,34 @@ fn maintain_secondary_indexes(
         {
             continue;
         }
-        let index = table
-            .indexes
-            .entry(idx_name.clone())
-            .or_insert_with(|| SecondaryIndex {
-                store: match idx_def.index_type {
-                    crate::catalog::schema::IndexType::BTree
-                    | crate::catalog::schema::IndexType::Art => {
-                        SecondaryIndexStore::BTree(im::OrdMap::new())
-                    }
-                    crate::catalog::schema::IndexType::Hash => {
-                        SecondaryIndexStore::Hash(im::HashMap::new())
-                    }
-                    crate::catalog::schema::IndexType::UniqueHash => {
-                        SecondaryIndexStore::UniqueHash(im::HashMap::new())
-                    }
-                },
-                columns_bitmask: idx_def.columns_bitmask,
-                partial_filter: idx_def.partial_filter.clone(),
-            });
+        let secondary_index =
+            table
+                .indexes
+                .entry(idx_name.clone())
+                .or_insert_with(|| SecondaryIndex {
+                    store: match idx_def.index_type {
+                        crate::catalog::schema::IndexType::BTree
+                        | crate::catalog::schema::IndexType::Art => {
+                            SecondaryIndexStore::BTree(im::OrdMap::new())
+                        }
+                        crate::catalog::schema::IndexType::Hash => {
+                            SecondaryIndexStore::Hash(im::HashMap::new())
+                        }
+                        crate::catalog::schema::IndexType::UniqueHash => {
+                            SecondaryIndexStore::UniqueHash(im::HashMap::new())
+                        }
+                    },
+                    columns_bitmask: idx_def.columns_bitmask,
+                    partial_filter: idx_def.partial_filter.clone(),
+                });
         if let Some(before) = old_row
-            && index.should_include_row(before, schema, table_name)?
+            && secondary_index.should_include_row(before, schema, table_name)?
         {
             let old_key = extract_index_key_encoded(before, schema, &idx_def.columns)?;
-            index.remove(&old_key, &encoded_pk);
+            secondary_index.remove(&old_key, &encoded_pk);
         }
         if let Some(after) = new_row
-            && index.should_include_row(after, schema, table_name)?
+            && secondary_index.should_include_row(after, schema, table_name)?
         {
             if matches!(
                 idx_def.index_type,
@@ -2874,7 +2932,7 @@ fn maintain_secondary_indexes(
             if matches!(
                 idx_def.index_type,
                 crate::catalog::schema::IndexType::UniqueHash
-            ) && index
+            ) && secondary_index
                 .unique_existing(&new_key)
                 .is_some_and(|existing| existing != encoded_pk)
             {
@@ -2882,7 +2940,7 @@ fn maintain_secondary_indexes(
                     "unique index violation on {idx_name}"
                 )));
             }
-            index.insert(new_key, encoded_pk.clone());
+            secondary_index.insert(new_key, encoded_pk.clone());
         }
     }
     Ok(())
@@ -2904,7 +2962,7 @@ fn rebuild_index_for_table(
         .ok_or_else(|| AedbError::Validation("table missing".into()))?;
     let table = keyspace.table_mut_by_namespace_key(&ns, table_name);
 
-    let mut index = crate::storage::keyspace::SecondaryIndex {
+    let mut secondary_index = crate::storage::keyspace::SecondaryIndex {
         store: match catalog
             .indexes
             .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
@@ -2932,7 +2990,7 @@ fn rebuild_index_for_table(
             .and_then(|d| d.partial_filter.clone()),
     };
     for (pk, row) in &table.rows {
-        if index.should_include_row(row, schema, table_name)? {
+        if secondary_index.should_include_row(row, schema, table_name)? {
             if matches!(
                 catalog
                     .indexes
@@ -2950,7 +3008,7 @@ fn rebuild_index_for_table(
                     .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
                     .map(|d| &d.index_type),
                 Some(crate::catalog::schema::IndexType::UniqueHash)
-            ) && index
+            ) && secondary_index
                 .unique_existing(&index_key)
                 .is_some_and(|existing| existing != *pk)
             {
@@ -2958,10 +3016,12 @@ fn rebuild_index_for_table(
                     "unique index violation on {index_name}"
                 )));
             }
-            index.insert(index_key, pk.clone());
+            secondary_index.insert(index_key, pk.clone());
         }
     }
-    table.indexes.insert(index_name.to_string(), index);
+    table
+        .indexes
+        .insert(index_name.to_string(), secondary_index);
     Ok(())
 }
 
@@ -2971,12 +3031,12 @@ fn has_null_in_columns(
     columns: &[String],
 ) -> Result<bool, AedbError> {
     for col in columns {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *col)
             .ok_or_else(|| AedbError::Validation(format!("column not found: {col}")))?;
-        if matches!(row.values.get(idx), Some(Value::Null) | None) {
+        if matches!(row.values.get(column_index), Some(Value::Null) | None) {
             return Ok(true);
         }
     }
@@ -2991,14 +3051,14 @@ fn calculate_modified_columns_bitmask(
     match (old_row, new_row) {
         (Some(before), Some(after)) => {
             let mut mask = 0u128;
-            for idx in 0..schema.columns.len() {
-                if idx >= 128 {
+            for column_index in 0..schema.columns.len() {
+                if column_index >= 128 {
                     break;
                 }
-                let lhs = before.values.get(idx);
-                let rhs = after.values.get(idx);
+                let lhs = before.values.get(column_index);
+                let rhs = after.values.get(column_index);
                 if lhs != rhs {
-                    mask |= 1u128 << idx;
+                    mask |= 1u128 << column_index;
                 }
             }
             mask

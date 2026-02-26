@@ -336,11 +336,12 @@ async fn crash_matrix_after_checkpoint_before_manifest_respects_manifest_lower_b
     let _unreferenced = write_checkpoint_with_key(
         &recovered_now.keyspace.snapshot(),
         &recovered_now.catalog,
-        recovered_now.current_seq,
+        recovered_now.current_seq.saturating_add(1),
         dir.path(),
         config.checkpoint_key(),
         config.checkpoint_key_id.clone(),
         HashMap::new(),
+        config.checkpoint_compression_level,
     )
     .expect("write unreferenced checkpoint");
 

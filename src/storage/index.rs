@@ -122,12 +122,12 @@ pub fn extract_index_key(
 ) -> Result<Vec<Value>, AedbError> {
     let mut out = Vec::with_capacity(indexed_columns.len());
     for col in indexed_columns {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *col)
             .ok_or_else(|| AedbError::Validation(format!("indexed column not found: {col}")))?;
-        out.push(row.values[idx].clone());
+        out.push(row.values[column_index].clone());
     }
     Ok(out)
 }
@@ -152,35 +152,36 @@ mod tests {
 
     #[test]
     fn secondary_index_insert_remove_and_range() {
-        let mut idx = SecondaryIndex::default();
-        idx.insert(
+        let mut secondary_index = SecondaryIndex::default();
+        secondary_index.insert(
             EncodedKey::from_values(&[Value::Integer(10)]),
             EncodedKey::from_values(&[Value::Integer(1)]),
         );
-        idx.insert(
+        secondary_index.insert(
             EncodedKey::from_values(&[Value::Integer(20)]),
             EncodedKey::from_values(&[Value::Integer(2)]),
         );
-        idx.insert(
+        secondary_index.insert(
             EncodedKey::from_values(&[Value::Integer(30)]),
             EncodedKey::from_values(&[Value::Integer(3)]),
         );
 
-        let eq = idx.scan_eq(&EncodedKey::from_values(&[Value::Integer(20)]));
+        let eq = secondary_index.scan_eq(&EncodedKey::from_values(&[Value::Integer(20)]));
         assert_eq!(eq, vec![EncodedKey::from_values(&[Value::Integer(2)])]);
 
-        let range = idx.scan_range(
+        let range = secondary_index.scan_range(
             Bound::Included(EncodedKey::from_values(&[Value::Integer(15)])),
             Bound::Included(EncodedKey::from_values(&[Value::Integer(30)])),
         );
         assert_eq!(range.len(), 2);
 
-        idx.remove(
+        secondary_index.remove(
             &EncodedKey::from_values(&[Value::Integer(20)]),
             &EncodedKey::from_values(&[Value::Integer(2)]),
         );
         assert!(
-            idx.scan_eq(&EncodedKey::from_values(&[Value::Integer(20)]))
+            secondary_index
+                .scan_eq(&EncodedKey::from_values(&[Value::Integer(20)]))
                 .is_empty()
         );
     }

@@ -4,6 +4,11 @@ use primitive_types::U256;
 use serde::{Deserialize, Serialize};
 use std::ops::Bound;
 
+const MASS_CANCEL_SCAN_LIMIT: usize = 200_000;
+const OPEN_ORDERS_SCAN_LIMIT: usize = 100_000;
+const TOP_LEVEL_SCAN_LIMIT: usize = 200_000;
+const FIFO_COUNT_SCAN_LIMIT: usize = 100_000;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum OrderSide {
@@ -432,14 +437,18 @@ pub fn key_owner_nonce(instrument: &str, owner: &str) -> Vec<u8> {
     k
 }
 
+fn append_segment_len_prefixed(out: &mut Vec<u8>, segment: &str) {
+    out.extend_from_slice(&(segment.len() as u64).to_be_bytes());
+    out.extend_from_slice(segment.as_bytes());
+}
+
 pub fn key_client_id(instrument: &str, owner: &str, client_order_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(9 + instrument.len() + owner.len() + client_order_id.len());
+    let mut k = Vec::with_capacity(25 + instrument.len() + owner.len() + client_order_id.len());
     k.extend_from_slice(b"ob:");
     k.extend_from_slice(instrument.as_bytes());
     k.extend_from_slice(b":cid:");
-    k.extend_from_slice(owner.as_bytes());
-    k.push(b':');
-    k.extend_from_slice(client_order_id.as_bytes());
+    append_segment_len_prefixed(&mut k, owner);
+    append_segment_len_prefixed(&mut k, client_order_id);
     k
 }
 
@@ -485,11 +494,11 @@ pub fn key_fifo(
 }
 
 pub fn key_open_order(instrument: &str, owner: &str, order_id: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(11 + instrument.len() + owner.len() + 8);
+    let mut k = Vec::with_capacity(20 + instrument.len() + owner.len() + 8);
     k.extend_from_slice(b"ob:");
     k.extend_from_slice(instrument.as_bytes());
     k.extend_from_slice(b":open:");
-    k.extend_from_slice(owner.as_bytes());
+    append_segment_len_prefixed(&mut k, owner);
     k.push(b':');
     k.extend_from_slice(&order_id.to_be_bytes());
     k
@@ -535,11 +544,11 @@ pub fn plqty_prefix(instrument: &str, side: OrderSide) -> Vec<u8> {
 }
 
 pub fn open_orders_prefix(instrument: &str, owner: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(10 + instrument.len() + owner.len());
+    let mut k = Vec::with_capacity(19 + instrument.len() + owner.len());
     k.extend_from_slice(b"ob:");
     k.extend_from_slice(instrument.as_bytes());
     k.extend_from_slice(b":open:");
-    k.extend_from_slice(owner.as_bytes());
+    append_segment_len_prefixed(&mut k, owner);
     k.push(b':');
     k
 }
@@ -1180,8 +1189,13 @@ pub fn apply_order_book_mass_cancel(
         project_id,
         scope_id,
         &all_orders_prefix(instrument),
-        usize::MAX,
+        MASS_CANCEL_SCAN_LIMIT.saturating_add(1),
     );
+    if orders.len() > MASS_CANCEL_SCAN_LIMIT {
+        return Err(AedbError::Validation(
+            "mass cancel scan limit exceeded".into(),
+        ));
+    }
     for (_, entry) in orders {
         let order: OrderRecord = deserialize(&entry.value)?;
         if u256_from_be(order.remaining_qty_be).is_zero() {
@@ -1391,14 +1405,20 @@ pub fn read_open_orders(
         project_id,
         scope_id,
         &open_orders_prefix(instrument, owner),
-        usize::MAX,
+        OPEN_ORDERS_SCAN_LIMIT.saturating_add(1),
         snapshot,
     );
+    if open.len() > OPEN_ORDERS_SCAN_LIMIT {
+        return Err(AedbError::Validation(
+            "open_orders scan limit exceeded".into(),
+        ));
+    }
     let mut out = Vec::with_capacity(open.len());
     for (k, _) in open {
         if let Some(order_id) = parse_order_id_suffix(&k)
             && let Some(order) =
                 read_order_status(snapshot, project_id, scope_id, instrument, order_id)?
+            && order.owner == owner
         {
             out.push(order);
         }
@@ -1522,9 +1542,12 @@ fn top_side(
         project_id,
         scope_id,
         &plqty_prefix(instrument, side),
-        usize::MAX,
+        TOP_LEVEL_SCAN_LIMIT.saturating_add(1),
         snapshot,
     );
+    if entries.len() > TOP_LEVEL_SCAN_LIMIT {
+        return Err(AedbError::Validation("top_n scan limit exceeded".into()));
+    }
     let mut out = Vec::new();
     for (k, v) in entries {
         let qty = decode_u256_bytes(&v.value)?;
@@ -1538,14 +1561,19 @@ fn top_side(
             project_id,
             scope_id,
             &fifo_prefix(instrument, side, price),
-            usize::MAX,
+            FIFO_COUNT_SCAN_LIMIT.saturating_add(1),
             snapshot,
         )
-        .len() as u32;
+        .len();
+        if order_count > FIFO_COUNT_SCAN_LIMIT {
+            return Err(AedbError::Validation(
+                "top_n fifo scan limit exceeded".into(),
+            ));
+        }
         out.push(PriceLevel {
             price_ticks: price,
             total_qty_be: u256_to_be(qty),
-            order_count,
+            order_count: order_count as u32,
         });
         if out.len() >= depth {
             break;
@@ -1651,10 +1679,10 @@ fn snapshot_scan_prefix(
 
 fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
-    for idx in (0..end.len()).rev() {
-        if end[idx] != u8::MAX {
-            end[idx] = end[idx].saturating_add(1);
-            end.truncate(idx + 1);
+    for byte_pos in (0..end.len()).rev() {
+        if end[byte_pos] != u8::MAX {
+            end[byte_pos] = end[byte_pos].saturating_add(1);
+            end.truncate(byte_pos + 1);
             return Some(end);
         }
     }
@@ -2288,5 +2316,77 @@ mod tests {
             prefix_range_end(&all_ff).is_none(),
             "all-0xff prefix has no finite upper bound"
         );
+    }
+
+    #[test]
+    fn key_client_id_is_collision_resistant_for_delimiter_inputs() {
+        let k1 = key_client_id("BTC-USD", "alice:desk", "order-1");
+        let k2 = key_client_id("BTC-USD", "alice", "desk:order-1");
+        assert_ne!(k1, k2, "length-prefixed encoding must be unambiguous");
+    }
+
+    #[test]
+    fn read_open_orders_enforces_owner_for_matching_prefix() {
+        let mut ks = Keyspace::default();
+        let order_a = OrderRecord {
+            order_id: 1,
+            instrument: "BTC-USD".into(),
+            client_order_id: "cid-a".into(),
+            owner: "alice".into(),
+            account: None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
+            price_ticks: 100,
+            original_qty_be: u256_to_be(U256::from(1u8)),
+            remaining_qty_be: u256_to_be(U256::from(1u8)),
+            filled_qty_be: u256_to_be(U256::zero()),
+            status: OrderStatus::Open,
+            placed_seq: 1,
+            last_modified_seq: 1,
+            nonce: 1,
+        };
+        let order_b = OrderRecord {
+            order_id: 2,
+            owner: "alice:desk".into(),
+            client_order_id: "cid-b".into(),
+            ..order_a.clone()
+        };
+        ks.kv_set(
+            "p",
+            "app",
+            key_order("BTC-USD", order_a.order_id),
+            serialize(&order_a).expect("encode"),
+            1,
+        );
+        ks.kv_set(
+            "p",
+            "app",
+            key_order("BTC-USD", order_b.order_id),
+            serialize(&order_b).expect("encode"),
+            1,
+        );
+        ks.kv_set(
+            "p",
+            "app",
+            key_open_order("BTC-USD", &order_a.owner, order_a.order_id),
+            vec![1],
+            1,
+        );
+        ks.kv_set(
+            "p",
+            "app",
+            key_open_order("BTC-USD", &order_b.owner, order_b.order_id),
+            vec![1],
+            1,
+        );
+
+        let snapshot = ks.snapshot();
+        let open =
+            read_open_orders(&snapshot, "p", "app", "BTC-USD", "alice").expect("read open orders");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].owner, "alice");
     }
 }
