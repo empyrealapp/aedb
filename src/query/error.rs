@@ -43,6 +43,17 @@ pub enum QueryError {
     InternalError(String),
 }
 
+fn parse_table_resource_id(resource_id: &str) -> (String, String) {
+    let mut parts = resource_id.split('.');
+    let project_id = parts.next().unwrap_or_default().to_string();
+    let table = resource_id
+        .rsplit('.')
+        .next()
+        .unwrap_or(resource_id)
+        .to_string();
+    (project_id, table)
+}
+
 impl fmt::Display for QueryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -96,6 +107,12 @@ impl fmt::Display for QueryError {
 
 impl std::error::Error for QueryError {}
 
+impl QueryError {
+    pub fn is_table_not_found(&self) -> bool {
+        matches!(self, QueryError::TableNotFound { .. })
+    }
+}
+
 impl From<AedbError> for QueryError {
     fn from(value: AedbError) -> Self {
         match value {
@@ -121,8 +138,14 @@ impl From<AedbError> for QueryError {
             AedbError::NotFound {
                 resource_type,
                 resource_id,
-            } => QueryError::InvalidQuery {
-                reason: format!("{resource_type} '{resource_id}' not found"),
+            } => match resource_type {
+                crate::error::ResourceType::Table => {
+                    let (project_id, table) = parse_table_resource_id(&resource_id);
+                    QueryError::TableNotFound { project_id, table }
+                }
+                _ => QueryError::InvalidQuery {
+                    reason: format!("{resource_type} '{resource_id}' not found"),
+                },
             },
             AedbError::DuplicatePK { table, key } => QueryError::InvalidQuery {
                 reason: format!("duplicate primary key in table '{table}': {key}"),
@@ -189,6 +212,8 @@ impl From<AedbError> for QueryError {
 
 #[cfg(test)]
 mod tests {
+    use crate::error::{AedbError, ResourceType};
+
     use super::QueryError;
 
     #[test]
@@ -198,5 +223,21 @@ mod tests {
             column: "name".into(),
         };
         assert_eq!(err.to_string(), "column 'name' not found in table 'users'");
+    }
+
+    #[test]
+    fn maps_aedb_table_not_found_to_structured_query_error() {
+        let err = QueryError::from(AedbError::NotFound {
+            resource_type: ResourceType::Table,
+            resource_id: "arcana.app.leaderboard_points".into(),
+        });
+        assert_eq!(
+            err,
+            QueryError::TableNotFound {
+                project_id: "arcana".into(),
+                table: "leaderboard_points".into(),
+            }
+        );
+        assert!(err.is_table_not_found());
     }
 }
