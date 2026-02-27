@@ -833,6 +833,7 @@ fn estimate_row_bytes(row: &Row) -> usize {
 fn estimate_value_bytes(v: &Value) -> usize {
     match v {
         Value::Text(s) | Value::Json(s) => s.len(),
+        Value::U8(_) => 1,
         Value::Integer(_) | Value::Float(_) | Value::Timestamp(_) => 8,
         Value::Boolean(_) => 1,
         Value::U256(_) | Value::I256(_) => 32,

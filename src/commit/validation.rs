@@ -1253,6 +1253,7 @@ fn value_matches_type(value: &Value, ty: &ColumnType) -> bool {
     matches!(
         (value, ty),
         (Value::Text(_), ColumnType::Text)
+            | (Value::U8(_), ColumnType::U8)
             | (Value::Integer(_), ColumnType::Integer)
             | (Value::Float(_), ColumnType::Float)
             | (Value::Boolean(_), ColumnType::Boolean)
@@ -1267,6 +1268,7 @@ fn value_matches_type(value: &Value, ty: &ColumnType) -> bool {
 fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Text(_) => "Text",
+        Value::U8(_) => "U8",
         Value::Integer(_) => "Integer",
         Value::Float(_) => "Float",
         Value::Boolean(_) => "Boolean",

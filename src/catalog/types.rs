@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ColumnType {
     Text,
+    U8,
     Integer,
     Float,
     Boolean,
@@ -111,6 +112,7 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Text(CompactString),
+    U8(u8),
     Integer(i64),
     Float(f64),
     Boolean(bool),
@@ -135,6 +137,7 @@ impl Hash for Value {
         self.kind_rank().hash(state);
         match self {
             Value::Text(v) => v.hash(state),
+            Value::U8(v) => v.hash(state),
             Value::Integer(v) => v.hash(state),
             Value::Float(v) => v.to_bits().hash(state),
             Value::Boolean(v) => v.hash(state),
@@ -164,14 +167,15 @@ impl Value {
         match self {
             Value::Null => 0,
             Value::Boolean(_) => 1,
-            Value::Integer(_) => 2,
-            Value::U256(_) => 3,
-            Value::I256(_) => 4,
-            Value::Timestamp(_) => 5,
-            Value::Float(_) => 6,
-            Value::Text(_) => 7,
-            Value::Json(_) => 8,
-            Value::Blob(_) => 9,
+            Value::U8(_) => 2,
+            Value::Integer(_) => 3,
+            Value::U256(_) => 4,
+            Value::I256(_) => 5,
+            Value::Timestamp(_) => 6,
+            Value::Float(_) => 7,
+            Value::Text(_) => 8,
+            Value::Json(_) => 9,
+            Value::Blob(_) => 10,
         }
     }
 }
@@ -200,6 +204,7 @@ impl Ord for Value {
         match (self, other) {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::U8(a), Value::U8(b)) => a.cmp(b),
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
             (Value::U256(a), Value::U256(b)) => a.cmp(b),
             (Value::I256(a), Value::I256(b)) => a.cmp(b),
@@ -221,6 +226,7 @@ mod tests {
     fn arb_value() -> impl Strategy<Value = Value> {
         let leaf = prop_oneof![
             any::<bool>().prop_map(Value::Boolean),
+            any::<u8>().prop_map(Value::U8),
             any::<i64>().prop_map(Value::Integer),
             prop::array::uniform32(any::<u8>()).prop_map(Value::U256),
             prop::array::uniform32(any::<u8>()).prop_map(Value::I256),

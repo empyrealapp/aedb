@@ -341,9 +341,22 @@ pub struct QueryDiagnostics {
     pub estimated_scan_rows: u64,
     pub max_scan_rows: u64,
     pub index_used: Option<String>,
+    pub selected_indexes: Vec<String>,
+    pub predicate_evaluation_path: PredicateEvaluationPath,
+    pub plan_trace: Vec<String>,
     pub stages: Vec<ExecutionStage>,
     pub bounded_by_limit_or_cursor: bool,
     pub has_joins: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PredicateEvaluationPath {
+    None,
+    PrimaryKeyEqLookup,
+    SecondaryIndexLookup,
+    AsyncIndexProjection,
+    FullScanFilter,
+    JoinExecution,
 }
 
 #[derive(Debug, Clone)]

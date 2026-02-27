@@ -3,7 +3,8 @@ use super::{
     QueryBatchItem, QueryCommitTelemetryHook, QueryTelemetryEvent, ReadOnlySqlAdapter,
     RecoveryCache, RemoteBackupAdapter, SYSTEM_CALLER_ID,
 };
-use crate::catalog::schema::ColumnDef;
+use crate::PredicateEvaluationPath;
+use crate::catalog::schema::{ColumnDef, IndexType};
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
 use crate::commit::tx::{TransactionEnvelope, WriteClass, WriteIntent};
@@ -4149,6 +4150,10 @@ async fn exists_and_explain_diagnostics_work() {
         .expect("explain");
     assert!(explain.estimated_scan_rows >= 1);
     assert!(explain.stages.contains(&ExecutionStage::Scan));
+    assert!(
+        !explain.plan_trace.is_empty(),
+        "explain should include access-path trace"
+    );
 
     let with_diag = tx
         .query_with_diagnostics(
@@ -4164,6 +4169,383 @@ async fn exists_and_explain_diagnostics_work() {
         .expect("diag query");
     assert_eq!(with_diag.result.rows.len(), 1);
     assert_eq!(with_diag.diagnostics.snapshot_seq, tx.snapshot_seq());
+}
+
+#[tokio::test]
+async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_paths() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "sessions",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "user_id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "status".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    for (id, user_id, status) in [
+        (1_i64, "8a25f1bc-ea96-48d0-8535-47b784a2df1d", "open"),
+        (2, "8a25f1bc-ea96-48d0-8535-47b784a2df1d", "closed"),
+        (3, "2cf2434c-ed95-4f35-b786-4853592e6f25", "open"),
+    ] {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "sessions".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![
+                Value::Integer(id),
+                Value::Text(user_id.into()),
+                Value::Text(status.into()),
+            ]),
+        })
+        .await
+        .expect("seed session");
+    }
+
+    let query = Query::select(&["id", "user_id"])
+        .from("sessions")
+        .where_(Expr::Eq(
+            "user_id".into(),
+            Value::Text("8a25f1bc-ea96-48d0-8535-47b784a2df1d".into()),
+        ));
+    let pre_index_result = db
+        .query("p", "app", query.clone())
+        .await
+        .expect("eq query without index");
+    assert_eq!(pre_index_result.rows.len(), 2);
+
+    let pre_index_explain = db
+        .explain_query("p", "app", query.clone(), QueryOptions::default())
+        .await
+        .expect("explain without index");
+    assert_eq!(
+        pre_index_explain.predicate_evaluation_path,
+        PredicateEvaluationPath::FullScanFilter
+    );
+    assert!(
+        pre_index_explain.selected_indexes.is_empty(),
+        "non-index path should not report selected indexes"
+    );
+
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "sessions".into(),
+        index_name: "by_user_id".into(),
+        if_not_exists: false,
+        columns: vec!["user_id".into()],
+        index_type: IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("user_id index");
+
+    let indexed_result = db
+        .query("p", "app", query.clone())
+        .await
+        .expect("eq query with index");
+    assert_eq!(indexed_result.rows.len(), 2);
+    assert!(
+        indexed_result.rows_examined <= pre_index_result.rows_examined,
+        "indexed equality should not examine more rows"
+    );
+
+    let indexed_explain = db
+        .explain_query("p", "app", query, QueryOptions::default())
+        .await
+        .expect("explain with index");
+    assert_eq!(
+        indexed_explain.predicate_evaluation_path,
+        PredicateEvaluationPath::SecondaryIndexLookup
+    );
+    assert!(
+        indexed_explain
+            .selected_indexes
+            .contains(&"by_user_id".to_string()),
+        "explain should report selected secondary index"
+    );
+    assert!(
+        indexed_explain
+            .plan_trace
+            .iter()
+            .any(|line| line.contains("by_user_id")),
+        "plan trace should include selected index name"
+    );
+}
+
+#[tokio::test]
+async fn uuid_text_equality_parity_between_primary_key_and_secondary_index_paths() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+
+    create_table(
+        &db,
+        "p",
+        "app",
+        "users_pk_uuid",
+        vec![
+            ColumnDef {
+                name: "user_uuid".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "display_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["user_uuid"],
+    )
+    .await;
+    create_table(
+        &db,
+        "p",
+        "app",
+        "users_secondary_uuid",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "user_uuid".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "display_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users_secondary_uuid".into(),
+        index_name: "by_user_uuid".into(),
+        if_not_exists: false,
+        columns: vec!["user_uuid".into()],
+        index_type: IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("secondary uuid index");
+
+    let rows = [
+        (1_i64, "8e1e917f-f8f8-4f06-bf38-3f2c37dcd857", "alice"),
+        (2, "6e0df6fd-5095-4e37-bf9d-1f6b5d6dfcb8", "bob"),
+        (3, "1b631635-766d-4207-aa53-f5367b9bf13a", "carol"),
+    ];
+    for (_id, user_uuid, display_name) in rows {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users_pk_uuid".into(),
+            primary_key: vec![Value::Text(user_uuid.to_string().into())],
+            row: Row::from_values(vec![
+                Value::Text(user_uuid.to_string().into()),
+                Value::Text(display_name.into()),
+            ]),
+        })
+        .await
+        .expect("seed pk uuid");
+    }
+
+    for (id, user_uuid, display_name) in rows {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users_secondary_uuid".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![
+                Value::Integer(id),
+                Value::Text(user_uuid.into()),
+                Value::Text(display_name.into()),
+            ]),
+        })
+        .await
+        .expect("seed secondary uuid");
+    }
+
+    for (_id, user_uuid, _display_name) in rows {
+        let pk_query = Query::select(&["display_name"])
+            .from("users_pk_uuid")
+            .where_(Expr::Eq(
+                "user_uuid".into(),
+                Value::Text(user_uuid.to_string().into()),
+            ));
+        let secondary_query = Query::select(&["display_name"])
+            .from("users_secondary_uuid")
+            .where_(Expr::Eq(
+                "user_uuid".into(),
+                Value::Text(user_uuid.to_string().into()),
+            ));
+
+        let pk_result = db
+            .query("p", "app", pk_query.clone())
+            .await
+            .expect("pk query");
+        let secondary_result = db
+            .query("p", "app", secondary_query.clone())
+            .await
+            .expect("secondary query");
+        assert_eq!(pk_result.rows.len(), 1);
+        assert_eq!(secondary_result.rows.len(), 1);
+        assert_eq!(pk_result.rows[0].values, secondary_result.rows[0].values);
+    }
+
+    let pk_query = Query::select(&["display_name"])
+        .from("users_pk_uuid")
+        .where_(Expr::Eq(
+            "user_uuid".into(),
+            Value::Text("8e1e917f-f8f8-4f06-bf38-3f2c37dcd857".into()),
+        ));
+    let secondary_query = Query::select(&["display_name"])
+        .from("users_secondary_uuid")
+        .where_(Expr::Eq(
+            "user_uuid".into(),
+            Value::Text("8e1e917f-f8f8-4f06-bf38-3f2c37dcd857".into()),
+        ));
+
+    let pk_explain = db
+        .explain_query("p", "app", pk_query, QueryOptions::default())
+        .await
+        .expect("pk explain");
+    assert_eq!(
+        pk_explain.predicate_evaluation_path,
+        PredicateEvaluationPath::PrimaryKeyEqLookup
+    );
+
+    let secondary_explain = db
+        .explain_query("p", "app", secondary_query, QueryOptions::default())
+        .await
+        .expect("secondary explain");
+    assert_eq!(
+        secondary_explain.predicate_evaluation_path,
+        PredicateEvaluationPath::SecondaryIndexLookup
+    );
+    assert!(
+        secondary_explain
+            .selected_indexes
+            .contains(&"by_user_uuid".to_string())
+    );
+}
+
+#[tokio::test]
+async fn u8_column_type_supports_write_read_and_indexed_equality() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+
+    create_table(
+        &db,
+        "p",
+        "app",
+        "levels",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "level".into(),
+                col_type: ColumnType::U8,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "levels".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::U8(7)]),
+    })
+    .await
+    .expect("seed u8 row");
+
+    let without_index = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["id", "level"])
+                .from("levels")
+                .where_(Expr::Eq("level".into(), Value::Integer(7))),
+        )
+        .await
+        .expect("u8 equality via integer literal");
+    assert_eq!(without_index.rows.len(), 1);
+    assert_eq!(without_index.rows[0].values[1], Value::U8(7));
+
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "levels".into(),
+        index_name: "by_level".into(),
+        if_not_exists: false,
+        columns: vec!["level".into()],
+        index_type: IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("create u8 index");
+
+    let with_index = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["id", "level"])
+                .from("levels")
+                .where_(Expr::Eq("level".into(), Value::U8(7))),
+        )
+        .await
+        .expect("u8 equality with index");
+    assert_eq!(with_index.rows.len(), 1);
+    assert!(with_index.rows_examined <= without_index.rows_examined);
+
+    let err = db
+        .commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "levels".into(),
+            primary_key: vec![Value::Integer(2)],
+            row: Row::from_values(vec![Value::Integer(2), Value::Integer(8)]),
+        })
+        .await
+        .expect_err("integer value should not satisfy U8 column type");
+    assert!(matches!(err, AedbError::TypeMismatch { .. }));
 }
 
 #[tokio::test]

@@ -17,6 +17,7 @@ use std::ops::Bound;
 
 type IndexBounds = (Bound<EncodedKey>, Bound<EncodedKey>);
 
+#[derive(Debug, Clone)]
 enum IndexLookup {
     Range { column: String, bounds: IndexBounds },
     MultiEq { column: String, values: Vec<Value> },
@@ -29,6 +30,13 @@ pub struct QueryResult {
     pub cursor: Option<String>,
     pub snapshot_seq: u64,
     pub materialized_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccessPathDiagnostics {
+    pub selected_indexes: Vec<String>,
+    pub predicate_evaluation_path: crate::PredicateEvaluationPath,
+    pub plan_trace: Vec<String>,
 }
 
 pub fn execute_query(
@@ -113,15 +121,16 @@ pub fn execute_query_with_options(
         );
     }
 
-    let table_key = (namespace_key(project_id, scope_id), query.table.clone());
+    let (q_project, q_scope, q_table) = resolve_table_ref(project_id, scope_id, &query.table);
+    let table_key = (namespace_key(&q_project, &q_scope), q_table.clone());
     let schema = catalog
         .tables
         .get(&table_key)
         .ok_or_else(|| QueryError::TableNotFound {
-            project_id: project_id.to_string(),
-            table: query.table.clone(),
+            project_id: q_project.clone(),
+            table: q_table.clone(),
         })?;
-    let table = snapshot.table(project_id, scope_id, &query.table);
+    let table = snapshot.table(&q_project, &q_scope, &q_table);
     let mut materialized_seq = None;
     validate_query(schema, &query)?;
 
@@ -140,46 +149,41 @@ pub fn execute_query_with_options(
     }
 
     let estimated_rows: usize;
-    let row_source: Box<dyn Iterator<Item = Row> + Send> =
-        if let Some(async_index) = &options.async_index {
-            let projection = snapshot
-                .async_index(project_id, scope_id, &query.table, async_index)
-                .ok_or_else(|| QueryError::InvalidQuery {
-                    reason: "async index not found".into(),
-                })?;
-            materialized_seq = Some(projection.materialized_seq);
-            estimated_rows = projection.rows.len();
-            let rows = projection.rows.clone();
-            Box::new(rows.into_iter().map(|(_, row)| row))
-        } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
-            let table_rows = table.rows.clone();
-            let indexed_pks = indexed_pks_for_predicate(
-                catalog,
-                project_id,
-                scope_id,
-                &query.table,
-                table,
-                predicate,
-            )?;
-            match indexed_pks {
-                Some(pks) => {
-                    estimated_rows = pks.len();
-                    Box::new(
-                        pks.into_iter()
-                            .filter_map(move |pk| table_rows.get(&pk).cloned()),
-                    )
-                }
-                None => {
-                    estimated_rows = table.rows.len();
-                    let rows = table.rows.clone();
-                    Box::new(rows.into_iter().map(|(_, row)| row))
-                }
+    let row_source: Box<dyn Iterator<Item = Row> + Send> = if let Some(async_index) =
+        &options.async_index
+    {
+        let projection = snapshot
+            .async_index(project_id, scope_id, &query.table, async_index)
+            .ok_or_else(|| QueryError::InvalidQuery {
+                reason: "async index not found".into(),
+            })?;
+        materialized_seq = Some(projection.materialized_seq);
+        estimated_rows = projection.rows.len();
+        let rows = projection.rows.clone();
+        Box::new(rows.into_iter().map(|(_, row)| row))
+    } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
+        let table_rows = table.rows.clone();
+        let indexed_pks =
+            indexed_pks_for_predicate(catalog, &q_project, &q_scope, &q_table, table, predicate)?;
+        match indexed_pks {
+            Some(pks) => {
+                estimated_rows = pks.len();
+                Box::new(
+                    pks.into_iter()
+                        .filter_map(move |pk| table_rows.get(&pk).cloned()),
+                )
             }
-        } else {
-            let rows = table.map(|t| t.rows.clone()).unwrap_or_default();
-            estimated_rows = rows.len();
-            Box::new(rows.into_iter().map(|(_, row)| row))
-        };
+            None => {
+                estimated_rows = table.rows.len();
+                let rows = table.rows.clone();
+                Box::new(rows.into_iter().map(|(_, row)| row))
+            }
+        }
+    } else {
+        let rows = table.map(|t| t.rows.clone()).unwrap_or_default();
+        estimated_rows = rows.len();
+        Box::new(rows.into_iter().map(|(_, row)| row))
+    };
 
     if estimated_rows > max_scan_rows && query.limit.is_none() && options.cursor.is_none() {
         return Err(QueryError::ScanBoundExceeded {
@@ -372,6 +376,135 @@ pub fn execute_query_with_options(
         cursor,
         snapshot_seq,
         materialized_seq,
+    })
+}
+
+pub(crate) fn explain_access_path_for_query(
+    snapshot: &KeyspaceSnapshot,
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<AccessPathDiagnostics, QueryError> {
+    if !query.joins.is_empty() {
+        let mut trace = Vec::new();
+        trace.push("join query: predicate evaluation happens after join execution".to_string());
+        if query.predicate.is_some() {
+            trace.push("post-join filter stage evaluates query predicate".to_string());
+        }
+        return Ok(AccessPathDiagnostics {
+            selected_indexes: Vec::new(),
+            predicate_evaluation_path: crate::PredicateEvaluationPath::JoinExecution,
+            plan_trace: trace,
+        });
+    }
+
+    let mut selected_indexes = Vec::new();
+    let mut trace = Vec::new();
+    let mut predicate_evaluation_path = crate::PredicateEvaluationPath::None;
+
+    let mut effective_options = options.clone();
+    if effective_options.async_index.is_none() {
+        effective_options.async_index = query.use_index.clone();
+    }
+
+    if let Some(async_index) = &effective_options.async_index {
+        selected_indexes.push(async_index.clone());
+        trace.push(format!(
+            "selected async index projection '{async_index}' as row source"
+        ));
+        predicate_evaluation_path = crate::PredicateEvaluationPath::AsyncIndexProjection;
+        if query.predicate.is_some() {
+            trace.push("query predicate is evaluated as filter on projected rows".to_string());
+        }
+        return Ok(AccessPathDiagnostics {
+            selected_indexes,
+            predicate_evaluation_path,
+            plan_trace: trace,
+        });
+    }
+
+    let table_key = (namespace_key(project_id, scope_id), query.table.clone());
+    let schema = catalog
+        .tables
+        .get(&table_key)
+        .ok_or_else(|| QueryError::TableNotFound {
+            project_id: project_id.to_string(),
+            table: query.table.clone(),
+        })?;
+    let table = snapshot.table(project_id, scope_id, &query.table);
+
+    if let Some(predicate) = query.predicate.as_ref() {
+        if query.limit != Some(0)
+            && query.group_by.is_empty()
+            && query.aggregates.is_empty()
+            && query.having.is_none()
+            && query.order_by.is_empty()
+            && options.cursor.is_none()
+            && extract_primary_key_values(predicate, &schema.primary_key).is_some()
+        {
+            trace.push("primary-key equality predicate detected; using direct row lookup".into());
+            return Ok(AccessPathDiagnostics {
+                selected_indexes,
+                predicate_evaluation_path: crate::PredicateEvaluationPath::PrimaryKeyEqLookup,
+                plan_trace: trace,
+            });
+        }
+
+        if let Some(table) = table {
+            let indexed = indexed_pks_for_predicate_with_trace(
+                catalog,
+                project_id,
+                scope_id,
+                &query.table,
+                table,
+                predicate,
+            )?;
+            if let Some(indexed) = indexed {
+                if !indexed.selected_indexes.is_empty() {
+                    selected_indexes.extend(indexed.selected_indexes.clone());
+                    predicate_evaluation_path =
+                        crate::PredicateEvaluationPath::SecondaryIndexLookup;
+                } else {
+                    predicate_evaluation_path = crate::PredicateEvaluationPath::FullScanFilter;
+                }
+                trace.extend(indexed.plan_trace);
+                if matches!(
+                    predicate_evaluation_path,
+                    crate::PredicateEvaluationPath::FullScanFilter
+                ) {
+                    trace.push(
+                        "no matching secondary index; evaluating predicate during table scan"
+                            .to_string(),
+                    );
+                } else {
+                    trace.push(
+                        "residual predicate is evaluated on rows returned by index lookup"
+                            .to_string(),
+                    );
+                }
+                return Ok(AccessPathDiagnostics {
+                    selected_indexes,
+                    predicate_evaluation_path,
+                    plan_trace: trace,
+                });
+            }
+        }
+
+        trace.push("predicate not indexable for current schema/index set".to_string());
+        return Ok(AccessPathDiagnostics {
+            selected_indexes,
+            predicate_evaluation_path: crate::PredicateEvaluationPath::FullScanFilter,
+            plan_trace: trace,
+        });
+    }
+
+    trace.push("no predicate supplied; full table scan path".to_string());
+    Ok(AccessPathDiagnostics {
+        selected_indexes,
+        predicate_evaluation_path,
+        plan_trace: trace,
     })
 }
 
@@ -950,17 +1083,21 @@ fn validate_expr_types(
     let value_compatible = |col_type: &ColumnType, value: &Value| -> bool {
         matches!(value, Value::Null)
             || match col_type {
+                ColumnType::U8 => matches!(
+                    value,
+                    Value::U8(_) | Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                ),
                 ColumnType::Integer => matches!(
                     value,
-                    Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                    Value::U8(_) | Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
                 ),
                 ColumnType::Float => matches!(
                     value,
-                    Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                    Value::U8(_) | Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
                 ),
                 ColumnType::Timestamp => matches!(
                     value,
-                    Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                    Value::U8(_) | Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
                 ),
                 ColumnType::Text => matches!(value, Value::Text(_)),
                 ColumnType::Boolean => matches!(value, Value::Boolean(_)),
@@ -1108,28 +1245,87 @@ fn indexed_pks_for_predicate(
     table: &crate::storage::keyspace::TableData,
     predicate: &crate::query::plan::Expr,
 ) -> Result<Option<Vec<EncodedKey>>, QueryError> {
+    Ok(indexed_pks_for_predicate_with_trace(
+        catalog, project_id, scope_id, table_name, table, predicate,
+    )?
+    .map(|result| result.pks))
+}
+
+#[derive(Debug, Clone)]
+struct IndexLookupResult {
+    pks: Vec<EncodedKey>,
+    selected_indexes: Vec<String>,
+    plan_trace: Vec<String>,
+}
+
+fn indexed_pks_for_predicate_with_trace(
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    table: &crate::storage::keyspace::TableData,
+    predicate: &crate::query::plan::Expr,
+) -> Result<Option<IndexLookupResult>, QueryError> {
     use crate::query::plan::Expr;
 
     match predicate {
         Expr::And(lhs, rhs) => {
-            let left =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, lhs)?;
-            let right =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, rhs)?;
+            let left = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, lhs,
+            )?;
+            let right = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, rhs,
+            )?;
             return Ok(match (left, right) {
-                (Some(left), Some(right)) => Some(intersect_pks(left, right)),
-                (Some(left), None) => Some(left),
-                (None, Some(right)) => Some(right),
+                (Some(left), Some(right)) => Some(IndexLookupResult {
+                    pks: intersect_pks(left.pks, right.pks),
+                    selected_indexes: merge_selected_indexes(
+                        left.selected_indexes,
+                        right.selected_indexes,
+                    ),
+                    plan_trace: merge_trace(
+                        "AND predicate combines indexed candidates with intersection",
+                        left.plan_trace,
+                        right.plan_trace,
+                    ),
+                }),
+                (Some(left), None) => Some(IndexLookupResult {
+                    plan_trace: merge_trace_single(
+                        "AND predicate uses indexed left side; right side will be residual filter",
+                        left.plan_trace,
+                    ),
+                    ..left
+                }),
+                (None, Some(right)) => Some(IndexLookupResult {
+                    plan_trace: merge_trace_single(
+                        "AND predicate uses indexed right side; left side will be residual filter",
+                        right.plan_trace,
+                    ),
+                    ..right
+                }),
                 (None, None) => None,
             });
         }
         Expr::Or(lhs, rhs) => {
-            let left =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, lhs)?;
-            let right =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, rhs)?;
+            let left = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, lhs,
+            )?;
+            let right = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, rhs,
+            )?;
             return Ok(match (left, right) {
-                (Some(left), Some(right)) => Some(union_pks(left, right)),
+                (Some(left), Some(right)) => Some(IndexLookupResult {
+                    pks: union_pks(left.pks, right.pks),
+                    selected_indexes: merge_selected_indexes(
+                        left.selected_indexes,
+                        right.selected_indexes,
+                    ),
+                    plan_trace: merge_trace(
+                        "OR predicate combines indexed candidates with union",
+                        left.plan_trace,
+                        right.plan_trace,
+                    ),
+                }),
                 _ => None,
             });
         }
@@ -1196,7 +1392,13 @@ fn indexed_pks_for_predicate(
         } else {
             index.scan_prefix(&encoded)
         };
-        return Ok(Some(pks));
+        return Ok(Some(IndexLookupResult {
+            pks,
+            selected_indexes: vec![idx_name.clone()],
+            plan_trace: vec![format!(
+                "selected composite index '{idx_name}' with leftmost prefix columns={prefix_cols}"
+            )],
+        }));
     };
     let column = match &lookup {
         IndexLookup::Range { column, .. } => column,
@@ -1229,14 +1431,45 @@ fn indexed_pks_for_predicate(
         return Ok(None);
     };
 
-    let pks = match lookup {
+    let pks = match lookup.clone() {
         IndexLookup::Range { bounds, .. } => index.scan_range(bounds.0, bounds.1),
         IndexLookup::MultiEq { values, .. } => values
             .into_iter()
             .flat_map(|v| index.scan_eq(&EncodedKey::from_values(&[v])))
             .collect(),
     };
-    Ok(Some(pks))
+    Ok(Some(IndexLookupResult {
+        pks,
+        selected_indexes: vec![index_name.clone()],
+        plan_trace: vec![format!(
+            "selected single-column index '{index_name}' for predicate on '{column}'"
+        )],
+    }))
+}
+
+fn merge_selected_indexes(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    for name in left.into_iter().chain(right) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn merge_trace(header: &str, mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(1 + left.len() + right.len());
+    out.push(header.to_string());
+    out.append(&mut left);
+    out.extend(right);
+    out
+}
+
+fn merge_trace_single(header: &str, mut trace: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(1 + trace.len());
+    out.push(header.to_string());
+    out.append(&mut trace);
+    out
 }
 
 fn intersect_pks(left: Vec<EncodedKey>, right: Vec<EncodedKey>) -> Vec<EncodedKey> {

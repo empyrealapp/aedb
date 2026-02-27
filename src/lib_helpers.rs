@@ -80,6 +80,14 @@ pub(crate) fn explain_query_against_view(
         .clone()
         .or_else(|| query.use_index.clone());
     let bounded_by_limit_or_cursor = query.limit.is_some() || options.cursor.is_some();
+    let access_path = crate::query::executor::explain_access_path_for_query(
+        snapshot.as_ref(),
+        catalog.as_ref(),
+        project_id,
+        scope_id,
+        &query,
+        options,
+    )?;
     if !query.joins.is_empty() {
         let mut estimated = snapshot
             .table(project_id, scope_id, &query.table)
@@ -111,6 +119,9 @@ pub(crate) fn explain_query_against_view(
             estimated_scan_rows: estimated,
             max_scan_rows: max_scan_rows as u64,
             index_used,
+            selected_indexes: access_path.selected_indexes,
+            predicate_evaluation_path: access_path.predicate_evaluation_path,
+            plan_trace: access_path.plan_trace,
             stages,
             bounded_by_limit_or_cursor,
             has_joins: true,
@@ -141,6 +152,9 @@ pub(crate) fn explain_query_against_view(
         estimated_scan_rows,
         max_scan_rows: max_scan_rows as u64,
         index_used,
+        selected_indexes: access_path.selected_indexes,
+        predicate_evaluation_path: access_path.predicate_evaluation_path,
+        plan_trace: access_path.plan_trace,
         stages: planned.stages,
         bounded_by_limit_or_cursor,
         has_joins: false,

@@ -468,6 +468,7 @@ pub fn u256_at(row: &Row, index: usize, column: &str) -> Result<[u8; 32], RowDec
 fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::Text(_) => "Text",
+        Value::U8(_) => "U8",
         Value::Integer(_) => "Integer",
         Value::Float(_) => "Float",
         Value::Boolean(_) => "Boolean",

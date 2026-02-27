@@ -431,10 +431,13 @@ impl AggregateState {
                 *v = v.saturating_add(1);
             }
             (AggregateState::Sum(sum), Aggregate::Sum(_)) => {
-                if let Some(idx) = col_idx
-                    && let Value::Integer(v) = &row.values[idx]
-                {
-                    *sum = sum.saturating_add(*v);
+                if let Some(idx) = col_idx {
+                    let v = match &row.values[idx] {
+                        Value::Integer(v) => *v,
+                        Value::U8(v) => *v as i64,
+                        _ => 0,
+                    };
+                    *sum = sum.saturating_add(v);
                 }
             }
             (AggregateState::Min(state), Aggregate::Min(_)) => {
@@ -454,11 +457,16 @@ impl AggregateState {
                 }
             }
             (AggregateState::Avg { total, count }, Aggregate::Avg(_)) => {
-                if let Some(idx) = col_idx
-                    && let Value::Integer(v) = &row.values[idx]
-                {
-                    *total = total.saturating_add(*v);
-                    *count = count.saturating_add(1);
+                if let Some(idx) = col_idx {
+                    let maybe_v = match &row.values[idx] {
+                        Value::Integer(v) => Some(*v),
+                        Value::U8(v) => Some(*v as i64),
+                        _ => None,
+                    };
+                    if let Some(v) = maybe_v {
+                        *total = total.saturating_add(v);
+                        *count = count.saturating_add(1);
+                    }
                 }
             }
             _ => {}
@@ -645,6 +653,13 @@ fn like_match(value: &str, pattern: &str) -> bool {
 fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => None,
+        (Value::U8(a), Value::U8(b)) => a.partial_cmp(b),
+        (Value::U8(a), Value::Integer(b)) => (*a as i64).partial_cmp(b),
+        (Value::Integer(a), Value::U8(b)) => a.partial_cmp(&(*b as i64)),
+        (Value::U8(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::U8(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::U8(a), Value::Timestamp(b)) => (*a as i64).partial_cmp(b),
+        (Value::Timestamp(a), Value::U8(b)) => a.partial_cmp(&(*b as i64)),
         (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
         (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
         (Value::Timestamp(a), Value::Integer(b)) => a.partial_cmp(b),
