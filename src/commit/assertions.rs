@@ -133,7 +133,11 @@ fn validate_assertion(catalog: &Catalog, assertion: &ReadAssertion) -> Result<()
             };
             if !matches!(
                 col.col_type,
-                ColumnType::Integer | ColumnType::Float | ColumnType::U256 | ColumnType::Timestamp
+                ColumnType::U8
+                    | ColumnType::Integer
+                    | ColumnType::Float
+                    | ColumnType::U256
+                    | ColumnType::Timestamp
             ) {
                 return Err(AedbError::Validation(format!(
                     "column {column} is not numeric for SumCompare"
@@ -470,17 +474,25 @@ fn sum_rows_for_column<'a>(
 ) -> Result<Value, AedbError> {
     let col_type = &schema.columns[column_idx].col_type;
     match col_type {
-        ColumnType::Integer | ColumnType::Timestamp => {
+        ColumnType::U8 | ColumnType::Integer | ColumnType::Timestamp => {
             let mut sum: i64 = 0;
             for row in rows {
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
-                if let Some(Value::Integer(v) | Value::Timestamp(v)) = row.values.get(column_idx) {
-                    sum = sum.checked_add(*v).ok_or(AedbError::Overflow)?;
+                if let Some(value) = row.values.get(column_idx) {
+                    let addend = match value {
+                        Value::U8(x) => *x as i64,
+                        Value::Integer(x) | Value::Timestamp(x) => *x,
+                        _ => continue,
+                    };
+                    sum = sum.checked_add(addend).ok_or(AedbError::Overflow)?;
                 }
             }
-            if matches!(col_type, ColumnType::Timestamp) {
+            if matches!(col_type, ColumnType::U8) {
+                let as_u8 = u8::try_from(sum).map_err(|_| AedbError::Overflow)?;
+                Ok(Value::U8(as_u8))
+            } else if matches!(col_type, ColumnType::Timestamp) {
                 Ok(Value::Timestamp(sum))
             } else {
                 Ok(Value::Integer(sum))
@@ -521,6 +533,7 @@ fn sum_rows_for_column<'a>(
 
 fn zero_for_threshold(threshold: &Value) -> Value {
     match threshold {
+        Value::U8(_) => Value::U8(0),
         Value::Integer(_) => Value::Integer(0),
         Value::Timestamp(_) => Value::Timestamp(0),
         Value::Float(_) => Value::Float(0.0),
@@ -559,6 +572,7 @@ fn value_matches_type(value: &Value, col_type: &ColumnType) -> bool {
     matches!(
         (value, col_type),
         (Value::Text(_), ColumnType::Text)
+            | (Value::U8(_), ColumnType::U8)
             | (Value::Integer(_), ColumnType::Integer)
             | (Value::Float(_), ColumnType::Float)
             | (Value::Boolean(_), ColumnType::Boolean)

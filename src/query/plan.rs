@@ -303,6 +303,12 @@ impl IntoQueryValue for i32 {
     }
 }
 
+impl IntoQueryValue for u8 {
+    fn into_query_value(self) -> Value {
+        Value::U8(self)
+    }
+}
+
 impl IntoQueryValue for u64 {
     fn into_query_value(self) -> Value {
         Value::Integer(self as i64)

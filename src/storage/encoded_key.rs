@@ -45,6 +45,10 @@ pub fn prefix_successor(prefix: &EncodedKey) -> Option<EncodedKey> {
 
 fn encode_value(v: &Value, out: &mut SmallVec<[u8; 64]>) {
     match v {
+        Value::U8(i) => {
+            out.push(0x0F);
+            out.push(*i);
+        }
         Value::Integer(i) => {
             out.push(0x10);
             let shifted = (*i as u64) ^ 0x8000_0000_0000_0000;
