@@ -10,9 +10,17 @@ use super::predicate::collect_eq_constraints;
 
 type IndexBounds = (Bound<EncodedKey>, Bound<EncodedKey>);
 
+#[derive(Clone)]
 enum IndexLookup {
     Range { column: String, bounds: IndexBounds },
     MultiEq { column: String, values: Vec<Value> },
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct IndexLookupResult {
+    pub pks: Vec<EncodedKey>,
+    pub selected_indexes: Vec<String>,
+    pub plan_trace: Vec<String>,
 }
 
 pub(super) fn indexed_pks_for_predicate(
@@ -23,28 +31,80 @@ pub(super) fn indexed_pks_for_predicate(
     table: &crate::storage::keyspace::TableData,
     predicate: &crate::query::plan::Expr,
 ) -> Result<Option<Vec<EncodedKey>>, QueryError> {
+    Ok(indexed_pks_for_predicate_with_trace(
+        catalog, project_id, scope_id, table_name, table, predicate,
+    )?
+    .map(|result| result.pks))
+}
+
+pub(super) fn indexed_pks_for_predicate_with_trace(
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    table: &crate::storage::keyspace::TableData,
+    predicate: &crate::query::plan::Expr,
+) -> Result<Option<IndexLookupResult>, QueryError> {
     use crate::query::plan::Expr;
 
     match predicate {
         Expr::And(lhs, rhs) => {
-            let left =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, lhs)?;
-            let right =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, rhs)?;
+            let left = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, lhs,
+            )?;
+            let right = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, rhs,
+            )?;
             return Ok(match (left, right) {
-                (Some(left), Some(right)) => Some(intersect_pks(left, right)),
-                (Some(left), None) => Some(left),
-                (None, Some(right)) => Some(right),
+                (Some(left), Some(right)) => Some(IndexLookupResult {
+                    pks: intersect_pks(left.pks, right.pks),
+                    selected_indexes: merge_selected_indexes(
+                        left.selected_indexes,
+                        right.selected_indexes,
+                    ),
+                    plan_trace: merge_trace(
+                        "AND predicate combines indexed candidates with intersection",
+                        left.plan_trace,
+                        right.plan_trace,
+                    ),
+                }),
+                (Some(left), None) => Some(IndexLookupResult {
+                    plan_trace: merge_trace_single(
+                        "AND predicate uses indexed left side; right side will be residual filter",
+                        left.plan_trace,
+                    ),
+                    ..left
+                }),
+                (None, Some(right)) => Some(IndexLookupResult {
+                    plan_trace: merge_trace_single(
+                        "AND predicate uses indexed right side; left side will be residual filter",
+                        right.plan_trace,
+                    ),
+                    ..right
+                }),
                 (None, None) => None,
             });
         }
         Expr::Or(lhs, rhs) => {
-            let left =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, lhs)?;
-            let right =
-                indexed_pks_for_predicate(catalog, project_id, scope_id, table_name, table, rhs)?;
+            let left = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, lhs,
+            )?;
+            let right = indexed_pks_for_predicate_with_trace(
+                catalog, project_id, scope_id, table_name, table, rhs,
+            )?;
             return Ok(match (left, right) {
-                (Some(left), Some(right)) => Some(union_pks(left, right)),
+                (Some(left), Some(right)) => Some(IndexLookupResult {
+                    pks: union_pks(left.pks, right.pks),
+                    selected_indexes: merge_selected_indexes(
+                        left.selected_indexes,
+                        right.selected_indexes,
+                    ),
+                    plan_trace: merge_trace(
+                        "OR predicate combines indexed candidates with union",
+                        left.plan_trace,
+                        right.plan_trace,
+                    ),
+                }),
                 _ => None,
             });
         }
@@ -112,7 +172,13 @@ pub(super) fn indexed_pks_for_predicate(
         } else {
             selected_index.scan_prefix(&encoded)
         };
-        return Ok(Some(pks));
+        return Ok(Some(IndexLookupResult {
+            pks,
+            selected_indexes: vec![idx_name.clone()],
+            plan_trace: vec![format!(
+                "selected composite index '{idx_name}' with leftmost prefix columns={prefix_cols}"
+            )],
+        }));
     };
     let column = match &lookup {
         IndexLookup::Range { column, .. } => column,
@@ -145,14 +211,45 @@ pub(super) fn indexed_pks_for_predicate(
         return Ok(None);
     };
 
-    let pks = match lookup {
+    let pks = match lookup.clone() {
         IndexLookup::Range { bounds, .. } => index.scan_range(bounds.0, bounds.1),
         IndexLookup::MultiEq { values, .. } => values
             .into_iter()
             .flat_map(|v| index.scan_eq(&EncodedKey::from_values(&[v])))
             .collect(),
     };
-    Ok(Some(pks))
+    Ok(Some(IndexLookupResult {
+        pks,
+        selected_indexes: vec![index_name.clone()],
+        plan_trace: vec![format!(
+            "selected single-column index '{index_name}' for predicate on '{column}'"
+        )],
+    }))
+}
+
+fn merge_selected_indexes(left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(left.len() + right.len());
+    for name in left.into_iter().chain(right) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn merge_trace(header: &str, mut left: Vec<String>, right: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(1 + left.len() + right.len());
+    out.push(header.to_string());
+    out.append(&mut left);
+    out.extend(right);
+    out
+}
+
+fn merge_trace_single(header: &str, mut trace: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(1 + trace.len());
+    out.push(header.to_string());
+    out.append(&mut trace);
+    out
 }
 
 fn intersect_pks(left: Vec<EncodedKey>, right: Vec<EncodedKey>) -> Vec<EncodedKey> {

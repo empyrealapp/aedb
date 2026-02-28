@@ -23,7 +23,7 @@ use aggregate::{aggregate_col_idx, aggregate_output_name};
 use cursor::{
     CursorToken, decode_cursor, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor,
 };
-use indexing::indexed_pks_for_predicate;
+use indexing::{indexed_pks_for_predicate, indexed_pks_for_predicate_with_trace};
 use predicate::extract_primary_key_values;
 use validate::validate_query;
 
@@ -35,6 +35,13 @@ pub struct QueryResult {
     pub truncated: bool,
     pub snapshot_seq: u64,
     pub materialized_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AccessPathDiagnostics {
+    pub selected_indexes: Vec<String>,
+    pub predicate_evaluation_path: crate::PredicateEvaluationPath,
+    pub plan_trace: Vec<String>,
 }
 
 pub fn execute_query(
@@ -54,6 +61,134 @@ pub fn execute_query(
         0,
         10_000,
     )
+}
+
+pub(crate) fn explain_access_path_for_query(
+    snapshot: &KeyspaceSnapshot,
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<AccessPathDiagnostics, QueryError> {
+    if !query.joins.is_empty() {
+        let mut trace = Vec::new();
+        trace.push("join query: predicate evaluation happens after join execution".to_string());
+        if query.predicate.is_some() {
+            trace.push("post-join filter stage evaluates query predicate".to_string());
+        }
+        return Ok(AccessPathDiagnostics {
+            selected_indexes: Vec::new(),
+            predicate_evaluation_path: crate::PredicateEvaluationPath::JoinExecution,
+            plan_trace: trace,
+        });
+    }
+
+    let mut selected_indexes = Vec::new();
+    let mut trace = Vec::new();
+    let mut predicate_evaluation_path = crate::PredicateEvaluationPath::None;
+
+    let mut effective_options = options.clone();
+    if effective_options.async_index.is_none() {
+        effective_options.async_index = query.use_index.clone();
+    }
+
+    if let Some(async_index) = &effective_options.async_index {
+        selected_indexes.push(async_index.clone());
+        trace.push(format!(
+            "selected async index projection '{async_index}' as row source"
+        ));
+        predicate_evaluation_path = crate::PredicateEvaluationPath::AsyncIndexProjection;
+        if query.predicate.is_some() {
+            trace.push("query predicate is evaluated as filter on projected rows".to_string());
+        }
+        return Ok(AccessPathDiagnostics {
+            selected_indexes,
+            predicate_evaluation_path,
+            plan_trace: trace,
+        });
+    }
+
+    let table_key = (namespace_key(project_id, scope_id), query.table.clone());
+    let schema = catalog
+        .tables
+        .get(&table_key)
+        .ok_or_else(|| QueryError::TableNotFound {
+            project_id: project_id.to_string(),
+            table: query.table.clone(),
+        })?;
+    let table = snapshot.table(project_id, scope_id, &query.table);
+
+    if let Some(predicate) = query.predicate.as_ref() {
+        if query.limit != Some(0)
+            && query.group_by.is_empty()
+            && query.aggregates.is_empty()
+            && query.having.is_none()
+            && query.order_by.is_empty()
+            && options.cursor.is_none()
+            && extract_primary_key_values(predicate, &schema.primary_key).is_some()
+        {
+            trace.push("primary-key equality predicate detected; using direct row lookup".into());
+            return Ok(AccessPathDiagnostics {
+                selected_indexes,
+                predicate_evaluation_path: crate::PredicateEvaluationPath::PrimaryKeyEqLookup,
+                plan_trace: trace,
+            });
+        }
+
+        if let Some(table) = table {
+            if let Some(indexed) = indexed_pks_for_predicate_with_trace(
+                catalog,
+                project_id,
+                scope_id,
+                &query.table,
+                table,
+                predicate,
+            )? {
+                if !indexed.selected_indexes.is_empty() {
+                    selected_indexes.extend(indexed.selected_indexes.clone());
+                    predicate_evaluation_path =
+                        crate::PredicateEvaluationPath::SecondaryIndexLookup;
+                } else {
+                    predicate_evaluation_path = crate::PredicateEvaluationPath::FullScanFilter;
+                }
+                trace.extend(indexed.plan_trace);
+                if matches!(
+                    predicate_evaluation_path,
+                    crate::PredicateEvaluationPath::FullScanFilter
+                ) {
+                    trace.push(
+                        "no matching secondary index; evaluating predicate during table scan"
+                            .to_string(),
+                    );
+                } else {
+                    trace.push(
+                        "residual predicate is evaluated on rows returned by index lookup"
+                            .to_string(),
+                    );
+                }
+                return Ok(AccessPathDiagnostics {
+                    selected_indexes,
+                    predicate_evaluation_path,
+                    plan_trace: trace,
+                });
+            }
+        }
+
+        trace.push("predicate not indexable for current schema/index set".to_string());
+        return Ok(AccessPathDiagnostics {
+            selected_indexes,
+            predicate_evaluation_path: crate::PredicateEvaluationPath::FullScanFilter,
+            plan_trace: trace,
+        });
+    }
+
+    trace.push("no predicate supplied; full table scan path".to_string());
+    Ok(AccessPathDiagnostics {
+        selected_indexes,
+        predicate_evaluation_path,
+        plan_trace: trace,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -4517,9 +4517,9 @@ impl AedbInstance {
             for pk in &schema.primary_key {
                 query = query.order_by(pk, Order::Asc);
             }
-            let query_result = if let Some(caller_ref) = caller.as_ref() {
-                self.query_with_options_as(
-                    Some(caller_ref),
+            let query_result = self
+                .query_with_options_as(
+                    caller.as_ref(),
                     project_id,
                     scope_id,
                     query,
@@ -4530,21 +4530,7 @@ impl AedbInstance {
                     },
                 )
                 .await
-                .map_err(query_error_to_aedb)?
-            } else {
-                self.query_with_options(
-                    project_id,
-                    scope_id,
-                    query,
-                    QueryOptions {
-                        consistency: ConsistencyMode::AtLatest,
-                        allow_full_scan: true,
-                        ..QueryOptions::default()
-                    },
-                )
-                .await
-                .map_err(query_error_to_aedb)?
-            };
+                .map_err(query_error_to_aedb)?;
 
             let Some(before) = query_result.rows.first().cloned() else {
                 return Ok(None);

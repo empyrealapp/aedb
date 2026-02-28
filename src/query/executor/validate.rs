@@ -62,6 +62,7 @@ fn validate_expr_types(
                 ),
                 ColumnType::Text => matches!(value, Value::Text(_)),
                 ColumnType::Boolean => matches!(value, Value::Boolean(_)),
+                ColumnType::U8 => matches!(value, Value::U8(_) | Value::Integer(_)),
                 ColumnType::U256 => matches!(value, Value::U256(_)),
                 ColumnType::I256 => matches!(value, Value::I256(_)),
                 ColumnType::Blob => matches!(value, Value::Blob(_)),
