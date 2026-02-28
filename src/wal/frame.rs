@@ -3,6 +3,12 @@ use std::io::{self, Read, Write};
 use thiserror::Error;
 
 pub const MAX_FRAME_BODY_BYTES: usize = 64 * 1024 * 1024;
+const U32_SIZE_BYTES: usize = 4;
+const U64_SIZE_BYTES: usize = 8;
+const PAYLOAD_TYPE_SIZE_BYTES: usize = 1;
+const CRC32C_SIZE_BYTES: usize = 4;
+const MIN_FRAME_BODY_SIZE_BYTES: usize =
+    U64_SIZE_BYTES + U64_SIZE_BYTES + PAYLOAD_TYPE_SIZE_BYTES + CRC32C_SIZE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -46,14 +52,20 @@ impl<W: Write> FrameWriter<W> {
         payload_type: u8,
         payload: &[u8],
     ) -> Result<(), FrameError> {
-        let body_len = 8 + 8 + 1 + payload.len() + 4;
-        let frame_length = u32::try_from(body_len).map_err(|_| FrameError::Corruption)?;
+        let frame_body_size_bytes = U64_SIZE_BYTES
+            .saturating_add(U64_SIZE_BYTES)
+            .saturating_add(PAYLOAD_TYPE_SIZE_BYTES)
+            .saturating_add(payload.len())
+            .saturating_add(CRC32C_SIZE_BYTES);
+        let frame_length =
+            u32::try_from(frame_body_size_bytes).map_err(|_| FrameError::Corruption)?;
         let len_bytes = frame_length.to_be_bytes();
         let seq_bytes = commit_seq.to_be_bytes();
         let ts_bytes = timestamp_micros.to_be_bytes();
         let type_bytes = [payload_type];
 
-        let mut crc_input = Vec::with_capacity(4 + body_len - 4);
+        let mut crc_input =
+            Vec::with_capacity(U32_SIZE_BYTES + frame_body_size_bytes - CRC32C_SIZE_BYTES);
         crc_input.extend_from_slice(&len_bytes);
         crc_input.extend_from_slice(&seq_bytes);
         crc_input.extend_from_slice(&ts_bytes);
@@ -98,15 +110,15 @@ impl<R: Read> FrameReader<R> {
             Err(e) => return Err(FrameError::Io(e.to_string())),
         }
         let frame_length = u32::from_be_bytes(len_buf);
-        let body_len = frame_length as usize;
-        if body_len < 8 + 8 + 1 + 4 {
+        let frame_body_size_bytes = frame_length as usize;
+        if frame_body_size_bytes < MIN_FRAME_BODY_SIZE_BYTES {
             return Err(FrameError::Corruption);
         }
-        if body_len > MAX_FRAME_BODY_BYTES {
+        if frame_body_size_bytes > MAX_FRAME_BODY_BYTES {
             return Err(FrameError::Corruption);
         }
 
-        let mut body = vec![0u8; body_len];
+        let mut body = vec![0u8; frame_body_size_bytes];
         match self.inner.read_exact(&mut body) {
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -115,26 +127,35 @@ impl<R: Read> FrameReader<R> {
             Err(e) => return Err(FrameError::Io(e.to_string())),
         }
 
-        let crc_offset = body_len - 4;
+        let crc_offset_bytes = frame_body_size_bytes.saturating_sub(CRC32C_SIZE_BYTES);
+        debug_assert!(crc_offset_bytes < frame_body_size_bytes);
         let stored_crc = u32::from_be_bytes(
-            body[crc_offset..]
+            body[crc_offset_bytes..]
                 .try_into()
                 .map_err(|_| FrameError::Corruption)?,
         );
-        let mut crc_input = Vec::with_capacity(4 + crc_offset);
+        let mut crc_input = Vec::with_capacity(U32_SIZE_BYTES + crc_offset_bytes);
         crc_input.extend_from_slice(&len_buf);
-        crc_input.extend_from_slice(&body[..crc_offset]);
+        crc_input.extend_from_slice(&body[..crc_offset_bytes]);
         let computed_crc = crc32c(&crc_input);
         if stored_crc != computed_crc {
             return Err(FrameError::Corruption);
         }
 
-        let commit_seq =
-            u64::from_be_bytes(body[0..8].try_into().map_err(|_| FrameError::Corruption)?);
-        let timestamp_micros =
-            u64::from_be_bytes(body[8..16].try_into().map_err(|_| FrameError::Corruption)?);
-        let payload_type = body[16];
-        let payload = body[17..crc_offset].to_vec();
+        let commit_seq = u64::from_be_bytes(
+            body[0..U64_SIZE_BYTES]
+                .try_into()
+                .map_err(|_| FrameError::Corruption)?,
+        );
+        let timestamp_micros = u64::from_be_bytes(
+            body[U64_SIZE_BYTES..(2 * U64_SIZE_BYTES)]
+                .try_into()
+                .map_err(|_| FrameError::Corruption)?,
+        );
+        let payload_type = body[2 * U64_SIZE_BYTES];
+        let payload_offset_bytes = (2 * U64_SIZE_BYTES) + PAYLOAD_TYPE_SIZE_BYTES;
+        debug_assert!(payload_offset_bytes <= crc_offset_bytes);
+        let payload = body[payload_offset_bytes..crc_offset_bytes].to_vec();
 
         Ok(Some(Frame {
             frame_length,
@@ -149,7 +170,10 @@ impl<R: Read> FrameReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameError, FrameReader, FrameWriter};
+    use super::{
+        FrameError, FrameReader, FrameWriter, PAYLOAD_TYPE_SIZE_BYTES, U32_SIZE_BYTES,
+        U64_SIZE_BYTES,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -182,16 +206,27 @@ mod tests {
                 .expect("append");
         }
         let mut bytes = writer.into_inner();
-        let mut offset = 0usize;
-        for frame_idx in 1..=10 {
-            let len =
-                u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("len")) as usize;
-            if frame_idx == 5 {
-                let payload_start = offset + 4 + 8 + 8 + 1;
-                bytes[payload_start] ^= 0xFF;
+        let mut frame_offset_bytes = 0usize;
+        let frame_count = 10usize;
+        for frame_index in 1..=frame_count {
+            assert!(frame_index <= frame_count);
+            let frame_body_size_bytes = u32::from_be_bytes(
+                bytes[frame_offset_bytes..frame_offset_bytes + U32_SIZE_BYTES]
+                    .try_into()
+                    .expect("frame size bytes"),
+            ) as usize;
+            let frame_size_bytes = U32_SIZE_BYTES + frame_body_size_bytes;
+            assert!(frame_offset_bytes + frame_size_bytes <= bytes.len());
+            if frame_index == 5 {
+                let payload_offset_bytes = frame_offset_bytes
+                    + U32_SIZE_BYTES
+                    + U64_SIZE_BYTES
+                    + U64_SIZE_BYTES
+                    + PAYLOAD_TYPE_SIZE_BYTES;
+                bytes[payload_offset_bytes] ^= 0xFF;
                 break;
             }
-            offset += 4 + len;
+            frame_offset_bytes += frame_size_bytes;
         }
 
         let mut reader = FrameReader::new(Cursor::new(bytes));

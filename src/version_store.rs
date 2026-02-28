@@ -224,10 +224,10 @@ impl VersionStore {
 
         let mut keyspace = snapshot_to_keyspace(base_keyspace);
         let mut catalog = (**base_catalog).clone();
-        for idx in (base_idx + 1)..=target_idx {
+        for version_index in (base_idx + 1)..=target_idx {
             let version = self
                 .versions
-                .get(idx)
+                .get(version_index)
                 .ok_or_else(|| AedbError::Validation("delta version missing".into()))?;
             if let Some(delta) = &version.delta {
                 for mutation in &delta.mutations {

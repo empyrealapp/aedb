@@ -4,9 +4,15 @@ use crate::catalog::{Catalog, DdlOperation, KV_INDEX_TABLE, ResourceType, namesp
 use crate::config::AedbConfig;
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
+use crate::order_book::{
+    ExecInstruction, FillSpec, InstrumentConfig, OrderBookTableMode, OrderRequest, OrderSide,
+    TimeInForce,
+};
 use crate::permission::{CallerContext, Permission};
 use crate::query::plan::Expr;
 use primitive_types::U256;
+
+const ORDER_BOOK_ID_MAX_LEN: usize = 1024;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +171,76 @@ pub enum Mutation {
         primary_key: Vec<Value>,
         column: String,
         amount_be: [u8; 32],
+    },
+    OrderBookNew {
+        project_id: String,
+        scope_id: String,
+        request: OrderRequest,
+    },
+    OrderBookCancel {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        order_id: u64,
+        client_order_id: Option<String>,
+        owner: String,
+    },
+    OrderBookCancelReplace {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        order_id: u64,
+        owner: String,
+        new_price_ticks: Option<i64>,
+        new_qty_be: Option<[u8; 32]>,
+        new_time_in_force: Option<TimeInForce>,
+        new_exec_instructions: Option<ExecInstruction>,
+    },
+    OrderBookMassCancel {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        owner: String,
+        side: Option<OrderSide>,
+        owner_filter: Option<String>,
+        price_range_ticks: Option<(i64, i64)>,
+    },
+    OrderBookReduce {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        order_id: u64,
+        owner: String,
+        reduce_by_be: [u8; 32],
+    },
+    OrderBookMatch {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        fills: Vec<FillSpec>,
+    },
+    OrderBookDefineTable {
+        project_id: String,
+        scope_id: String,
+        table_id: String,
+        mode: OrderBookTableMode,
+    },
+    OrderBookDropTable {
+        project_id: String,
+        scope_id: String,
+        table_id: String,
+    },
+    OrderBookSetInstrumentConfig {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        config: InstrumentConfig,
+    },
+    OrderBookSetInstrumentHalted {
+        project_id: String,
+        scope_id: String,
+        instrument: String,
+        halted: bool,
     },
 }
 
@@ -461,6 +537,158 @@ pub fn validate_mutation_with_config(
             primary_key,
             column,
         ),
+        Mutation::OrderBookNew { request, .. } => {
+            if request.instrument.trim().is_empty() {
+                return Err(AedbError::Validation("instrument cannot be empty".into()));
+            }
+            if request.instrument.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("instrument too long".into()));
+            }
+            if request.client_order_id.trim().is_empty() {
+                return Err(AedbError::Validation(
+                    "client_order_id cannot be empty".into(),
+                ));
+            }
+            if request.client_order_id.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("client_order_id too long".into()));
+            }
+            if request.owner.trim().is_empty() {
+                return Err(AedbError::Validation("owner cannot be empty".into()));
+            }
+            if request.owner.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("owner too long".into()));
+            }
+            if primitive_types::U256::from_big_endian(&request.qty_be).is_zero() {
+                return Err(AedbError::Validation("qty must be > 0".into()));
+            }
+            if request.exec_instructions.post_only()
+                && !matches!(request.order_type, crate::order_book::OrderType::Limit)
+            {
+                return Err(AedbError::Validation(
+                    "post_only requires limit order".into(),
+                ));
+            }
+            if request.exec_instructions.post_only()
+                && matches!(request.time_in_force, TimeInForce::Fok)
+            {
+                return Err(AedbError::Validation(
+                    "post_only cannot be combined with FOK".into(),
+                ));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookCancel {
+            instrument,
+            owner,
+            client_order_id,
+            ..
+        } => {
+            if instrument.trim().is_empty() || owner.trim().is_empty() {
+                return Err(AedbError::Validation(
+                    "instrument and owner cannot be empty".into(),
+                ));
+            }
+            if instrument.len() > ORDER_BOOK_ID_MAX_LEN || owner.len() > ORDER_BOOK_ID_MAX_LEN {
+                return Err(AedbError::Validation("instrument/owner too long".into()));
+            }
+            if client_order_id
+                .as_ref()
+                .is_some_and(|v| v.len() > ORDER_BOOK_ID_MAX_LEN)
+            {
+                return Err(AedbError::Validation("client_order_id too long".into()));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookCancelReplace {
+            instrument, owner, ..
+        } => {
+            if instrument.trim().is_empty() || owner.trim().is_empty() {
+                return Err(AedbError::Validation(
+                    "instrument and owner cannot be empty".into(),
+                ));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookMassCancel {
+            instrument,
+            owner,
+            price_range_ticks,
+            ..
+        } => {
+            if instrument.trim().is_empty() || owner.trim().is_empty() {
+                return Err(AedbError::Validation(
+                    "instrument and owner cannot be empty".into(),
+                ));
+            }
+            if let Some((min_price, max_price)) = price_range_ticks
+                && min_price > max_price
+            {
+                return Err(AedbError::Validation("invalid price range".into()));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookReduce {
+            instrument,
+            owner,
+            reduce_by_be,
+            ..
+        } => {
+            if instrument.trim().is_empty() || owner.trim().is_empty() {
+                return Err(AedbError::Validation(
+                    "instrument and owner cannot be empty".into(),
+                ));
+            }
+            if primitive_types::U256::from_big_endian(reduce_by_be).is_zero() {
+                return Err(AedbError::Validation("reduce_by must be > 0".into()));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookMatch {
+            instrument, fills, ..
+        } => {
+            if instrument.trim().is_empty() {
+                return Err(AedbError::Validation("instrument cannot be empty".into()));
+            }
+            if fills.is_empty() {
+                return Err(AedbError::Validation("fills cannot be empty".into()));
+            }
+            if fills
+                .iter()
+                .any(|fill| primitive_types::U256::from_big_endian(&fill.qty_be).is_zero())
+            {
+                return Err(AedbError::Validation("fill qty must be > 0".into()));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookDefineTable { table_id, .. }
+        | Mutation::OrderBookDropTable { table_id, .. } => {
+            if table_id.trim().is_empty() {
+                return Err(AedbError::Validation("table_id cannot be empty".into()));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookSetInstrumentConfig {
+            instrument, config, ..
+        } => {
+            if instrument.trim().is_empty() {
+                return Err(AedbError::Validation("instrument cannot be empty".into()));
+            }
+            if config.instrument != *instrument {
+                return Err(AedbError::Validation(
+                    "instrument config instrument mismatch".into(),
+                ));
+            }
+            if primitive_types::U256::from_big_endian(&config.lot_size_be).is_zero() {
+                return Err(AedbError::Validation("lot_size must be > 0".into()));
+            }
+            Ok(())
+        }
+        Mutation::OrderBookSetInstrumentHalted { instrument, .. } => {
+            if instrument.trim().is_empty() {
+                return Err(AedbError::Validation("instrument cannot be empty".into()));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -607,6 +835,35 @@ pub fn validate_permissions(
     let Some(caller) = caller else {
         return Ok(());
     };
+    if matches!(mutation, Mutation::OrderBookMatch { .. }) {
+        if caller.is_internal_system() {
+            return Ok(());
+        }
+        return Err(AedbError::PermissionDenied(
+            "OrderBookMatch is system-only".into(),
+        ));
+    }
+    let is_admin = catalog.has_permission(&caller.caller_id, &Permission::GlobalAdmin);
+    match mutation {
+        Mutation::OrderBookNew { request, .. } => {
+            if !is_admin && request.owner != caller.caller_id {
+                return Err(AedbError::PermissionDenied(
+                    "order owner must match caller".into(),
+                ));
+            }
+        }
+        Mutation::OrderBookCancel { owner, .. }
+        | Mutation::OrderBookCancelReplace { owner, .. }
+        | Mutation::OrderBookReduce { owner, .. }
+        | Mutation::OrderBookMassCancel { owner, .. } => {
+            if !is_admin && owner != &caller.caller_id {
+                return Err(AedbError::PermissionDenied(
+                    "order owner must match caller".into(),
+                ));
+            }
+        }
+        _ => {}
+    }
     if let Some((project_id, scope_id, key)) = kv_write_target(mutation) {
         if catalog.has_kv_write_permission(&caller.caller_id, project_id, scope_id, key) {
             return Ok(());
@@ -703,6 +960,77 @@ fn kv_write_target(mutation: &Mutation) -> Option<(&str, &str, &[u8])> {
             key,
             ..
         } => Some((project_id.as_str(), scope_id.as_str(), key.as_slice())),
+        Mutation::OrderBookNew {
+            project_id,
+            scope_id,
+            request,
+        } => Some((
+            project_id.as_str(),
+            scope_id.as_str(),
+            request.instrument.as_bytes(),
+        )),
+        Mutation::OrderBookCancel {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookCancelReplace {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookMassCancel {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookReduce {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookMatch {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        } => Some((
+            project_id.as_str(),
+            scope_id.as_str(),
+            instrument.as_bytes(),
+        )),
+        Mutation::OrderBookDefineTable {
+            project_id,
+            scope_id,
+            table_id,
+            ..
+        }
+        | Mutation::OrderBookDropTable {
+            project_id,
+            scope_id,
+            table_id,
+            ..
+        } => Some((project_id.as_str(), scope_id.as_str(), table_id.as_bytes())),
+        Mutation::OrderBookSetInstrumentConfig {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookSetInstrumentHalted {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        } => Some((
+            project_id.as_str(),
+            scope_id.as_str(),
+            instrument.as_bytes(),
+        )),
         _ => None,
     }
 }
@@ -854,6 +1182,56 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             ..
         }
         | Mutation::KvDecU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookNew {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookCancel {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookCancelReplace {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookMassCancel {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookReduce {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookMatch {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookDefineTable {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookDropTable {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookSetInstrumentConfig {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::OrderBookSetInstrumentHalted {
             project_id,
             scope_id,
             ..
@@ -1024,14 +1402,14 @@ fn validate_conflict_target(
         ConflictTarget::PrimaryKey => Ok(()),
         ConflictTarget::Index(index_name) => {
             let ns = namespace_key(project_id, scope_id);
-            let idx = catalog
+            let index_def = catalog
                 .indexes
                 .get(&(ns, table_name.to_string(), index_name.clone()))
                 .ok_or_else(|| {
                     AedbError::Validation(format!("conflict index does not exist: {index_name}"))
                 })?;
             if !matches!(
-                idx.index_type,
+                index_def.index_type,
                 crate::catalog::schema::IndexType::UniqueHash
             ) {
                 return Err(AedbError::Validation(format!(
@@ -1170,14 +1548,14 @@ fn validate_update_expr(schema: &TableSchema, expr: &UpdateExpr) -> Result<(), A
 fn extract_primary_key(schema: &TableSchema, row: &Row) -> Result<Vec<Value>, AedbError> {
     let mut primary_key = Vec::with_capacity(schema.primary_key.len());
     for pk_name in &schema.primary_key {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *pk_name)
             .ok_or_else(|| {
                 AedbError::Validation(format!("primary key column missing: {pk_name}"))
             })?;
-        let value = row.values.get(idx).ok_or_else(|| {
+        let value = row.values.get(column_index).ok_or_else(|| {
             AedbError::Validation(format!(
                 "primary key column value missing from row: {pk_name}"
             ))

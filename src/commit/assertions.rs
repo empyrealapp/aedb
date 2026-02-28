@@ -458,11 +458,11 @@ fn compare_col(
 }
 
 fn col_value<'a>(row: &'a Row, schema: &TableSchema, col: &str) -> Result<&'a Value, AedbError> {
-    let Some(idx) = schema.columns.iter().position(|c| c.name == col) else {
+    let Some(column_index) = schema.columns.iter().position(|c| c.name == col) else {
         return Err(AedbError::Validation(format!("column not found: {col}")));
     };
     row.values
-        .get(idx)
+        .get(column_index)
         .ok_or_else(|| AedbError::Validation(format!("column value missing: {col}")))
 }
 

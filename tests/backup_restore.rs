@@ -411,6 +411,14 @@ async fn namespace_restore_replaces_only_target_namespace() {
     .expect("app new");
     db.shutdown().await.expect("shutdown");
 
+    let live_before_restore =
+        recover_with_config(live_dir.path(), &config).expect("recover live before restore");
+    let other_before_restore = live_before_restore
+        .keyspace
+        .kv_get("p", "other", b"k")
+        .expect("other value exists before restore");
+    assert_eq!(other_before_restore.value, b"other-new".to_vec());
+
     let merged_seq = AedbInstance::restore_namespace_from_backup_chain(
         &[full_dir.path().to_path_buf()],
         live_dir.path(),

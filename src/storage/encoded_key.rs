@@ -33,10 +33,10 @@ impl EncodedKey {
 
 pub fn prefix_successor(prefix: &EncodedKey) -> Option<EncodedKey> {
     let mut next = prefix.bytes.clone();
-    for i in (0..next.len()).rev() {
-        if next[i] != 0xFF {
-            next[i] += 1;
-            next.truncate(i + 1);
+    for byte_index in (0..next.len()).rev() {
+        if next[byte_index] != 0xFF {
+            next[byte_index] += 1;
+            next.truncate(byte_index + 1);
             return Some(EncodedKey { bytes: next });
         }
     }
@@ -93,7 +93,8 @@ fn encode_value(v: &Value, out: &mut SmallVec<[u8; 64]>) {
         }
         Value::Blob(b) => {
             out.push(0x18);
-            out.extend_from_slice(&(b.len() as u32).to_be_bytes());
+            let blob_size_bytes = b.len() as u32;
+            out.extend_from_slice(&blob_size_bytes.to_be_bytes());
             out.extend_from_slice(b);
         }
         Value::Null => {

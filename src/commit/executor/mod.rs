@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc as tokio_mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::warn;
 
@@ -97,6 +97,13 @@ struct EpochProcessResult {
     coordinator_apply_attempts: u64,
     coordinator_apply_micros: u64,
     read_set_conflicts: u64,
+    wal_append_ops: u64,
+    wal_append_bytes: u64,
+    wal_append_micros: u64,
+    wal_sync_ops: u64,
+    wal_sync_micros: u64,
+    sync_executed: bool,
+    catalog_changed: bool,
 }
 
 struct ExecutorState {
@@ -116,6 +123,7 @@ struct ExecutorState {
     idempotency: HashMap<IdempotencyKey, IdempotencyRecord>,
     version_store: VersionStore,
     last_full_snapshot_micros: u64,
+    last_memory_estimate_micros: u64,
 }
 
 #[derive(Clone)]
@@ -123,6 +131,13 @@ pub struct CommitExecutor {
     ingress_txs: Vec<tokio_mpsc::Sender<CommitRequest>>,
     config: Arc<AedbConfig>,
     state: Arc<Mutex<ExecutorState>>,
+    durable_notify: Arc<Notify>,
+    current_seq: Arc<AtomicU64>,
+    visible_head_seq: Arc<AtomicU64>,
+    durable_head_seq: Arc<AtomicU64>,
+    start_instant: Instant,
+    last_wal_sync_elapsed_us: Arc<AtomicU64>,
+    last_full_snapshot_micros: Arc<AtomicU64>,
     queued_bytes: Arc<AtomicUsize>,
     telemetry: Arc<ExecutorTelemetry>,
     background_tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
@@ -131,8 +146,11 @@ pub struct CommitExecutor {
 #[derive(Debug, Default)]
 struct ExecutorTelemetry {
     inflight_commits: AtomicUsize,
+    queued_commits: AtomicUsize,
     commits_total: AtomicU64,
     commit_errors: AtomicU64,
+    permission_rejections: AtomicU64,
+    validation_rejections: AtomicU64,
     queue_full_rejections: AtomicU64,
     timeout_rejections: AtomicU64,
     conflict_rejections: AtomicU64,
@@ -144,6 +162,15 @@ struct ExecutorTelemetry {
     read_set_conflicts: AtomicU64,
     coordinator_apply_attempts: AtomicU64,
     coordinator_apply_micros: AtomicU64,
+    wal_append_ops: AtomicU64,
+    wal_append_bytes: AtomicU64,
+    wal_append_micros: AtomicU64,
+    wal_sync_ops: AtomicU64,
+    wal_sync_micros: AtomicU64,
+    prestage_validate_ops: AtomicU64,
+    prestage_validate_micros: AtomicU64,
+    epoch_process_ops: AtomicU64,
+    epoch_process_micros: AtomicU64,
     parallel_runtime_queue_depth: AtomicUsize,
     adaptive_epoch_min_commits: AtomicUsize,
     adaptive_epoch_max_wait_us: AtomicU64,
@@ -153,9 +180,12 @@ struct ExecutorTelemetry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecutorMetrics {
     pub inflight_commits: usize,
+    pub queued_commits: usize,
     pub queued_bytes: usize,
     pub commits_total: u64,
     pub commit_errors: u64,
+    pub permission_rejections: u64,
+    pub validation_rejections: u64,
     pub queue_full_rejections: u64,
     pub timeout_rejections: u64,
     pub conflict_rejections: u64,
@@ -167,6 +197,15 @@ pub struct ExecutorMetrics {
     pub read_set_conflicts: u64,
     pub coordinator_apply_attempts: u64,
     pub avg_coordinator_apply_micros: u64,
+    pub wal_append_ops: u64,
+    pub wal_append_bytes: u64,
+    pub avg_wal_append_micros: u64,
+    pub wal_sync_ops: u64,
+    pub avg_wal_sync_micros: u64,
+    pub prestage_validate_ops: u64,
+    pub avg_prestage_validate_micros: u64,
+    pub epoch_process_ops: u64,
+    pub avg_epoch_process_micros: u64,
     pub parallel_runtime_queue_depth: usize,
     pub adaptive_epoch_min_commits: usize,
     pub adaptive_epoch_max_wait_us: u64,
@@ -227,6 +266,7 @@ impl CommitExecutor {
             .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
 
         let config = Arc::new(config);
+        let initial_last_full_snapshot_micros = now_micros();
         let state = Arc::new(Mutex::new(ExecutorState {
             keyspace,
             catalog,
@@ -243,11 +283,19 @@ impl CommitExecutor {
             global_unique_index,
             idempotency,
             version_store,
-            last_full_snapshot_micros: now_micros(),
+            last_full_snapshot_micros: initial_last_full_snapshot_micros,
+            last_memory_estimate_micros: 0,
         }));
         let (apply_tx, mut rx) = tokio_mpsc::channel::<CommitRequest>(max_inflight_commits);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let telemetry = Arc::new(ExecutorTelemetry::default());
+        let durable_notify = Arc::new(Notify::new());
+        let current_seq_atomic = Arc::new(AtomicU64::new(current_seq));
+        let visible_head_seq = Arc::new(AtomicU64::new(current_seq));
+        let durable_head_seq = Arc::new(AtomicU64::new(current_seq));
+        let start_instant = Instant::now();
+        let last_wal_sync_elapsed_us = Arc::new(AtomicU64::new(0));
+        let last_full_snapshot_micros = Arc::new(AtomicU64::new(initial_last_full_snapshot_micros));
         let background_tasks = Arc::new(StdMutex::new(Vec::new()));
         telemetry
             .adaptive_epoch_min_commits
@@ -288,6 +336,13 @@ impl CommitExecutor {
         let loop_post_txs = post_apply_txs.clone();
         let queue_counter = Arc::clone(&queued_bytes);
         let loop_telemetry = Arc::clone(&telemetry);
+        let loop_durable_notify = Arc::clone(&durable_notify);
+        let loop_current_seq = Arc::clone(&current_seq_atomic);
+        let loop_visible_head = Arc::clone(&visible_head_seq);
+        let loop_durable_head = Arc::clone(&durable_head_seq);
+        let loop_last_wal_sync_elapsed_us = Arc::clone(&last_wal_sync_elapsed_us);
+        let loop_start_instant = start_instant;
+        let loop_last_full_snapshot_micros = Arc::clone(&last_full_snapshot_micros);
         let apply_handle = tokio::spawn(async move {
             let mut pending = VecDeque::new();
             let mut ingress_closed = false;
@@ -321,8 +376,17 @@ impl CommitExecutor {
                 )
                 .await;
                 let mut s = loop_state.lock().await;
+                let durable_before = s.durable_head_seq;
                 let epoch_started = Instant::now();
                 let epoch_result = process_commit_epoch(&mut s, epoch_requests);
+                loop_telemetry
+                    .epoch_process_ops
+                    .fetch_add(1, Ordering::Relaxed);
+                loop_telemetry.epoch_process_micros.fetch_add(
+                    epoch_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
+                let catalog_changed = epoch_result.catalog_changed;
                 let outcomes = epoch_result.outcomes;
                 let had_error = outcomes.iter().any(|o| o.result.is_err());
                 s.adaptive_epoch.observe_epoch(
@@ -354,13 +418,44 @@ impl CommitExecutor {
                 loop_telemetry
                     .coordinator_apply_micros
                     .fetch_add(epoch_result.coordinator_apply_micros, Ordering::Relaxed);
+                loop_telemetry
+                    .wal_append_ops
+                    .fetch_add(epoch_result.wal_append_ops, Ordering::Relaxed);
+                loop_telemetry
+                    .wal_append_bytes
+                    .fetch_add(epoch_result.wal_append_bytes, Ordering::Relaxed);
+                loop_telemetry
+                    .wal_append_micros
+                    .fetch_add(epoch_result.wal_append_micros, Ordering::Relaxed);
+                loop_telemetry
+                    .wal_sync_ops
+                    .fetch_add(epoch_result.wal_sync_ops, Ordering::Relaxed);
+                loop_telemetry
+                    .wal_sync_micros
+                    .fetch_add(epoch_result.wal_sync_micros, Ordering::Relaxed);
+                if epoch_result.sync_executed {
+                    let elapsed = loop_start_instant.elapsed().as_micros() as u64;
+                    loop_last_wal_sync_elapsed_us
+                        .store(elapsed.saturating_add(1), Ordering::Relaxed);
+                }
                 if had_error {
                     loop_telemetry
                         .epoch_failures
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                *loop_validation_catalog.write() = s.catalog.clone();
+                if catalog_changed {
+                    *loop_validation_catalog.write() = s.catalog.clone();
+                }
+                loop_current_seq.store(s.current_seq, Ordering::Release);
+                loop_visible_head.store(s.visible_head_seq, Ordering::Release);
+                loop_durable_head.store(s.durable_head_seq, Ordering::Release);
+                loop_last_full_snapshot_micros
+                    .store(s.last_full_snapshot_micros, Ordering::Release);
+                let durable_advanced = s.durable_head_seq > durable_before;
                 drop(s);
+                if durable_advanced {
+                    loop_durable_notify.notify_waiters();
+                }
 
                 for outcome in outcomes {
                     if let Some(delta) = outcome.post_apply_delta {
@@ -379,6 +474,16 @@ impl CommitExecutor {
                     if outcome.result.is_err() {
                         loop_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
                         if let Err(err) = &outcome.result {
+                            if is_permission_rejection_error(err) {
+                                loop_telemetry
+                                    .permission_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            if is_validation_rejection_error(err) {
+                                loop_telemetry
+                                    .validation_rejections
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             if is_conflict_rejection_error(err) {
                                 loop_telemetry
                                     .conflict_rejections
@@ -398,6 +503,9 @@ impl CommitExecutor {
                     }
                     queue_counter.fetch_sub(outcome.request.encoded_len, Ordering::Relaxed);
                     loop_telemetry
+                        .queued_commits
+                        .fetch_sub(1, Ordering::Relaxed);
+                    loop_telemetry
                         .inflight_commits
                         .fetch_sub(1, Ordering::Relaxed);
                     let _ = outcome.request.result_tx.send(outcome.result);
@@ -406,6 +514,9 @@ impl CommitExecutor {
 
             for req in pending {
                 queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                loop_telemetry
+                    .queued_commits
+                    .fetch_sub(1, Ordering::Relaxed);
                 loop_telemetry
                     .inflight_commits
                     .fetch_sub(1, Ordering::Relaxed);
@@ -432,29 +543,63 @@ impl CommitExecutor {
             let pre_telemetry = Arc::clone(&telemetry);
             let handle = tokio::spawn(async move {
                 while let Some(mut req) = ingress_rx.recv().await {
+                    let mut prevalidate_elapsed_us = None;
                     let (write_partitions, read_partitions) = if req.prevalidated {
-                        let catalog = pre_validation_catalog.read().snapshot();
-                        (
+                        let write_partitions = if req
+                            .envelope
+                            .write_intent
+                            .mutations
+                            .iter()
+                            .any(mutation_requires_fk_expansion)
+                        {
+                            let catalog = pre_validation_catalog.read().snapshot();
                             derive_write_partitions_with_fk_expansion(
                                 &catalog,
                                 &req.envelope.write_intent.mutations,
-                            ),
-                            derive_read_partitions(&req.envelope),
-                        )
+                            )
+                        } else {
+                            derive_write_partitions(&req.envelope.write_intent.mutations)
+                        };
+                        (write_partitions, derive_read_partitions(&req.envelope))
                     } else {
-                        match pre_stage_validate(&pre_validation_catalog, &req.envelope).await {
+                        let prevalidate_started = Instant::now();
+                        let result =
+                            pre_stage_validate(&pre_validation_catalog, &req.envelope).await;
+                        prevalidate_elapsed_us =
+                            Some(prevalidate_started.elapsed().as_micros() as u64);
+                        match result {
                             Ok(partitions) => partitions,
                             Err(e) => {
                                 pre_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
+                                if is_permission_rejection_error(&e) {
+                                    pre_telemetry
+                                        .permission_rejections
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                if is_validation_rejection_error(&e) {
+                                    pre_telemetry
+                                        .validation_rejections
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
                                 pre_queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                                pre_telemetry.queued_commits.fetch_sub(1, Ordering::Relaxed);
                                 let _ = req.result_tx.send(Err(e));
                                 continue;
                             }
                         }
                     };
+                    if let Some(elapsed_us) = prevalidate_elapsed_us {
+                        pre_telemetry
+                            .prestage_validate_ops
+                            .fetch_add(1, Ordering::Relaxed);
+                        pre_telemetry
+                            .prestage_validate_micros
+                            .fetch_add(elapsed_us, Ordering::Relaxed);
+                    }
                     if write_partitions.is_empty() {
                         pre_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
                         pre_queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                        pre_telemetry.queued_commits.fetch_sub(1, Ordering::Relaxed);
                         let _ = req.result_tx.send(Err(AedbError::Validation(
                             "transaction envelope has no mutations".into(),
                         )));
@@ -471,6 +616,7 @@ impl CommitExecutor {
                             .inflight_commits
                             .fetch_sub(1, Ordering::Relaxed);
                         pre_queue_counter.fetch_sub(req.encoded_len, Ordering::Relaxed);
+                        pre_telemetry.queued_commits.fetch_sub(1, Ordering::Relaxed);
                         let _ = req.result_tx.send(Err(AedbError::Validation(
                             "commit apply queue closed".into(),
                         )));
@@ -485,6 +631,11 @@ impl CommitExecutor {
 
         let flush_state = Arc::clone(&state);
         let flush_config = Arc::clone(&config);
+        let flush_telemetry = Arc::clone(&telemetry);
+        let flush_durable_notify = Arc::clone(&durable_notify);
+        let flush_durable_head = Arc::clone(&durable_head_seq);
+        let flush_last_wal_sync_elapsed_us = Arc::clone(&last_wal_sync_elapsed_us);
+        let flush_start_instant = start_instant;
         let flush_handle = tokio::spawn(async move {
             loop {
                 let sleep_ms = flush_config.batch_interval_ms;
@@ -493,10 +644,23 @@ impl CommitExecutor {
                 if flush_config.durability_mode != DurabilityMode::Batch {
                     continue;
                 }
-                if s.pending_batch_bytes > 0 && s.wal.sync_active().is_ok() {
-                    s.durable_head_seq = s.pending_batch_max_seq.max(s.durable_head_seq);
-                    s.pending_batch_bytes = 0;
-                    s.pending_batch_max_seq = s.durable_head_seq;
+                if s.pending_batch_bytes > 0 {
+                    let sync_started = Instant::now();
+                    if s.wal.sync_active().is_ok() {
+                        let sync_us = sync_started.elapsed().as_micros() as u64;
+                        s.durable_head_seq = s.pending_batch_max_seq.max(s.durable_head_seq);
+                        s.pending_batch_bytes = 0;
+                        s.pending_batch_max_seq = s.durable_head_seq;
+                        flush_durable_head.store(s.durable_head_seq, Ordering::Release);
+                        flush_telemetry.wal_sync_ops.fetch_add(1, Ordering::Relaxed);
+                        flush_telemetry
+                            .wal_sync_micros
+                            .fetch_add(sync_us, Ordering::Relaxed);
+                        let elapsed = flush_start_instant.elapsed().as_micros() as u64;
+                        flush_last_wal_sync_elapsed_us
+                            .store(elapsed.saturating_add(1), Ordering::Relaxed);
+                        flush_durable_notify.notify_waiters();
+                    }
                 }
                 prune_idempotency(&mut s);
             }
@@ -525,6 +689,13 @@ impl CommitExecutor {
             ingress_txs,
             config,
             state,
+            durable_notify,
+            current_seq: current_seq_atomic,
+            visible_head_seq,
+            durable_head_seq,
+            start_instant,
+            last_wal_sync_elapsed_us,
+            last_full_snapshot_micros,
             queued_bytes,
             telemetry,
             background_tasks,
@@ -535,12 +706,33 @@ impl CommitExecutor {
         self.submit_as(None, mutation).await
     }
 
+    pub(crate) async fn submit_prevalidated(
+        &self,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        self.submit_envelope_with_mode(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![mutation],
+                },
+                base_seq: 0,
+            },
+            true,
+            false,
+        )
+        .await
+    }
+
     pub async fn submit_as(
         &self,
         caller: Option<CallerContext>,
         mutation: Mutation,
     ) -> Result<CommitResult, AedbError> {
-        let base_seq = self.current_seq().await;
         self.submit_envelope(TransactionEnvelope {
             caller,
             idempotency_key: None,
@@ -550,7 +742,9 @@ impl CommitExecutor {
             write_intent: WriteIntent {
                 mutations: vec![mutation],
             },
-            base_seq,
+            // No read set/assertions in single-mutation submit path.
+            // A fixed base_seq avoids an extra state lock on the hot write path.
+            base_seq: 0,
         })
         .await
     }
@@ -604,16 +798,16 @@ impl CommitExecutor {
     ) -> Result<CommitResult, AedbError> {
         let config = &self.config;
         let encoded = rmp_serde::to_vec(&envelope).map_err(|e| AedbError::Encode(e.to_string()))?;
-        if encoded.len() > config.max_transaction_bytes {
+        let encoded_size_bytes = encoded.len();
+        if encoded_size_bytes > config.max_transaction_bytes {
             return Err(AedbError::Validation(
                 "transaction exceeds max_transaction_bytes".into(),
             ));
         }
-        let len = encoded.len();
         let mut current = self.queued_bytes.load(Ordering::Relaxed);
         loop {
-            let next = current.saturating_add(len);
-            if next > config.max_commit_queue_bytes {
+            let next_queued_size_bytes = current.saturating_add(encoded_size_bytes);
+            if next_queued_size_bytes > config.max_commit_queue_bytes {
                 self.telemetry
                     .queue_full_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -621,7 +815,7 @@ impl CommitExecutor {
             }
             match self.queued_bytes.compare_exchange_weak(
                 current,
-                next,
+                next_queued_size_bytes,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -629,6 +823,9 @@ impl CommitExecutor {
                 Err(observed) => current = observed,
             }
         }
+        self.telemetry
+            .queued_commits
+            .fetch_add(1, Ordering::Relaxed);
         let (result_tx, result_rx) = oneshot::channel();
         let shard = shard_for_envelope(&envelope, self.ingress_txs.len());
         let ingress_tx = self
@@ -640,7 +837,7 @@ impl CommitExecutor {
             std::time::Duration::from_millis(config.commit_timeout_ms),
             ingress_tx.send(CommitRequest {
                 envelope,
-                encoded_len: len,
+                encoded_len: encoded_size_bytes,
                 enqueue_micros: now_micros(),
                 prevalidated,
                 assertions_engine_verified,
@@ -654,11 +851,19 @@ impl CommitExecutor {
         match send_result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.queued_bytes
+                    .fetch_sub(encoded_size_bytes, Ordering::Relaxed);
+                self.telemetry
+                    .queued_commits
+                    .fetch_sub(1, Ordering::Relaxed);
                 return Err(AedbError::Validation(format!("commit queue closed: {e}")));
             }
             Err(_) => {
-                self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.queued_bytes
+                    .fetch_sub(encoded_size_bytes, Ordering::Relaxed);
+                self.telemetry
+                    .queued_commits
+                    .fetch_sub(1, Ordering::Relaxed);
                 self.telemetry
                     .timeout_rejections
                     .fetch_add(1, Ordering::Relaxed);
@@ -685,33 +890,53 @@ impl CommitExecutor {
     }
 
     pub async fn current_seq(&self) -> u64 {
-        self.state.lock().await.current_seq
+        self.current_seq.load(Ordering::Acquire)
     }
 
     pub async fn visible_head_seq(&self) -> u64 {
-        self.state.lock().await.visible_head_seq
+        self.visible_head_seq_now()
+    }
+
+    #[inline]
+    pub fn visible_head_seq_now(&self) -> u64 {
+        self.visible_head_seq.load(Ordering::Acquire)
     }
 
     pub async fn durable_head_seq(&self) -> u64 {
-        self.state.lock().await.durable_head_seq
+        self.durable_head_seq_now()
+    }
+
+    #[inline]
+    pub fn durable_head_seq_now(&self) -> u64 {
+        self.durable_head_seq.load(Ordering::Acquire)
     }
 
     pub async fn head_state(&self) -> HeadState {
-        let s = self.state.lock().await;
         HeadState {
-            visible_head_seq: s.visible_head_seq,
-            durable_head_seq: s.durable_head_seq,
+            visible_head_seq: self.visible_head_seq.load(Ordering::Acquire),
+            durable_head_seq: self.durable_head_seq.load(Ordering::Acquire),
         }
     }
 
     pub async fn snapshot_state(&self) -> (KeyspaceSnapshot, Catalog, u64) {
         let mut state = self.state.lock().await;
-        let view = state
-            .version_store
-            .acquire_latest()
-            .expect("version store should always have a latest view")
-            .into_view();
-        ((*view.keyspace).clone(), (*view.catalog).clone(), view.seq)
+        match state.version_store.acquire_latest() {
+            Ok(view) => {
+                let view = view.into_view();
+                ((*view.keyspace).clone(), (*view.catalog).clone(), view.seq)
+            }
+            Err(err) => {
+                warn!(
+                    error = ?err,
+                    "version store latest view unavailable; falling back to executor state snapshot"
+                );
+                (
+                    state.keyspace.snapshot(),
+                    state.catalog.snapshot(),
+                    state.visible_head_seq,
+                )
+            }
+        }
     }
 
     pub async fn snapshot_at_seq(&self, seq: u64) -> Result<SnapshotReadView, AedbError> {
@@ -722,22 +947,54 @@ impl CommitExecutor {
 
     pub async fn wait_for_durable(&self, seq: u64) -> Result<(), AedbError> {
         loop {
-            if self.durable_head_seq().await >= seq {
+            let notified = self.durable_notify.notified();
+            if self.durable_head_seq_now() >= seq {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            notified.await;
         }
     }
 
     pub async fn force_fsync(&self) -> Result<u64, AedbError> {
         let mut s = self.state.lock().await;
+        if s.pending_batch_bytes == 0 && s.durable_head_seq >= s.visible_head_seq {
+            return Ok(s.durable_head_seq);
+        }
+        let durable_before = s.durable_head_seq;
+        let sync_started = Instant::now();
         s.wal
             .sync_active()
             .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
+        let sync_us = sync_started.elapsed().as_micros() as u64;
         s.durable_head_seq = s.visible_head_seq;
         s.pending_batch_bytes = 0;
         s.pending_batch_max_seq = s.durable_head_seq;
-        Ok(s.durable_head_seq)
+        self.durable_head_seq
+            .store(s.durable_head_seq, Ordering::Release);
+        self.telemetry.wal_sync_ops.fetch_add(1, Ordering::Relaxed);
+        self.telemetry
+            .wal_sync_micros
+            .fetch_add(sync_us, Ordering::Relaxed);
+        let elapsed = self.start_instant.elapsed().as_micros() as u64;
+        self.last_wal_sync_elapsed_us
+            .store(elapsed.saturating_add(1), Ordering::Relaxed);
+        let durable = s.durable_head_seq;
+        let durable_advanced = durable > durable_before;
+        drop(s);
+        if durable_advanced {
+            self.durable_notify.notify_waiters();
+        }
+        Ok(durable)
+    }
+
+    #[inline]
+    pub fn last_wal_sync_age_us(&self) -> Option<u64> {
+        let last_plus_one = self.last_wal_sync_elapsed_us.load(Ordering::Relaxed);
+        if last_plus_one == 0 {
+            return None;
+        }
+        let elapsed = self.start_instant.elapsed().as_micros() as u64;
+        Some(elapsed.saturating_sub(last_plus_one - 1))
     }
 
     pub async fn idempotency_snapshot(&self) -> HashMap<IdempotencyKey, IdempotencyRecord> {
@@ -766,11 +1023,46 @@ impl CommitExecutor {
         } else {
             coordinator_apply_micros / coordinator_apply_attempts
         };
+        let wal_sync_ops = self.telemetry.wal_sync_ops.load(Ordering::Relaxed);
+        let wal_sync_micros = self.telemetry.wal_sync_micros.load(Ordering::Relaxed);
+        let wal_append_ops = self.telemetry.wal_append_ops.load(Ordering::Relaxed);
+        let wal_append_bytes = self.telemetry.wal_append_bytes.load(Ordering::Relaxed);
+        let wal_append_micros = self.telemetry.wal_append_micros.load(Ordering::Relaxed);
+        let avg_wal_append_micros = if wal_append_ops == 0 {
+            0
+        } else {
+            wal_append_micros / wal_append_ops
+        };
+        let avg_wal_sync_micros = if wal_sync_ops == 0 {
+            0
+        } else {
+            wal_sync_micros / wal_sync_ops
+        };
+        let prestage_validate_ops = self.telemetry.prestage_validate_ops.load(Ordering::Relaxed);
+        let prestage_validate_micros = self
+            .telemetry
+            .prestage_validate_micros
+            .load(Ordering::Relaxed);
+        let avg_prestage_validate_micros = if prestage_validate_ops == 0 {
+            0
+        } else {
+            prestage_validate_micros / prestage_validate_ops
+        };
+        let epoch_process_ops = self.telemetry.epoch_process_ops.load(Ordering::Relaxed);
+        let epoch_process_micros = self.telemetry.epoch_process_micros.load(Ordering::Relaxed);
+        let avg_epoch_process_micros = if epoch_process_ops == 0 {
+            0
+        } else {
+            epoch_process_micros / epoch_process_ops
+        };
         ExecutorMetrics {
             inflight_commits: self.telemetry.inflight_commits.load(Ordering::Relaxed),
+            queued_commits: self.telemetry.queued_commits.load(Ordering::Relaxed),
             queued_bytes: self.queued_bytes.load(Ordering::Relaxed),
             commits_total,
             commit_errors: self.telemetry.commit_errors.load(Ordering::Relaxed),
+            permission_rejections: self.telemetry.permission_rejections.load(Ordering::Relaxed),
+            validation_rejections: self.telemetry.validation_rejections.load(Ordering::Relaxed),
             queue_full_rejections: self.telemetry.queue_full_rejections.load(Ordering::Relaxed),
             timeout_rejections: self.telemetry.timeout_rejections.load(Ordering::Relaxed),
             conflict_rejections: self.telemetry.conflict_rejections.load(Ordering::Relaxed),
@@ -788,6 +1080,15 @@ impl CommitExecutor {
             read_set_conflicts: self.telemetry.read_set_conflicts.load(Ordering::Relaxed),
             coordinator_apply_attempts,
             avg_coordinator_apply_micros,
+            wal_append_ops,
+            wal_append_bytes,
+            avg_wal_append_micros,
+            wal_sync_ops,
+            avg_wal_sync_micros,
+            prestage_validate_ops,
+            avg_prestage_validate_micros,
+            epoch_process_ops,
+            avg_epoch_process_micros,
             parallel_runtime_queue_depth: self
                 .telemetry
                 .parallel_runtime_queue_depth
@@ -808,12 +1109,11 @@ impl CommitExecutor {
     }
 
     pub async fn runtime_state_metrics(&self) -> ExecutorRuntimeState {
-        let s = self.state.lock().await;
         ExecutorRuntimeState {
-            current_seq: s.current_seq,
-            visible_head_seq: s.visible_head_seq,
-            durable_head_seq: s.durable_head_seq,
-            last_full_snapshot_micros: s.last_full_snapshot_micros,
+            current_seq: self.current_seq.load(Ordering::Acquire),
+            visible_head_seq: self.visible_head_seq.load(Ordering::Acquire),
+            durable_head_seq: self.durable_head_seq.load(Ordering::Acquire),
+            last_full_snapshot_micros: self.last_full_snapshot_micros.load(Ordering::Acquire),
         }
     }
 }
@@ -836,6 +1136,14 @@ impl Drop for CommitExecutor {
 fn is_conflict_rejection_error(err: &AedbError) -> bool {
     matches!(err, AedbError::Conflict(_))
         || matches!(err, AedbError::Validation(msg) if msg.contains("conflict"))
+}
+
+fn is_permission_rejection_error(err: &AedbError) -> bool {
+    matches!(err, AedbError::PermissionDenied(_))
+}
+
+fn is_validation_rejection_error(err: &AedbError) -> bool {
+    matches!(err, AedbError::Validation(msg) if !msg.contains("conflict"))
 }
 
 fn is_coordinator_timeout_error(err: &AedbError) -> bool {

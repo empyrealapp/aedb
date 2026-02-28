@@ -646,7 +646,7 @@ fn assertion_read_dependency_conflicts_with_write_token_in_epoch_selection() {
     pending.push_back(candidate);
     let mut epoch_writes = HashSet::new();
     epoch_writes.insert(format!("k:{}:62616c616e6365", namespace_key("p", "app")));
-    let idx = super::find_compatible_candidate_index(
+    let candidate_index = super::find_compatible_candidate_index(
         &pending,
         &epoch_writes,
         &HashSet::new(),
@@ -654,7 +654,7 @@ fn assertion_read_dependency_conflicts_with_write_token_in_epoch_selection() {
         false,
     );
     assert!(
-        idx.is_none(),
+        candidate_index.is_none(),
         "assertion-derived read token must conflict with same-key write token"
     );
 }
@@ -1252,8 +1252,8 @@ async fn create_index_builds_existing_rows_synchronously() {
     let table = snapshot
         .table_by_namespace_key(&namespace_key("a", "app"), "users")
         .expect("table snapshot");
-    let idx = table.indexes.get("by_age").expect("index materialized");
-    let at_25 = idx.scan_eq(&EncodedKey::from_values(&[Value::Integer(25)]));
+    let age_index = table.indexes.get("by_age").expect("index materialized");
+    let at_25 = age_index.scan_eq(&EncodedKey::from_values(&[Value::Integer(25)]));
     assert!(!at_25.is_empty());
 }
 

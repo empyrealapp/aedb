@@ -176,6 +176,25 @@ pub(crate) fn authorize_and_bind_query_for_caller(
     ensure_query_caller_allowed(caller)?;
     let (base_project_id, base_scope_id, base_table_name) =
         resolve_query_table_ref(project_id, scope_id, &query.table);
+    let base_alias = query
+        .table_alias
+        .clone()
+        .unwrap_or_else(|| base_table_name.clone());
+    let mut seen_aliases = std::collections::BTreeSet::new();
+    if !seen_aliases.insert(base_alias.clone()) {
+        return Err(QueryError::InvalidQuery {
+            reason: format!("duplicate table alias in query: {base_alias}"),
+        });
+    }
+    for join in &query.joins {
+        let (_, _, join_table_name) = resolve_query_table_ref(project_id, scope_id, &join.table);
+        let join_alias = join.alias.clone().unwrap_or(join_table_name);
+        if !seen_aliases.insert(join_alias.clone()) {
+            return Err(QueryError::InvalidQuery {
+                reason: format!("duplicate table alias in query: {join_alias}"),
+            });
+        }
+    }
     let required = if let Some(index_name) = &options.async_index {
         Permission::IndexRead {
             project_id: base_project_id.clone(),
@@ -211,26 +230,40 @@ pub(crate) fn authorize_and_bind_query_for_caller(
             });
         }
     }
+    let caller_id = caller.caller_id.as_str();
+    let has_policy_bypass = |project_id: &str, table_name: &str| {
+        catalog.has_permission(
+            caller_id,
+            &Permission::PolicyBypass {
+                project_id: project_id.to_string(),
+                table_name: Some(table_name.to_string()),
+            },
+        ) || catalog.has_permission(
+            caller_id,
+            &Permission::PolicyBypass {
+                project_id: project_id.to_string(),
+                table_name: None,
+            },
+        )
+    };
     let mut policies = Vec::new();
-    if let Some(policy) =
-        catalog.read_policy_for_table(&base_project_id, &base_scope_id, &base_table_name)
+    if !has_policy_bypass(&base_project_id, &base_table_name)
+        && let Some(policy) =
+            catalog.read_policy_for_table(&base_project_id, &base_scope_id, &base_table_name)
     {
         let bound_policy = bind_policy_expr(&policy, &caller.caller_id);
         if query.joins.is_empty() {
             policies.push(bound_policy);
         } else {
-            let base_alias = query
-                .table_alias
-                .clone()
-                .unwrap_or_else(|| base_table_name.clone());
             policies.push(qualify_policy_columns(&bound_policy, &base_alias));
         }
     }
     for join in &query.joins {
         let (join_project_id, join_scope_id, join_table_name) =
             resolve_query_table_ref(project_id, scope_id, &join.table);
-        if let Some(policy) =
-            catalog.read_policy_for_table(&join_project_id, &join_scope_id, &join_table_name)
+        if !has_policy_bypass(&join_project_id, &join_table_name)
+            && let Some(policy) =
+                catalog.read_policy_for_table(&join_project_id, &join_scope_id, &join_table_name)
         {
             let bound_policy = bind_policy_expr(&policy, &caller.caller_id);
             let join_alias = join.alias.clone().unwrap_or(join_table_name);
@@ -439,6 +472,11 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
             message: "checkpoint_key_id requires checkpoint_encryption_key".into(),
         });
     }
+    if !(-7..=22).contains(&config.checkpoint_compression_level) {
+        return Err(AedbError::InvalidConfig {
+            message: "checkpoint_compression_level must be between -7 and 22".into(),
+        });
+    }
     if let Some(key) = &config.manifest_hmac_key
         && key.is_empty()
     {
@@ -451,9 +489,14 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
 
 pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbError> {
     validate_config(config)?;
-    if config.manifest_hmac_key.is_none() {
+    let Some(hmac_key) = &config.manifest_hmac_key else {
         return Err(AedbError::InvalidConfig {
             message: "secure mode requires manifest_hmac_key".into(),
+        });
+    };
+    if hmac_key.len() < 32 {
+        return Err(AedbError::InvalidConfig {
+            message: "secure mode requires manifest_hmac_key length >= 32 bytes".into(),
         });
     }
     if !matches!(config.recovery_mode, RecoveryMode::Strict) {
@@ -461,9 +504,9 @@ pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbErro
             message: "secure mode requires strict recovery".into(),
         });
     }
-    if matches!(config.durability_mode, DurabilityMode::OsBuffered) {
+    if !matches!(config.durability_mode, DurabilityMode::Full) {
         return Err(AedbError::InvalidConfig {
-            message: "secure mode forbids OsBuffered durability mode".into(),
+            message: "secure mode requires DurabilityMode::Full for crash-safe durability".into(),
         });
     }
     if !config.hash_chain_required {
@@ -476,9 +519,15 @@ pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbErro
 
 pub fn validate_arcana_config(config: &AedbConfig) -> Result<(), AedbError> {
     validate_config(config)?;
-    if config.manifest_hmac_key.is_none() {
+    let Some(hmac_key) = &config.manifest_hmac_key else {
         return Err(AedbError::InvalidConfig {
             message: "manifest_hmac_key is required for Arcana production profile".into(),
+        });
+    };
+    if hmac_key.len() < 32 {
+        return Err(AedbError::InvalidConfig {
+            message: "Arcana production profile requires manifest_hmac_key length >= 32 bytes"
+                .into(),
         });
     }
     if !matches!(config.recovery_mode, RecoveryMode::Strict) {
@@ -486,9 +535,11 @@ pub fn validate_arcana_config(config: &AedbConfig) -> Result<(), AedbError> {
             message: "Arcana production profile requires strict recovery".into(),
         });
     }
-    if matches!(config.durability_mode, DurabilityMode::OsBuffered) {
+    if !matches!(config.durability_mode, DurabilityMode::Full) {
         return Err(AedbError::InvalidConfig {
-            message: "Arcana production profile forbids OsBuffered durability mode".into(),
+            message:
+                "Arcana production profile requires DurabilityMode::Full for crash-safe durability"
+                    .into(),
         });
     }
     if !config.hash_chain_required {
@@ -629,6 +680,11 @@ pub(crate) fn qualify_policy_columns(expr: &Expr, alias: &str) -> Expr {
 }
 
 pub(crate) fn ensure_external_caller_allowed(caller: &CallerContext) -> Result<(), AedbError> {
+    if caller.caller_id.trim().is_empty() {
+        return Err(AedbError::PermissionDenied(
+            "caller_id must be non-empty".into(),
+        ));
+    }
     if caller.caller_id == SYSTEM_CALLER_ID && !caller.is_internal_system() {
         return Err(AedbError::PermissionDenied(
             "caller_id 'system' is reserved for internal use".into(),
@@ -638,6 +694,12 @@ pub(crate) fn ensure_external_caller_allowed(caller: &CallerContext) -> Result<(
 }
 
 pub(crate) fn ensure_query_caller_allowed(caller: &CallerContext) -> Result<(), QueryError> {
+    if caller.caller_id.trim().is_empty() {
+        return Err(QueryError::PermissionDenied {
+            permission: "caller_id must be non-empty".into(),
+            scope: caller.caller_id.clone(),
+        });
+    }
     if caller.caller_id == SYSTEM_CALLER_ID && !caller.is_internal_system() {
         return Err(QueryError::PermissionDenied {
             permission: "caller_id 'system' is reserved for internal use".into(),
@@ -653,14 +715,14 @@ pub(crate) fn extract_primary_key_values(
 ) -> Result<Vec<Value>, AedbError> {
     let mut primary_key = Vec::with_capacity(schema.primary_key.len());
     for pk_name in &schema.primary_key {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *pk_name)
             .ok_or_else(|| {
                 AedbError::Validation(format!("primary key column missing: {pk_name}"))
             })?;
-        let value = row.values.get(idx).ok_or_else(|| {
+        let value = row.values.get(column_index).ok_or_else(|| {
             AedbError::Validation(format!(
                 "row missing primary key value for column: {pk_name}"
             ))
@@ -1250,6 +1312,36 @@ pub(crate) fn read_segments(dir: &Path) -> Result<Vec<SegmentMeta>, AedbError> {
     Ok(out)
 }
 
+pub(crate) fn read_segments_for_checkpoint(
+    dir: &Path,
+    checkpoint_seq: u64,
+) -> Result<Vec<SegmentMeta>, AedbError> {
+    let segments = read_segments(dir)?;
+    let last_segment = segments.last().cloned();
+    let mut filtered = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let path = dir.join(&segment.filename);
+        let keep = match scan_segment_seq_range(&path)? {
+            Some((_, max_seq)) => max_seq > checkpoint_seq,
+            None => false,
+        };
+        if keep {
+            filtered.push(segment);
+        }
+    }
+
+    // Keep at least the current active segment so manifest metadata remains anchored
+    // even if all observed frames are covered by the checkpoint.
+    if filtered.is_empty()
+        && let Some(last) = last_segment
+    {
+        filtered.push(last);
+    }
+
+    filtered.sort_by_key(|segment| segment.segment_seq);
+    Ok(filtered)
+}
+
 pub(crate) fn segment_seq_from_name(name: &str) -> Option<u64> {
     if !name.starts_with("segment_") || !name.ends_with(".aedbwal") {
         return None;
@@ -1301,28 +1393,28 @@ pub(crate) fn validate_backup_chain(chain: &[(PathBuf, BackupManifest)]) -> Resu
             "backup chain must start with a full backup".into(),
         ));
     }
-    for idx in 1..chain.len() {
-        let prev = &chain[idx - 1].1;
-        let cur = &chain[idx].1;
+    for chain_index in 1..chain.len() {
+        let prev = &chain[chain_index - 1].1;
+        let cur = &chain[chain_index].1;
         if cur.backup_type != "incremental" {
             return Err(AedbError::Validation(format!(
-                "chain entry {idx} is not incremental"
+                "chain entry {chain_index} is not incremental"
             )));
         }
         if cur.parent_backup_id.as_deref() != Some(prev.backup_id.as_str()) {
             return Err(AedbError::Validation(format!(
-                "chain entry {idx} parent mismatch"
+                "chain entry {chain_index} parent mismatch"
             )));
         }
         let expected_from = prev.wal_head_seq.saturating_add(1);
         if cur.from_seq != Some(expected_from) {
             return Err(AedbError::Validation(format!(
-                "chain entry {idx} from_seq mismatch"
+                "chain entry {chain_index} from_seq mismatch"
             )));
         }
         if cur.wal_head_seq < expected_from.saturating_sub(1) {
             return Err(AedbError::Validation(format!(
-                "chain entry {idx} wal_head_seq invalid"
+                "chain entry {chain_index} wal_head_seq invalid"
             )));
         }
     }

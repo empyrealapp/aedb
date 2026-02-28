@@ -69,11 +69,17 @@ pub fn load_checkpoint_with_key(
 }
 
 fn decrypt_checkpoint_payload(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AedbError> {
-    if bytes.len() < 8 + 12 {
+    const ENCRYPTED_MAGIC_SIZE_BYTES: usize = 8;
+    const NONCE_SIZE_BYTES: usize = 12;
+    let encrypted_header_size_bytes = ENCRYPTED_MAGIC_SIZE_BYTES + NONCE_SIZE_BYTES;
+    if bytes.len() < encrypted_header_size_bytes {
         return Err(AedbError::Decode("encrypted checkpoint too small".into()));
     }
-    let nonce = Nonce::from_slice(&bytes[8..20]);
-    let ciphertext = &bytes[20..];
+    let nonce_offset_bytes = ENCRYPTED_MAGIC_SIZE_BYTES;
+    let ciphertext_offset_bytes = encrypted_header_size_bytes;
+    debug_assert!(ciphertext_offset_bytes <= bytes.len());
+    let nonce = Nonce::from_slice(&bytes[nonce_offset_bytes..ciphertext_offset_bytes]);
+    let ciphertext = &bytes[ciphertext_offset_bytes..];
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AedbError::Validation(format!("invalid encryption key: {e}")))?;
     cipher
@@ -185,6 +191,7 @@ mod tests {
             Some(&key),
             Some("k1".into()),
             std::collections::HashMap::new(),
+            3,
         )
         .expect("write");
         assert_eq!(meta.key_id.as_deref(), Some("k1"));

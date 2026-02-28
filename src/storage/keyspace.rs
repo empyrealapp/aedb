@@ -547,14 +547,13 @@ impl Keyspace {
         commit_seq: u64,
     ) {
         let kv = self.kv_data_mut(project_id, scope_id);
-        if !kv.entries.contains_key(&key) {
-            kv.structural_version = commit_seq;
-        }
-        let created_at = kv
-            .entries
-            .get(&key)
-            .map(|e| e.created_at)
-            .unwrap_or(commit_seq);
+        let created_at = match kv.entries.get(&key) {
+            Some(entry) => entry.created_at,
+            None => {
+                kv.structural_version = commit_seq;
+                commit_seq
+            }
+        };
         kv.entries.insert(
             key,
             KvEntry {
@@ -593,12 +592,90 @@ impl Keyspace {
         else {
             return Vec::new();
         };
+        if prefix.is_empty() {
+            return kv
+                .entries
+                .iter()
+                .take(limit)
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+        }
+        let start = Bound::Included(prefix.to_vec());
+        let end = prefix_range_end(prefix)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
         kv.entries
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
+            .range((start, end))
             .take(limit)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    pub fn kv_scan_prefix_ref<'a>(
+        &'a self,
+        project_id: &str,
+        scope_id: &str,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Vec<(&'a [u8], &'a KvEntry)> {
+        let Some(kv) = self
+            .namespace(&NamespaceId::project_scope(project_id, scope_id))
+            .map(|ns| &ns.kv)
+        else {
+            return Vec::new();
+        };
+        if prefix.is_empty() {
+            return kv
+                .entries
+                .iter()
+                .take(limit)
+                .map(|(k, v)| (k.as_slice(), v))
+                .collect();
+        }
+        let start = Bound::Included(prefix.to_vec());
+        let end = prefix_range_end(prefix)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        kv.entries
+            .range((start, end))
+            .take(limit)
+            .map(|(k, v)| (k.as_slice(), v))
+            .collect()
+    }
+
+    pub fn kv_visit_prefix_ref<F>(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        prefix: &[u8],
+        limit: usize,
+        mut visitor: F,
+    ) where
+        F: FnMut(&[u8], &KvEntry) -> bool,
+    {
+        let Some(kv) = self
+            .namespace(&NamespaceId::project_scope(project_id, scope_id))
+            .map(|ns| &ns.kv)
+        else {
+            return;
+        };
+        if prefix.is_empty() {
+            for (k, v) in kv.entries.iter().take(limit) {
+                if !visitor(k.as_slice(), v) {
+                    break;
+                }
+            }
+            return;
+        }
+        let start = Bound::Included(prefix.to_vec());
+        let end = prefix_range_end(prefix)
+            .map(Bound::Excluded)
+            .unwrap_or(Bound::Unbounded);
+        for (k, v) in kv.entries.range((start, end)).take(limit) {
+            if !visitor(k.as_slice(), v) {
+                break;
+            }
+        }
     }
 
     pub fn kv_scan_range(
@@ -811,6 +888,18 @@ fn default_primary_index_backend() -> PrimaryIndexBackend {
     PrimaryIndexBackend::OrdMap
 }
 
+fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for byte_index in (0..end.len()).rev() {
+        if end[byte_index] != u8::MAX {
+            end[byte_index] = end[byte_index].saturating_add(1);
+            end.truncate(byte_index + 1);
+            return Some(end);
+        }
+    }
+    None
+}
+
 fn encode_u256(v: U256) -> Vec<u8> {
     let mut bytes = [0u8; 32];
     v.to_big_endian(&mut bytes);
@@ -818,7 +907,8 @@ fn encode_u256(v: U256) -> Vec<u8> {
 }
 
 fn decode_u256(bytes: &[u8]) -> Result<U256, crate::error::AedbError> {
-    if bytes.len() != 32 {
+    let value_size_bytes = bytes.len();
+    if value_size_bytes != 32 {
         return Err(crate::error::AedbError::Validation(
             "invalid u256 bytes length".into(),
         ));
@@ -998,5 +1088,23 @@ mod tests {
             ks.get_row_version("p", "app", "users", &[Value::Integer(1)]),
             11
         );
+    }
+
+    #[test]
+    fn kv_prefix_scans_are_lexicographically_bounded() {
+        let mut ks = Keyspace::default();
+        ks.kv_set("p", "app", b"ob:a:1".to_vec(), b"v1".to_vec(), 1);
+        ks.kv_set("p", "app", b"ob:a:2".to_vec(), b"v2".to_vec(), 2);
+        ks.kv_set("p", "app", b"ob:b:1".to_vec(), b"v3".to_vec(), 3);
+        ks.kv_set("p", "app", b"zz".to_vec(), b"v4".to_vec(), 4);
+
+        let rows = ks.kv_scan_prefix("p", "app", b"ob:a:", 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, b"ob:a:1".to_vec());
+        assert_eq!(rows[1].0, b"ob:a:2".to_vec());
+
+        let refs = ks.kv_scan_prefix_ref("p", "app", b"ob:", 10);
+        assert_eq!(refs.len(), 3);
+        assert!(refs.iter().all(|(k, _)| k.starts_with(b"ob:")));
     }
 }

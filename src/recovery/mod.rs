@@ -157,7 +157,7 @@ fn segment_paths_for_replay(
 
     let mut segments = manifest.segments.clone();
     segments.sort_by_key(|segment| segment.segment_seq);
-    let mut paths = Vec::with_capacity(segments.len());
+    let mut segment_paths = Vec::with_capacity(segments.len());
     let mut replay_limits = HashMap::new();
     let active_segment_seq = manifest.active_segment_seq;
     for segment in segments {
@@ -254,13 +254,13 @@ fn segment_paths_for_replay(
                 );
             }
         }
-        let limit_path = path.clone();
-        paths.push(path);
+        let replay_limit_path = path.clone();
+        segment_paths.push(path);
         if segment.size_bytes > 0 {
-            replay_limits.insert(limit_path, segment.size_bytes);
+            replay_limits.insert(replay_limit_path, segment.size_bytes);
         }
     }
-    Ok((paths, replay_limits))
+    Ok((segment_paths, replay_limits))
 }
 
 fn load_latest_valid_checkpoint(
@@ -344,18 +344,20 @@ fn sha256_prefix_hex(path: &Path, bytes_to_hash: u64) -> Result<String, AedbErro
     let mut file = File::open(path)?;
     let mut reader = std::io::BufReader::new(&mut file);
     let mut hasher = Sha256::new();
-    let mut remaining = bytes_to_hash;
-    let mut buf = [0u8; 16 * 1024];
-    while remaining > 0 {
-        let read_len = usize::try_from(remaining.min(buf.len() as u64)).unwrap_or(buf.len());
-        let n = reader.read(&mut buf[..read_len])?;
-        if n == 0 {
+    let mut remaining_size_bytes = bytes_to_hash;
+    let mut buffer = [0u8; 16 * 1024];
+    while remaining_size_bytes > 0 {
+        let read_size_bytes =
+            usize::try_from(remaining_size_bytes.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        debug_assert!(read_size_bytes <= buffer.len());
+        let read_count = reader.read(&mut buffer[..read_size_bytes])?;
+        if read_count == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
-        remaining = remaining.saturating_sub(n as u64);
+        hasher.update(&buffer[..read_count]);
+        remaining_size_bytes = remaining_size_bytes.saturating_sub(read_count as u64);
     }
-    if remaining > 0 {
+    if remaining_size_bytes > 0 {
         return Err(AedbError::Validation(
             "segment shorter than expected".into(),
         ));

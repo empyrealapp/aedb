@@ -444,6 +444,141 @@ pub fn preflight_plan(
                 version_at_read: version,
             });
         }
+        Mutation::OrderBookNew {
+            project_id,
+            scope_id,
+            request,
+        } => {
+            let version = snapshot
+                .kv_get(project_id, scope_id, request.instrument.as_bytes())
+                .map(|e| e.version)
+                .unwrap_or(0);
+            read_set.points.push(ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    key: request.instrument.clone().into_bytes(),
+                },
+                version_at_read: version,
+            });
+        }
+        Mutation::OrderBookCancel {
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            ..
+        }
+        | Mutation::OrderBookCancelReplace {
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            ..
+        }
+        | Mutation::OrderBookReduce {
+            project_id,
+            scope_id,
+            instrument,
+            order_id,
+            ..
+        } => {
+            let mut key = format!("ob:{instrument}:ord:").into_bytes();
+            key.extend_from_slice(&order_id.to_be_bytes());
+            let version = snapshot
+                .kv_get(project_id, scope_id, &key)
+                .map(|e| e.version)
+                .unwrap_or(0);
+            read_set.points.push(ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    key,
+                },
+                version_at_read: version,
+            });
+        }
+        Mutation::OrderBookMassCancel {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookMatch {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        } => {
+            let prefix = format!("ob:{instrument}:").into_bytes();
+            let start = ReadBound::Included(prefix.clone());
+            let mut end = prefix.clone();
+            end.push(0xff);
+            let max_version =
+                snapshot_max_kv_version_for_prefix(snapshot, project_id, scope_id, &prefix);
+            let structural_version = snapshot_kv_structural_version(snapshot, project_id, scope_id);
+            read_set.ranges.push(ReadRangeEntry {
+                range: ReadRange::KvRange {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    start,
+                    end: ReadBound::Excluded(end),
+                },
+                max_version_at_read: max_version,
+                structural_version_at_read: structural_version,
+            });
+        }
+        Mutation::OrderBookDefineTable {
+            project_id,
+            scope_id,
+            table_id,
+            ..
+        }
+        | Mutation::OrderBookDropTable {
+            project_id,
+            scope_id,
+            table_id,
+        } => {
+            let key = crate::order_book::key_order_book_table_spec(table_id);
+            let version = snapshot
+                .kv_get(project_id, scope_id, &key)
+                .map(|e| e.version)
+                .unwrap_or(0);
+            read_set.points.push(ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    key,
+                },
+                version_at_read: version,
+            });
+        }
+        Mutation::OrderBookSetInstrumentConfig {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        }
+        | Mutation::OrderBookSetInstrumentHalted {
+            project_id,
+            scope_id,
+            instrument,
+            ..
+        } => {
+            let key = crate::order_book::key_instrument_config(instrument);
+            let version = snapshot
+                .kv_get(project_id, scope_id, &key)
+                .map(|e| e.version)
+                .unwrap_or(0);
+            read_set.points.push(ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    key,
+                },
+                version_at_read: version,
+            });
+        }
         Mutation::Ddl(_) => {}
     }
 
@@ -503,6 +638,39 @@ fn load_table_u256_field(
         crate::catalog::types::Value::U256(bytes) => Ok(U256::from_big_endian(bytes)),
         _ => Err(AedbError::Validation(format!("column {column} is not U256")).to_string()),
     }
+}
+
+fn snapshot_max_kv_version_for_prefix(
+    snapshot: &KeyspaceSnapshot,
+    project_id: &str,
+    scope_id: &str,
+    prefix: &[u8],
+) -> u64 {
+    let ns = crate::storage::keyspace::NamespaceId::project_scope(project_id, scope_id);
+    let Some(namespace) = snapshot.namespaces.get(&ns) else {
+        return 0;
+    };
+    namespace
+        .kv
+        .entries
+        .iter()
+        .filter(|(k, _)| k.starts_with(prefix))
+        .map(|(_, v)| v.version)
+        .max()
+        .unwrap_or(0)
+}
+
+fn snapshot_kv_structural_version(
+    snapshot: &KeyspaceSnapshot,
+    project_id: &str,
+    scope_id: &str,
+) -> u64 {
+    let ns = crate::storage::keyspace::NamespaceId::project_scope(project_id, scope_id);
+    snapshot
+        .namespaces
+        .get(&ns)
+        .map(|n| n.kv.structural_version)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

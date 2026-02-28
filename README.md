@@ -144,12 +144,18 @@ let db = aedb::AedbInstance::open(config, dir.path())?;
 AEDB supports permission-aware APIs via `CallerContext` and `Permission`.
 
 - `open_production` and `open_secure` require authenticated `*_as` calls
-- `open_secure` enforces hardened durability/recovery settings
+- `open_secure` enforces hardened durability/recovery settings (`DurabilityMode::Full`, strict recovery, hash chain, HMAC)
 - table/KV/query access can be scoped per project/scope/resource
+- `authz_audit` and `assertion_audit` system tables provide built-in audit trails
+
+Security/operations docs:
+
+- `docs/SECURITY_ACCEPTANCE_CRITERIA.md`
+- `docs/SECURITY_OPERATIONS_RUNBOOK.md`
 
 ## Operational APIs
 
-- `checkpoint_now()` to force a checkpoint
+- `checkpoint_now()` to force a fuzzy checkpoint (does not block commit/query traffic)
 - `backup_full(...)` / restore helpers for backup workflows
 - `operational_metrics()` for commit latency, queue depth, durable head lag, and more
 
@@ -184,6 +190,12 @@ cargo test --test query_integration
 cargo test --test backup_restore
 cargo test --test crash_matrix
 cargo test --test stress
+```
+
+Security acceptance gate (mandatory profile):
+
+```bash
+./scripts/security_gate.sh
 ```
 
 ## License

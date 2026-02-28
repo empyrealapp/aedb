@@ -34,9 +34,9 @@ impl GlobalUniqueIndexState {
         let mut state = Self {
             entries: HashMap::new(),
         };
-        for (idx, schema) in global_unique_index_definitions(catalog) {
-            state.entries.entry(idx.clone()).or_default();
-            let Some(by_value) = state.entries.get_mut(&idx) else {
+        for (index_key, schema) in global_unique_index_definitions(catalog) {
+            state.entries.entry(index_key.clone()).or_default();
+            let Some(by_value) = state.entries.get_mut(&index_key) else {
                 continue;
             };
             for (ns_id, ns_data) in keyspace.namespaces.iter() {
@@ -46,15 +46,16 @@ impl GlobalUniqueIndexState {
                 if !ns_key.starts_with("_global::") {
                     continue;
                 }
-                let Some(table) = ns_data.tables.get(&idx.table_name) else {
+                let Some(table) = ns_data.tables.get(&index_key.table_name) else {
                     continue;
                 };
                 let Some(table_schema) = schema.get(&**ns_key) else {
                     continue;
                 };
                 for (pk, row) in &table.rows {
-                    let index_key = extract_index_key_encoded(row, table_schema, &idx.columns)?;
-                    by_value.insert(index_key, (ns_key.clone(), pk.clone()));
+                    let encoded_index_key =
+                        extract_index_key_encoded(row, table_schema, &index_key.columns)?;
+                    by_value.insert(encoded_index_key, (ns_key.clone(), pk.clone()));
                 }
             }
         }
@@ -316,15 +317,16 @@ impl GlobalUniqueIndexState {
         let incoming_pk_encoded = EncodedKey::from_values(input.incoming_pk);
         let schema = table_schema_for(catalog, input.project_id, input.scope_id, input.table_name)?;
         let defs = defs_for_table(catalog, input.table_name);
-        for idx in defs {
-            let index_key = extract_index_key_encoded(input.incoming_row, &schema, &idx.columns)?;
-            let map = self.entries.entry(idx.clone()).or_default();
-            if let Some((existing_ns, existing_pk)) = map.get(&index_key)
+        for index_key in defs {
+            let encoded_index_key =
+                extract_index_key_encoded(input.incoming_row, &schema, &index_key.columns)?;
+            let map = self.entries.entry(index_key.clone()).or_default();
+            if let Some((existing_ns, existing_pk)) = map.get(&encoded_index_key)
                 && !(existing_ns == &current_ns && existing_pk == &incoming_pk_encoded)
             {
                 return Err(AedbError::Validation(format!(
                     "global unique constraint violation on {} ({})",
-                    input.table_name, idx.index_name
+                    input.table_name, index_key.index_name
                 )));
             }
 
@@ -334,10 +336,14 @@ impl GlobalUniqueIndexState {
                 input.table_name,
                 &incoming_pk_encoded,
             ) {
-                let previous_key = extract_index_key_encoded(existing_row, &schema, &idx.columns)?;
+                let previous_key =
+                    extract_index_key_encoded(existing_row, &schema, &index_key.columns)?;
                 map.remove(&previous_key);
             }
-            map.insert(index_key, (current_ns.clone(), incoming_pk_encoded.clone()));
+            map.insert(
+                encoded_index_key,
+                (current_ns.clone(), incoming_pk_encoded.clone()),
+            );
         }
         Ok(())
     }
@@ -360,9 +366,9 @@ impl GlobalUniqueIndexState {
             return Ok(());
         };
         let schema = table_schema_for(catalog, project_id, scope_id, table_name)?;
-        for idx in defs_for_table(catalog, table_name) {
-            let key = extract_index_key_encoded(row, &schema, &idx.columns)?;
-            if let Some(map) = self.entries.get_mut(&idx) {
+        for index_key in defs_for_table(catalog, table_name) {
+            let key = extract_index_key_encoded(row, &schema, &index_key.columns)?;
+            if let Some(map) = self.entries.get_mut(&index_key) {
                 map.remove(&key);
             }
         }
@@ -451,16 +457,16 @@ fn global_unique_index_definitions(
         ) {
             continue;
         }
-        let idx = IndexKey {
+        let index_key = IndexKey {
             table_name: table_name.clone(),
             index_name: idx_name.clone(),
             columns: def.columns.clone(),
         };
         let signature = format!(
             "{}:{}:{}",
-            idx.table_name,
-            idx.index_name,
-            idx.columns.join(",")
+            index_key.table_name,
+            index_key.index_name,
+            index_key.columns.join(",")
         );
         if !seen.insert(signature) {
             continue;
@@ -476,7 +482,7 @@ fn global_unique_index_definitions(
                 }
             })
             .collect::<HashMap<_, _>>();
-        defs.push((idx, schemas));
+        defs.push((index_key, schemas));
     }
     defs
 }
@@ -498,12 +504,12 @@ fn table_schema_for(
 fn extract_pk_from_row(schema: &TableSchema, row: &Row) -> Result<Vec<Value>, AedbError> {
     let mut pk = Vec::with_capacity(schema.primary_key.len());
     for col in &schema.primary_key {
-        let idx = schema
+        let column_index = schema
             .columns
             .iter()
             .position(|c| c.name == *col)
             .ok_or_else(|| AedbError::Validation(format!("primary key column missing: {col}")))?;
-        pk.push(row.values[idx].clone());
+        pk.push(row.values[column_index].clone());
     }
     Ok(pk)
 }

@@ -215,7 +215,7 @@ impl Operator for ProjectOperator {
         let values = self
             .selected
             .iter()
-            .map(|idx| row.values[*idx].clone())
+            .map(|column_index| row.values[*column_index].clone())
             .collect();
         Some(Row { values })
     }
@@ -227,7 +227,7 @@ impl Operator for ProjectOperator {
 
 pub struct SortOperator {
     rows: Vec<Row>,
-    idx: usize,
+    row_index: usize,
     examined: usize,
 }
 
@@ -259,7 +259,7 @@ impl SortOperator {
             if limit == 0 {
                 return Self {
                     rows: Vec::new(),
-                    idx: 0,
+                    row_index: 0,
                     examined: 0,
                 };
             }
@@ -305,7 +305,10 @@ impl SortOperator {
 
             impl Eq for TopKRow {}
 
-            let sort_key_columns: Vec<usize> = order_by.iter().map(|(idx, _)| *idx).collect();
+            let sort_key_columns: Vec<usize> = order_by
+                .iter()
+                .map(|(column_index, _)| *column_index)
+                .collect();
             let sort_orders =
                 Arc::new(order_by.iter().map(|(_, order)| *order).collect::<Vec<_>>());
             let mut heap: BinaryHeap<TopKRow> = BinaryHeap::with_capacity(limit);
@@ -313,7 +316,7 @@ impl SortOperator {
                 let candidate = TopKRow {
                     sort_key: sort_key_columns
                         .iter()
-                        .map(|idx| row.values[*idx].clone())
+                        .map(|column_index| row.values[*column_index].clone())
                         .collect(),
                     row,
                     orders: Arc::clone(&sort_orders),
@@ -336,7 +339,7 @@ impl SortOperator {
             rows.sort_by(compare_rows);
             return Self {
                 rows,
-                idx: 0,
+                row_index: 0,
                 examined,
             };
         }
@@ -349,7 +352,7 @@ impl SortOperator {
         rows.sort_by(compare_rows);
         Self {
             rows,
-            idx: 0,
+            row_index: 0,
             examined,
         }
     }
@@ -357,11 +360,11 @@ impl SortOperator {
 
 impl Operator for SortOperator {
     fn next(&mut self) -> Option<Row> {
-        if self.idx >= self.rows.len() {
+        if self.row_index >= self.rows.len() {
             return None;
         }
-        let row = self.rows[self.idx].clone();
-        self.idx += 1;
+        let row = self.rows[self.row_index].clone();
+        self.row_index += 1;
         Some(row)
     }
 
@@ -401,7 +404,7 @@ impl Operator for LimitOperator {
 
 pub struct AggregateOperator {
     rows: Vec<Row>,
-    idx: usize,
+    row_index: usize,
     examined: usize,
 }
 
@@ -425,14 +428,14 @@ impl AggregateState {
         }
     }
 
-    fn update(&mut self, aggregate: &Aggregate, row: &Row, col_idx: Option<usize>) {
+    fn update(&mut self, aggregate: &Aggregate, row: &Row, aggregate_column_index: Option<usize>) {
         match (self, aggregate) {
             (AggregateState::Count(v), Aggregate::Count) => {
                 *v = v.saturating_add(1);
             }
             (AggregateState::Sum(sum), Aggregate::Sum(_)) => {
-                if let Some(idx) = col_idx {
-                    let v = match &row.values[idx] {
+                if let Some(column_index) = aggregate_column_index {
+                    let v = match &row.values[column_index] {
                         Value::Integer(v) => *v,
                         Value::U8(v) => *v as i64,
                         _ => 0,
@@ -441,24 +444,24 @@ impl AggregateState {
                 }
             }
             (AggregateState::Min(state), Aggregate::Min(_)) => {
-                if let Some(idx) = col_idx {
-                    let value = row.values[idx].clone();
+                if let Some(column_index) = aggregate_column_index {
+                    let value = row.values[column_index].clone();
                     if state.as_ref().is_none_or(|current| value < *current) {
                         *state = Some(value);
                     }
                 }
             }
             (AggregateState::Max(state), Aggregate::Max(_)) => {
-                if let Some(idx) = col_idx {
-                    let value = row.values[idx].clone();
+                if let Some(column_index) = aggregate_column_index {
+                    let value = row.values[column_index].clone();
                     if state.as_ref().is_none_or(|current| value > *current) {
                         *state = Some(value);
                     }
                 }
             }
             (AggregateState::Avg { total, count }, Aggregate::Avg(_)) => {
-                if let Some(idx) = col_idx {
-                    let maybe_v = match &row.values[idx] {
+                if let Some(column_index) = aggregate_column_index {
+                    let maybe_v = match &row.values[column_index] {
                         Value::Integer(v) => Some(*v),
                         Value::U8(v) => Some(*v as i64),
                         _ => None,
@@ -515,8 +518,12 @@ impl AggregateOperator {
                     .map(AggregateState::from_aggregate)
                     .collect::<Vec<_>>()
             });
-            for (idx, state) in states.iter_mut().enumerate() {
-                state.update(&aggregates[idx], &row, aggregate_col_idx[idx]);
+            for (aggregate_index, state) in states.iter_mut().enumerate() {
+                state.update(
+                    &aggregates[aggregate_index],
+                    &row,
+                    aggregate_col_idx[aggregate_index],
+                );
             }
         }
         let examined = child.rows_examined();
@@ -532,7 +539,7 @@ impl AggregateOperator {
 
         Self {
             rows,
-            idx: 0,
+            row_index: 0,
             examined,
         }
     }
@@ -540,11 +547,11 @@ impl AggregateOperator {
 
 impl Operator for AggregateOperator {
     fn next(&mut self) -> Option<Row> {
-        if self.idx >= self.rows.len() {
+        if self.row_index >= self.rows.len() {
             return None;
         }
-        let row = self.rows[self.idx].clone();
-        self.idx += 1;
+        let row = self.rows[self.row_index].clone();
+        self.row_index += 1;
         Some(row)
     }
 
@@ -555,41 +562,41 @@ impl Operator for AggregateOperator {
 
 fn eval_compiled_expr(expr: &CompiledExpr, row: &Row) -> bool {
     match expr {
-        CompiledExpr::Eq(idx, v) => {
-            get_col(row, *idx).is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_eq()))
-        }
-        CompiledExpr::Ne(idx, v) => {
-            get_col(row, *idx).is_some_and(|rv| compare_values(rv, v).is_some_and(|o| !o.is_eq()))
-        }
-        CompiledExpr::Lt(idx, v) => {
-            get_col(row, *idx).is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_lt()))
-        }
-        CompiledExpr::Lte(idx, v) => {
-            get_col(row, *idx).is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_le()))
-        }
-        CompiledExpr::Gt(idx, v) => {
-            get_col(row, *idx).is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_gt()))
-        }
-        CompiledExpr::Gte(idx, v) => {
-            get_col(row, *idx).is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_ge()))
-        }
-        CompiledExpr::In(idx, values) => get_col(row, *idx).is_some_and(|rv| {
+        CompiledExpr::Eq(column_index, v) => get_col(row, *column_index)
+            .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_eq())),
+        CompiledExpr::Ne(column_index, v) => get_col(row, *column_index)
+            .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| !o.is_eq())),
+        CompiledExpr::Lt(column_index, v) => get_col(row, *column_index)
+            .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_lt())),
+        CompiledExpr::Lte(column_index, v) => get_col(row, *column_index)
+            .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_le())),
+        CompiledExpr::Gt(column_index, v) => get_col(row, *column_index)
+            .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_gt())),
+        CompiledExpr::Gte(column_index, v) => get_col(row, *column_index)
+            .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_ge())),
+        CompiledExpr::In(column_index, values) => get_col(row, *column_index).is_some_and(|rv| {
             values
                 .iter()
                 .any(|v| compare_values(rv, v).is_some_and(|o| o.is_eq()))
         }),
-        CompiledExpr::Between(idx, lo, hi) => get_col(row, *idx).is_some_and(|rv| {
-            compare_values(rv, lo).is_some_and(|o| o.is_ge())
-                && compare_values(rv, hi).is_some_and(|o| o.is_le())
-        }),
-        CompiledExpr::IsNull(idx) => get_col(row, *idx).is_some_and(|rv| matches!(rv, Value::Null)),
-        CompiledExpr::IsNotNull(idx) => {
-            get_col(row, *idx).is_some_and(|rv| !matches!(rv, Value::Null))
+        CompiledExpr::Between(column_index, lo, hi) => {
+            get_col(row, *column_index).is_some_and(|rv| {
+                compare_values(rv, lo).is_some_and(|o| o.is_ge())
+                    && compare_values(rv, hi).is_some_and(|o| o.is_le())
+            })
         }
-        CompiledExpr::Like(idx, pattern) => get_col(row, *idx).is_some_and(|rv| match rv {
-            Value::Text(s) => like_match(s, pattern),
-            _ => false,
-        }),
+        CompiledExpr::IsNull(column_index) => {
+            get_col(row, *column_index).is_some_and(|rv| matches!(rv, Value::Null))
+        }
+        CompiledExpr::IsNotNull(column_index) => {
+            get_col(row, *column_index).is_some_and(|rv| !matches!(rv, Value::Null))
+        }
+        CompiledExpr::Like(column_index, pattern) => {
+            get_col(row, *column_index).is_some_and(|rv| match rv {
+                Value::Text(s) => like_match(s, pattern),
+                _ => false,
+            })
+        }
         CompiledExpr::And(a, b) => eval_compiled_expr(a, row) && eval_compiled_expr(b, row),
         CompiledExpr::Or(a, b) => eval_compiled_expr(a, row) || eval_compiled_expr(b, row),
         CompiledExpr::Not(inner) => !eval_compiled_expr(inner, row),
@@ -610,8 +617,8 @@ fn find_col_idx(columns: &[String], col: &str, table: &str) -> Result<usize, Que
         })
 }
 
-fn get_col(row: &Row, idx: usize) -> Option<&Value> {
-    row.values.get(idx)
+fn get_col(row: &Row, column_index: usize) -> Option<&Value> {
+    row.values.get(column_index)
 }
 
 fn like_match(value: &str, pattern: &str) -> bool {

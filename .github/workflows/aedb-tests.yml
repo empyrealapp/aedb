@@ -38,8 +38,33 @@ jobs:
       - name: L1 balance conservation (must-pass smoke)
         run: cargo test --test stress arcana_l1_balance_conservation_under_load
 
-  crash:
+  security_strict:
     needs: integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Security boundaries
+        run: |
+          cargo test --test security_boundaries -- --test-threads=1
+          cargo test --test security_properties -- --test-threads=1
+      - name: Security property tests (fuzz-style randomized)
+        env:
+          PROPTEST_CASES: "16"
+        run: cargo test --test security_properties_proptest -- --test-threads=1
+      - name: Strict backup hash-chain acceptance
+        run: |
+          cargo test --test backup_restore strict_backup_chain_restore_succeeds_with_hash_chain_enforcement -- --test-threads=1
+          cargo test --test backup_restore strict_backup_chain_restore_rejects_tampered_incremental_segment -- --test-threads=1
+      - name: Idempotency and audit trail behavior
+        run: |
+          cargo test --test read_assertions integration_idempotent_retry_skips_assertion_re_evaluation -- --test-threads=1
+          cargo test --test read_assertions integration_failed_assertion_is_logged_to_system_audit_table -- --test-threads=1
+
+  crash:
+    needs: security_strict
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -50,7 +75,6 @@ jobs:
         run: cargo test --test crash_matrix -- --test-threads=1
 
   crash_longrun:
-    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/')
     needs: crash
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -63,8 +87,7 @@ jobs:
       - name: A17b durability crash loop
         run: cargo test --test crash_matrix crash_matrix_a17b_thousand_crash_cycles_preserve_state -- --ignored --test-threads=1
 
-  stress:
-    if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/')
+  chaos_longrun:
     needs: crash_longrun
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -72,8 +95,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Full ignored stress suite
-        run: cargo test --test stress -- --ignored --test-threads=1
+      - name: Orderbook adversarial randomized matrix
+        run: cargo test -p aedb-orderbook --test property_randomized_matrix -- --test-threads=1
+      - name: Orderbook adversarial SLO/SLA gate
+        env:
+          AEDB_ORDERBOOK_SLA_MIN_ATTEMPTED_TPS: "600"
+          AEDB_ORDERBOOK_SLA_MAX_P99_US: "1000000"
+          AEDB_ORDERBOOK_SLA_MAX_FINALITY_GAP: "10000"
+          AEDB_ORDERBOOK_SLA_MAX_PRIMARY_REJECT_RATIO_PPM: "900000"
+        run: cargo test -p aedb-orderbook --test adversarial_slo_sla -- --test-threads=1
+      - name: Orderbook CI chaos profile
+        run: cargo test -p aedb-orderbook --test chaos_ci_profile -- --test-threads=1
+      - name: Orderbook soak profiles (mandatory)
+        run: |
+          cargo test -p aedb-orderbook --test simulation_smoke simulation_soak_multi_asset_mixed -- --ignored --test-threads=1
+          cargo test -p aedb-orderbook --test simulation_smoke simulation_soak_single_asset_contention_limit -- --ignored --test-threads=1
+      - name: Core orderbook chaos read/write accuracy
+        run: cargo test --test order_book_simulation order_book_chaos_read_write_accuracy -- --test-threads=1
 
   benchmark:
     if: github.event_name == 'schedule' || startsWith(github.ref, 'refs/heads/release/')
