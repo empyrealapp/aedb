@@ -6350,7 +6350,11 @@ impl ReadTx<'_> {
         hydrate_query: Query,
         hydrate_key_column: &str,
     ) -> Result<(QueryResult, QueryResult), QueryError> {
-        let source = self.query(project_id, scope_id, source_query).await?;
+        let mut source = self.query(project_id, scope_id, source_query).await?;
+        // This helper treats the source query's limit as the caller's complete key set.
+        // Do not surface pagination state from the underlying query engine here.
+        source.cursor = None;
+        source.truncated = false;
         let keys = source
             .rows
             .iter()
@@ -6363,6 +6367,7 @@ impl ReadTx<'_> {
                     rows: Vec::new(),
                     rows_examined: 0,
                     cursor: None,
+                    truncated: false,
                     snapshot_seq: self.lease.view.seq,
                     materialized_seq: None,
                 },
@@ -6376,7 +6381,51 @@ impl ReadTx<'_> {
             }),
             ..hydrate_query
         };
-        let hydrated = self.query(project_id, scope_id, hydrate_query).await?;
+        let page_size = self.db._config.max_scan_rows.min(100).max(1);
+        let mut hydrate_query = ensure_stable_order_from_catalog(
+            project_id,
+            scope_id,
+            &self.lease.view.catalog,
+            hydrate_query,
+        );
+        hydrate_query.limit = Some(page_size);
+
+        let mut all_rows = Vec::new();
+        let mut total_rows_examined = 0usize;
+        let mut next_cursor: Option<String> = None;
+        let mut materialized_seq = None;
+        loop {
+            let page = self
+                .query_with_options(
+                    project_id,
+                    scope_id,
+                    hydrate_query.clone(),
+                    QueryOptions {
+                        consistency: ConsistencyMode::AtSeq(self.lease.view.seq),
+                        cursor: next_cursor.clone(),
+                        ..QueryOptions::default()
+                    },
+                )
+                .await?;
+            total_rows_examined = total_rows_examined.saturating_add(page.rows_examined);
+            if materialized_seq.is_none() {
+                materialized_seq = page.materialized_seq;
+            }
+            all_rows.extend(page.rows);
+            if let Some(cursor) = page.cursor {
+                next_cursor = Some(cursor);
+                continue;
+            }
+            break;
+        }
+        let hydrated = QueryResult {
+            rows: all_rows,
+            rows_examined: total_rows_examined,
+            cursor: None,
+            truncated: false,
+            snapshot_seq: self.lease.view.seq,
+            materialized_seq,
+        };
         Ok((source, hydrated))
     }
 }

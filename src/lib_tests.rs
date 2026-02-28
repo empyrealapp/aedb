@@ -6616,7 +6616,99 @@ async fn list_batch_and_lookup_helpers_work() {
         .await
         .expect("lookup/hydrate");
     assert_eq!(source.rows.len(), 3);
+    assert!(!source.truncated);
     assert_eq!(hydrated.rows.len(), 3);
+    assert!(!hydrated.truncated);
+}
+
+#[tokio::test]
+async fn lookup_then_hydrate_fetches_all_pages_for_large_key_sets() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "user_id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+    create_table(
+        &db,
+        "p",
+        "app",
+        "users",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "username".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    for id in 1_i64..=1_000_i64 {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![Value::Integer(id), Value::Integer(id)]),
+        })
+        .await
+        .expect("insert item");
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![
+                Value::Integer(id),
+                Value::Text(format!("u{id}").into()),
+            ]),
+        })
+        .await
+        .expect("insert user");
+    }
+
+    let (source, hydrated) = db
+        .lookup_then_hydrate(
+            "p",
+            "app",
+            Query::select(&["user_id"]).from("items").limit(1_000),
+            0,
+            Query::select(&["id", "username"]).from("users"),
+            "id",
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect("lookup/hydrate");
+    assert_eq!(source.rows.len(), 1_000);
+    assert!(!source.truncated);
+    assert_eq!(hydrated.rows.len(), 1_000);
+    assert!(!hydrated.truncated);
 }
 
 #[tokio::test]
