@@ -634,7 +634,6 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-            ..EpochProcessResult::default()
         };
     }
 
@@ -674,7 +673,6 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-            ..EpochProcessResult::default()
         };
     }
 
@@ -738,7 +736,6 @@ pub(super) fn process_commit_epoch(
                 wal_sync_micros,
                 sync_executed,
                 catalog_changed,
-                ..EpochProcessResult::default()
             };
         }
         wal_append_ops = wal_append_ops.saturating_add(1);
@@ -776,7 +773,6 @@ pub(super) fn process_commit_epoch(
                 wal_sync_micros,
                 sync_executed,
                 catalog_changed,
-                ..EpochProcessResult::default()
             };
         }
         wal_sync_ops = wal_sync_ops.saturating_add(1);
@@ -905,7 +901,6 @@ pub(super) fn process_commit_epoch(
         wal_sync_micros,
         sync_executed,
         catalog_changed,
-        ..EpochProcessResult::default()
     }
 }
 

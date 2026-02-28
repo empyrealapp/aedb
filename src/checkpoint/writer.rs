@@ -40,6 +40,7 @@ pub fn write_checkpoint(
     write_checkpoint_with_key(snapshot, catalog, seq, dir, None, None, HashMap::new(), 3)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn write_checkpoint_with_key(
     snapshot: &KeyspaceSnapshot,
     catalog: &Catalog,

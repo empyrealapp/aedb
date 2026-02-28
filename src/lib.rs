@@ -3270,6 +3270,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_cancel_as_with_finality(
         &self,
         caller: CallerContext,
@@ -3287,6 +3288,7 @@ impl AedbInstance {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_cancel_strict_as(
         &self,
         caller: CallerContext,
@@ -3309,6 +3311,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn order_book_cancel_strict_as_internal(
         &self,
         caller: Option<CallerContext>,
@@ -3321,8 +3324,7 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         let lease = self
             .acquire_snapshot(ConsistencyMode::AtLatest)
-            .await
-            .map_err(AedbError::from)?;
+            .await?;
         let order_key = key_order(instrument, order_id);
         let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
             return Err(AedbError::Validation(format!(
@@ -3443,6 +3445,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_cancel_by_client_id_strict_as(
         &self,
         caller: CallerContext,
@@ -3465,6 +3468,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn order_book_cancel_by_client_id_strict_as_internal(
         &self,
         caller: Option<CallerContext>,
@@ -3477,8 +3481,7 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         let lease = self
             .acquire_snapshot(ConsistencyMode::AtLatest)
-            .await
-            .map_err(AedbError::from)?;
+            .await?;
         let cid_key = key_client_id(instrument, owner, client_order_id);
         let Some(cid_entry) = lease.view.keyspace.kv_get(project_id, scope_id, &cid_key) else {
             return Err(AedbError::Validation(format!(
@@ -3672,6 +3675,7 @@ impl AedbInstance {
         self.commit_envelope_with_finality(envelope, finality).await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_reduce_strict(
         &self,
         project_id: &str,
@@ -3695,6 +3699,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_reduce_strict_as(
         &self,
         caller: CallerContext,
@@ -3719,6 +3724,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn order_book_reduce_strict_as_internal(
         &self,
         caller: Option<CallerContext>,
@@ -3782,8 +3788,7 @@ impl AedbInstance {
     ) -> Result<(Vec<u8>, u64, u64), AedbError> {
         let lease = self
             .acquire_snapshot(ConsistencyMode::AtLatest)
-            .await
-            .map_err(AedbError::from)?;
+            .await?;
         let order_key = key_order(instrument, order_id);
         let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
             return Err(AedbError::Validation(format!(
@@ -3810,6 +3815,7 @@ impl AedbInstance {
         Ok((order_key, entry.version, lease.view.seq))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_cancel_replace(
         &self,
         project_id: &str,
@@ -3870,6 +3876,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_mass_cancel(
         &self,
         project_id: &str,
@@ -3895,6 +3902,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_mass_cancel_as(
         &self,
         caller: CallerContext,
@@ -3944,6 +3952,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn order_book_reduce_as(
         &self,
         caller: CallerContext,

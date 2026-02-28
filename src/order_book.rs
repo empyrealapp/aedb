@@ -637,20 +637,21 @@ pub fn apply_order_book_new(
         return Err(AedbError::Validation("duplicate client_order_id".into()));
     }
 
-    if effective_request.exec_instructions.post_only() {
-        if let Some(best_price) = best_price_for_side(
+    if effective_request.exec_instructions.post_only()
+        && let Some(best_price) = best_price_for_side(
             keyspace,
             project_id,
             scope_id,
             &effective_request.instrument,
             effective_request.side.opposite(),
-        ) && crosses(
+        )
+        && crosses(
             effective_request.side,
             effective_request.price_ticks,
             best_price,
-        ) {
-            return Err(AedbError::Validation("post_only would cross".into()));
-        }
+        )
+    {
+        return Err(AedbError::Validation("post_only would cross".into()));
     }
 
     if matches!(effective_request.time_in_force, TimeInForce::Fok)
@@ -832,12 +833,10 @@ pub fn apply_order_book_new(
         } else {
             OrderStatus::PartiallyFilled
         }
+    } else if filled.is_zero() {
+        OrderStatus::Cancelled
     } else {
-        if filled.is_zero() {
-            OrderStatus::Cancelled
-        } else {
-            OrderStatus::PartiallyFilled
-        }
+        OrderStatus::PartiallyFilled
     };
 
     let record = OrderRecord {
@@ -938,6 +937,7 @@ pub fn apply_order_book_new(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_order_book_cancel(
     keyspace: &mut Keyspace,
     project_id: &str,
@@ -1237,6 +1237,7 @@ pub fn apply_order_book_mass_cancel(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_order_book_reduce(
     keyspace: &mut Keyspace,
     project_id: &str,
@@ -2054,6 +2055,7 @@ fn clear_open_order(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dec_price_level_qty(
     keyspace: &mut Keyspace,
     project_id: &str,
@@ -2072,6 +2074,7 @@ fn dec_price_level_qty(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_fill(
     keyspace: &mut Keyspace,
     project_id: &str,
