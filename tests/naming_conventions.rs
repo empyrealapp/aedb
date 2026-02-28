@@ -75,8 +75,8 @@ fn critical_modules_avoid_ambiguous_index_size_offset_len_bindings() {
             include_str!("../src/commit/executor/internals.rs"),
         ),
         (
-            "src/query/executor.rs",
-            include_str!("../src/query/executor.rs"),
+            "src/query/executor/mod.rs",
+            include_str!("../src/query/executor/mod.rs"),
         ),
         (
             "src/query/operators.rs",
