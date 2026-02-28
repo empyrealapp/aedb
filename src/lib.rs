@@ -3322,9 +3322,7 @@ impl AedbInstance {
         owner: &str,
         finality: CommitFinality,
     ) -> Result<CommitResult, AedbError> {
-        let lease = self
-            .acquire_snapshot(ConsistencyMode::AtLatest)
-            .await?;
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let order_key = key_order(instrument, order_id);
         let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
             return Err(AedbError::Validation(format!(
@@ -3479,9 +3477,7 @@ impl AedbInstance {
         owner: &str,
         finality: CommitFinality,
     ) -> Result<CommitResult, AedbError> {
-        let lease = self
-            .acquire_snapshot(ConsistencyMode::AtLatest)
-            .await?;
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let cid_key = key_client_id(instrument, owner, client_order_id);
         let Some(cid_entry) = lease.view.keyspace.kv_get(project_id, scope_id, &cid_key) else {
             return Err(AedbError::Validation(format!(
@@ -3786,9 +3782,7 @@ impl AedbInstance {
         order_id: u64,
         owner: &str,
     ) -> Result<(Vec<u8>, u64, u64), AedbError> {
-        let lease = self
-            .acquire_snapshot(ConsistencyMode::AtLatest)
-            .await?;
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let order_key = key_order(instrument, order_id);
         let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
             return Err(AedbError::Validation(format!(
