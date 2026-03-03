@@ -815,8 +815,7 @@ pub(super) fn process_commit_epoch(
         };
     }
 
-    if !deferred_parallel_commits.is_empty()
-    {
+    if !deferred_parallel_commits.is_empty() {
         let parallel_apply_started = Instant::now();
         let parallel_apply_result = apply_deferred_parallel_single_partition_commits(
             &working_catalog,
@@ -828,49 +827,50 @@ pub(super) fn process_commit_epoch(
         );
         parallel_apply_micros = parallel_apply_micros
             .saturating_add(parallel_apply_started.elapsed().as_micros() as u64);
-        if let Err(err) = parallel_apply_result
-    {
-        let wrapped = format!("epoch aborted during parallel apply: {err}");
-        for failed in sequenced {
-            let surfaced = match &err {
-                AedbError::EpochApplyTimeout => AedbError::EpochApplyTimeout,
-                AedbError::ParallelApplyCancelled => AedbError::ParallelApplyCancelled,
-                AedbError::ParallelApplyWorkerPanicked => AedbError::ParallelApplyWorkerPanicked,
-                AedbError::AssertionFailed {
-                    index,
-                    assertion,
-                    actual,
-                } => AedbError::AssertionFailed {
-                    index: *index,
-                    assertion: assertion.clone(),
-                    actual: actual.clone(),
-                },
-                _ => AedbError::Validation(wrapped.clone()),
+        if let Err(err) = parallel_apply_result {
+            let wrapped = format!("epoch aborted during parallel apply: {err}");
+            for failed in sequenced {
+                let surfaced = match &err {
+                    AedbError::EpochApplyTimeout => AedbError::EpochApplyTimeout,
+                    AedbError::ParallelApplyCancelled => AedbError::ParallelApplyCancelled,
+                    AedbError::ParallelApplyWorkerPanicked => {
+                        AedbError::ParallelApplyWorkerPanicked
+                    }
+                    AedbError::AssertionFailed {
+                        index,
+                        assertion,
+                        actual,
+                    } => AedbError::AssertionFailed {
+                        index: *index,
+                        assertion: assertion.clone(),
+                        actual: actual.clone(),
+                    },
+                    _ => AedbError::Validation(wrapped.clone()),
+                };
+                outcomes.push(EpochOutcome {
+                    request: failed.request,
+                    result: Err(surfaced),
+                    post_apply_delta: None,
+                });
+            }
+            return EpochProcessResult {
+                outcomes,
+                coordinator_apply_attempts,
+                coordinator_apply_micros,
+                parallel_apply_micros,
+                pre_wal_micros: process_started.elapsed().as_micros() as u64,
+                finalize_micros: 0,
+                read_set_conflicts,
+                wal_append_ops,
+                wal_append_bytes,
+                wal_append_micros,
+                wal_sync_ops,
+                wal_sync_micros,
+                sync_executed,
+                catalog_changed,
+                ..EpochProcessResult::default()
             };
-            outcomes.push(EpochOutcome {
-                request: failed.request,
-                result: Err(surfaced),
-                post_apply_delta: None,
-            });
         }
-        return EpochProcessResult {
-            outcomes,
-            coordinator_apply_attempts,
-            coordinator_apply_micros,
-            parallel_apply_micros,
-            pre_wal_micros: process_started.elapsed().as_micros() as u64,
-            finalize_micros: 0,
-            read_set_conflicts,
-            wal_append_ops,
-            wal_append_bytes,
-            wal_append_micros,
-            wal_sync_ops,
-            wal_sync_micros,
-            sync_executed,
-            catalog_changed,
-            ..EpochProcessResult::default()
-        };
-    }
     }
 
     let mut wal_payload_size_bytes = 0usize;

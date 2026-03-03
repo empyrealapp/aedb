@@ -267,6 +267,43 @@ async fn crash_matrix_mid_commit_batch_loses_unflushed_tail() {
 }
 
 #[tokio::test]
+async fn crash_matrix_full_durability_abrupt_restart_recovers_all_acknowledged_commits() {
+    let dir = tempdir().expect("temp dir");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Full,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    seed_project(&db).await;
+
+    let mut last_commit_seq = 1u64; // project + app scope bootstrap writes
+    for i in 0..512u64 {
+        let committed = db
+            .commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("full:{i}").into_bytes(),
+                value: i.to_string().into_bytes(),
+            })
+            .await
+            .expect("full durability write");
+        assert_eq!(
+            committed.durable_head_seq, committed.commit_seq,
+            "DurabilityMode::Full must only acknowledge durable commits"
+        );
+        last_commit_seq = committed.commit_seq;
+    }
+    drop(db);
+
+    let recovered = recover_with_config(dir.path(), &config).expect("recover");
+    assert_eq!(recovered.current_seq, last_commit_seq);
+    assert!(recovered.keyspace.kv_get("p", "app", b"full:0").is_some());
+    assert!(recovered.keyspace.kv_get("p", "app", b"full:511").is_some());
+}
+
+#[tokio::test]
 async fn crash_matrix_mid_checkpoint_tmp_file_is_ignored() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();

@@ -237,8 +237,7 @@ static COMMIT_PHASE_LOG_SETTINGS: LazyLock<CommitPhaseLogSettings> = LazyLock::n
     }
 });
 
-static COMMIT_PHASE_LOG_SAMPLE_COUNTER: LazyLock<AtomicU64> =
-    LazyLock::new(|| AtomicU64::new(0));
+static COMMIT_PHASE_LOG_SAMPLE_COUNTER: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
 
 fn should_log_commit_phase(total_elapsed_ms: u64) -> bool {
     let settings = &*COMMIT_PHASE_LOG_SETTINGS;

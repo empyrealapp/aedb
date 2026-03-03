@@ -1,0 +1,10 @@
+[package]
+name = "aedb-explorer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+aedb = { path = "../.." }
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
