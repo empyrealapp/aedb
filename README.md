@@ -438,6 +438,14 @@ cargo run --bin aedb -- dump parity --dump /tmp/aedb-dump.aedbdump --data-dir /t
 cargo run --bin aedb -- check invariants --data-dir /tmp/aedb-data
 ```
 
+Explorer CLI crate (`crates/aedb-explorer`) provides read-only inspection of projects/scopes/tables, schema, and sample rows:
+
+```bash
+cargo run -p aedb-explorer -- projects --data-dir /tmp/aedb-data
+cargo run -p aedb-explorer -- tables --data-dir /tmp/aedb-data --project demo --scope app
+cargo run -p aedb-explorer -- scan-table --data-dir /tmp/aedb-data --project demo --scope app --table users --limit 25
+```
+
 ## API Areas
 
 - `aedb::commit`: mutations, envelopes, validation

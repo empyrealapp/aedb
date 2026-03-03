@@ -48,6 +48,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aedb-explorer"
+version = "0.1.0"
+dependencies = [
+ "aedb",
+ "hex",
+ "tokio",
+]
+
+[[package]]
 name = "aedb-orderbook"
 version = "0.1.0"
 dependencies = [
