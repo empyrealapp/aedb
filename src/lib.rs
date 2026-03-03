@@ -86,7 +86,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
@@ -190,7 +190,6 @@ pub struct AedbInstance {
     /// Serializes checkpoint writers without blocking commit/query traffic.
     checkpoint_lock: Arc<AsyncMutex<()>>,
     snapshot_manager: Arc<Mutex<SnapshotManager>>,
-    latest_snapshot_inflight: Arc<AtomicUsize>,
     recovery_cache: Arc<Mutex<RecoveryCache>>,
     lifecycle_hooks: Arc<Mutex<Vec<Arc<dyn LifecycleHook>>>>,
     telemetry_hooks: Arc<Mutex<Vec<Arc<dyn QueryCommitTelemetryHook>>>>,
@@ -890,7 +889,6 @@ pub trait RemoteBackupAdapter: Send + Sync {
 struct SnapshotLease {
     manager: Option<Arc<Mutex<SnapshotManager>>>,
     handle: Option<SnapshotHandle>,
-    latest_inflight: Option<Arc<AtomicUsize>>,
     view: SnapshotReadView,
 }
 
@@ -1008,9 +1006,6 @@ impl RecoveryCache {
 
 impl Drop for SnapshotLease {
     fn drop(&mut self) {
-        if let Some(inflight) = &self.latest_inflight {
-            inflight.fetch_sub(1, Ordering::AcqRel);
-        }
         let (Some(manager), Some(handle)) = (&self.manager, self.handle) else {
             return;
         };
@@ -1138,7 +1133,6 @@ impl AedbInstance {
             executor,
             checkpoint_lock: Arc::new(AsyncMutex::new(())),
             snapshot_manager: Arc::new(Mutex::new(SnapshotManager::default())),
-            latest_snapshot_inflight: Arc::new(AtomicUsize::new(0)),
             recovery_cache: Arc::new(Mutex::new(RecoveryCache::default())),
             lifecycle_hooks: Arc::new(Mutex::new(Vec::new())),
             telemetry_hooks: Arc::new(Mutex::new(Vec::new())),
@@ -7816,22 +7810,6 @@ impl AedbInstance {
         consistency: ConsistencyMode,
     ) -> Result<SnapshotLease, AedbError> {
         let view = self.snapshot_for_consistency(consistency).await?;
-        if matches!(consistency, ConsistencyMode::AtLatest) {
-            let cap = self._config.max_concurrent_snapshots.max(1);
-            let prior = self
-                .latest_snapshot_inflight
-                .fetch_add(1, Ordering::AcqRel);
-            if prior >= cap {
-                self.latest_snapshot_inflight.fetch_sub(1, Ordering::AcqRel);
-                return Err(AedbError::QueueFull);
-            }
-            return Ok(SnapshotLease {
-                manager: None,
-                handle: None,
-                latest_inflight: Some(Arc::clone(&self.latest_snapshot_inflight)),
-                view,
-            });
-        }
         let mut mgr = self.snapshot_manager.lock();
         let handle = mgr.acquire_bounded(view.clone(), self._config.max_concurrent_snapshots)?;
         let checked = mgr
@@ -7840,7 +7818,6 @@ impl AedbInstance {
         Ok(SnapshotLease {
             manager: Some(Arc::clone(&self.snapshot_manager)),
             handle: Some(handle),
-            latest_inflight: None,
             view: checked,
         })
     }

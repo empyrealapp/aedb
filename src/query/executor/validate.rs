@@ -48,21 +48,43 @@ fn validate_expr_types(
     let value_compatible = |col_type: &ColumnType, value: &Value| -> bool {
         matches!(value, Value::Null)
             || match col_type {
+                ColumnType::U8 => matches!(
+                    value,
+                    Value::U8(_)
+                        | Value::U64(_)
+                        | Value::Integer(_)
+                        | Value::Float(_)
+                        | Value::Timestamp(_)
+                ),
+                ColumnType::U64 => {
+                    matches!(value, Value::U8(_) | Value::U64(_) | Value::Integer(_))
+                }
                 ColumnType::Integer => matches!(
                     value,
-                    Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                    Value::U8(_)
+                        | Value::U64(_)
+                        | Value::Integer(_)
+                        | Value::Float(_)
+                        | Value::Timestamp(_)
                 ),
                 ColumnType::Float => matches!(
                     value,
-                    Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                    Value::U8(_)
+                        | Value::U64(_)
+                        | Value::Integer(_)
+                        | Value::Float(_)
+                        | Value::Timestamp(_)
                 ),
                 ColumnType::Timestamp => matches!(
                     value,
-                    Value::Integer(_) | Value::Float(_) | Value::Timestamp(_)
+                    Value::U8(_)
+                        | Value::U64(_)
+                        | Value::Integer(_)
+                        | Value::Float(_)
+                        | Value::Timestamp(_)
                 ),
                 ColumnType::Text => matches!(value, Value::Text(_)),
                 ColumnType::Boolean => matches!(value, Value::Boolean(_)),
-                ColumnType::U8 => matches!(value, Value::U8(_) | Value::Integer(_)),
                 ColumnType::U256 => matches!(value, Value::U256(_)),
                 ColumnType::I256 => matches!(value, Value::I256(_)),
                 ColumnType::Blob => matches!(value, Value::Blob(_)),
