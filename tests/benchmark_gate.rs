@@ -5,8 +5,10 @@ use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
+use aedb::error::AedbError;
 use aedb::permission::{CallerContext, Permission};
 use aedb::query::plan::{ConsistencyMode, Query, col, lit};
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -360,4 +362,248 @@ async fn benchmark_coordinator_vs_parallel_lanes() {
         "benchmark_coordinator_vs_parallel_lanes: parallel_tps={} coordinator_tps={} (parallel_commits={} coordinator_commits={})",
         parallel_tps, coordinator_tps, parallel_count, coordinator_count
     );
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_accumulator_expose_throughput() {
+    let enforce = std::env::var("AEDB_ENFORCE_BENCH_GATES")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let target_tps = 10_000u64;
+    let enforce_percentile = std::env::var("AEDB_BENCH_GATE_PERCENTILE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|p| p.clamp(0.0, 1.0))
+        .unwrap_or(0.25);
+
+    let mode = std::env::var("AEDB_BENCH_DURABILITY").unwrap_or_else(|_| "batch".to_string());
+    let config = if mode.eq_ignore_ascii_case("full") {
+        AedbConfig {
+            durability_mode: DurabilityMode::Full,
+            recovery_mode: RecoveryMode::Strict,
+            ..AedbConfig::default()
+        }
+        .with_hmac_key(vec![9u8; 32])
+    } else {
+        AedbConfig {
+            durability_mode: DurabilityMode::Batch,
+            batch_interval_ms: 10,
+            batch_max_bytes: usize::MAX,
+            recovery_mode: RecoveryMode::Permissive,
+            hash_chain_required: false,
+            ..AedbConfig::default()
+        }
+    };
+    let workers = std::env::var("AEDB_BENCH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(32);
+    let run_secs = std::env::var("AEDB_BENCH_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
+    let runs = std::env::var("AEDB_BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(if enforce { 5 } else { 1 })
+        .max(1);
+    let mut run_tps = Vec::with_capacity(runs);
+    let mut rejected_total = 0u64;
+    for run_idx in 0..runs {
+        let dir = tempdir().expect("temp dir");
+        let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+        db.create_project(PROJECT_ID).await.expect("project");
+        db.create_accumulator_with_options(
+            PROJECT_ID,
+            SCOPE_ID,
+            "house_balance",
+            Some(200_000),
+            20_000,
+            0,
+            None,
+        )
+        .await
+        .expect("create accumulator");
+        db.accumulate(
+            PROJECT_ID,
+            SCOPE_ID,
+            "house_balance",
+            1_000_000_000,
+            "seed".into(),
+            1,
+        )
+        .await
+        .expect("seed balance");
+        let deadline = Instant::now() + std::time::Duration::from_secs(run_secs);
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let db = Arc::clone(&db);
+            handles.push(tokio::spawn(async move {
+                let mut ok = 0u64;
+                let mut rejected = 0u64;
+                let mut seq = 0u64;
+                while Instant::now() < deadline {
+                    let exposure_id = format!("bench:{run_idx}:{worker}:{seq}");
+                    match db
+                        .expose_accumulator(PROJECT_ID, SCOPE_ID, "house_balance", 1, exposure_id)
+                        .await
+                    {
+                        Ok(_) => ok += 1,
+                        Err(AedbError::Validation(_)) => rejected += 1,
+                        Err(e) => panic!("unexpected expose error: {e}"),
+                    }
+                    seq += 1;
+                }
+                (ok, rejected)
+            }));
+        }
+        let mut ok_total = 0u64;
+        let mut rejected_run = 0u64;
+        for handle in handles {
+            let (ok, rejected) = handle.await.expect("worker join");
+            ok_total += ok;
+            rejected_run += rejected;
+        }
+        rejected_total += rejected_run;
+        let tps = (ok_total as f64 / run_secs as f64).round() as u64;
+        run_tps.push(tps);
+        eprintln!(
+            "benchmark_accumulator_expose_throughput: durability={} run={} workers={} seconds={} ok={} rejected={} tps={}",
+            mode,
+            run_idx + 1,
+            workers,
+            run_secs,
+            ok_total,
+            rejected_run,
+            tps
+        );
+    }
+    run_tps.sort_unstable();
+    let run_tps_u128: Vec<u128> = run_tps.iter().map(|v| *v as u128).collect();
+    let p50 = percentile(&run_tps_u128, 0.50) as u64;
+    let p10 = percentile(&run_tps_u128, 0.10) as u64;
+    let gate_tps = percentile(&run_tps_u128, enforce_percentile) as u64;
+    eprintln!(
+        "benchmark_accumulator_expose_throughput summary: durability={} runs={} gate_percentile={} gate_tps={} p10_tps={} p50_tps={} min_tps={} max_tps={} rejected_total={}",
+        mode,
+        runs,
+        enforce_percentile,
+        gate_tps,
+        p10,
+        p50,
+        run_tps.first().copied().unwrap_or_default(),
+        run_tps.last().copied().unwrap_or_default(),
+        rejected_total
+    );
+
+    if enforce {
+        assert_eq!(rejected_total, 0, "unexpected exposure rejections");
+        assert!(
+            gate_tps >= target_tps,
+            "accumulator expose throughput p{} below target: {} < {}",
+            (enforce_percentile * 100.0).round() as u64,
+            gate_tps,
+            target_tps
+        );
+    } else {
+        assert!(p50 > 0);
+    }
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_accumulator_expose_batched_throughput() {
+    let mode = std::env::var("AEDB_BENCH_DURABILITY").unwrap_or_else(|_| "batch".to_string());
+    let config = if mode.eq_ignore_ascii_case("full") {
+        AedbConfig {
+            durability_mode: DurabilityMode::Full,
+            recovery_mode: RecoveryMode::Strict,
+            ..AedbConfig::default()
+        }
+        .with_hmac_key(vec![9u8; 32])
+    } else {
+        AedbConfig {
+            durability_mode: DurabilityMode::Batch,
+            batch_interval_ms: 10,
+            batch_max_bytes: usize::MAX,
+            recovery_mode: RecoveryMode::Permissive,
+            hash_chain_required: false,
+            ..AedbConfig::default()
+        }
+    };
+    let dir = tempdir().expect("temp dir");
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project(PROJECT_ID).await.expect("project");
+    db.create_accumulator_with_options(
+        PROJECT_ID,
+        SCOPE_ID,
+        "house_balance",
+        Some(200_000),
+        20_000,
+        0,
+        None,
+    )
+    .await
+    .expect("create accumulator");
+    db.accumulate(
+        PROJECT_ID,
+        SCOPE_ID,
+        "house_balance",
+        1_000_000_000,
+        "seed".into(),
+        1,
+    )
+    .await
+    .expect("seed balance");
+
+    let batch_size = std::env::var("AEDB_BENCH_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+        .max(1);
+    let workers = std::env::var("AEDB_BENCH_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+        .max(1);
+    let run_secs = std::env::var("AEDB_BENCH_SECONDS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(2);
+    let deadline = Instant::now() + std::time::Duration::from_secs(run_secs);
+
+    let mut handles = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let db = Arc::clone(&db);
+        handles.push(tokio::spawn(async move {
+            let mut batches = 0u64;
+            let mut seq = 0u64;
+            while Instant::now() < deadline {
+                let mut exposures = Vec::with_capacity(batch_size);
+                for _ in 0..batch_size {
+                    exposures.push((1, format!("bench-batch:{worker}:{seq}")));
+                    seq += 1;
+                }
+                db.expose_accumulator_many_atomic(PROJECT_ID, SCOPE_ID, "house_balance", exposures)
+                    .await
+                    .expect("batch expose");
+                batches += 1;
+            }
+            batches
+        }));
+    }
+    let mut batches = 0u64;
+    for handle in handles {
+        batches += handle.await.expect("worker join");
+    }
+    let elapsed = run_secs as f64;
+    let total_ops = batches * batch_size as u64;
+    let ops_tps = (total_ops as f64 / elapsed).round() as u64;
+    let commit_tps = (batches as f64 / elapsed).round() as u64;
+    eprintln!(
+        "benchmark_accumulator_expose_batched_throughput: durability={} workers={} batch_size={} seconds={} commits={} commit_tps={} ops_tps={}",
+        mode, workers, batch_size, run_secs, batches, commit_tps, ops_tps
+    );
+    assert!(ops_tps > 0);
 }

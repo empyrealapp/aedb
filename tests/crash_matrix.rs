@@ -13,6 +13,8 @@ use aedb::recovery::recover_with_config;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 fn production_config() -> AedbConfig {
@@ -150,6 +152,30 @@ async fn seed_project(db: &AedbInstance) {
     db.create_project("p").await.expect("create project");
 }
 
+async fn wait_for_processor_checkpoint(
+    db: &AedbInstance,
+    processor_name: &str,
+    expected_checkpoint_seq: u64,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let lag = db
+            .reactive_processor_lag(processor_name, ConsistencyMode::AtLatest)
+            .await
+            .expect("read processor lag");
+        if lag.checkpoint_seq >= expected_checkpoint_seq {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "processor {processor_name} did not reach checkpoint {} before timeout",
+            expected_checkpoint_seq
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn crash_matrix_baseline_graceful_shutdown_recovers_all_commits() {
     let dir = tempdir().expect("temp dir");
@@ -276,6 +302,145 @@ async fn crash_matrix_mid_checkpoint_tmp_file_is_ignored() {
     assert_eq!(recovered.current_seq, seq_before);
     assert!(recovered.keyspace.kv_get("p", "app", b"before").is_some());
     assert!(recovered.keyspace.kv_get("p", "app", b"after").is_none());
+}
+
+#[tokio::test]
+async fn crash_matrix_reactive_processor_registry_and_checkpoint_resume_after_crash() {
+    let dir = tempdir().expect("temp dir");
+    let mut config = production_config();
+    config.recovery_mode = RecoveryMode::Permissive;
+    config.hash_chain_required = false;
+    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    seed_project(&db).await;
+    db.create_scope("p", "app").await.expect("scope");
+
+    db.start_reactive_processor(
+        "resume_after_crash",
+        aedb::ReactiveProcessorOptions {
+            caller_id: None,
+            topic_filter: Some("topic_resume".into()),
+            checkpoint_watermark_commits: 1,
+            run_interval_ms: 10,
+            idle_backoff_ms: 10,
+            ..aedb::ReactiveProcessorOptions::default()
+        },
+        move |_db, _events| async move { Ok(()) },
+    )
+    .await
+    .expect("start processor");
+
+    let first = db
+        .emit_event("p", "app", "topic_resume", "k1".into(), "{}".into())
+        .await
+        .expect("emit first");
+    wait_for_processor_checkpoint(
+        &db,
+        "resume_after_crash",
+        first.commit_seq,
+        Duration::from_secs(3),
+    )
+    .await;
+    db.checkpoint_now().await.expect("checkpoint before crash");
+
+    // Simulate crash: drop instance without graceful shutdown.
+    drop(db);
+
+    let db2 = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("reopen"));
+    let resumed = db2
+        .register_reactive_processor_handler("resume_after_crash", move |_db, _events| async move {
+            Ok(())
+        })
+        .await
+        .expect("register handler");
+    assert!(
+        resumed,
+        "processor should auto-resume from durable registry"
+    );
+
+    let second = db2
+        .emit_event("p", "app", "topic_resume", "k2".into(), "{}".into())
+        .await
+        .expect("emit second");
+    wait_for_processor_checkpoint(
+        &db2,
+        "resume_after_crash",
+        second.commit_seq,
+        Duration::from_secs(3),
+    )
+    .await;
+    db2.stop_reactive_processor("resume_after_crash")
+        .await
+        .expect("stop");
+}
+
+#[tokio::test]
+async fn crash_matrix_reactive_processor_dlq_survives_crash_recovery() {
+    let dir = tempdir().expect("temp dir");
+    let mut config = production_config();
+    config.recovery_mode = RecoveryMode::Permissive;
+    config.hash_chain_required = false;
+    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    seed_project(&db).await;
+    db.create_scope("p", "app").await.expect("scope");
+
+    db.start_reactive_processor(
+        "dlq_after_crash",
+        aedb::ReactiveProcessorOptions {
+            caller_id: None,
+            topic_filter: Some("topic_dlq".into()),
+            checkpoint_watermark_commits: 1,
+            max_retries: 0,
+            run_interval_ms: 10,
+            idle_backoff_ms: 10,
+            ..aedb::ReactiveProcessorOptions::default()
+        },
+        move |_db, _events| async move { Err(AedbError::Validation("forced failure".into())) },
+    )
+    .await
+    .expect("start failing processor");
+
+    let event = db
+        .emit_event("p", "app", "topic_dlq", "dlq-key".into(), "{}".into())
+        .await
+        .expect("emit");
+    wait_for_processor_checkpoint(
+        &db,
+        "dlq_after_crash",
+        event.commit_seq,
+        Duration::from_secs(4),
+    )
+    .await;
+    db.checkpoint_now().await.expect("checkpoint before crash");
+
+    drop(db);
+
+    let db2 = AedbInstance::open(config, dir.path()).expect("reopen");
+    let dlq = db2
+        .query(
+            aedb::catalog::SYSTEM_PROJECT_ID,
+            "app",
+            Query::select(&["processor_name", "event_key", "attempts"])
+                .from("reactive_processor_dead_letters")
+                .where_(Expr::Eq(
+                    "processor_name".into(),
+                    Value::Text("dlq_after_crash".into()),
+                ))
+                .limit(10),
+        )
+        .await
+        .expect("query dlq after reopen");
+    assert_eq!(dlq.rows.len(), 1, "dlq row should survive crash/recovery");
+    assert_eq!(dlq.rows[0].values[1], Value::Text("dlq-key".into()));
+    assert_eq!(dlq.rows[0].values[2], Value::Integer(1));
+
+    let lag = db2
+        .reactive_processor_lag("dlq_after_crash", ConsistencyMode::AtLatest)
+        .await
+        .expect("lag after reopen");
+    assert!(
+        lag.checkpoint_seq >= event.commit_seq,
+        "checkpoint should survive crash/recovery"
+    );
 }
 
 #[tokio::test]

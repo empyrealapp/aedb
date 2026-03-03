@@ -11,7 +11,7 @@ pub enum Order {
     Desc,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Expr {
     Eq(String, Value),
     Ne(String, Value),
@@ -142,6 +142,8 @@ pub struct QueryOptions {
     pub cursor: Option<String>,
     pub async_index: Option<String>,
     pub allow_full_scan: bool,
+    pub vectorized: bool,
+    pub vector_batch_size: usize,
 }
 
 impl Default for QueryOptions {
@@ -151,6 +153,8 @@ impl Default for QueryOptions {
             cursor: None,
             async_index: None,
             allow_full_scan: false,
+            vectorized: false,
+            vector_batch_size: 1024,
         }
     }
 }
@@ -311,7 +315,7 @@ impl IntoQueryValue for u8 {
 
 impl IntoQueryValue for u64 {
     fn into_query_value(self) -> Value {
-        Value::Integer(self as i64)
+        Value::U64(self)
     }
 }
 

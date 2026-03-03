@@ -2,6 +2,7 @@ use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
 use crate::catalog::schema::{ColumnDef, Constraint, ForeignKeyAction, TableSchema};
 use crate::catalog::types::{ColumnType, Row, Value};
+use crate::commit::tx::{AssertionActual, ReadAssertion};
 use crate::commit::validation::{
     ConflictAction, ConflictTarget, Mutation, TableUpdateExpr, UpdateExpr,
 };
@@ -16,7 +17,9 @@ use crate::order_book::{
 use crate::query::operators::{compile_expr, eval_compiled_expr_public};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::index::extract_index_key_encoded;
-use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndex, SecondaryIndexStore};
+use crate::storage::keyspace::{
+    AccumulatorAppendResult, Keyspace, NamespaceId, SecondaryIndex, SecondaryIndexStore,
+};
 use primitive_types::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -362,6 +365,28 @@ pub fn apply_mutation(
                 } => {
                     keyspace.drop_table(&project_id, &scope_id, crate::catalog::KV_INDEX_TABLE);
                 }
+                crate::catalog::DdlOperation::CreateAccumulator {
+                    project_id,
+                    scope_id,
+                    accumulator_name,
+                    exposure_margin_bps,
+                    ..
+                } => {
+                    keyspace.create_accumulator(
+                        &project_id,
+                        &scope_id,
+                        &accumulator_name,
+                        exposure_margin_bps,
+                    );
+                }
+                crate::catalog::DdlOperation::DropAccumulator {
+                    project_id,
+                    scope_id,
+                    accumulator_name,
+                    ..
+                } => {
+                    keyspace.drop_accumulator(&project_id, &scope_id, &accumulator_name);
+                }
                 crate::catalog::DdlOperation::GrantPermission {
                     caller_id,
                     permission,
@@ -509,6 +534,349 @@ pub fn apply_mutation(
                 U256::from_big_endian(&amount_be),
                 commit_seq,
             )?;
+        }
+        Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_overflow,
+        } => {
+            keyspace.kv_add_u256_ex(
+                &project_id,
+                &scope_id,
+                key,
+                U256::from_big_endian(&amount_be),
+                &on_missing,
+                &on_overflow,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_underflow,
+        } => {
+            keyspace.kv_sub_u256_ex(
+                &project_id,
+                &scope_id,
+                key,
+                U256::from_big_endian(&amount_be),
+                &on_missing,
+                &on_underflow,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            key,
+            candidate_be,
+            on_missing,
+        } => {
+            keyspace.kv_max_u256(
+                &project_id,
+                &scope_id,
+                key,
+                U256::from_big_endian(&candidate_be),
+                &on_missing,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            key,
+            candidate_be,
+            on_missing,
+        } => {
+            keyspace.kv_min_u256(
+                &project_id,
+                &scope_id,
+                key,
+                U256::from_big_endian(&candidate_be),
+                &on_missing,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            key,
+            op,
+            operand_be,
+            expected_seq,
+        } => {
+            if let Some(expected_seq) = expected_seq {
+                let actual = keyspace
+                    .kv_get(&project_id, &scope_id, &key)
+                    .map(|entry| entry.version)
+                    .unwrap_or(0);
+                if actual != expected_seq {
+                    return Err(AedbError::AssertionFailed {
+                        index: 0,
+                        assertion: Box::new(ReadAssertion::KeyVersion {
+                            project_id,
+                            scope_id,
+                            key,
+                            expected_seq,
+                        }),
+                        actual: Box::new(AssertionActual::Version(actual)),
+                    });
+                }
+            }
+            keyspace.kv_mutate_u256(
+                &project_id,
+                &scope_id,
+                key,
+                op,
+                U256::from_big_endian(&operand_be),
+                commit_seq,
+            )?;
+        }
+        Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_overflow,
+        } => {
+            keyspace.kv_add_u64_ex(
+                &project_id,
+                &scope_id,
+                key,
+                u64::from_be_bytes(amount_be),
+                &on_missing,
+                &on_overflow,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_underflow,
+        } => {
+            keyspace.kv_sub_u64_ex(
+                &project_id,
+                &scope_id,
+                key,
+                u64::from_be_bytes(amount_be),
+                &on_missing,
+                &on_underflow,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            key,
+            amount,
+            on_missing,
+            on_underflow,
+        } => {
+            keyspace.kv_sub_int_ex(
+                &project_id,
+                &scope_id,
+                key,
+                amount,
+                on_missing,
+                on_underflow,
+                commit_seq,
+            )?;
+        }
+        Mutation::CounterAdd {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            shard_count,
+            shard_hint,
+        } => {
+            keyspace.counter_add_sharded(
+                &project_id,
+                &scope_id,
+                key,
+                amount_be,
+                shard_count,
+                shard_hint,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            key,
+            candidate_be,
+            on_missing,
+        } => {
+            keyspace.kv_max_u64(
+                &project_id,
+                &scope_id,
+                key,
+                u64::from_be_bytes(candidate_be),
+                &on_missing,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            key,
+            candidate_be,
+            on_missing,
+        } => {
+            keyspace.kv_min_u64(
+                &project_id,
+                &scope_id,
+                key,
+                u64::from_be_bytes(candidate_be),
+                &on_missing,
+                commit_seq,
+            )?;
+        }
+        Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            key,
+            op,
+            operand_be,
+            expected_seq,
+        } => {
+            if let Some(expected_seq) = expected_seq {
+                let actual = keyspace
+                    .kv_get(&project_id, &scope_id, &key)
+                    .map(|entry| entry.version)
+                    .unwrap_or(0);
+                if actual != expected_seq {
+                    return Err(AedbError::AssertionFailed {
+                        index: 0,
+                        assertion: Box::new(ReadAssertion::KeyVersion {
+                            project_id,
+                            scope_id,
+                            key,
+                            expected_seq,
+                        }),
+                        actual: Box::new(AssertionActual::Version(actual)),
+                    });
+                }
+            }
+            keyspace.kv_mutate_u64(
+                &project_id,
+                &scope_id,
+                key,
+                op,
+                u64::from_be_bytes(operand_be),
+                commit_seq,
+            )?;
+        }
+        Mutation::Accumulate {
+            project_id,
+            scope_id,
+            accumulator_name,
+            delta,
+            dedupe_key,
+            order_key,
+            release_exposure_id,
+        } => {
+            let append_result = keyspace.append_accumulator_delta(
+                &project_id,
+                &scope_id,
+                &accumulator_name,
+                delta,
+                &dedupe_key,
+                order_key,
+                commit_seq,
+            )?;
+            if let Some(exposure_id) = release_exposure_id
+                && matches!(append_result, AccumulatorAppendResult::Applied)
+            {
+                keyspace.release_accumulator_exposure(
+                    &project_id,
+                    &scope_id,
+                    &accumulator_name,
+                    &exposure_id,
+                )?;
+            }
+        }
+        Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            amount,
+            exposure_id,
+        } => {
+            keyspace.expose_accumulator(
+                &project_id,
+                &scope_id,
+                &accumulator_name,
+                amount,
+                &exposure_id,
+                commit_seq,
+            )?;
+        }
+        Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposures,
+        } => {
+            keyspace.expose_accumulator_batch(
+                &project_id,
+                &scope_id,
+                &accumulator_name,
+                &exposures,
+                commit_seq,
+            )?;
+        }
+        Mutation::ReleaseAccumulatorExposure {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposure_id,
+        } => {
+            keyspace.release_accumulator_exposure(
+                &project_id,
+                &scope_id,
+                &accumulator_name,
+                &exposure_id,
+            )?;
+        }
+        Mutation::EmitEvent {
+            project_id,
+            scope_id,
+            topic,
+            event_key,
+            payload_json,
+        } => {
+            ensure_event_outbox_schema(catalog)?;
+            keyspace.upsert_row(
+                crate::catalog::SYSTEM_PROJECT_ID,
+                SYSTEM_SCOPE_ID,
+                EVENT_OUTBOX_TABLE,
+                vec![
+                    Value::Integer(commit_seq as i64),
+                    Value::Text(topic.clone().into()),
+                    Value::Text(event_key.clone().into()),
+                ],
+                Row::from_values(vec![
+                    Value::Integer(commit_seq as i64),
+                    Value::Timestamp(now_micros() as i64),
+                    Value::Text(project_id.into()),
+                    Value::Text(scope_id.into()),
+                    Value::Text(topic.into()),
+                    Value::Text(event_key.into()),
+                    Value::Json(payload_json.into()),
+                ]),
+                commit_seq,
+            );
         }
         Mutation::TableIncU256 {
             project_id,
@@ -890,6 +1258,10 @@ pub fn apply_mutation_trusted_if_eligible(
 const AUTHZ_AUDIT_TABLE: &str = "authz_audit";
 const ASSERTION_AUDIT_TABLE: &str = "assertion_audit";
 const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
+const EVENT_OUTBOX_TABLE: &str = "event_outbox";
+const REACTIVE_PROCESSOR_CHECKPOINTS_TABLE: &str = "reactive_processor_checkpoints";
+const REACTIVE_PROCESSOR_REGISTRY_TABLE: &str = "reactive_processor_registry";
+const REACTIVE_PROCESSOR_DLQ_TABLE: &str = "reactive_processor_dead_letters";
 const SYSTEM_SCOPE_ID: &str = "app";
 
 struct AuthzAuditContext<'a> {
@@ -1003,6 +1375,26 @@ fn ensure_internal_audit_schema_for_upsert(
         && table_name == LIFECYCLE_OUTBOX_TABLE
     {
         ensure_lifecycle_outbox_schema(catalog)?;
+    } else if project_id == crate::catalog::SYSTEM_PROJECT_ID
+        && scope_id == SYSTEM_SCOPE_ID
+        && table_name == EVENT_OUTBOX_TABLE
+    {
+        ensure_event_outbox_schema(catalog)?;
+    } else if project_id == crate::catalog::SYSTEM_PROJECT_ID
+        && scope_id == SYSTEM_SCOPE_ID
+        && table_name == REACTIVE_PROCESSOR_CHECKPOINTS_TABLE
+    {
+        ensure_reactive_processor_checkpoints_schema(catalog)?;
+    } else if project_id == crate::catalog::SYSTEM_PROJECT_ID
+        && scope_id == SYSTEM_SCOPE_ID
+        && table_name == REACTIVE_PROCESSOR_REGISTRY_TABLE
+    {
+        ensure_reactive_processor_registry_schema(catalog)?;
+    } else if project_id == crate::catalog::SYSTEM_PROJECT_ID
+        && scope_id == SYSTEM_SCOPE_ID
+        && table_name == REACTIVE_PROCESSOR_DLQ_TABLE
+    {
+        ensure_reactive_processor_dead_letter_schema(catalog)?;
     }
     Ok(())
 }
@@ -1199,6 +1591,228 @@ fn ensure_lifecycle_outbox_schema(catalog: &mut Catalog) -> Result<(), AedbError
                 },
             ],
             primary_key: vec!["commit_seq".to_string()],
+            constraints: vec![],
+            foreign_keys: vec![],
+        },
+    );
+    Ok(())
+}
+
+fn ensure_event_outbox_schema(catalog: &mut Catalog) -> Result<(), AedbError> {
+    ensure_system_project_scope(catalog);
+    let key = (
+        namespace_key(crate::catalog::SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID),
+        EVENT_OUTBOX_TABLE.to_string(),
+    );
+    if catalog.tables.contains_key(&key) {
+        return Ok(());
+    }
+    catalog.tables.insert(
+        key,
+        TableSchema {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            scope_id: SYSTEM_SCOPE_ID.to_string(),
+            table_name: EVENT_OUTBOX_TABLE.to_string(),
+            owner_id: Some("system".to_string()),
+            columns: vec![
+                ColumnDef {
+                    name: "commit_seq".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "ts_micros".to_string(),
+                    col_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "project_id".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "scope_id".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "topic".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "event_key".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "payload".to_string(),
+                    col_type: ColumnType::Json,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec![
+                "commit_seq".to_string(),
+                "topic".to_string(),
+                "event_key".to_string(),
+            ],
+            constraints: vec![],
+            foreign_keys: vec![],
+        },
+    );
+    Ok(())
+}
+
+fn ensure_reactive_processor_checkpoints_schema(catalog: &mut Catalog) -> Result<(), AedbError> {
+    ensure_system_project_scope(catalog);
+    let key = (
+        namespace_key(crate::catalog::SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID),
+        REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+    );
+    if catalog.tables.contains_key(&key) {
+        return Ok(());
+    }
+    catalog.tables.insert(
+        key,
+        TableSchema {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            scope_id: SYSTEM_SCOPE_ID.to_string(),
+            table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+            owner_id: Some("system".to_string()),
+            columns: vec![
+                ColumnDef {
+                    name: "processor_name".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "checkpoint_seq".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "updated_at_micros".to_string(),
+                    col_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["processor_name".to_string()],
+            constraints: vec![],
+            foreign_keys: vec![],
+        },
+    );
+    Ok(())
+}
+
+fn ensure_reactive_processor_registry_schema(catalog: &mut Catalog) -> Result<(), AedbError> {
+    ensure_system_project_scope(catalog);
+    let key = (
+        namespace_key(crate::catalog::SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID),
+        REACTIVE_PROCESSOR_REGISTRY_TABLE.to_string(),
+    );
+    if catalog.tables.contains_key(&key) {
+        return Ok(());
+    }
+    catalog.tables.insert(
+        key,
+        TableSchema {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            scope_id: SYSTEM_SCOPE_ID.to_string(),
+            table_name: REACTIVE_PROCESSOR_REGISTRY_TABLE.to_string(),
+            owner_id: Some("system".to_string()),
+            columns: vec![
+                ColumnDef {
+                    name: "processor_name".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "options_json".to_string(),
+                    col_type: ColumnType::Json,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "enabled".to_string(),
+                    col_type: ColumnType::Boolean,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "updated_at_micros".to_string(),
+                    col_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["processor_name".to_string()],
+            constraints: vec![],
+            foreign_keys: vec![],
+        },
+    );
+    Ok(())
+}
+
+fn ensure_reactive_processor_dead_letter_schema(catalog: &mut Catalog) -> Result<(), AedbError> {
+    ensure_system_project_scope(catalog);
+    let key = (
+        namespace_key(crate::catalog::SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID),
+        REACTIVE_PROCESSOR_DLQ_TABLE.to_string(),
+    );
+    if catalog.tables.contains_key(&key) {
+        return Ok(());
+    }
+    catalog.tables.insert(
+        key,
+        TableSchema {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            scope_id: SYSTEM_SCOPE_ID.to_string(),
+            table_name: REACTIVE_PROCESSOR_DLQ_TABLE.to_string(),
+            owner_id: Some("system".to_string()),
+            columns: vec![
+                ColumnDef {
+                    name: "processor_name".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "commit_seq".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "topic".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "event_key".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "payload_json".to_string(),
+                    col_type: ColumnType::Json,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "error".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "attempts".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "failed_at_micros".to_string(),
+                    col_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec![
+                "processor_name".to_string(),
+                "commit_seq".to_string(),
+                "event_key".to_string(),
+            ],
             constraints: vec![],
             foreign_keys: vec![],
         },

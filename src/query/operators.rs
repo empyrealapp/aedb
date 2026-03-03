@@ -1,41 +1,178 @@
 use crate::catalog::types::{Row, Value};
 use crate::query::error::QueryError;
 use crate::query::plan::{Aggregate, Expr, Order};
-use lru::LruCache;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 const EXPR_CACHE_SHARDS: usize = 16;
 const EXPR_CACHE_TOTAL_CAPACITY: usize = 256;
 const EXPR_CACHE_PER_SHARD: usize = EXPR_CACHE_TOTAL_CAPACITY / EXPR_CACHE_SHARDS;
+const OPERATOR_BUILD_BATCH_SIZE: usize = 1024;
 
 /// Global cache for compiled expressions to avoid recompiling identical predicates.
-/// Key is (expr_debug_string, column_names, table) to ensure correct schema context.
+/// Key is (expr_ast, column_names, table) to ensure correct schema context.
 /// This provides 50-100μs savings for repeated queries with the same predicates.
-type ExprCacheKey = (String, Vec<String>, String);
-type ExprCompileCacheShard = parking_lot::Mutex<LruCache<ExprCacheKey, CompiledExpr>>;
+type ExprCacheKey = (Expr, Vec<String>, String);
+type ExprCompileCacheShard = parking_lot::Mutex<ExprCompileLruCache>;
 type ExprCompileCache = [ExprCompileCacheShard; EXPR_CACHE_SHARDS];
 
 static EXPR_COMPILE_CACHE: once_cell::sync::Lazy<ExprCompileCache> =
     once_cell::sync::Lazy::new(|| {
         std::array::from_fn(|_| {
-            let cap = NonZeroUsize::new(EXPR_CACHE_PER_SHARD).unwrap_or(NonZeroUsize::MIN);
-            parking_lot::Mutex::new(LruCache::new(cap))
+            parking_lot::Mutex::new(ExprCompileLruCache::new(EXPR_CACHE_PER_SHARD))
         })
     });
 
-fn expr_cache_shard_idx(cache_key: &ExprCacheKey) -> usize {
-    let mut hasher = DefaultHasher::new();
-    cache_key.hash(&mut hasher);
-    (hasher.finish() as usize) % EXPR_CACHE_SHARDS
+struct ExprCompileLruCache {
+    capacity: usize,
+    clock: u64,
+    map: HashMap<ExprCacheKey, ExprCacheEntry>,
+    order: VecDeque<(u64, ExprCacheKey)>,
+}
+
+#[derive(Clone)]
+struct ExprCacheEntry {
+    value: CompiledExpr,
+    stamp: u64,
+}
+
+impl ExprCompileLruCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            clock: 0,
+            map: HashMap::with_capacity(capacity.max(1)),
+            order: VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn get(&mut self, expr: &Expr, columns: &[String], table: &str) -> Option<CompiledExpr> {
+        let stamp = self.next_stamp();
+        for (key, entry) in &mut self.map {
+            if key.2 != table || key.1.len() != columns.len() {
+                continue;
+            }
+            if key.0 == *expr && key.1.as_slice() == columns {
+                entry.stamp = stamp;
+                self.order.push_back((stamp, key.clone()));
+                return Some(entry.value.clone());
+            }
+        }
+        None
+    }
+
+    fn put(&mut self, key: ExprCacheKey, value: CompiledExpr) {
+        let stamp = self.next_stamp();
+        if let Some(entry) = self.map.get_mut(&key) {
+            entry.value = value;
+            entry.stamp = stamp;
+            self.order.push_back((stamp, key));
+            return;
+        }
+
+        if self.map.len() >= self.capacity {
+            while let Some(evicted) = self.order.pop_front() {
+                let (stamp, evicted_key) = evicted;
+                let should_evict = self
+                    .map
+                    .get(&evicted_key)
+                    .map(|entry| entry.stamp == stamp)
+                    .unwrap_or(false);
+                if should_evict {
+                    self.map.remove(&evicted_key);
+                    break;
+                }
+            }
+        }
+
+        self.order.push_back((stamp, key.clone()));
+        self.map.insert(key, ExprCacheEntry { value, stamp });
+    }
+
+    fn next_stamp(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+}
+
+#[cfg(test)]
+mod expr_compile_lru_cache_tests {
+    use super::{CompiledExpr, ExprCacheKey, ExprCompileLruCache};
+
+    fn key(name: &str) -> ExprCacheKey {
+        (
+            crate::query::plan::Expr::IsNull(name.to_string()),
+            vec!["c".to_string()],
+            "t".to_string(),
+        )
+    }
+
+    #[test]
+    fn evicts_oldest_entry_when_capacity_reached() {
+        let mut cache = ExprCompileLruCache::new(2);
+        cache.put(key("a"), CompiledExpr::IsNull(0));
+        cache.put(key("b"), CompiledExpr::IsNull(1));
+        cache.put(key("c"), CompiledExpr::IsNull(2));
+
+        let ka = key("a");
+        let kb = key("b");
+        let kc = key("c");
+        assert!(cache.get(&ka.0, &ka.1, &ka.2).is_none());
+        assert_eq!(
+            cache.get(&kb.0, &kb.1, &kb.2),
+            Some(CompiledExpr::IsNull(1))
+        );
+        assert_eq!(
+            cache.get(&kc.0, &kc.1, &kc.2),
+            Some(CompiledExpr::IsNull(2))
+        );
+    }
+
+    #[test]
+    fn hit_promotes_entry_and_prevents_eviction() {
+        let mut cache = ExprCompileLruCache::new(2);
+        cache.put(key("a"), CompiledExpr::IsNull(0));
+        cache.put(key("b"), CompiledExpr::IsNull(1));
+
+        let ka = key("a");
+        let kb = key("b");
+        assert_eq!(
+            cache.get(&ka.0, &ka.1, &ka.2),
+            Some(CompiledExpr::IsNull(0))
+        );
+        cache.put(key("c"), CompiledExpr::IsNull(2));
+
+        let kc = key("c");
+        assert_eq!(
+            cache.get(&ka.0, &ka.1, &ka.2),
+            Some(CompiledExpr::IsNull(0))
+        );
+        assert!(cache.get(&kb.0, &kb.1, &kb.2).is_none());
+        assert_eq!(
+            cache.get(&kc.0, &kc.1, &kc.2),
+            Some(CompiledExpr::IsNull(2))
+        );
+    }
 }
 
 pub trait Operator {
     fn next(&mut self) -> Option<Row>;
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        let batch_size = batch_size.max(1);
+        let mut rows = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            match self.next() {
+                Some(row) => rows.push(row),
+                None => break,
+            }
+        }
+        if rows.is_empty() { None } else { Some(rows) }
+    }
     fn rows_examined(&self) -> usize {
         0
     }
@@ -69,6 +206,19 @@ impl Operator for ScanOperator {
     fn rows_examined(&self) -> usize {
         self.examined
     }
+
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        let batch_size = batch_size.max(1);
+        let mut rows = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            match self.rows.next() {
+                Some(row) => rows.push(row),
+                None => break,
+            }
+        }
+        self.examined = self.examined.saturating_add(rows.len());
+        if rows.is_empty() { None } else { Some(rows) }
+    }
 }
 
 pub struct FilterOperator {
@@ -95,6 +245,22 @@ impl Operator for FilterOperator {
     fn rows_examined(&self) -> usize {
         self.child.rows_examined()
     }
+
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        let batch_size = batch_size.max(1);
+        loop {
+            let child_batch = self.child.next_batch(batch_size)?;
+            let mut filtered = Vec::with_capacity(child_batch.len());
+            for row in child_batch {
+                if eval_compiled_expr(&self.predicate, &row) {
+                    filtered.push(row);
+                }
+            }
+            if !filtered.is_empty() {
+                return Some(filtered);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +271,7 @@ pub enum CompiledExpr {
     Lte(usize, Value),
     Gt(usize, Value),
     Gte(usize, Value),
-    In(usize, Vec<Value>),
+    In(usize, Vec<Value>, HashSet<Value>),
     Between(usize, Value, Value),
     IsNull(usize),
     IsNotNull(usize),
@@ -120,20 +286,23 @@ pub fn compile_expr(
     columns: &[String],
     table: &str,
 ) -> Result<CompiledExpr, QueryError> {
-    // Try cache first - use debug representation as key (includes expr structure)
-    let cache_key = (format!("{:?}", expr), columns.to_vec(), table.to_string());
-    let shard_idx = expr_cache_shard_idx(&cache_key);
+    // Try cache first - keyed by expression AST + schema context.
+    let mut hasher = DefaultHasher::new();
+    expr.hash(&mut hasher);
+    columns.hash(&mut hasher);
+    table.hash(&mut hasher);
+    let shard_idx = (hasher.finish() as usize) % EXPR_CACHE_SHARDS;
     let cache_shard = &EXPR_COMPILE_CACHE[shard_idx];
 
-    if let Some(compiled) = cache_shard.lock().get(&cache_key) {
-        // Cache hit - return cloned compiled expression
-        return Ok(compiled.clone());
+    if let Some(compiled) = cache_shard.lock().get(expr, columns, table) {
+        return Ok(compiled);
     }
 
     // Cache miss - compile the expression
     let compiled = compile_expr_uncached(expr, columns, table)?;
 
     // Store in cache
+    let cache_key = (expr.clone(), columns.to_vec(), table.to_string());
     cache_shard.lock().put(cache_key, compiled.clone());
 
     Ok(compiled)
@@ -169,10 +338,14 @@ fn compile_expr_uncached(
             find_col_idx(columns, c, table)?,
             v.clone(),
         )),
-        Expr::In(c, values) => Ok(CompiledExpr::In(
-            find_col_idx(columns, c, table)?,
-            values.clone(),
-        )),
+        Expr::In(c, values) => {
+            let set: HashSet<Value> = values.iter().cloned().collect();
+            Ok(CompiledExpr::In(
+                find_col_idx(columns, c, table)?,
+                values.clone(),
+                set,
+            ))
+        }
         Expr::Between(c, lo, hi) => Ok(CompiledExpr::Between(
             find_col_idx(columns, c, table)?,
             lo.clone(),
@@ -223,6 +396,25 @@ impl Operator for ProjectOperator {
     fn rows_examined(&self) -> usize {
         self.child.rows_examined()
     }
+
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        let child_batch = self.child.next_batch(batch_size)?;
+        let projected = child_batch
+            .into_iter()
+            .map(|row| Row {
+                values: self
+                    .selected
+                    .iter()
+                    .map(|column_index| row.values[*column_index].clone())
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        if projected.is_empty() {
+            None
+        } else {
+            Some(projected)
+        }
+    }
 }
 
 pub struct SortOperator {
@@ -266,19 +458,26 @@ impl SortOperator {
             #[derive(Clone)]
             struct TopKRow {
                 row: Row,
-                sort_key: Vec<Value>,
+                sort_key_columns: Arc<Vec<usize>>,
                 orders: Arc<Vec<Order>>,
             }
 
             impl Ord for TopKRow {
                 fn cmp(&self, other: &Self) -> Ordering {
-                    for ((lhs, rhs), order) in self
-                        .sort_key
-                        .iter()
-                        .zip(other.sort_key.iter())
-                        .zip(self.orders.iter())
+                    if self.sort_key_columns.len() == 1 {
+                        let column_index = self.sort_key_columns[0];
+                        let cmp =
+                            self.row.values[column_index].cmp(&other.row.values[column_index]);
+                        return match self.orders[0] {
+                            Order::Asc => cmp,
+                            Order::Desc => cmp.reverse(),
+                        };
+                    }
+                    for (column_index, order) in
+                        self.sort_key_columns.iter().zip(self.orders.iter())
                     {
-                        let cmp = lhs.cmp(rhs);
+                        let cmp =
+                            self.row.values[*column_index].cmp(&other.row.values[*column_index]);
                         let ord = match order {
                             Order::Asc => cmp,
                             Order::Desc => cmp.reverse(),
@@ -309,29 +508,38 @@ impl SortOperator {
                 .iter()
                 .map(|(column_index, _)| *column_index)
                 .collect();
+            let sort_key_columns = Arc::new(sort_key_columns);
             let sort_orders =
                 Arc::new(order_by.iter().map(|(_, order)| *order).collect::<Vec<_>>());
             let mut heap: BinaryHeap<TopKRow> = BinaryHeap::with_capacity(limit);
-            while let Some(row) = child.next() {
-                let candidate = TopKRow {
-                    sort_key: sort_key_columns
-                        .iter()
-                        .map(|column_index| row.values[*column_index].clone())
-                        .collect(),
-                    row,
-                    orders: Arc::clone(&sort_orders),
-                };
-                if heap.len() < limit {
-                    heap.push(candidate);
-                    continue;
-                }
-                // Keep only the best N rows under the requested ORDER BY.
-                if heap
-                    .peek()
-                    .is_some_and(|worst_of_best| candidate < *worst_of_best)
-                {
-                    let _ = heap.pop();
-                    heap.push(candidate);
+            while let Some(rows) = child.next_batch(OPERATOR_BUILD_BATCH_SIZE) {
+                for row in rows {
+                    if heap.len() < limit {
+                        heap.push(TopKRow {
+                            row,
+                            sort_key_columns: Arc::clone(&sort_key_columns),
+                            orders: Arc::clone(&sort_orders),
+                        });
+                        continue;
+                    }
+                    let should_insert = heap.peek().is_some_and(|worst_of_best| {
+                        compare_rows_with_order_by(
+                            &row,
+                            &worst_of_best.row,
+                            sort_key_columns.as_ref(),
+                            sort_orders.as_ref(),
+                        )
+                        .is_lt()
+                    });
+                    // Keep only the best N rows under the requested ORDER BY.
+                    if should_insert {
+                        let _ = heap.pop();
+                        heap.push(TopKRow {
+                            row,
+                            sort_key_columns: Arc::clone(&sort_key_columns),
+                            orders: Arc::clone(&sort_orders),
+                        });
+                    }
                 }
             }
             let examined = child.rows_examined();
@@ -345,8 +553,8 @@ impl SortOperator {
         }
 
         let mut rows = Vec::new();
-        while let Some(row) = child.next() {
-            rows.push(row);
+        while let Some(batch) = child.next_batch(OPERATOR_BUILD_BATCH_SIZE) {
+            rows.extend(batch);
         }
         let examined = child.rows_examined();
         rows.sort_by(compare_rows);
@@ -356,6 +564,33 @@ impl SortOperator {
             examined,
         }
     }
+}
+
+#[inline]
+fn compare_rows_with_order_by(
+    left: &Row,
+    right: &Row,
+    sort_key_columns: &[usize],
+    sort_orders: &[Order],
+) -> Ordering {
+    if sort_key_columns.len() == 1 {
+        let cmp = left.values[sort_key_columns[0]].cmp(&right.values[sort_key_columns[0]]);
+        return match sort_orders[0] {
+            Order::Asc => cmp,
+            Order::Desc => cmp.reverse(),
+        };
+    }
+    for (column_index, sort_order) in sort_key_columns.iter().zip(sort_orders.iter()) {
+        let cmp = left.values[*column_index].cmp(&right.values[*column_index]);
+        let ord = match sort_order {
+            Order::Asc => cmp,
+            Order::Desc => cmp.reverse(),
+        };
+        if !ord.is_eq() {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 impl Operator for SortOperator {
@@ -370,6 +605,18 @@ impl Operator for SortOperator {
 
     fn rows_examined(&self) -> usize {
         self.examined
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        if self.row_index >= self.rows.len() {
+            return None;
+        }
+        let remaining = self.rows.len() - self.row_index;
+        let take = remaining.min(batch_size.max(1));
+        let end = self.row_index + take;
+        let out = self.rows[self.row_index..end].to_vec();
+        self.row_index = end;
+        Some(out)
     }
 }
 
@@ -399,6 +646,20 @@ impl Operator for LimitOperator {
 
     fn rows_examined(&self) -> usize {
         self.child.rows_examined()
+    }
+
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let mut batch = self
+            .child
+            .next_batch(batch_size.max(1).min(self.remaining))?;
+        if batch.len() > self.remaining {
+            batch.truncate(self.remaining);
+        }
+        self.remaining = self.remaining.saturating_sub(batch.len());
+        if batch.is_empty() { None } else { Some(batch) }
     }
 }
 
@@ -500,36 +761,66 @@ impl AggregateOperator {
         group_by_idx: Vec<usize>,
         aggregate_col_idx: Vec<Option<usize>>,
     ) -> Self {
-        let aggregates = Arc::new(aggregates);
-        let aggregate_col_idx = Arc::new(aggregate_col_idx);
-        let mut buckets: BTreeMap<Vec<Value>, Vec<AggregateState>> = BTreeMap::new();
-        while let Some(row) = child.next() {
-            let key: Vec<Value> = if group_by_idx.is_empty() {
-                Vec::new()
+        let template_states = aggregates
+            .iter()
+            .map(AggregateState::from_aggregate)
+            .collect::<Vec<_>>();
+
+        if group_by_idx.is_empty() {
+            let mut states = template_states.clone();
+            let mut saw_row = false;
+            while let Some(rows) = child.next_batch(OPERATOR_BUILD_BATCH_SIZE) {
+                saw_row = true;
+                for row in rows {
+                    for ((state, aggregate), agg_col_idx) in states
+                        .iter_mut()
+                        .zip(aggregates.iter())
+                        .zip(aggregate_col_idx.iter().copied())
+                    {
+                        state.update(aggregate, &row, agg_col_idx);
+                    }
+                }
+            }
+            let examined = child.rows_examined();
+            let rows = if saw_row {
+                vec![Row {
+                    values: states.into_iter().map(AggregateState::finalize).collect(),
+                }]
             } else {
-                group_by_idx
-                    .iter()
-                    .map(|i| row.values[*i].clone())
-                    .collect()
+                Vec::new()
             };
-            let states = buckets.entry(key).or_insert_with(|| {
-                aggregates
-                    .iter()
-                    .map(AggregateState::from_aggregate)
-                    .collect::<Vec<_>>()
-            });
-            for (aggregate_index, state) in states.iter_mut().enumerate() {
-                state.update(
-                    &aggregates[aggregate_index],
-                    &row,
-                    aggregate_col_idx[aggregate_index],
-                );
+            return Self {
+                rows,
+                row_index: 0,
+                examined,
+            };
+        }
+
+        let mut buckets: HashMap<Vec<Value>, Vec<AggregateState>> = HashMap::new();
+        while let Some(rows) = child.next_batch(OPERATOR_BUILD_BATCH_SIZE) {
+            for row in rows {
+                let mut key: Vec<Value> = Vec::with_capacity(group_by_idx.len());
+                for group_idx in &group_by_idx {
+                    key.push(row.values[*group_idx].clone());
+                }
+                let states = buckets
+                    .entry(key)
+                    .or_insert_with(|| template_states.clone());
+                for ((state, aggregate), agg_col_idx) in states
+                    .iter_mut()
+                    .zip(aggregates.iter())
+                    .zip(aggregate_col_idx.iter().copied())
+                {
+                    state.update(aggregate, &row, agg_col_idx);
+                }
             }
         }
         let examined = child.rows_examined();
 
-        let mut rows = Vec::new();
-        for (group_key, group_states) in buckets {
+        let mut bucket_entries = buckets.into_iter().collect::<Vec<_>>();
+        bucket_entries.sort_unstable_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
+        let mut rows = Vec::with_capacity(bucket_entries.len());
+        for (group_key, group_states) in bucket_entries {
             let mut values = group_key;
             for state in group_states {
                 values.push(state.finalize());
@@ -558,6 +849,18 @@ impl Operator for AggregateOperator {
     fn rows_examined(&self) -> usize {
         self.examined
     }
+
+    fn next_batch(&mut self, batch_size: usize) -> Option<Vec<Row>> {
+        if self.row_index >= self.rows.len() {
+            return None;
+        }
+        let remaining = self.rows.len() - self.row_index;
+        let take = remaining.min(batch_size.max(1));
+        let end = self.row_index + take;
+        let out = self.rows[self.row_index..end].to_vec();
+        self.row_index = end;
+        Some(out)
+    }
 }
 
 fn eval_compiled_expr(expr: &CompiledExpr, row: &Row) -> bool {
@@ -574,11 +877,15 @@ fn eval_compiled_expr(expr: &CompiledExpr, row: &Row) -> bool {
             .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_gt())),
         CompiledExpr::Gte(column_index, v) => get_col(row, *column_index)
             .is_some_and(|rv| compare_values(rv, v).is_some_and(|o| o.is_ge())),
-        CompiledExpr::In(column_index, values) => get_col(row, *column_index).is_some_and(|rv| {
-            values
-                .iter()
-                .any(|v| compare_values(rv, v).is_some_and(|o| o.is_eq()))
-        }),
+        CompiledExpr::In(column_index, values, value_set) => get_col(row, *column_index)
+            .is_some_and(|rv| {
+                if value_set.contains(rv) {
+                    return true;
+                }
+                values
+                    .iter()
+                    .any(|v| compare_values(rv, v).is_some_and(|o| o.is_eq()))
+            }),
         CompiledExpr::Between(column_index, lo, hi) => {
             get_col(row, *column_index).is_some_and(|rv| {
                 compare_values(rv, lo).is_some_and(|o| o.is_ge())
@@ -661,12 +968,45 @@ fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => None,
         (Value::U8(a), Value::U8(b)) => a.partial_cmp(b),
+        (Value::U64(a), Value::U64(b)) => a.partial_cmp(b),
+        (Value::U8(a), Value::U64(b)) => (*a as u64).partial_cmp(b),
+        (Value::U64(a), Value::U8(b)) => a.partial_cmp(&(*b as u64)),
         (Value::U8(a), Value::Integer(b)) => (*a as i64).partial_cmp(b),
         (Value::Integer(a), Value::U8(b)) => a.partial_cmp(&(*b as i64)),
+        (Value::U64(a), Value::Integer(b)) => {
+            if *b < 0 {
+                Some(std::cmp::Ordering::Greater)
+            } else {
+                a.partial_cmp(&(*b as u64))
+            }
+        }
+        (Value::Integer(a), Value::U64(b)) => {
+            if *a < 0 {
+                Some(std::cmp::Ordering::Less)
+            } else {
+                (*a as u64).partial_cmp(b)
+            }
+        }
         (Value::U8(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
         (Value::Float(a), Value::U8(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::U64(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::U64(b)) => a.partial_cmp(&(*b as f64)),
         (Value::U8(a), Value::Timestamp(b)) => (*a as i64).partial_cmp(b),
         (Value::Timestamp(a), Value::U8(b)) => a.partial_cmp(&(*b as i64)),
+        (Value::U64(a), Value::Timestamp(b)) => {
+            if *b < 0 {
+                Some(std::cmp::Ordering::Greater)
+            } else {
+                a.partial_cmp(&(*b as u64))
+            }
+        }
+        (Value::Timestamp(a), Value::U64(b)) => {
+            if *a < 0 {
+                Some(std::cmp::Ordering::Less)
+            } else {
+                (*a as u64).partial_cmp(b)
+            }
+        }
         (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
         (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
         (Value::Timestamp(a), Value::Integer(b)) => a.partial_cmp(b),

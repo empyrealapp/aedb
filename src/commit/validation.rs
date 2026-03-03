@@ -60,6 +60,76 @@ pub enum CompareOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU256MissingPolicy {
+    TreatAsZero,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU256UnderflowPolicy {
+    Reject,
+    NoOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU256OverflowPolicy {
+    Reject,
+    Saturate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU256MutatorOp {
+    Set,
+    Add,
+    Sub,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU64MissingPolicy {
+    TreatAsZero,
+    Reject,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU64UnderflowPolicy {
+    Reject,
+    NoOp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU64OverflowPolicy {
+    Reject,
+    Saturate,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvU64MutatorOp {
+    Set,
+    Add,
+    Sub,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvIntegerAmount {
+    U64([u8; 8]),
+    U256([u8; 32]),
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvIntegerMissingPolicy {
+    TreatAsZero,
+    Reject,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KvIntegerUnderflowPolicy {
+    Reject,
+    NoOp,
+}
+
+pub const MAX_COUNTER_SHARDS: u16 = 4096;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Mutation {
     Insert {
         project_id: String,
@@ -155,6 +225,134 @@ pub enum Mutation {
         scope_id: String,
         key: Vec<u8>,
         amount_be: [u8; 32],
+    },
+    KvAddU256Ex {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        amount_be: [u8; 32],
+        on_missing: KvU256MissingPolicy,
+        on_overflow: KvU256OverflowPolicy,
+    },
+    KvSubU256Ex {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        amount_be: [u8; 32],
+        on_missing: KvU256MissingPolicy,
+        on_underflow: KvU256UnderflowPolicy,
+    },
+    KvMaxU256 {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        candidate_be: [u8; 32],
+        on_missing: KvU256MissingPolicy,
+    },
+    KvMinU256 {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        candidate_be: [u8; 32],
+        on_missing: KvU256MissingPolicy,
+    },
+    KvMutateU256 {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        op: KvU256MutatorOp,
+        operand_be: [u8; 32],
+        expected_seq: Option<u64>,
+    },
+    KvAddU64Ex {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+        on_overflow: KvU64OverflowPolicy,
+    },
+    KvSubU64Ex {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+        on_underflow: KvU64UnderflowPolicy,
+    },
+    KvSubIntEx {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        amount: KvIntegerAmount,
+        on_missing: KvIntegerMissingPolicy,
+        on_underflow: KvIntegerUnderflowPolicy,
+    },
+    CounterAdd {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        shard_count: u16,
+        shard_hint: u32,
+    },
+    KvMaxU64 {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        candidate_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+    },
+    KvMinU64 {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        candidate_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+    },
+    KvMutateU64 {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        op: KvU64MutatorOp,
+        operand_be: [u8; 8],
+        expected_seq: Option<u64>,
+    },
+    Accumulate {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        delta: i64,
+        dedupe_key: String,
+        order_key: u64,
+        #[serde(default)]
+        release_exposure_id: Option<String>,
+    },
+    ExposeAccumulator {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        amount: i64,
+        exposure_id: String,
+    },
+    ExposeAccumulatorBatch {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        exposures: Vec<(i64, String)>,
+    },
+    ReleaseAccumulatorExposure {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        exposure_id: String,
+    },
+    EmitEvent {
+        project_id: String,
+        scope_id: String,
+        topic: String,
+        event_key: String,
+        payload_json: String,
     },
     TableIncU256 {
         project_id: String,
@@ -267,7 +465,27 @@ pub fn validate_kv_sizes_early(mutation: &Mutation, config: &AedbConfig) -> Resu
         }
         Mutation::KvDel { key, .. }
         | Mutation::KvIncU256 { key, .. }
-        | Mutation::KvDecU256 { key, .. } => {
+        | Mutation::KvDecU256 { key, .. }
+        | Mutation::KvAddU256Ex { key, .. }
+        | Mutation::KvSubU256Ex { key, .. }
+        | Mutation::KvMaxU256 { key, .. }
+        | Mutation::KvMinU256 { key, .. }
+        | Mutation::KvMutateU256 { key, .. }
+        | Mutation::KvAddU64Ex { key, .. }
+        | Mutation::KvSubU64Ex { key, .. }
+        | Mutation::KvSubIntEx { key, .. }
+        | Mutation::KvMaxU64 { key, .. }
+        | Mutation::KvMinU64 { key, .. }
+        | Mutation::KvMutateU64 { key, .. } => {
+            if key.len() > config.max_kv_key_bytes {
+                return Err(AedbError::Validation(format!(
+                    "kv key size {} exceeds maximum {}",
+                    key.len(),
+                    config.max_kv_key_bytes
+                )));
+            }
+        }
+        Mutation::CounterAdd { key, .. } => {
             if key.len() > config.max_kv_key_bytes {
                 return Err(AedbError::Validation(format!(
                     "kv key size {} exceeds maximum {}",
@@ -506,6 +724,36 @@ pub fn validate_mutation_with_config(
             scope_id,
             key,
             ..
+        }
+        | Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
         } => validate_kv(
             catalog,
             project_id,
@@ -514,6 +762,216 @@ pub fn validate_mutation_with_config(
             Some(&vec![0u8; 32]),
             config,
         ),
+        Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        } => validate_kv(
+            catalog,
+            project_id,
+            scope_id,
+            key,
+            Some(&vec![0u8; 8]),
+            config,
+        ),
+        Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            key,
+            amount,
+            ..
+        } => {
+            let encoded = match amount {
+                KvIntegerAmount::U64(_) => vec![0u8; 8],
+                KvIntegerAmount::U256(_) => vec![0u8; 32],
+            };
+            validate_kv(catalog, project_id, scope_id, key, Some(&encoded), config)
+        }
+        Mutation::CounterAdd {
+            project_id,
+            scope_id,
+            key,
+            shard_count,
+            ..
+        } => {
+            validate_kv(
+                catalog,
+                project_id,
+                scope_id,
+                key,
+                Some(&vec![0u8; 8]),
+                config,
+            )?;
+            if *shard_count == 0 {
+                return Err(AedbError::Validation(
+                    "counter shard_count must be > 0".into(),
+                ));
+            }
+            if *shard_count > MAX_COUNTER_SHARDS {
+                return Err(AedbError::Validation(format!(
+                    "counter shard_count exceeds maximum {}",
+                    MAX_COUNTER_SHARDS
+                )));
+            }
+            Ok(())
+        }
+        Mutation::Accumulate {
+            project_id,
+            scope_id,
+            accumulator_name,
+            dedupe_key,
+            release_exposure_id,
+            ..
+        } => {
+            validate_identifier_like(accumulator_name, "accumulator_name")?;
+            if dedupe_key.trim().is_empty() {
+                return Err(AedbError::Validation("dedupe_key cannot be empty".into()));
+            }
+            if let Some(exposure_id) = release_exposure_id
+                && exposure_id.trim().is_empty()
+            {
+                return Err(AedbError::Validation(
+                    "release_exposure_id cannot be empty".into(),
+                ));
+            }
+            let ns = namespace_key(project_id, scope_id);
+            if !catalog
+                .accumulators
+                .contains_key(&(ns, accumulator_name.to_string()))
+            {
+                return Err(AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                )));
+            }
+            Ok(())
+        }
+        Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            amount,
+            exposure_id,
+        } => {
+            validate_identifier_like(accumulator_name, "accumulator_name")?;
+            if *amount <= 0 {
+                return Err(AedbError::Validation("exposure amount must be > 0".into()));
+            }
+            if exposure_id.trim().is_empty() {
+                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+            }
+            let ns = namespace_key(project_id, scope_id);
+            if !catalog
+                .accumulators
+                .contains_key(&(ns, accumulator_name.to_string()))
+            {
+                return Err(AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                )));
+            }
+            Ok(())
+        }
+        Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposures,
+        } => {
+            validate_identifier_like(accumulator_name, "accumulator_name")?;
+            if exposures.is_empty() {
+                return Err(AedbError::Validation("exposures cannot be empty".into()));
+            }
+            for (amount, exposure_id) in exposures {
+                if *amount <= 0 {
+                    return Err(AedbError::Validation("exposure amount must be > 0".into()));
+                }
+                if exposure_id.trim().is_empty() {
+                    return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+                }
+            }
+            let ns = namespace_key(project_id, scope_id);
+            if !catalog
+                .accumulators
+                .contains_key(&(ns, accumulator_name.to_string()))
+            {
+                return Err(AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                )));
+            }
+            Ok(())
+        }
+        Mutation::ReleaseAccumulatorExposure {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposure_id,
+        } => {
+            validate_identifier_like(accumulator_name, "accumulator_name")?;
+            if exposure_id.trim().is_empty() {
+                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+            }
+            let ns = namespace_key(project_id, scope_id);
+            if !catalog
+                .accumulators
+                .contains_key(&(ns, accumulator_name.to_string()))
+            {
+                return Err(AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                )));
+            }
+            Ok(())
+        }
+        Mutation::EmitEvent {
+            project_id,
+            scope_id,
+            topic,
+            event_key,
+            payload_json,
+        } => {
+            validate_identifier_like(topic, "topic")?;
+            if event_key.trim().is_empty() {
+                return Err(AedbError::Validation("event_key cannot be empty".into()));
+            }
+            if payload_json.trim().is_empty() {
+                return Err(AedbError::Validation("payload_json cannot be empty".into()));
+            }
+            let _v: serde_json::Value = serde_json::from_str(payload_json).map_err(|e| {
+                AedbError::Validation(format!("payload_json must be valid JSON: {e}"))
+            })?;
+            if !catalog
+                .scopes
+                .contains_key(&(project_id.to_string(), scope_id.to_string()))
+            {
+                return Err(AedbError::Validation(format!(
+                    "scope does not exist: {project_id}.{scope_id}"
+                )));
+            }
+            Ok(())
+        }
         Mutation::TableIncU256 {
             project_id,
             scope_id,
@@ -959,7 +1417,95 @@ fn kv_write_target(mutation: &Mutation) -> Option<(&str, &str, &[u8])> {
             scope_id,
             key,
             ..
+        }
+        | Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
         } => Some((project_id.as_str(), scope_id.as_str(), key.as_slice())),
+        Mutation::Accumulate {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | Mutation::EmitEvent {
+            project_id,
+            scope_id,
+            topic: accumulator_name,
+            ..
+        } => Some((
+            project_id.as_str(),
+            scope_id.as_str(),
+            accumulator_name.as_bytes(),
+        )),
         Mutation::OrderBookNew {
             project_id,
             scope_id,
@@ -1139,6 +1685,8 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             | DdlOperation::DropIndex { project_id, .. }
             | DdlOperation::CreateAsyncIndex { project_id, .. }
             | DdlOperation::DropAsyncIndex { project_id, .. }
+            | DdlOperation::CreateAccumulator { project_id, .. }
+            | DdlOperation::DropAccumulator { project_id, .. }
             | DdlOperation::EnableKvProjection { project_id, .. }
             | DdlOperation::DisableKvProjection { project_id, .. }
             | DdlOperation::SetReadPolicy { project_id, .. }
@@ -1182,6 +1730,91 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             ..
         }
         | Mutation::KvDecU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::CounterAdd {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::Accumulate {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::ReleaseAccumulatorExposure {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::EmitEvent {
             project_id,
             scope_id,
             ..
@@ -1374,6 +2007,26 @@ fn validate_kv(
         && v.len() > config.max_kv_value_bytes
     {
         return Err(AedbError::Validation("kv value too large".into()));
+    }
+    Ok(())
+}
+
+fn validate_identifier_like(value: &str, label: &str) -> Result<(), AedbError> {
+    if value.is_empty() {
+        return Err(AedbError::Validation(format!("{label} must not be empty")));
+    }
+    if value.len() > 128 {
+        return Err(AedbError::Validation(format!(
+            "{label} must be <= 128 bytes"
+        )));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(AedbError::Validation(format!(
+            "{label} must contain only [A-Za-z0-9_-]"
+        )));
     }
     Ok(())
 }
@@ -1574,6 +2227,24 @@ pub fn amount_to_u256(amount_be: &[u8; 32]) -> U256 {
     U256::from_big_endian(amount_be)
 }
 
+const COUNTER_SHARD_KEY_PREFIX: &[u8] = b"__aedb_counter_shard__";
+
+pub fn counter_shard_index(shard_hint: u32, shard_count: u16) -> u16 {
+    if shard_count == 0 {
+        return 0;
+    }
+    (shard_hint % shard_count as u32) as u16
+}
+
+pub fn counter_shard_storage_key(logical_key: &[u8], shard_index: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(COUNTER_SHARD_KEY_PREFIX.len() + 4 + logical_key.len() + 2);
+    out.extend_from_slice(COUNTER_SHARD_KEY_PREFIX);
+    out.extend_from_slice(&(logical_key.len() as u32).to_be_bytes());
+    out.extend_from_slice(logical_key);
+    out.extend_from_slice(&shard_index.to_be_bytes());
+    out
+}
+
 fn table_schema<'a>(
     catalog: &'a Catalog,
     project_id: &str,
@@ -1632,6 +2303,7 @@ fn value_matches_type(value: &Value, ty: &ColumnType) -> bool {
         (value, ty),
         (Value::Text(_), ColumnType::Text)
             | (Value::U8(_), ColumnType::U8)
+            | (Value::U64(_), ColumnType::U64)
             | (Value::Integer(_), ColumnType::Integer)
             | (Value::Float(_), ColumnType::Float)
             | (Value::Boolean(_), ColumnType::Boolean)
@@ -1647,6 +2319,7 @@ fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Text(_) => "Text",
         Value::U8(_) => "U8",
+        Value::U64(_) => "U64",
         Value::Integer(_) => "Integer",
         Value::Float(_) => "Float",
         Value::Boolean(_) => "Boolean",

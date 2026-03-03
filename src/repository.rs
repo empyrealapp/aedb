@@ -134,6 +134,8 @@ impl<'a> RepositoryContext<'a> {
             cursor: None,
             async_index: None,
             allow_full_scan: self.allow_full_scan,
+            vectorized: false,
+            vector_batch_size: 1024,
         }
     }
 
@@ -420,6 +422,21 @@ pub fn i64_at(row: &Row, index: usize, column: &str) -> Result<i64, RowDecodeErr
     }
 }
 
+pub fn u64_at(row: &Row, index: usize, column: &str) -> Result<u64, RowDecodeError> {
+    match row.values.get(index) {
+        Some(Value::U64(v)) => Ok(*v),
+        Some(other) => Err(RowDecodeError::TypeMismatch {
+            column: column.to_string(),
+            expected: "U64",
+            actual: value_kind(other),
+        }),
+        None => Err(RowDecodeError::MissingColumn {
+            column: column.to_string(),
+            index,
+        }),
+    }
+}
+
 pub fn bool_at(row: &Row, index: usize, column: &str) -> Result<bool, RowDecodeError> {
     match row.values.get(index) {
         Some(Value::Boolean(v)) => Ok(*v),
@@ -469,6 +486,7 @@ fn value_kind(value: &Value) -> &'static str {
     match value {
         Value::Text(_) => "Text",
         Value::U8(_) => "U8",
+        Value::U64(_) => "U64",
         Value::Integer(_) => "Integer",
         Value::Float(_) => "Float",
         Value::Boolean(_) => "Boolean",

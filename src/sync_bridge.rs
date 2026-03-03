@@ -137,6 +137,43 @@ impl AedbSync {
         )
     }
 
+    pub fn counter_add_sharded(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        shard_count: u16,
+        shard_hint: u32,
+    ) -> Result<CommitResult, AedbError> {
+        block_on_aedb(
+            &self.rt,
+            self.inner.counter_add_sharded(
+                project_id,
+                scope_id,
+                key,
+                amount_be,
+                shard_count,
+                shard_hint,
+            ),
+        )
+    }
+
+    pub fn counter_read_sharded(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: &[u8],
+        shard_count: u16,
+        consistency: crate::query::plan::ConsistencyMode,
+    ) -> Result<u64, AedbError> {
+        block_on_aedb(
+            &self.rt,
+            self.inner
+                .counter_read_sharded(project_id, scope_id, key, shard_count, consistency),
+        )
+    }
+
     pub fn preflight(&self, mutation: Mutation) -> PreflightResult {
         block_on_aedb(&self.rt, self.inner.preflight(mutation))
     }

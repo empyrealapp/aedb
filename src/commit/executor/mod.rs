@@ -5,7 +5,7 @@ use crate::catalog::types::{Row, Value};
 use crate::commit::apply::{apply_mutation, apply_mutation_trusted_if_eligible};
 use crate::commit::tx::{
     IdempotencyKey, IdempotencyRecord, ReadBound, ReadKey, ReadRange, TransactionEnvelope,
-    WalCommitPayload, WriteClass, WriteIntent,
+    WriteClass, WriteIntent,
 };
 use crate::commit::validation::{Mutation, validate_mutation, validate_permissions};
 use crate::config::{AedbConfig, DurabilityMode};
@@ -20,24 +20,35 @@ use crate::wal::segment::{SegmentConfig, SegmentManager};
 use adaptive::AdaptiveEpochState;
 use coordinator::CoordinatorLockManager;
 use global_index::GlobalUniqueIndexState;
+use group_commit::{
+    GroupCommitFlushReason, GroupCommitPhase, GroupCommitPolicy, GroupCommitStateMachine,
+};
 use parallel_runtime::ParallelApplyRuntime;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
 pub struct CommitResult {
     pub commit_seq: u64,
     pub durable_head_seq: u64,
+    pub idempotency: IdempotencyOutcome,
+    pub canonical_commit_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdempotencyOutcome {
+    Applied,
+    Duplicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +88,69 @@ struct SequencedCommit {
     delta: CommitDelta,
 }
 
+#[derive(Default)]
+struct CountingWriter {
+    len: usize,
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.len = self.len.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn estimate_prevalidated_single_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
+    const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 256;
+    match mutation {
+        Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposure_id,
+            ..
+        } => Some(
+            ENVELOPE_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + accumulator_name.len()
+                + exposure_id.len(),
+        ),
+        Mutation::Accumulate {
+            project_id,
+            scope_id,
+            accumulator_name,
+            dedupe_key,
+            release_exposure_id,
+            ..
+        } => Some(
+            ENVELOPE_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + accumulator_name.len()
+                + dedupe_key.len()
+                + release_exposure_id.as_ref().map(|id| id.len()).unwrap_or(0),
+        ),
+        Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposures,
+        } => Some(
+            ENVELOPE_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + accumulator_name.len()
+                + exposures.iter().map(|(_, id)| id.len() + 16).sum::<usize>(),
+        ),
+        _ => None,
+    }
+}
+
 struct InternalSequencedCommit {
     seq: u64,
     commit_ts_micros: u64,
@@ -96,6 +170,9 @@ struct EpochProcessResult {
     outcomes: Vec<EpochOutcome>,
     coordinator_apply_attempts: u64,
     coordinator_apply_micros: u64,
+    parallel_apply_micros: u64,
+    pre_wal_micros: u64,
+    finalize_micros: u64,
     read_set_conflicts: u64,
     wal_append_ops: u64,
     wal_append_bytes: u64,
@@ -126,11 +203,58 @@ struct ExecutorState {
     last_memory_estimate_micros: u64,
 }
 
+struct CommitPhaseLogSettings {
+    enabled: bool,
+    threshold_ms: u64,
+    sample_every: u64,
+}
+
+static COMMIT_PHASE_LOG_SETTINGS: LazyLock<CommitPhaseLogSettings> = LazyLock::new(|| {
+    let enabled = std::env::var("AEDB_COMMIT_PHASE_LOG_ENABLED")
+        .ok()
+        .and_then(|v| {
+            let n = v.trim().to_ascii_lowercase();
+            match n.as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false);
+    let threshold_ms = std::env::var("AEDB_COMMIT_PHASE_LOG_THRESHOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5);
+    let sample_every = std::env::var("AEDB_COMMIT_PHASE_LOG_SAMPLE_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    CommitPhaseLogSettings {
+        enabled,
+        threshold_ms,
+        sample_every,
+    }
+});
+
+static COMMIT_PHASE_LOG_SAMPLE_COUNTER: LazyLock<AtomicU64> =
+    LazyLock::new(|| AtomicU64::new(0));
+
+fn should_log_commit_phase(total_elapsed_ms: u64) -> bool {
+    let settings = &*COMMIT_PHASE_LOG_SETTINGS;
+    if !settings.enabled || total_elapsed_ms < settings.threshold_ms {
+        return false;
+    }
+    let n = COMMIT_PHASE_LOG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    n % settings.sample_every == 0
+}
+
 #[derive(Clone)]
 pub struct CommitExecutor {
     ingress_txs: Vec<tokio_mpsc::Sender<CommitRequest>>,
     config: Arc<AedbConfig>,
     state: Arc<Mutex<ExecutorState>>,
+    latest_snapshot_view: Arc<RwLock<SnapshotReadView>>,
     durable_notify: Arc<Notify>,
     current_seq: Arc<AtomicU64>,
     visible_head_seq: Arc<AtomicU64>,
@@ -175,6 +299,13 @@ struct ExecutorTelemetry {
     adaptive_epoch_min_commits: AtomicUsize,
     adaptive_epoch_max_wait_us: AtomicU64,
     global_unique_index_entries: AtomicUsize,
+    group_commit_filling_epochs: AtomicU64,
+    group_commit_flushing_epochs: AtomicU64,
+    group_commit_complete_epochs: AtomicU64,
+    group_commit_flush_reason_max_group_size: AtomicU64,
+    group_commit_flush_reason_max_group_delay: AtomicU64,
+    group_commit_flush_reason_ingress_drained: AtomicU64,
+    group_commit_flush_reason_structural_barrier: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +341,13 @@ pub struct ExecutorMetrics {
     pub adaptive_epoch_min_commits: usize,
     pub adaptive_epoch_max_wait_us: u64,
     pub global_unique_index_entries: usize,
+    pub group_commit_filling_epochs: u64,
+    pub group_commit_flushing_epochs: u64,
+    pub group_commit_complete_epochs: u64,
+    pub group_commit_flush_reason_max_group_size: u64,
+    pub group_commit_flush_reason_max_group_delay: u64,
+    pub group_commit_flush_reason_ingress_drained: u64,
+    pub group_commit_flush_reason_structural_barrier: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,6 +392,7 @@ impl CommitExecutor {
         let global_unique_index = GlobalUniqueIndexState::from_snapshot(&catalog, &keyspace)?;
         let mut version_store = VersionStore::new(config.max_versions, config.min_version_age_ms);
         version_store.bootstrap(current_seq, keyspace.snapshot(), catalog.snapshot());
+        let initial_latest_snapshot_view = version_store.acquire_latest()?.into_view();
         let mut wal = SegmentManager::new(
             wal_dir,
             SegmentConfig {
@@ -286,6 +425,7 @@ impl CommitExecutor {
             last_full_snapshot_micros: initial_last_full_snapshot_micros,
             last_memory_estimate_micros: 0,
         }));
+        let latest_snapshot_view = Arc::new(RwLock::new(initial_latest_snapshot_view));
         let (apply_tx, mut rx) = tokio_mpsc::channel::<CommitRequest>(max_inflight_commits);
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let telemetry = Arc::new(ExecutorTelemetry::default());
@@ -310,6 +450,7 @@ impl CommitExecutor {
                 tokio_mpsc::channel::<PostApplyTask>(max_inflight_commits * 2);
             post_apply_txs.push(post_tx);
             let post_state = Arc::clone(&state);
+            let post_latest_snapshot_view = Arc::clone(&latest_snapshot_view);
             let handle = tokio::spawn(async move {
                 while let Some(task) = post_rx.recv().await {
                     let mut s = post_state.lock().await;
@@ -321,6 +462,9 @@ impl CommitExecutor {
                         let catalog_snapshot = s.catalog.snapshot();
                         s.version_store
                             .publish_full(seq, keyspace_snapshot, catalog_snapshot);
+                        if let Ok(view) = s.version_store.acquire_latest() {
+                            *post_latest_snapshot_view.write() = view.into_view();
+                        }
                     }
                 }
             });
@@ -343,9 +487,14 @@ impl CommitExecutor {
         let loop_last_wal_sync_elapsed_us = Arc::clone(&last_wal_sync_elapsed_us);
         let loop_start_instant = start_instant;
         let loop_last_full_snapshot_micros = Arc::clone(&last_full_snapshot_micros);
+        let loop_latest_snapshot_view = Arc::clone(&latest_snapshot_view);
         let apply_handle = tokio::spawn(async move {
             let mut pending = VecDeque::new();
             let mut ingress_closed = false;
+            let mut group_commit = GroupCommitStateMachine::new(GroupCommitPolicy {
+                max_group_size: 1,
+                max_group_delay: Duration::from_micros(1),
+            });
 
             loop {
                 if pending.is_empty() && !ingress_closed {
@@ -365,6 +514,16 @@ impl CommitExecutor {
                     let s = loop_state.lock().await;
                     s.adaptive_epoch.epoch_params(&loop_config, pending.len())
                 };
+                group_commit.begin_filling(
+                    Instant::now(),
+                    GroupCommitPolicy {
+                        max_group_size: max_commits.max(1),
+                        max_group_delay: Duration::from_micros(max_wait_us.max(1)),
+                    },
+                );
+                loop_telemetry
+                    .group_commit_filling_epochs
+                    .fetch_add(1, Ordering::Relaxed);
                 let deadline = Instant::now() + Duration::from_micros(max_wait_us);
                 let epoch_requests = build_epoch_requests(
                     &mut pending,
@@ -375,10 +534,62 @@ impl CommitExecutor {
                     ingress_closed,
                 )
                 .await;
+                if epoch_requests.is_empty() {
+                    continue;
+                }
+                group_commit.record_pending_commits(epoch_requests.len());
+                let flush_reason = if group_commit.reached_size_limit() {
+                    GroupCommitFlushReason::MaxGroupSize
+                } else if group_commit.reached_delay_limit(Instant::now()) {
+                    GroupCommitFlushReason::MaxGroupDelay
+                } else if pending.is_empty() || ingress_closed {
+                    GroupCommitFlushReason::IngressDrained
+                } else {
+                    GroupCommitFlushReason::StructuralBarrier
+                };
+                group_commit.begin_flushing(flush_reason);
+                loop_telemetry
+                    .group_commit_flushing_epochs
+                    .fetch_add(1, Ordering::Relaxed);
+                match flush_reason {
+                    GroupCommitFlushReason::MaxGroupSize => {
+                        loop_telemetry
+                            .group_commit_flush_reason_max_group_size
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    GroupCommitFlushReason::MaxGroupDelay => {
+                        loop_telemetry
+                            .group_commit_flush_reason_max_group_delay
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    GroupCommitFlushReason::IngressDrained => {
+                        loop_telemetry
+                            .group_commit_flush_reason_ingress_drained
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    GroupCommitFlushReason::StructuralBarrier => {
+                        loop_telemetry
+                            .group_commit_flush_reason_structural_barrier
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                debug_assert!(matches!(
+                    group_commit.snapshot().phase,
+                    GroupCommitPhase::Flushing
+                ));
+
                 let mut s = loop_state.lock().await;
                 let durable_before = s.durable_head_seq;
                 let epoch_started = Instant::now();
                 let epoch_result = process_commit_epoch(&mut s, epoch_requests);
+                group_commit.complete_flush();
+                loop_telemetry
+                    .group_commit_complete_epochs
+                    .fetch_add(1, Ordering::Relaxed);
+                debug_assert!(matches!(
+                    group_commit.snapshot().phase,
+                    GroupCommitPhase::Complete
+                ));
                 loop_telemetry
                     .epoch_process_ops
                     .fetch_add(1, Ordering::Relaxed);
@@ -388,7 +599,9 @@ impl CommitExecutor {
                 );
                 let catalog_changed = epoch_result.catalog_changed;
                 let outcomes = epoch_result.outcomes;
+                let epoch_commit_count = outcomes.len();
                 let had_error = outcomes.iter().any(|o| o.result.is_err());
+                let epoch_elapsed_micros = epoch_started.elapsed().as_micros() as u64;
                 s.adaptive_epoch.observe_epoch(
                     &loop_config,
                     outcomes.len(),
@@ -451,6 +664,9 @@ impl CommitExecutor {
                 loop_durable_head.store(s.durable_head_seq, Ordering::Release);
                 loop_last_full_snapshot_micros
                     .store(s.last_full_snapshot_micros, Ordering::Release);
+                if let Ok(view) = s.version_store.acquire_latest() {
+                    *loop_latest_snapshot_view.write() = view.into_view();
+                }
                 let durable_advanced = s.durable_head_seq > durable_before;
                 drop(s);
                 if durable_advanced {
@@ -467,6 +683,39 @@ impl CommitExecutor {
                     }
                     let elapsed_micros =
                         now_micros().saturating_sub(outcome.request.enqueue_micros);
+                    let elapsed_ms = elapsed_micros / 1_000;
+                    if should_log_commit_phase(elapsed_ms) {
+                        let queue_wait_micros = elapsed_micros.saturating_sub(epoch_elapsed_micros);
+                        info!(
+                            target: "aedb.commit_phase",
+                            total_us = elapsed_micros,
+                            total_ms = elapsed_ms,
+                            queue_wait_us = queue_wait_micros,
+                            queue_wait_ms = queue_wait_micros / 1_000,
+                            epoch_us = epoch_elapsed_micros,
+                            epoch_ms = epoch_elapsed_micros / 1_000,
+                            pre_wal_us = epoch_result.pre_wal_micros,
+                            pre_wal_ms = epoch_result.pre_wal_micros / 1_000,
+                            coordinator_apply_us = epoch_result.coordinator_apply_micros,
+                            coordinator_apply_ms = epoch_result.coordinator_apply_micros / 1_000,
+                            parallel_apply_us = epoch_result.parallel_apply_micros,
+                            parallel_apply_ms = epoch_result.parallel_apply_micros / 1_000,
+                            wal_append_us = epoch_result.wal_append_micros,
+                            wal_append_ms = epoch_result.wal_append_micros / 1_000,
+                            wal_sync_us = epoch_result.wal_sync_micros,
+                            wal_sync_ms = epoch_result.wal_sync_micros / 1_000,
+                            finalize_us = epoch_result.finalize_micros,
+                            finalize_ms = epoch_result.finalize_micros / 1_000,
+                            epoch_commit_count,
+                            epoch_wal_append_ops = epoch_result.wal_append_ops,
+                            epoch_wal_sync_ops = epoch_result.wal_sync_ops,
+                            mutation_count = outcome.request.envelope.write_intent.mutations.len(),
+                            write_class = ?outcome.request.envelope.write_class,
+                            prevalidated = outcome.request.prevalidated,
+                            has_error = outcome.result.is_err(),
+                            "aedb commit phase timing"
+                        );
+                    }
                     loop_telemetry
                         .total_latency_micros
                         .fetch_add(elapsed_micros, Ordering::Relaxed);
@@ -689,6 +938,7 @@ impl CommitExecutor {
             ingress_txs,
             config,
             state,
+            latest_snapshot_view,
             durable_notify,
             current_seq: current_seq_atomic,
             visible_head_seq,
@@ -710,7 +960,8 @@ impl CommitExecutor {
         &self,
         mutation: Mutation,
     ) -> Result<CommitResult, AedbError> {
-        self.submit_envelope_with_mode(
+        let fast_size_hint = estimate_prevalidated_single_mutation_size_upper_bound(&mutation);
+        self.submit_envelope_with_mode_size_hint(
             TransactionEnvelope {
                 caller: None,
                 idempotency_key: None,
@@ -724,6 +975,7 @@ impl CommitExecutor {
             },
             true,
             false,
+            fast_size_hint,
         )
         .await
     }
@@ -754,6 +1006,13 @@ impl CommitExecutor {
         envelope: TransactionEnvelope,
     ) -> Result<CommitResult, AedbError> {
         self.submit_envelope_with_mode(envelope, false, false).await
+    }
+
+    pub(crate) async fn submit_envelope_prevalidated(
+        &self,
+        envelope: TransactionEnvelope,
+    ) -> Result<CommitResult, AedbError> {
+        self.submit_envelope_with_mode(envelope, true, false).await
     }
 
     #[cfg(test)]
@@ -796,9 +1055,40 @@ impl CommitExecutor {
         prevalidated: bool,
         assertions_engine_verified: bool,
     ) -> Result<CommitResult, AedbError> {
+        self.submit_envelope_with_mode_size_hint(
+            envelope,
+            prevalidated,
+            assertions_engine_verified,
+            None,
+        )
+        .await
+    }
+
+    async fn submit_envelope_with_mode_size_hint(
+        &self,
+        envelope: TransactionEnvelope,
+        prevalidated: bool,
+        assertions_engine_verified: bool,
+        encoded_size_hint: Option<usize>,
+    ) -> Result<CommitResult, AedbError> {
         let config = &self.config;
-        let encoded = rmp_serde::to_vec(&envelope).map_err(|e| AedbError::Encode(e.to_string()))?;
-        let encoded_size_bytes = encoded.len();
+        let encoded_size_bytes = if let Some(upper_bound) = encoded_size_hint {
+            if upper_bound <= config.max_transaction_bytes {
+                upper_bound
+            } else {
+                // Hint exceeded max bytes; compute exact size to avoid false rejections.
+                let mut counter = CountingWriter::default();
+                rmp_serde::encode::write(&mut counter, &envelope)
+                    .map_err(|e| AedbError::Encode(e.to_string()))?;
+                counter.len
+            }
+        } else {
+            // Compute exact encoded byte length without allocating a transient Vec<u8>.
+            let mut counter = CountingWriter::default();
+            rmp_serde::encode::write(&mut counter, &envelope)
+                .map_err(|e| AedbError::Encode(e.to_string()))?;
+            counter.len
+        };
         if encoded_size_bytes > config.max_transaction_bytes {
             return Err(AedbError::Validation(
                 "transaction exceeds max_transaction_bytes".into(),
@@ -937,6 +1227,10 @@ impl CommitExecutor {
                 )
             }
         }
+    }
+
+    pub async fn snapshot_latest_view(&self) -> SnapshotReadView {
+        self.latest_snapshot_view.read().clone()
     }
 
     pub async fn snapshot_at_seq(&self, seq: u64) -> Result<SnapshotReadView, AedbError> {
@@ -1105,6 +1399,34 @@ impl CommitExecutor {
                 .telemetry
                 .global_unique_index_entries
                 .load(Ordering::Relaxed),
+            group_commit_filling_epochs: self
+                .telemetry
+                .group_commit_filling_epochs
+                .load(Ordering::Relaxed),
+            group_commit_flushing_epochs: self
+                .telemetry
+                .group_commit_flushing_epochs
+                .load(Ordering::Relaxed),
+            group_commit_complete_epochs: self
+                .telemetry
+                .group_commit_complete_epochs
+                .load(Ordering::Relaxed),
+            group_commit_flush_reason_max_group_size: self
+                .telemetry
+                .group_commit_flush_reason_max_group_size
+                .load(Ordering::Relaxed),
+            group_commit_flush_reason_max_group_delay: self
+                .telemetry
+                .group_commit_flush_reason_max_group_delay
+                .load(Ordering::Relaxed),
+            group_commit_flush_reason_ingress_drained: self
+                .telemetry
+                .group_commit_flush_reason_ingress_drained
+                .load(Ordering::Relaxed),
+            group_commit_flush_reason_structural_barrier: self
+                .telemetry
+                .group_commit_flush_reason_structural_barrier
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -1160,6 +1482,7 @@ fn is_parallel_apply_timeout_error(err: &AedbError) -> bool {
 mod adaptive;
 mod coordinator;
 mod global_index;
+mod group_commit;
 mod internals;
 mod parallel_runtime;
 use internals::*;

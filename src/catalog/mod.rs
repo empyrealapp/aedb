@@ -4,8 +4,8 @@ pub mod types;
 
 use crate::catalog::project::{ProjectMeta, ScopeMeta};
 use crate::catalog::schema::{
-    AsyncIndexDef, ColumnDef, Constraint, IndexDef, IndexType, KvProjectionDef, TableAlteration,
-    TableSchema,
+    AccumulatorDef, AccumulatorValueType, AsyncIndexDef, ColumnDef, Constraint, IndexDef,
+    IndexType, KvProjectionDef, TableAlteration, TableSchema,
 };
 use crate::catalog::types::ColumnType;
 use crate::error::AedbError;
@@ -20,6 +20,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn default_true() -> bool {
     true
+}
+
+fn default_accumulator_exposure_margin_bps() -> u32 {
+    1_000
 }
 
 /// Cache entry for permission checks with TTL
@@ -41,6 +45,8 @@ pub struct Catalog {
     pub async_indexes: HashMap<(String, String, String), AsyncIndexDef>,
     #[serde(default)]
     pub kv_projections: HashMap<(String, String), KvProjectionDef>,
+    #[serde(default)]
+    pub accumulators: HashMap<(String, String), AccumulatorDef>,
     pub permissions: HashMap<String, BTreeSet<Permission>>,
     #[serde(default)]
     pub permission_grants: HashMap<(String, Permission), PermissionGrantMeta>,
@@ -155,6 +161,29 @@ pub enum DdlOperation {
         #[serde(default = "default_true")]
         if_exists: bool,
     },
+    CreateAccumulator {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        #[serde(default)]
+        if_not_exists: bool,
+        value_type: AccumulatorValueType,
+        #[serde(default)]
+        dedupe_retain_commits: Option<u64>,
+        #[serde(default)]
+        snapshot_every: u64,
+        #[serde(default = "default_accumulator_exposure_margin_bps")]
+        exposure_margin_bps: u32,
+        #[serde(default)]
+        exposure_ttl_commits: Option<u64>,
+    },
+    DropAccumulator {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        #[serde(default = "default_true")]
+        if_exists: bool,
+    },
     EnableKvProjection {
         project_id: String,
         scope_id: String,
@@ -214,6 +243,7 @@ impl Default for Catalog {
             indexes: HashMap::new(),
             async_indexes: HashMap::new(),
             kv_projections: HashMap::new(),
+            accumulators: HashMap::new(),
             permissions: HashMap::new(),
             permission_grants: HashMap::new(),
             read_policies: HashMap::new(),
@@ -231,6 +261,7 @@ impl PartialEq for Catalog {
             && self.indexes == other.indexes
             && self.async_indexes == other.async_indexes
             && self.kv_projections == other.kv_projections
+            && self.accumulators == other.accumulators
             && self.permissions == other.permissions
             && self.permission_grants == other.permission_grants
             && self.read_policies == other.read_policies
@@ -507,6 +538,38 @@ impl Catalog {
                 &scope_id,
                 &table_name,
                 &index_name,
+                if_exists,
+            ),
+            DdlOperation::CreateAccumulator {
+                project_id,
+                scope_id,
+                accumulator_name,
+                if_not_exists,
+                value_type,
+                dedupe_retain_commits,
+                snapshot_every,
+                exposure_margin_bps,
+                exposure_ttl_commits,
+            } => self.create_accumulator_with_options(
+                &project_id,
+                &scope_id,
+                &accumulator_name,
+                if_not_exists,
+                value_type,
+                dedupe_retain_commits,
+                snapshot_every,
+                exposure_margin_bps,
+                exposure_ttl_commits,
+            ),
+            DdlOperation::DropAccumulator {
+                project_id,
+                scope_id,
+                accumulator_name,
+                if_exists,
+            } => self.drop_accumulator_with_options(
+                &project_id,
+                &scope_id,
+                &accumulator_name,
                 if_exists,
             ),
             DdlOperation::EnableKvProjection {
@@ -827,6 +890,15 @@ impl Catalog {
             .collect();
         for key in projection_keys {
             self.kv_projections.remove(&key);
+        }
+        let accumulator_keys: Vec<(String, String)> = self
+            .accumulators
+            .keys()
+            .filter(|(p, _)| p == &project || p.starts_with(&format!("{project}::")))
+            .cloned()
+            .collect();
+        for key in accumulator_keys {
+            self.accumulators.remove(&key);
         }
         Ok(())
     }
@@ -1299,6 +1371,98 @@ impl Catalog {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_accumulator_with_options(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        if_not_exists: bool,
+        value_type: AccumulatorValueType,
+        dedupe_retain_commits: Option<u64>,
+        snapshot_every: u64,
+        exposure_margin_bps: u32,
+        exposure_ttl_commits: Option<u64>,
+    ) -> Result<(), AedbError> {
+        validate_identifier(accumulator_name, "accumulator_name")?;
+        if snapshot_every == 0 {
+            return Err(AedbError::Validation(
+                "snapshot_every must be greater than 0".into(),
+            ));
+        }
+        if exposure_margin_bps >= 10_000 {
+            return Err(AedbError::Validation(
+                "exposure_margin_bps must be in [0, 10000)".into(),
+            ));
+        }
+        if !self.projects.contains_key(project_id) {
+            return Err(AedbError::NotFound {
+                resource_type: ErrorResourceType::Project,
+                resource_id: project_id.to_string(),
+            });
+        }
+        if !self
+            .scopes
+            .contains_key(&(project_id.to_string(), scope_id.to_string()))
+        {
+            return Err(AedbError::NotFound {
+                resource_type: ErrorResourceType::Scope,
+                resource_id: format!("{project_id}.{scope_id}"),
+            });
+        }
+        let key = (
+            namespace_key(project_id, scope_id),
+            accumulator_name.to_string(),
+        );
+        if self.accumulators.contains_key(&key) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(AedbError::AlreadyExists {
+                resource_type: ErrorResourceType::Table,
+                resource_id: format!("{project_id}.{scope_id}.{accumulator_name}"),
+            });
+        }
+        self.accumulators.insert(
+            key,
+            AccumulatorDef {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                value_type,
+                dedupe_retain_commits,
+                snapshot_every,
+                exposure_margin_bps,
+                exposure_ttl_commits,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn drop_accumulator_with_options(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        if_exists: bool,
+    ) -> Result<(), AedbError> {
+        let key = (
+            namespace_key(project_id, scope_id),
+            accumulator_name.to_string(),
+        );
+        if !self.accumulators.contains_key(&key) {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(AedbError::NotFound {
+                resource_type: ErrorResourceType::Table,
+                resource_id: format!("{project_id}.{scope_id}.{accumulator_name}"),
+            });
+        }
+        self.accumulators.remove(&key);
+        Ok(())
+    }
+
     pub fn create_async_index(
         &mut self,
         project_id: &str,
@@ -1590,6 +1754,15 @@ impl Catalog {
         }
         self.kv_projections
             .remove(&(project_id.to_string(), scope_id.to_string()));
+        let accumulator_keys: Vec<(String, String)> = self
+            .accumulators
+            .keys()
+            .filter(|(p, _)| p == &ns)
+            .cloned()
+            .collect();
+        for key in accumulator_keys {
+            self.accumulators.remove(&key);
+        }
         Ok(())
     }
 

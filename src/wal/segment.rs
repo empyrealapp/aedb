@@ -106,6 +106,13 @@ struct ActiveSegment {
     hasher: blake3::Hasher,
 }
 
+pub(crate) struct PendingFrame<'a> {
+    pub seq: u64,
+    pub timestamp_micros: u64,
+    pub payload_type: u8,
+    pub payload: &'a [u8],
+}
+
 pub struct SegmentManager {
     dir: PathBuf,
     config: SegmentConfig,
@@ -116,6 +123,8 @@ pub struct SegmentManager {
 }
 
 impl SegmentManager {
+    const FRAME_FIXED_BYTES: usize = 4 + 8 + 8 + 1 + 4;
+
     pub fn new(dir: impl Into<PathBuf>, config: SegmentConfig, instance_id: u64) -> Self {
         Self {
             dir: dir.into(),
@@ -176,34 +185,51 @@ impl SegmentManager {
         payload_type: u8,
         payload: &[u8],
     ) -> Result<(), SegmentError> {
-        self.append_frame_with_sync(seq, timestamp_micros, payload_type, payload, true)
+        let single = [PendingFrame {
+            seq,
+            timestamp_micros,
+            payload_type,
+            payload,
+        }];
+        self.append_frames_with_sync(&single, true)
     }
 
-    pub(crate) fn append_frame_with_sync(
+    pub(crate) fn append_frames_with_sync(
         &mut self,
-        seq: u64,
-        timestamp_micros: u64,
-        payload_type: u8,
-        payload: &[u8],
+        frames: &[PendingFrame<'_>],
         sync: bool,
     ) -> Result<(), SegmentError> {
-        let active = self.active.as_mut().ok_or(SegmentError::NotOpen)?;
-        {
-            let mut writer = FrameWriter::new(Vec::<u8>::new());
-            writer
-                .append(seq, timestamp_micros, payload_type, payload)
-                .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
-            let frame = writer.into_inner();
-            let frame_size_bytes = frame.len() as u64;
-            active.file.write_all(&frame)?;
-            active.hasher.update(&frame);
-            active.size_bytes = active.size_bytes.saturating_add(frame_size_bytes);
+        if frames.is_empty() {
+            return Ok(());
         }
+        let active = self.active.as_mut().ok_or(SegmentError::NotOpen)?;
+
+        let estimated_encoded_bytes = frames.iter().fold(0usize, |acc, frame| {
+            acc.saturating_add(Self::FRAME_FIXED_BYTES.saturating_add(frame.payload.len()))
+        });
+        let mut writer = FrameWriter::new(Vec::<u8>::with_capacity(estimated_encoded_bytes));
+        for frame in frames {
+            writer
+                .append(
+                    frame.seq,
+                    frame.timestamp_micros,
+                    frame.payload_type,
+                    frame.payload,
+                )
+                .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        let encoded_frames = writer.into_inner();
+        let encoded_size_bytes = encoded_frames.len() as u64;
+
+        active.file.write_all(&encoded_frames)?;
+        active.hasher.update(&encoded_frames);
+        active.size_bytes = active.size_bytes.saturating_add(encoded_size_bytes);
+
         if sync {
             active.file.flush()?;
             active.file.sync_data()?;
         }
-        active.commit_count += 1;
+        active.commit_count = active.commit_count.saturating_add(frames.len() as u64);
         Ok(())
     }
 
@@ -264,8 +290,10 @@ mod tests {
         SEGMENT_HEADER_SIZE, SEGMENT_MAGIC, SegmentConfig, SegmentError, SegmentHeader,
         SegmentManager,
     };
+    use crate::wal::frame::FrameReader;
     use crate::wal::rotation::RotationReason;
     use std::fs;
+    use std::io::Cursor;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
 
@@ -369,5 +397,59 @@ mod tests {
                 assert_eq!(parsed.prev_segment_hash, prev.hash);
             }
         }
+    }
+
+    #[test]
+    fn append_frames_batch_writes_multiple_frames_in_order() {
+        let dir = tempdir().expect("temp dir");
+        let mut manager = SegmentManager::new(
+            dir.path(),
+            SegmentConfig {
+                max_segment_bytes: 10_000,
+                max_segment_age: Duration::from_secs(3600),
+            },
+            9,
+        );
+        manager.open_active(1).expect("open");
+
+        let batch = [
+            super::PendingFrame {
+                seq: 11,
+                timestamp_micros: 111,
+                payload_type: 0x01,
+                payload: b"first",
+            },
+            super::PendingFrame {
+                seq: 12,
+                timestamp_micros: 222,
+                payload_type: 0x02,
+                payload: b"second",
+            },
+        ];
+        manager
+            .append_frames_with_sync(&batch, false)
+            .expect("append batch");
+        let closed = manager.close_active().expect("close");
+
+        let data = fs::read(&closed.path).expect("read segment");
+        let mut reader = FrameReader::new(Cursor::new(&data[SEGMENT_HEADER_SIZE..]));
+        let first = reader
+            .next_frame()
+            .expect("first frame parse")
+            .expect("first frame");
+        assert_eq!(first.commit_seq, 11);
+        assert_eq!(first.timestamp_micros, 111);
+        assert_eq!(first.payload_type, 0x01);
+        assert_eq!(first.payload, b"first");
+
+        let second = reader
+            .next_frame()
+            .expect("second frame parse")
+            .expect("second frame");
+        assert_eq!(second.commit_seq, 12);
+        assert_eq!(second.timestamp_micros, 222);
+        assert_eq!(second.payload_type, 0x02);
+        assert_eq!(second.payload, b"second");
+        assert!(reader.next_frame().expect("end parse").is_none());
     }
 }

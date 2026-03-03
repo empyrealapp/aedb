@@ -42,6 +42,30 @@ pub fn evaluate_assertions(
 
 fn validate_assertion(catalog: &Catalog, assertion: &ReadAssertion) -> Result<(), AedbError> {
     match assertion {
+        ReadAssertion::AccumulatorAvailableAtLeast {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | ReadAssertion::AccumulatorExposureWithinMargin {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        } => {
+            let exists = catalog.accumulators.contains_key(&(
+                namespace_key(project_id, scope_id),
+                accumulator_name.clone(),
+            ));
+            if exists {
+                Ok(())
+            } else {
+                Err(AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                )))
+            }
+        }
         ReadAssertion::KeyEquals { .. }
         | ReadAssertion::KeyCompare { .. }
         | ReadAssertion::KeyExists { .. }
@@ -134,6 +158,7 @@ fn validate_assertion(catalog: &Catalog, assertion: &ReadAssertion) -> Result<()
             if !matches!(
                 col.col_type,
                 ColumnType::U8
+                    | ColumnType::U64
                     | ColumnType::Integer
                     | ColumnType::Float
                     | ColumnType::U256
@@ -170,6 +195,48 @@ fn evaluate_assertion(
     assertion: &ReadAssertion,
 ) -> Result<Option<AssertionActual>, AedbError> {
     match assertion {
+        ReadAssertion::AccumulatorAvailableAtLeast {
+            project_id,
+            scope_id,
+            accumulator_name,
+            min_amount,
+        } => {
+            let Some(acc) = keyspace.accumulator(project_id, scope_id, accumulator_name) else {
+                return Ok(Some(AssertionActual::Missing));
+            };
+            let available = acc.value.saturating_sub(acc.total_exposure);
+            if available >= *min_amount {
+                Ok(None)
+            } else {
+                Ok(Some(AssertionActual::Value(Value::Integer(available))))
+            }
+        }
+        ReadAssertion::AccumulatorExposureWithinMargin {
+            project_id,
+            scope_id,
+            accumulator_name,
+            additional_exposure,
+        } => {
+            if *additional_exposure <= 0 {
+                return Err(AedbError::Validation(
+                    "AccumulatorExposureWithinMargin additional_exposure must be > 0".into(),
+                ));
+            }
+            let Some(acc) = keyspace.accumulator(project_id, scope_id, accumulator_name) else {
+                return Ok(Some(AssertionActual::Missing));
+            };
+            let allowed_ratio_bps = 10_000i128 - acc.exposure_margin_bps as i128;
+            let allowed_total = ((acc.value as i128 * allowed_ratio_bps) / 10_000)
+                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            let projected = acc.total_exposure.saturating_add(*additional_exposure);
+            if projected <= allowed_total {
+                Ok(None)
+            } else {
+                Ok(Some(AssertionActual::Value(Value::Integer(
+                    acc.total_exposure,
+                ))))
+            }
+        }
         ReadAssertion::KeyEquals {
             project_id,
             scope_id,
@@ -474,7 +541,7 @@ fn sum_rows_for_column<'a>(
 ) -> Result<Value, AedbError> {
     let col_type = &schema.columns[column_idx].col_type;
     match col_type {
-        ColumnType::U8 | ColumnType::Integer | ColumnType::Timestamp => {
+        ColumnType::U8 | ColumnType::U64 | ColumnType::Integer | ColumnType::Timestamp => {
             let mut sum: i64 = 0;
             for row in rows {
                 if !match_filter(row, schema, filter)? {
@@ -483,6 +550,7 @@ fn sum_rows_for_column<'a>(
                 if let Some(value) = row.values.get(column_idx) {
                     let addend = match value {
                         Value::U8(x) => *x as i64,
+                        Value::U64(x) => i64::try_from(*x).map_err(|_| AedbError::Overflow)?,
                         Value::Integer(x) | Value::Timestamp(x) => *x,
                         _ => continue,
                     };
@@ -492,6 +560,9 @@ fn sum_rows_for_column<'a>(
             if matches!(col_type, ColumnType::U8) {
                 let as_u8 = u8::try_from(sum).map_err(|_| AedbError::Overflow)?;
                 Ok(Value::U8(as_u8))
+            } else if matches!(col_type, ColumnType::U64) {
+                let as_u64 = u64::try_from(sum).map_err(|_| AedbError::Overflow)?;
+                Ok(Value::U64(as_u64))
             } else if matches!(col_type, ColumnType::Timestamp) {
                 Ok(Value::Timestamp(sum))
             } else {
@@ -534,6 +605,7 @@ fn sum_rows_for_column<'a>(
 fn zero_for_threshold(threshold: &Value) -> Value {
     match threshold {
         Value::U8(_) => Value::U8(0),
+        Value::U64(_) => Value::U64(0),
         Value::Integer(_) => Value::Integer(0),
         Value::Timestamp(_) => Value::Timestamp(0),
         Value::Float(_) => Value::Float(0.0),
@@ -573,6 +645,7 @@ fn value_matches_type(value: &Value, col_type: &ColumnType) -> bool {
         (value, col_type),
         (Value::Text(_), ColumnType::Text)
             | (Value::U8(_), ColumnType::U8)
+            | (Value::U64(_), ColumnType::U64)
             | (Value::Integer(_), ColumnType::Integer)
             | (Value::Float(_), ColumnType::Float)
             | (Value::Boolean(_), ColumnType::Boolean)
