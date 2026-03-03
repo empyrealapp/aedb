@@ -75,6 +75,35 @@ fn request_with_mutations(mutations: Vec<Mutation>) -> CommitRequest {
     }
 }
 
+fn request_with_assertions_and_mutations(
+    assertions: Vec<ReadAssertion>,
+    mutations: Vec<Mutation>,
+) -> CommitRequest {
+    let (result_tx, _result_rx) = oneshot::channel();
+    let envelope = TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions,
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent { mutations },
+        base_seq: 0,
+    };
+    let write_partitions = super::derive_write_partitions(&envelope.write_intent.mutations);
+    let read_partitions = super::derive_read_partitions(&envelope);
+    CommitRequest {
+        envelope,
+        encoded_len: 0,
+        enqueue_micros: 0,
+        prevalidated: false,
+        assertions_engine_verified: false,
+        write_partitions,
+        read_partitions,
+        defer_count: 0,
+        result_tx,
+    }
+}
+
 fn scope_of(req: &CommitRequest) -> &str {
     let mutation = req
         .envelope
@@ -656,6 +685,114 @@ fn assertion_read_dependency_conflicts_with_write_token_in_epoch_selection() {
     assert!(
         candidate_index.is_none(),
         "assertion-derived read token must conflict with same-key write token"
+    );
+}
+
+#[test]
+fn assertion_read_dependency_non_conflicting_key_can_coexist_in_epoch_selection() {
+    let candidate = request_with_assertions_and_mutations(
+        vec![ReadAssertion::KeyExists {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"balance".to_vec(),
+            expected: true,
+        }],
+        vec![Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"marker".to_vec(),
+            value: b"v".to_vec(),
+        }],
+    );
+
+    let mut pending = VecDeque::new();
+    pending.push_back(candidate);
+    let mut epoch_writes = HashSet::new();
+    epoch_writes.insert(format!("k:{}:6f74686572", namespace_key("p", "app"))); // "other"
+    let candidate_index = super::find_compatible_candidate_index(
+        &pending,
+        &epoch_writes,
+        &HashSet::new(),
+        false,
+        false,
+    );
+    assert_eq!(
+        candidate_index,
+        Some(0),
+        "assertion-derived token on one key should not block unrelated-key writes"
+    );
+}
+
+#[test]
+fn accumulator_assertion_dependency_conflicts_with_same_accumulator_write_token() {
+    let candidate = request_with_assertions_and_mutations(
+        vec![ReadAssertion::AccumulatorAvailableAtLeast {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            accumulator_name: "house_balance".into(),
+            min_amount: 100,
+        }],
+        vec![Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"marker".to_vec(),
+            value: b"v".to_vec(),
+        }],
+    );
+
+    let mut pending = VecDeque::new();
+    pending.push_back(candidate);
+    let mut epoch_writes = HashSet::new();
+    epoch_writes.insert(format!(
+        "acc:{}:{}",
+        namespace_key("p", "app"),
+        "house_balance"
+    ));
+    let candidate_index = super::find_compatible_candidate_index(
+        &pending,
+        &epoch_writes,
+        &HashSet::new(),
+        false,
+        false,
+    );
+    assert!(
+        candidate_index.is_none(),
+        "accumulator assertion token must conflict with same-accumulator write token"
+    );
+}
+
+#[test]
+fn accumulator_assertion_dependency_allows_different_accumulator_parallel_selection() {
+    let candidate = request_with_assertions_and_mutations(
+        vec![ReadAssertion::AccumulatorExposureWithinMargin {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            accumulator_name: "house_balance".into(),
+            additional_exposure: 50,
+        }],
+        vec![Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"marker".to_vec(),
+            value: b"v".to_vec(),
+        }],
+    );
+
+    let mut pending = VecDeque::new();
+    pending.push_back(candidate);
+    let mut epoch_writes = HashSet::new();
+    epoch_writes.insert(format!("acc:{}:{}", namespace_key("p", "app"), "vip_pool"));
+    let candidate_index = super::find_compatible_candidate_index(
+        &pending,
+        &epoch_writes,
+        &HashSet::new(),
+        false,
+        false,
+    );
+    assert_eq!(
+        candidate_index,
+        Some(0),
+        "accumulator assertion token should allow unrelated accumulator writes"
     );
 }
 
@@ -2578,6 +2715,66 @@ async fn batch_mode_groups_commits_without_per_commit_fsync() {
     }
     assert_eq!(exec.durable_head_seq().await, durable_before);
     assert!(exec.visible_head_seq().await > durable_before);
+}
+
+#[tokio::test]
+async fn group_commit_metrics_counters_advance_after_commits() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+    exec.submit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"gc:1".to_vec(),
+        value: b"v1".to_vec(),
+    })
+    .await
+    .expect("kv set");
+
+    let metrics = exec.metrics();
+    assert!(
+        metrics.group_commit_filling_epochs >= 1,
+        "expected at least one filling epoch, got {}",
+        metrics.group_commit_filling_epochs
+    );
+    assert!(
+        metrics.group_commit_flushing_epochs >= 1,
+        "expected at least one flushing epoch, got {}",
+        metrics.group_commit_flushing_epochs
+    );
+    assert!(
+        metrics.group_commit_complete_epochs >= 1,
+        "expected at least one complete epoch, got {}",
+        metrics.group_commit_complete_epochs
+    );
+    assert_eq!(
+        metrics.group_commit_flushing_epochs, metrics.group_commit_complete_epochs,
+        "every flushing epoch should complete"
+    );
+    let flush_reason_total = metrics.group_commit_flush_reason_max_group_size
+        + metrics.group_commit_flush_reason_max_group_delay
+        + metrics.group_commit_flush_reason_ingress_drained
+        + metrics.group_commit_flush_reason_structural_barrier;
+    assert_eq!(
+        flush_reason_total, metrics.group_commit_flushing_epochs,
+        "flush reasons should account for every flushing epoch"
+    );
 }
 
 #[tokio::test]

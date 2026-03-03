@@ -92,6 +92,83 @@ impl SecondaryIndex {
         self.scan_range(Bound::Included(prefix.clone()), Bound::Excluded(end))
     }
 
+    pub fn scan_prefix_window(
+        &self,
+        prefix: Option<&EncodedKey>,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<EncodedKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let SecondaryIndexStore::BTree(entries) = &self.store else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::with_capacity(limit);
+        let mut skipped = 0usize;
+
+        match prefix {
+            None => {
+                for (_, pks) in entries {
+                    for pk in pks {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if out.len() < limit {
+                            out.push(pk.clone());
+                        }
+                        if out.len() >= limit {
+                            return out;
+                        }
+                    }
+                }
+            }
+            Some(prefix_key) => {
+                let range_end = prefix_successor(prefix_key);
+                let iter = match range_end {
+                    Some(end) => {
+                        entries.range((Bound::Included(prefix_key.clone()), Bound::Excluded(end)))
+                    }
+                    None => entries.range((Bound::Included(prefix_key.clone()), Bound::Unbounded)),
+                };
+                for (_, pks) in iter {
+                    for pk in pks {
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if out.len() < limit {
+                            out.push(pk.clone());
+                        }
+                        if out.len() >= limit {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    pub fn rank_of_pk(&self, target_pk: &EncodedKey) -> Option<usize> {
+        let SecondaryIndexStore::BTree(entries) = &self.store else {
+            return None;
+        };
+        let mut rank = 0usize;
+        for (_, pks) in entries {
+            for pk in pks {
+                if pk == target_pk {
+                    return Some(rank);
+                }
+                rank += 1;
+            }
+        }
+        None
+    }
+
     pub fn unique_existing(&self, key: &EncodedKey) -> Option<EncodedKey> {
         match &self.store {
             SecondaryIndexStore::UniqueHash(entries) => entries.get(key).cloned(),

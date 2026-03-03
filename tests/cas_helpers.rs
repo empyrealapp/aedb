@@ -2,7 +2,7 @@ use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
-use aedb::commit::validation::Mutation;
+use aedb::commit::validation::{KvU64MutatorOp, KvU256MutatorOp, Mutation};
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::query::plan::{ConsistencyMode, Query};
@@ -12,6 +12,10 @@ fn u256_from_u64(v: u64) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[24..32].copy_from_slice(&v.to_be_bytes());
     out
+}
+
+fn u64_be(v: u64) -> [u8; 8] {
+    v.to_be_bytes()
 }
 
 #[tokio::test]
@@ -243,7 +247,10 @@ async fn kv_compare_and_u256_ops_enforce_expected_seq_and_value() {
         )
         .await
         .expect_err("stale expected seq should fail");
-    assert!(matches!(stale, AedbError::AssertionFailed { .. }));
+    assert!(
+        matches!(stale, AedbError::AssertionFailed { .. }),
+        "unexpected stale error: {stale:?}"
+    );
 
     let entry = db
         .kv_get_no_auth("p", "app", b"nonce", ConsistencyMode::AtLatest)
@@ -268,4 +275,125 @@ async fn kv_compare_and_u256_ops_enforce_expected_seq_and_value() {
         .expect("kv get")
         .expect("kv exists");
     assert_eq!(final_entry.value, u256_from_u64(4).to_vec());
+
+    db.kv_compare_and_set_u256(
+        "p",
+        "app",
+        b"nonce".to_vec(),
+        u256_from_u64(12),
+        final_entry.version,
+    )
+    .await
+    .expect("guarded kv set");
+
+    let stale_set = db
+        .kv_compare_and_set_u256(
+            "p",
+            "app",
+            b"nonce".to_vec(),
+            u256_from_u64(13),
+            final_entry.version,
+        )
+        .await
+        .expect_err("stale guarded kv set should fail");
+    assert!(matches!(stale_set, AedbError::AssertionFailed { .. }));
+}
+
+#[tokio::test]
+async fn kv_mutate_u256_supports_set_add_sub() {
+    let dir = tempdir().expect("tempdir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+
+    db.create_project("p").await.expect("create project");
+    db.create_scope("p", "app").await.expect("create scope");
+
+    db.kv_mutate_u256(
+        "p",
+        "app",
+        b"counter".to_vec(),
+        KvU256MutatorOp::Set,
+        u256_from_u64(10),
+    )
+    .await
+    .expect("set u256");
+
+    db.kv_mutate_u256(
+        "p",
+        "app",
+        b"counter".to_vec(),
+        KvU256MutatorOp::Add,
+        u256_from_u64(3),
+    )
+    .await
+    .expect("add u256");
+
+    db.kv_mutate_u256(
+        "p",
+        "app",
+        b"counter".to_vec(),
+        KvU256MutatorOp::Sub,
+        u256_from_u64(4),
+    )
+    .await
+    .expect("sub u256");
+
+    let entry = db
+        .kv_get_no_auth("p", "app", b"counter", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv get")
+        .expect("kv exists");
+    assert_eq!(entry.value, u256_from_u64(9).to_vec());
+}
+
+#[tokio::test]
+async fn kv_mutate_u64_supports_set_add_sub_and_expected_seq() {
+    let dir = tempdir().expect("tempdir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+
+    db.create_project("p").await.expect("create project");
+    db.create_scope("p", "app").await.expect("create scope");
+
+    db.kv_mutate_u64(
+        "p",
+        "app",
+        b"ctr64".to_vec(),
+        KvU64MutatorOp::Set,
+        u64_be(10),
+    )
+    .await
+    .expect("set u64");
+
+    let entry = db
+        .kv_get_no_auth("p", "app", b"ctr64", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv get")
+        .expect("kv exists");
+
+    db.kv_compare_and_add_u64("p", "app", b"ctr64".to_vec(), u64_be(7), entry.version)
+        .await
+        .expect("guarded add u64");
+
+    let stale = db
+        .kv_compare_and_add_u64("p", "app", b"ctr64".to_vec(), u64_be(1), entry.version)
+        .await
+        .expect_err("stale guarded add should fail");
+    assert!(matches!(stale, AedbError::AssertionFailed { .. }));
+
+    let next = db
+        .kv_get_no_auth("p", "app", b"ctr64", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv get")
+        .expect("kv exists");
+    assert_eq!(next.value, u64_be(17).to_vec());
+
+    db.kv_compare_and_sub_u64("p", "app", b"ctr64".to_vec(), u64_be(5), next.version)
+        .await
+        .expect("guarded sub u64");
+
+    let final_entry = db
+        .kv_get_no_auth("p", "app", b"ctr64", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv get")
+        .expect("kv exists");
+    assert_eq!(final_entry.value, u64_be(12).to_vec());
 }

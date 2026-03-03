@@ -3,12 +3,88 @@ use super::*;
 use crate::catalog::SYSTEM_PROJECT_ID;
 use crate::commit::assertions::{evaluate_assertions, validate_assertions};
 use crate::commit::tx::ReadAssertion;
-use crate::lib_helpers::{ddl_would_apply, lifecycle_template_for_ddl};
+use crate::lib_helpers::{
+    ddl_would_apply, lifecycle_template_for_ddl, lifecycle_templates_for_mutation,
+};
+use crate::wal::segment::PendingFrame;
 use primitive_types::U256;
+use serde::Serialize;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 const MEMORY_ESTIMATE_INTERVAL_MICROS: u64 = 250_000;
+
+fn apply_accumulator_hot_mutation(
+    keyspace: &mut Keyspace,
+    mutation: &Mutation,
+    commit_seq: u64,
+) -> Option<Result<(), AedbError>> {
+    match mutation {
+        Mutation::Accumulate {
+            project_id,
+            scope_id,
+            accumulator_name,
+            delta,
+            dedupe_key,
+            order_key,
+            release_exposure_id,
+        } => {
+            let appended = keyspace.append_accumulator_delta(
+                project_id,
+                scope_id,
+                accumulator_name,
+                *delta,
+                dedupe_key,
+                *order_key,
+                commit_seq,
+            );
+            Some(appended.and_then(|append_result| {
+                if let Some(exposure_id) = release_exposure_id
+                    && matches!(
+                        append_result,
+                        crate::storage::keyspace::AccumulatorAppendResult::Applied
+                    )
+                {
+                    keyspace.release_accumulator_exposure(
+                        project_id,
+                        scope_id,
+                        accumulator_name,
+                        exposure_id,
+                    )?;
+                }
+                Ok(())
+            }))
+        }
+        Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            amount,
+            exposure_id,
+        } => Some(keyspace.expose_accumulator(
+            project_id,
+            scope_id,
+            accumulator_name,
+            *amount,
+            exposure_id,
+            commit_seq,
+        )),
+        Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposures,
+        } => Some(keyspace.expose_accumulator_batch(
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposures,
+            commit_seq,
+        )),
+        _ => None,
+    }
+}
 
 pub(super) fn pre_stage_validate(
     validation_catalog: &Arc<RwLock<Catalog>>,
@@ -151,7 +227,97 @@ pub(super) fn scope_shard_key(mutations: &[Mutation]) -> String {
             project_id,
             scope_id,
             ..
+        }
+        | Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::CounterAdd {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            ..
         } => format!("k:{project_id}:{scope_id}"),
+        Mutation::Accumulate {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | Mutation::ReleaseAccumulatorExposure {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        } => format!("acc:{project_id}:{scope_id}:{accumulator_name}"),
+        Mutation::EmitEvent {
+            project_id,
+            scope_id,
+            topic,
+            ..
+        } => format!("evt:{project_id}:{scope_id}:{topic}"),
         Mutation::OrderBookNew {
             project_id,
             scope_id,
@@ -327,6 +493,7 @@ pub(super) fn process_commit_epoch(
     state: &mut ExecutorState,
     requests: Vec<CommitRequest>,
 ) -> EpochProcessResult {
+    let process_started = Instant::now();
     if requests.is_empty() {
         return EpochProcessResult::default();
     }
@@ -334,6 +501,7 @@ pub(super) fn process_commit_epoch(
     let mut outcomes = Vec::with_capacity(requests.len());
     let mut coordinator_apply_attempts = 0u64;
     let mut coordinator_apply_micros = 0u64;
+    let mut parallel_apply_micros = 0u64;
     let mut read_set_conflicts = 0u64;
     let mut wal_append_ops = 0u64;
     let mut wal_append_bytes = 0u64;
@@ -375,6 +543,8 @@ pub(super) fn process_commit_epoch(
                     result: Ok(CommitResult {
                         commit_seq: record.commit_seq,
                         durable_head_seq: state.durable_head_seq.max(record.commit_seq),
+                        idempotency: IdempotencyOutcome::Duplicate,
+                        canonical_commit_seq: record.commit_seq,
                     }),
                     post_apply_delta: None,
                 });
@@ -523,18 +693,22 @@ pub(super) fn process_commit_epoch(
             let mut trial_catalog = working_catalog.clone();
             let mut apply_error = None;
             for mutation in &mutations {
-                let applied = if request.prevalidated {
-                    apply_mutation_trusted_if_eligible(
-                        &mut trial_catalog,
-                        &mut trial_keyspace,
-                        mutation.clone(),
-                        commit_seq,
-                        request.envelope.base_seq,
-                        snapshot_seq_before_commit,
-                    )
-                } else {
-                    None
-                };
+                let applied =
+                    apply_accumulator_hot_mutation(&mut trial_keyspace, mutation, commit_seq)
+                        .or_else(|| {
+                            if request.prevalidated {
+                                apply_mutation_trusted_if_eligible(
+                                    &mut trial_catalog,
+                                    &mut trial_keyspace,
+                                    mutation.clone(),
+                                    commit_seq,
+                                    request.envelope.base_seq,
+                                    snapshot_seq_before_commit,
+                                )
+                            } else {
+                                None
+                            }
+                        });
                 match applied {
                     Some(Ok(())) => {}
                     Some(Err(err)) => {
@@ -568,11 +742,11 @@ pub(super) fn process_commit_epoch(
         }
 
         let payload_type = payload_type_for_mutations(&mutations);
-        let payload = match encode_wal_payload(&WalCommitPayload {
-            mutations: mutations.clone(),
-            assertions: request.envelope.assertions.clone(),
-            idempotency_key: request.envelope.idempotency_key.clone(),
-        }) {
+        let payload = match encode_wal_payload_from_parts(
+            &mutations,
+            &request.envelope.assertions,
+            request.envelope.idempotency_key.as_ref(),
+        ) {
             Ok(payload) => payload,
             Err(err) => {
                 outcomes.push(EpochOutcome {
@@ -598,13 +772,13 @@ pub(super) fn process_commit_epoch(
                 );
         }
 
-        let delta = CommitDelta {
-            seq: commit_seq,
-            mutations: mutations.clone(),
-        };
         if !catalog_changed && mutations.iter().any(|m| matches!(m, Mutation::Ddl(_))) {
             catalog_changed = true;
         }
+        let delta = CommitDelta {
+            seq: commit_seq,
+            mutations,
+        };
         sequenced.push(SequencedCommit {
             request,
             seq: commit_seq,
@@ -626,6 +800,9 @@ pub(super) fn process_commit_epoch(
             outcomes,
             coordinator_apply_attempts,
             coordinator_apply_micros,
+            parallel_apply_micros,
+            pre_wal_micros: process_started.elapsed().as_micros() as u64,
+            finalize_micros: 0,
             read_set_conflicts,
             wal_append_ops,
             wal_append_bytes,
@@ -639,14 +816,19 @@ pub(super) fn process_commit_epoch(
     }
 
     if !deferred_parallel_commits.is_empty()
-        && let Err(err) = apply_deferred_parallel_single_partition_commits(
+    {
+        let parallel_apply_started = Instant::now();
+        let parallel_apply_result = apply_deferred_parallel_single_partition_commits(
             &working_catalog,
             &mut working_keyspace,
             &state.parallel_runtime,
             &sequenced,
             &deferred_parallel_commits,
             state.config.epoch_apply_timeout_ms,
-        )
+        );
+        parallel_apply_micros = parallel_apply_micros
+            .saturating_add(parallel_apply_started.elapsed().as_micros() as u64);
+        if let Err(err) = parallel_apply_result
     {
         let wrapped = format!("epoch aborted during parallel apply: {err}");
         for failed in sequenced {
@@ -654,6 +836,15 @@ pub(super) fn process_commit_epoch(
                 AedbError::EpochApplyTimeout => AedbError::EpochApplyTimeout,
                 AedbError::ParallelApplyCancelled => AedbError::ParallelApplyCancelled,
                 AedbError::ParallelApplyWorkerPanicked => AedbError::ParallelApplyWorkerPanicked,
+                AedbError::AssertionFailed {
+                    index,
+                    assertion,
+                    actual,
+                } => AedbError::AssertionFailed {
+                    index: *index,
+                    assertion: assertion.clone(),
+                    actual: actual.clone(),
+                },
                 _ => AedbError::Validation(wrapped.clone()),
             };
             outcomes.push(EpochOutcome {
@@ -666,6 +857,9 @@ pub(super) fn process_commit_epoch(
             outcomes,
             coordinator_apply_attempts,
             coordinator_apply_micros,
+            parallel_apply_micros,
+            pre_wal_micros: process_started.elapsed().as_micros() as u64,
+            finalize_micros: 0,
             read_set_conflicts,
             wal_append_ops,
             wal_append_bytes,
@@ -677,6 +871,7 @@ pub(super) fn process_commit_epoch(
             ..EpochProcessResult::default()
         };
     }
+    }
 
     let mut wal_payload_size_bytes = 0usize;
     let requires_sync = sequenced
@@ -685,6 +880,8 @@ pub(super) fn process_commit_epoch(
         || matches!(state.config.durability_mode, DurabilityMode::Full);
     let mut user_idx = 0usize;
     let mut internal_idx = 0usize;
+    let mut wal_frames =
+        Vec::with_capacity(sequenced.len().saturating_add(internal_sequenced.len()));
     while user_idx < sequenced.len() || internal_idx < internal_sequenced.len() {
         let next_is_user = match (
             sequenced.get(user_idx).map(|c| c.seq),
@@ -706,43 +903,51 @@ pub(super) fn process_commit_epoch(
         };
         let payload_size_bytes = payload.len();
         wal_payload_size_bytes = wal_payload_size_bytes.saturating_add(payload_size_bytes);
-        let append_started = Instant::now();
-        if let Err(err) = state
-            .wal
-            .append_frame_with_sync(seq, ts, payload_type, payload, false)
-        {
-            let err = AedbError::Io(std::io::Error::other(err.to_string()));
-            overwrite_assertion_failures_with_wal_error(
-                &mut outcomes,
-                &err,
-                "epoch aborted before WAL commit",
-            );
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted before WAL commit: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
-            }
-            return EpochProcessResult {
-                outcomes,
-                coordinator_apply_attempts,
-                coordinator_apply_micros,
-                read_set_conflicts,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                sync_executed,
-                catalog_changed,
-                ..EpochProcessResult::default()
-            };
+        wal_frames.push(PendingFrame {
+            seq,
+            timestamp_micros: ts,
+            payload_type,
+            payload,
+        });
+    }
+    let pre_wal_micros = process_started.elapsed().as_micros() as u64;
+    let append_started = Instant::now();
+    if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
+        let err = AedbError::Io(std::io::Error::other(err.to_string()));
+        overwrite_assertion_failures_with_wal_error(
+            &mut outcomes,
+            &err,
+            "epoch aborted before WAL commit",
+        );
+        for failed in sequenced {
+            outcomes.push(EpochOutcome {
+                request: failed.request,
+                result: Err(AedbError::Validation(format!(
+                    "epoch aborted before WAL commit: {err}"
+                ))),
+                post_apply_delta: None,
+            });
         }
+        return EpochProcessResult {
+            outcomes,
+            coordinator_apply_attempts,
+            coordinator_apply_micros,
+            parallel_apply_micros,
+            pre_wal_micros,
+            finalize_micros: 0,
+            read_set_conflicts,
+            wal_append_ops,
+            wal_append_bytes,
+            wal_append_micros,
+            wal_sync_ops,
+            wal_sync_micros,
+            sync_executed,
+            catalog_changed,
+        };
+    }
+    if !wal_frames.is_empty() {
         wal_append_ops = wal_append_ops.saturating_add(1);
-        wal_append_bytes = wal_append_bytes.saturating_add(payload_size_bytes as u64);
+        wal_append_bytes = wal_append_bytes.saturating_add(wal_payload_size_bytes as u64);
         wal_append_micros =
             wal_append_micros.saturating_add(append_started.elapsed().as_micros() as u64);
     }
@@ -768,6 +973,9 @@ pub(super) fn process_commit_epoch(
                 outcomes,
                 coordinator_apply_attempts,
                 coordinator_apply_micros,
+                parallel_apply_micros,
+                pre_wal_micros,
+                finalize_micros: 0,
                 read_set_conflicts,
                 wal_append_ops,
                 wal_append_bytes,
@@ -883,12 +1091,15 @@ pub(super) fn process_commit_epoch(
     }
 
     let durable_head = state.durable_head_seq;
+    let finalize_started = Instant::now();
     for commit in sequenced {
         outcomes.push(EpochOutcome {
             request: commit.request,
             result: Ok(CommitResult {
                 commit_seq: commit.seq,
                 durable_head_seq: durable_head,
+                idempotency: IdempotencyOutcome::Applied,
+                canonical_commit_seq: commit.seq,
             }),
             post_apply_delta: Some(commit.delta),
         });
@@ -897,6 +1108,9 @@ pub(super) fn process_commit_epoch(
         outcomes,
         coordinator_apply_attempts,
         coordinator_apply_micros,
+        parallel_apply_micros,
+        pre_wal_micros,
+        finalize_micros: finalize_started.elapsed().as_micros() as u64,
         read_set_conflicts,
         wal_append_ops,
         wal_append_bytes,
@@ -946,19 +1160,30 @@ fn plan_lifecycle_outbox_events_for_mutations(
     catalog: &Catalog,
     mutations: &[Mutation],
 ) -> Result<Vec<crate::lib_helpers::LifecycleEventTemplate>, AedbError> {
-    if !mutations.iter().any(|m| matches!(m, Mutation::Ddl(_))) {
+    let has_ddl = mutations.iter().any(|m| matches!(m, Mutation::Ddl(_)));
+    let has_emit_event = mutations
+        .iter()
+        .any(|m| matches!(m, Mutation::EmitEvent { .. }));
+    if !has_ddl && !has_emit_event {
         return Ok(Vec::new());
     }
-    let mut planned_catalog = catalog.clone();
+    let mut planned_catalog = has_ddl.then(|| catalog.clone());
     let mut events = Vec::new();
     for mutation in mutations {
-        let Mutation::Ddl(op) = mutation else {
-            continue;
-        };
-        let applied = ddl_would_apply(&planned_catalog, op);
-        planned_catalog.apply_ddl(op.clone())?;
-        if applied && let Some(event) = lifecycle_template_for_ddl(op) {
-            events.push(event);
+        match mutation {
+            Mutation::Ddl(op) => {
+                let Some(working_catalog) = planned_catalog.as_mut() else {
+                    continue;
+                };
+                let applied = ddl_would_apply(working_catalog, op);
+                working_catalog.apply_ddl(op.clone())?;
+                if applied && let Some(event) = lifecycle_template_for_ddl(op) {
+                    events.push(event);
+                }
+            }
+            _ => {
+                events.extend(lifecycle_templates_for_mutation(mutation));
+            }
         }
     }
     Ok(events)
@@ -1041,18 +1266,14 @@ fn build_assertion_audit_commit(
     }];
 
     for mutation in &mutations {
-        if let Err(apply_err) = apply_mutation(catalog, keyspace, mutation.clone(), commit_seq) {
+        if let Err(apply_err) = apply_mutation(catalog, keyspace, mutation.to_owned(), commit_seq) {
             warn!(error = ?apply_err, "failed to apply assertion audit mutation");
             *next_seq = next_seq.saturating_sub(1);
             return None;
         }
     }
 
-    let payload = match encode_wal_payload(&WalCommitPayload {
-        mutations: mutations.clone(),
-        assertions: Vec::new(),
-        idempotency_key: None,
-    }) {
+    let payload = match encode_wal_payload_from_parts(&mutations, &[], None) {
         Ok(payload) => payload,
         Err(encode_err) => {
             warn!(error = ?encode_err, "failed to encode assertion audit payload");
@@ -1148,6 +1369,7 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
                     id: ns_id.clone(),
                     tables: Default::default(),
                     kv: KvData::default(),
+                    accumulators: Default::default(),
                 });
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std_mpsc::channel::<Result<(NamespaceId, Namespace), AedbError>>();
@@ -1232,6 +1454,81 @@ pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<
             ..
         }
         | Mutation::KvDecU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::CounterAdd {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::Accumulate {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::ExposeAccumulatorBatch {
             project_id,
             scope_id,
             ..
@@ -1321,6 +1618,21 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         | Mutation::KvDel { .. }
         | Mutation::KvIncU256 { .. }
         | Mutation::KvDecU256 { .. }
+        | Mutation::KvAddU256Ex { .. }
+        | Mutation::KvSubU256Ex { .. }
+        | Mutation::KvMaxU256 { .. }
+        | Mutation::KvMinU256 { .. }
+        | Mutation::KvMutateU256 { .. }
+        | Mutation::KvAddU64Ex { .. }
+        | Mutation::KvSubU64Ex { .. }
+        | Mutation::KvSubIntEx { .. }
+        | Mutation::CounterAdd { .. }
+        | Mutation::KvMaxU64 { .. }
+        | Mutation::KvMinU64 { .. }
+        | Mutation::KvMutateU64 { .. }
+        | Mutation::Accumulate { .. }
+        | Mutation::ExposeAccumulator { .. }
+        | Mutation::ExposeAccumulatorBatch { .. }
         | Mutation::OrderBookNew { .. }
         | Mutation::OrderBookCancel { .. }
         | Mutation::OrderBookCancelReplace { .. }
@@ -1843,7 +2155,11 @@ pub(super) fn apply_via_coordinator(
         } else {
             enforce_global_unique_scope_invariants(catalog, keyspace, mutation)?;
         }
-        apply_mutation(catalog, keyspace, mutation.clone(), commit_seq)?;
+        if let Some(result) = apply_accumulator_hot_mutation(keyspace, mutation, commit_seq) {
+            result?;
+        } else {
+            apply_mutation(catalog, keyspace, mutation.clone(), commit_seq)?;
+        }
         if matches!(mutation, Mutation::Ddl(_)) {
             *global_unique_index = GlobalUniqueIndexState::from_snapshot(catalog, keyspace)?;
         }
@@ -1884,8 +2200,24 @@ pub(super) fn parallel_worker_test_hook_for_mutation(mutation: &Mutation) {
 #[inline]
 pub(super) fn parallel_worker_test_hook_for_mutation(_mutation: &Mutation) {}
 
-pub(super) fn encode_wal_payload(payload: &WalCommitPayload) -> Result<Vec<u8>, AedbError> {
-    rmp_serde::to_vec(payload).map_err(|e| AedbError::Encode(e.to_string()))
+#[derive(Serialize)]
+struct WalCommitPayloadRef<'a> {
+    mutations: &'a [Mutation],
+    assertions: &'a [ReadAssertion],
+    idempotency_key: Option<&'a IdempotencyKey>,
+}
+
+pub(super) fn encode_wal_payload_from_parts(
+    mutations: &[Mutation],
+    assertions: &[ReadAssertion],
+    idempotency_key: Option<&IdempotencyKey>,
+) -> Result<Vec<u8>, AedbError> {
+    let payload = WalCommitPayloadRef {
+        mutations,
+        assertions,
+        idempotency_key,
+    };
+    rmp_serde::to_vec(&payload).map_err(|e| AedbError::Encode(e.to_string()))
 }
 
 pub(super) fn payload_type_for_mutations(mutations: &[Mutation]) -> u8 {
@@ -1900,6 +2232,23 @@ pub(super) fn payload_type_for_mutations(mutations: &[Mutation]) -> u8 {
                 | Mutation::KvDel { .. }
                 | Mutation::KvIncU256 { .. }
                 | Mutation::KvDecU256 { .. }
+                | Mutation::KvAddU256Ex { .. }
+                | Mutation::KvSubU256Ex { .. }
+                | Mutation::KvMaxU256 { .. }
+                | Mutation::KvMinU256 { .. }
+                | Mutation::KvMutateU256 { .. }
+                | Mutation::KvAddU64Ex { .. }
+                | Mutation::KvSubU64Ex { .. }
+                | Mutation::KvSubIntEx { .. }
+                | Mutation::CounterAdd { .. }
+                | Mutation::KvMaxU64 { .. }
+                | Mutation::KvMinU64 { .. }
+                | Mutation::KvMutateU64 { .. }
+                | Mutation::Accumulate { .. }
+                | Mutation::ExposeAccumulator { .. }
+                | Mutation::ExposeAccumulatorBatch { .. }
+                | Mutation::ReleaseAccumulatorExposure { .. }
+                | Mutation::EmitEvent { .. }
                 | Mutation::OrderBookNew { .. }
                 | Mutation::OrderBookCancel { .. }
                 | Mutation::OrderBookCancelReplace { .. }
@@ -2020,9 +2369,134 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
                 scope_id,
                 key,
                 ..
+            }
+            | Mutation::KvAddU256Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvSubU256Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMaxU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMinU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMutateU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvAddU64Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvSubU64Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvSubIntEx {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMaxU64 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMinU64 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMutateU64 {
+                project_id,
+                scope_id,
+                key,
+                ..
             } => {
                 let ns = namespace_key(project_id, scope_id);
                 out.insert(kv_key_partition_token(&ns, key));
+            }
+            Mutation::CounterAdd {
+                project_id,
+                scope_id,
+                key,
+                shard_count,
+                shard_hint,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                let shard =
+                    crate::commit::validation::counter_shard_index(*shard_hint, *shard_count);
+                let shard_key = crate::commit::validation::counter_shard_storage_key(key, shard);
+                out.insert(kv_key_partition_token(&ns, &shard_key));
+            }
+            Mutation::Accumulate {
+                project_id,
+                scope_id,
+                accumulator_name,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(format!("acc:{ns}:{accumulator_name}"));
+            }
+            Mutation::ExposeAccumulator {
+                project_id,
+                scope_id,
+                accumulator_name,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(format!("acc:{ns}:{accumulator_name}"));
+            }
+            Mutation::ExposeAccumulatorBatch {
+                project_id,
+                scope_id,
+                accumulator_name,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(format!("acc:{ns}:{accumulator_name}"));
+            }
+            Mutation::ReleaseAccumulatorExposure {
+                project_id,
+                scope_id,
+                accumulator_name,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(format!("acc:{ns}:{accumulator_name}"));
+            }
+            Mutation::EmitEvent {
+                project_id,
+                scope_id,
+                topic,
+                ..
+            } => {
+                let ns = namespace_key(project_id, scope_id);
+                out.insert(format!("evt:{ns}:{topic}"));
             }
             Mutation::OrderBookNew {
                 project_id,
@@ -2195,6 +2669,21 @@ fn derive_tokens_for_assertions(out: &mut HashSet<String>, assertions: &[ReadAss
 
 fn derive_tokens_for_assertion(out: &mut HashSet<String>, assertion: &ReadAssertion) {
     match assertion {
+        ReadAssertion::AccumulatorAvailableAtLeast {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        }
+        | ReadAssertion::AccumulatorExposureWithinMargin {
+            project_id,
+            scope_id,
+            accumulator_name,
+            ..
+        } => {
+            let ns = namespace_key(project_id, scope_id);
+            out.insert(format!("acc:{ns}:{accumulator_name}"));
+        }
         ReadAssertion::KeyEquals {
             project_id,
             scope_id,
@@ -2644,6 +3133,125 @@ pub(super) fn refresh_async_indexes(
     if refresh_kv_projection_tables(state, pending_delta)? {
         changed = true;
     }
+    if refresh_accumulators(state)? {
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn refresh_accumulators(state: &mut ExecutorState) -> Result<bool, AedbError> {
+    let mut changed = false;
+    for ((ns, accumulator_name), def) in state.catalog.accumulators.clone().iter() {
+        let Some(acc) = state
+            .keyspace
+            .namespace_mut(NamespaceId::Project(ns.clone()))
+            .accumulators
+            .get_mut(accumulator_name)
+        else {
+            continue;
+        };
+
+        let previous_error = acc.projector_error.clone();
+        acc.projector_error = None;
+        let mut next_value = acc.value;
+        let mut next_last_applied = acc.last_applied_order_key;
+        let mut next_materialized_seq = acc.materialized_seq;
+        for (order_key, record) in acc.deltas.range((
+            Bound::Excluded(acc.last_applied_order_key),
+            Bound::Unbounded,
+        )) {
+            let Some(sum) = next_value.checked_add(record.delta) else {
+                acc.projector_error = Some("accumulator overflow during projection".to_string());
+                break;
+            };
+            next_value = sum;
+            next_last_applied = *order_key;
+            next_materialized_seq = next_materialized_seq.max(record.commit_seq);
+            acc.applied_since_snapshot = acc.applied_since_snapshot.saturating_add(1);
+        }
+        if next_last_applied != acc.last_applied_order_key {
+            acc.value = next_value;
+            acc.exposure_limit_cached =
+                ((acc.value as i128 * (10_000i128 - acc.exposure_margin_bps as i128)) / 10_000)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            acc.exposure_limit_cache_valid = true;
+            acc.last_applied_order_key = next_last_applied;
+            acc.materialized_seq = next_materialized_seq;
+            changed = true;
+        }
+        if acc.applied_since_snapshot >= def.snapshot_every {
+            acc.deltas = acc
+                .deltas
+                .iter()
+                .filter(|(order_key, _)| **order_key > acc.last_applied_order_key)
+                .map(|(order_key, record)| (*order_key, record.clone()))
+                .collect();
+            acc.applied_since_snapshot = 0;
+            changed = true;
+        }
+        if let Some(window_commits) = def.dedupe_retain_commits {
+            let min_commit = state.visible_head_seq.saturating_sub(window_commits);
+            let before = acc.dedupe.len();
+            acc.dedupe = acc
+                .dedupe
+                .iter()
+                .filter(|(_, rec)| rec.commit_seq >= min_commit)
+                .map(|(key, rec)| (key.clone(), rec.clone()))
+                .collect();
+            if acc.dedupe.len() != before {
+                changed = true;
+            }
+        }
+        if let Some(ttl_commits) = def.exposure_ttl_commits {
+            let min_open_seq = state.visible_head_seq.saturating_sub(ttl_commits);
+            let mut removed_total = 0i64;
+            let before = acc.open_exposures.len();
+            let next_open_exposures = acc
+                .open_exposures
+                .iter()
+                .filter_map(|(id, rec)| {
+                    if rec.opened_at_seq < min_open_seq {
+                        removed_total = removed_total.saturating_add(rec.amount);
+                        None
+                    } else {
+                        Some((id.clone(), rec.clone()))
+                    }
+                })
+                .collect();
+            if removed_total > 0 {
+                if acc.total_exposure < removed_total {
+                    acc.exposure_rebuild_required = true;
+                } else {
+                    acc.total_exposure -= removed_total;
+                }
+            }
+            acc.open_exposures = next_open_exposures;
+            if acc.open_exposures.len() != before {
+                changed = true;
+            }
+        }
+        if acc.exposure_rebuild_required {
+            let mut rebuilt_exposure = 0i64;
+            for (_, rec) in &acc.open_exposures {
+                let Some(next) = rebuilt_exposure.checked_add(rec.amount) else {
+                    acc.projector_error =
+                        Some("accumulator exposure overflow during rebuild".into());
+                    break;
+                };
+                rebuilt_exposure = next;
+            }
+            if acc.projector_error.is_none() {
+                if rebuilt_exposure != acc.total_exposure {
+                    acc.total_exposure = rebuilt_exposure;
+                    changed = true;
+                }
+                acc.exposure_rebuild_required = false;
+            }
+        }
+        if acc.projector_error != previous_error {
+            changed = true;
+        }
+    }
     Ok(changed)
 }
 
@@ -2808,6 +3416,66 @@ fn apply_kv_projection_delta(
             ..
         }
         | Mutation::KvDecU256 {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvAddU256Ex {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvMutateU256 {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvAddU64Ex {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id: p,
+            scope_id: s,
+            key,
+            ..
+        }
+        | Mutation::KvMutateU64 {
             project_id: p,
             scope_id: s,
             key,

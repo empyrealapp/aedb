@@ -70,6 +70,18 @@ pub struct ReadSet {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReadAssertion {
+    AccumulatorAvailableAtLeast {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        min_amount: i64,
+    },
+    AccumulatorExposureWithinMargin {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        additional_exposure: i64,
+    },
     KeyEquals {
         project_id: String,
         scope_id: String,

@@ -4,6 +4,7 @@ pub mod checkpoint;
 pub mod commit;
 pub mod config;
 pub mod declarative;
+pub mod engine_interface;
 pub mod error;
 mod lib_helpers;
 #[cfg(test)]
@@ -28,17 +29,20 @@ use crate::backup::{
     sha256_file_hex, verify_backup_files, write_backup_archive, write_backup_manifest,
 };
 use crate::catalog::namespace_key;
-use crate::catalog::schema::{AsyncIndexDef, IndexDef, TableSchema};
+use crate::catalog::schema::{AccumulatorValueType, AsyncIndexDef, IndexDef, TableSchema};
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
 use crate::checkpoint::loader::load_checkpoint_with_key;
 use crate::checkpoint::writer::write_checkpoint_with_key;
-use crate::commit::executor::{CommitExecutor, CommitResult, ExecutorMetrics};
+use crate::commit::action::{ActionCommitOutcome, ActionCommitResult, ActionEnvelopeRequest};
+use crate::commit::executor::{CommitExecutor, CommitResult, ExecutorMetrics, IdempotencyOutcome};
 use crate::commit::tx::{
     ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
 };
 use crate::commit::validation::{
-    Mutation, TableUpdateExpr, validate_mutation_with_config, validate_permissions,
+    KvU64MissingPolicy, KvU64MutatorOp, KvU64OverflowPolicy, KvU64UnderflowPolicy, KvU256MutatorOp,
+    MAX_COUNTER_SHARDS, Mutation, TableUpdateExpr, validate_mutation_with_config,
+    validate_permissions,
 };
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use crate::error::AedbError;
@@ -72,16 +76,20 @@ use crate::wal::frame::{FrameError, FrameReader};
 use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::File;
+use std::future::Future;
 use std::io::{BufReader, Read};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 const TRUST_MODE_MARKER_FILE: &str = "trust_mode.json";
@@ -182,6 +190,7 @@ pub struct AedbInstance {
     /// Serializes checkpoint writers without blocking commit/query traffic.
     checkpoint_lock: Arc<AsyncMutex<()>>,
     snapshot_manager: Arc<Mutex<SnapshotManager>>,
+    latest_snapshot_inflight: Arc<AtomicUsize>,
     recovery_cache: Arc<Mutex<RecoveryCache>>,
     lifecycle_hooks: Arc<Mutex<Vec<Arc<dyn LifecycleHook>>>>,
     telemetry_hooks: Arc<Mutex<Vec<Arc<dyn QueryCommitTelemetryHook>>>>,
@@ -189,8 +198,307 @@ pub struct AedbInstance {
     durable_wait_ops: Arc<AtomicU64>,
     durable_wait_micros: Arc<AtomicU64>,
     durable_ack_fsync_leader: Arc<AtomicBool>,
+    reactive_processor_ack_watermarks:
+        Arc<Mutex<HashMap<ReactiveCheckpointAckCacheKey, ReactiveCheckpointAckState>>>,
+    reactive_processor_handlers: Arc<Mutex<HashMap<String, ReactiveProcessorHandler>>>,
+    reactive_processor_runtimes: Arc<AsyncMutex<HashMap<String, ReactiveProcessorRuntime>>>,
     startup_recovery_micros: u64,
     startup_recovered_seq: u64,
+}
+
+const SYSTEM_SCOPE_ID: &str = "app";
+const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
+const EVENT_OUTBOX_TABLE: &str = "event_outbox";
+const REACTIVE_PROCESSOR_CHECKPOINTS_TABLE: &str = "reactive_processor_checkpoints";
+const REACTIVE_PROCESSOR_REGISTRY_TABLE: &str = "reactive_processor_registry";
+const REACTIVE_PROCESSOR_DLQ_TABLE: &str = "reactive_processor_dead_letters";
+
+struct ReadPhaseLogSettings {
+    enabled: bool,
+    threshold_ms: u64,
+    sample_every: u64,
+}
+
+static READ_PHASE_LOG_SETTINGS: LazyLock<ReadPhaseLogSettings> = LazyLock::new(|| {
+    let enabled = std::env::var("AEDB_READ_PHASE_LOG_ENABLED")
+        .ok()
+        .and_then(|v| {
+            let n = v.trim().to_ascii_lowercase();
+            match n.as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            }
+        })
+        .unwrap_or(false);
+    let threshold_ms = std::env::var("AEDB_READ_PHASE_LOG_THRESHOLD_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5);
+    let sample_every = std::env::var("AEDB_READ_PHASE_LOG_SAMPLE_EVERY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+        .max(1);
+    ReadPhaseLogSettings {
+        enabled,
+        threshold_ms,
+        sample_every,
+    }
+});
+
+static READ_PHASE_LOG_SAMPLE_COUNTER: LazyLock<AtomicU64> = LazyLock::new(|| AtomicU64::new(0));
+
+fn should_log_read_phase(total_micros: u64) -> bool {
+    let settings = &*READ_PHASE_LOG_SETTINGS;
+    if !settings.enabled || total_micros < settings.threshold_ms.saturating_mul(1_000) {
+        return false;
+    }
+    let n = READ_PHASE_LOG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    n % settings.sample_every == 0
+}
+
+fn system_now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn reactive_processor_checkpoint_mutation(processor_name: &str, checkpoint_seq: u64) -> Mutation {
+    Mutation::Upsert {
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+        scope_id: SYSTEM_SCOPE_ID.to_string(),
+        table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+        primary_key: vec![Value::Text(processor_name.to_string().into())],
+        row: Row::from_values(vec![
+            Value::Text(processor_name.to_string().into()),
+            Value::Integer(checkpoint_seq as i64),
+            Value::Timestamp(system_now_micros() as i64),
+        ]),
+    }
+}
+
+fn reactive_processor_registry_mutation(
+    processor_name: &str,
+    options: &ReactiveProcessorOptions,
+    enabled: bool,
+) -> Result<Mutation, AedbError> {
+    let options_json =
+        serde_json::to_string(options).map_err(|e| AedbError::Encode(e.to_string()))?;
+    Ok(Mutation::Upsert {
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+        scope_id: SYSTEM_SCOPE_ID.to_string(),
+        table_name: REACTIVE_PROCESSOR_REGISTRY_TABLE.to_string(),
+        primary_key: vec![Value::Text(processor_name.to_string().into())],
+        row: Row::from_values(vec![
+            Value::Text(processor_name.to_string().into()),
+            Value::Json(options_json.into()),
+            Value::Boolean(enabled),
+            Value::Timestamp(system_now_micros() as i64),
+        ]),
+    })
+}
+
+fn reactive_processor_dlq_mutation(
+    processor_name: &str,
+    events: &[EventOutboxRecord],
+    error: &str,
+    attempts: u32,
+) -> Mutation {
+    let failed_at = system_now_micros() as i64;
+    let rows = events
+        .iter()
+        .map(|event| {
+            Row::from_values(vec![
+                Value::Text(processor_name.to_string().into()),
+                Value::Integer(event.commit_seq as i64),
+                Value::Text(event.topic.clone().into()),
+                Value::Text(event.event_key.clone().into()),
+                Value::Json(event.payload_json.clone().into()),
+                Value::Text(error.to_string().into()),
+                Value::Integer(attempts as i64),
+                Value::Timestamp(failed_at),
+            ])
+        })
+        .collect();
+    Mutation::UpsertBatch {
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+        scope_id: SYSTEM_SCOPE_ID.to_string(),
+        table_name: REACTIVE_PROCESSOR_DLQ_TABLE.to_string(),
+        rows,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReactiveCheckpointAckState {
+    last_persisted_seq: u64,
+    last_touch_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReactiveCheckpointAckCacheKey {
+    processor_name: String,
+    caller_id: Option<String>,
+}
+
+const REACTIVE_ACK_CACHE_MAX_ENTRIES: usize = 1_024;
+const REACTIVE_ACK_CACHE_EVICT_BATCH: usize = 128;
+
+fn prune_reactive_ack_cache(
+    cache: &mut HashMap<ReactiveCheckpointAckCacheKey, ReactiveCheckpointAckState>,
+) {
+    if cache.len() <= REACTIVE_ACK_CACHE_MAX_ENTRIES {
+        return;
+    }
+    let excess = cache.len() - REACTIVE_ACK_CACHE_MAX_ENTRIES;
+    let prune_count = excess
+        .saturating_add(REACTIVE_ACK_CACHE_EVICT_BATCH)
+        .min(cache.len());
+    let mut oldest: Vec<(ReactiveCheckpointAckCacheKey, u64)> = cache
+        .iter()
+        .map(|(k, v)| (k.clone(), v.last_touch_micros))
+        .collect();
+    oldest.sort_by_key(|(_, ts)| *ts);
+    for (key, _) in oldest.into_iter().take(prune_count) {
+        cache.remove(&key);
+    }
+}
+
+pub type ReactiveProcessorHandlerFuture =
+    Pin<Box<dyn Future<Output = Result<(), AedbError>> + Send>>;
+pub type ReactiveProcessorHandler = Arc<
+    dyn Fn(Arc<AedbInstance>, Vec<EventOutboxRecord>) -> ReactiveProcessorHandlerFuture
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReactiveProcessorOptions {
+    pub caller_id: Option<String>,
+    pub topic_filter: Option<String>,
+    pub run_on_interval: bool,
+    pub max_allowed_lag_commits: Option<u64>,
+    pub max_allowed_stall_ms: Option<u64>,
+    pub max_events_per_run: usize,
+    pub max_bytes_per_run: usize,
+    pub max_run_duration_ms: u64,
+    pub run_interval_ms: u64,
+    pub idle_backoff_ms: u64,
+    pub checkpoint_watermark_commits: u64,
+    pub max_retries: u32,
+    pub retry_backoff_ms: u64,
+}
+
+impl Default for ReactiveProcessorOptions {
+    fn default() -> Self {
+        Self {
+            caller_id: None,
+            topic_filter: None,
+            run_on_interval: false,
+            max_allowed_lag_commits: None,
+            max_allowed_stall_ms: None,
+            max_events_per_run: 256,
+            max_bytes_per_run: 2 * 1024 * 1024,
+            max_run_duration_ms: 250,
+            run_interval_ms: 20,
+            idle_backoff_ms: 50,
+            checkpoint_watermark_commits: 64,
+            max_retries: 3,
+            retry_backoff_ms: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReactiveProcessorRuntimeStatus {
+    pub processor_name: String,
+    pub running: bool,
+    pub runs_total: u64,
+    pub processed_events_total: u64,
+    pub failures_total: u64,
+    pub retries_total: u64,
+    pub dead_lettered_total: u64,
+    pub last_processed_seq: u64,
+    pub last_error: Option<String>,
+    pub last_run_started_micros: Option<u64>,
+    pub last_run_completed_micros: Option<u64>,
+    pub last_success_micros: Option<u64>,
+    pub last_failure_micros: Option<u64>,
+    pub last_retry_micros: Option<u64>,
+    pub last_sleep_ms: u64,
+    pub last_batch_events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactiveProcessorInfo {
+    pub processor_name: String,
+    pub options: ReactiveProcessorOptions,
+    pub enabled: bool,
+    pub running: bool,
+    pub updated_at_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactiveProcessorHealth {
+    pub processor_name: String,
+    pub enabled: bool,
+    pub running: bool,
+    pub checkpoint_seq: u64,
+    pub head_seq: u64,
+    pub lag_commits: u64,
+    pub runs_total: u64,
+    pub processed_events_total: u64,
+    pub failures_total: u64,
+    pub retries_total: u64,
+    pub dead_lettered_total: u64,
+    pub last_processed_seq: u64,
+    pub last_error: Option<String>,
+    pub last_run_started_micros: Option<u64>,
+    pub last_run_completed_micros: Option<u64>,
+    pub last_success_micros: Option<u64>,
+    pub last_failure_micros: Option<u64>,
+    pub last_retry_micros: Option<u64>,
+    pub last_sleep_ms: u64,
+    pub last_batch_events: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactiveProcessorSloStatus {
+    pub processor_name: String,
+    pub breached: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub lag_commits: u64,
+    pub max_allowed_lag_commits: Option<u64>,
+    pub stall_ms: Option<u64>,
+    pub max_allowed_stall_ms: Option<u64>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ReactiveProcessorRuntime {
+    stop: Arc<AtomicBool>,
+    join: JoinHandle<()>,
+    stats: Arc<AsyncMutex<ReactiveProcessorRuntimeStatus>>,
+}
+
+#[derive(Debug, Clone)]
+struct ReactiveProcessorRetryState {
+    events: Vec<EventOutboxRecord>,
+    last_seq: u64,
+    attempts: u32,
+    next_retry_at: Instant,
+    last_error: String,
+}
+
+#[derive(Debug, Clone)]
+struct ReactiveProcessorRegistration {
+    processor_name: String,
+    options: ReactiveProcessorOptions,
+    enabled: bool,
+    updated_at_micros: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +532,13 @@ pub struct OperationalMetrics {
     pub avg_prestage_validate_micros: u64,
     pub epoch_process_ops: u64,
     pub avg_epoch_process_micros: u64,
+    pub group_commit_filling_epochs: u64,
+    pub group_commit_flushing_epochs: u64,
+    pub group_commit_complete_epochs: u64,
+    pub group_commit_flush_reason_max_group_size: u64,
+    pub group_commit_flush_reason_max_group_delay: u64,
+    pub group_commit_flush_reason_ingress_drained: u64,
+    pub group_commit_flush_reason_structural_barrier: u64,
     pub durable_wait_ops: u64,
     pub avg_durable_wait_micros: u64,
     pub inflight_commits: usize,
@@ -258,6 +573,52 @@ pub struct TableInfo {
     pub column_count: u32,
     pub index_count: u32,
     pub row_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatorLag {
+    pub latest_order_key: u64,
+    pub last_applied_order_key: u64,
+    pub lag_orders: u64,
+    pub latest_seq: u64,
+    pub materialized_seq: u64,
+    pub lag_commits: u64,
+    pub unapplied_deltas: usize,
+    pub projector_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccumulatorExposureMetrics {
+    pub total_exposure: i64,
+    pub available: i64,
+    pub rejection_count: u64,
+    pub open_exposure_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventOutboxRecord {
+    pub commit_seq: u64,
+    pub ts_micros: u64,
+    pub project_id: String,
+    pub scope_id: String,
+    pub topic: String,
+    pub event_key: String,
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventStreamPage {
+    pub events: Vec<EventOutboxRecord>,
+    pub next_commit_seq: Option<u64>,
+    pub snapshot_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactiveProcessorLag {
+    pub processor_name: String,
+    pub checkpoint_seq: u64,
+    pub head_seq: u64,
+    pub lag_commits: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +690,32 @@ pub enum LifecycleEvent {
         project_id: String,
         scope_id: String,
         table_name: String,
+        seq: u64,
+    },
+    AccumulatorDeltaAppended {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        delta: i64,
+        dedupe_key: String,
+        order_key: u64,
+        release_exposure_id: Option<String>,
+        seq: u64,
+    },
+    AccumulatorExposureReserved {
+        project_id: String,
+        scope_id: String,
+        accumulator_name: String,
+        amount: i64,
+        exposure_id: String,
+        seq: u64,
+    },
+    AppEventEmitted {
+        project_id: String,
+        scope_id: String,
+        topic: String,
+        event_key: String,
+        payload_json: String,
         seq: u64,
     },
 }
@@ -501,8 +888,9 @@ pub trait RemoteBackupAdapter: Send + Sync {
 }
 
 struct SnapshotLease {
-    manager: Arc<Mutex<SnapshotManager>>,
-    handle: SnapshotHandle,
+    manager: Option<Arc<Mutex<SnapshotManager>>>,
+    handle: Option<SnapshotHandle>,
+    latest_inflight: Option<Arc<AtomicUsize>>,
     view: SnapshotReadView,
 }
 
@@ -620,8 +1008,14 @@ impl RecoveryCache {
 
 impl Drop for SnapshotLease {
     fn drop(&mut self) {
-        let mut mgr = self.manager.lock();
-        mgr.release(self.handle);
+        if let Some(inflight) = &self.latest_inflight {
+            inflight.fetch_sub(1, Ordering::AcqRel);
+        }
+        let (Some(manager), Some(handle)) = (&self.manager, self.handle) else {
+            return;
+        };
+        let mut mgr = manager.lock();
+        mgr.release(handle);
         let _ = mgr.gc();
     }
 }
@@ -744,6 +1138,7 @@ impl AedbInstance {
             executor,
             checkpoint_lock: Arc::new(AsyncMutex::new(())),
             snapshot_manager: Arc::new(Mutex::new(SnapshotManager::default())),
+            latest_snapshot_inflight: Arc::new(AtomicUsize::new(0)),
             recovery_cache: Arc::new(Mutex::new(RecoveryCache::default())),
             lifecycle_hooks: Arc::new(Mutex::new(Vec::new())),
             telemetry_hooks: Arc::new(Mutex::new(Vec::new())),
@@ -751,6 +1146,9 @@ impl AedbInstance {
             durable_wait_ops: Arc::new(AtomicU64::new(0)),
             durable_wait_micros: Arc::new(AtomicU64::new(0)),
             durable_ack_fsync_leader: Arc::new(AtomicBool::new(false)),
+            reactive_processor_ack_watermarks: Arc::new(Mutex::new(HashMap::new())),
+            reactive_processor_handlers: Arc::new(Mutex::new(HashMap::new())),
+            reactive_processor_runtimes: Arc::new(AsyncMutex::new(HashMap::new())),
             startup_recovery_micros,
             startup_recovered_seq,
         })
@@ -787,6 +1185,34 @@ impl AedbInstance {
         }
         crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
         let result = self.executor.submit_prevalidated(mutation).await;
+        self.emit_commit_telemetry(op_name, started, &result);
+        result
+    }
+
+    async fn commit_prevalidated_system_internal(
+        &self,
+        op_name: &'static str,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        let started = Instant::now();
+        crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
+        let result = self.executor.submit_prevalidated(mutation).await;
+        self.emit_commit_telemetry(op_name, started, &result);
+        result
+    }
+
+    async fn commit_envelope_prevalidated_internal(
+        &self,
+        op_name: &'static str,
+        envelope: TransactionEnvelope,
+    ) -> Result<CommitResult, AedbError> {
+        let started = Instant::now();
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required; use commit_as in secure mode".into(),
+            ));
+        }
+        let result = self.executor.submit_envelope_prevalidated(envelope).await;
         self.emit_commit_telemetry(op_name, started, &result);
         result
     }
@@ -948,6 +1374,34 @@ impl AedbInstance {
         Ok(result)
     }
 
+    pub async fn commit_action_envelope(
+        &self,
+        req: ActionEnvelopeRequest,
+    ) -> Result<ActionCommitResult, AedbError> {
+        let result = self
+            .commit_envelope(TransactionEnvelope {
+                caller: req.caller,
+                idempotency_key: Some(req.idempotency_key),
+                write_class: req.write_class,
+                assertions: req.assertions,
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: req.mutations,
+                },
+                base_seq: req.base_seq,
+            })
+            .await?;
+        let outcome = match result.idempotency {
+            IdempotencyOutcome::Applied => ActionCommitOutcome::Applied,
+            IdempotencyOutcome::Duplicate => ActionCommitOutcome::Duplicate,
+        };
+        Ok(ActionCommitResult {
+            commit_seq: result.commit_seq,
+            durable_head_seq: result.durable_head_seq,
+            outcome,
+        })
+    }
+
     pub async fn commit_envelope_with_finality(
         &self,
         envelope: TransactionEnvelope,
@@ -1054,8 +1508,8 @@ impl AedbInstance {
         &self,
         commit_seq: u64,
     ) -> Result<Vec<LifecycleEvent>, AedbError> {
-        let ns = namespace_key(crate::catalog::SYSTEM_PROJECT_ID, "app");
-        let table_key = (ns.clone(), "lifecycle_outbox".to_string());
+        let ns = namespace_key(crate::catalog::SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID);
+        let table_key = (ns.clone(), LIFECYCLE_OUTBOX_TABLE.to_string());
         let (snapshot, catalog, _) = self.executor.snapshot_state().await;
         let Some(schema) = catalog.tables.get(&table_key) else {
             return Ok(Vec::new());
@@ -1063,9 +1517,11 @@ impl AedbInstance {
         let Some(events_idx) = schema.columns.iter().position(|c| c.name == "events") else {
             return Ok(Vec::new());
         };
-        let Some(table) =
-            snapshot.table(crate::catalog::SYSTEM_PROJECT_ID, "app", "lifecycle_outbox")
-        else {
+        let Some(table) = snapshot.table(
+            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            LIFECYCLE_OUTBOX_TABLE,
+        ) else {
             return Ok(Vec::new());
         };
         let encoded_pk = EncodedKey::from_values(&[Value::Integer(commit_seq as i64)]);
@@ -1160,6 +1616,35 @@ impl AedbInstance {
         }
     }
 
+    fn maybe_log_read_phase(
+        &self,
+        op: &'static str,
+        consistency: ConsistencyMode,
+        snapshot_micros: u64,
+        execute_micros: u64,
+        units: usize,
+        ok: bool,
+    ) {
+        let total_micros = snapshot_micros.saturating_add(execute_micros);
+        if !should_log_read_phase(total_micros) {
+            return;
+        }
+        info!(
+            target: "aedb.read_phase",
+            operation = op,
+            total_us = total_micros,
+            total_ms = total_micros / 1_000,
+            snapshot_us = snapshot_micros,
+            snapshot_ms = snapshot_micros / 1_000,
+            execute_us = execute_micros,
+            execute_ms = execute_micros / 1_000,
+            units,
+            consistency = ?consistency,
+            ok,
+            "aedb read phase timing"
+        );
+    }
+
     pub async fn query(
         &self,
         project_id: &str,
@@ -1248,11 +1733,14 @@ impl AedbInstance {
             options.consistency = ConsistencyMode::AtSeq(token);
         }
 
+        let snapshot_started = Instant::now();
         let lease = self
             .acquire_snapshot(options.consistency)
             .await
             .map_err(QueryError::from)?;
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
         let started = Instant::now();
+        let execute_started = Instant::now();
         let table = query.table.clone();
         let result = execute_query_against_view(
             &lease.view,
@@ -1262,6 +1750,19 @@ impl AedbInstance {
             &options,
             caller,
             self._config.max_scan_rows,
+        );
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
+        let units = result
+            .as_ref()
+            .map(|res| res.rows_examined)
+            .unwrap_or_default();
+        self.maybe_log_read_phase(
+            "query_with_options",
+            options.consistency,
+            snapshot_micros,
+            execute_micros,
+            units,
+            result.is_ok(),
         );
         self.emit_query_telemetry(
             started,
@@ -2062,11 +2563,13 @@ impl AedbInstance {
         consistency: ConsistencyMode,
         caller: &CallerContext,
     ) -> Result<Option<KvEntry>, QueryError> {
-        ensure_query_caller_allowed(caller)?;
+        ensure_external_caller_allowed(caller)?;
+        let snapshot_started = Instant::now();
         let lease = self
             .acquire_snapshot(consistency)
             .await
             .map_err(QueryError::from)?;
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
         let snapshot = &lease.view.keyspace;
         let catalog = &lease.view.catalog;
         if !catalog.has_kv_read_permission(&caller.caller_id, project_id, scope_id, key) {
@@ -2075,7 +2578,18 @@ impl AedbInstance {
                 scope: caller.caller_id.clone(),
             });
         }
-        Ok(snapshot.kv_get(project_id, scope_id, key).cloned())
+        let execute_started = Instant::now();
+        let result = snapshot.kv_get(project_id, scope_id, key).cloned();
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
+        self.maybe_log_read_phase(
+            "kv_get",
+            consistency,
+            snapshot_micros,
+            execute_micros,
+            usize::from(result.is_some()),
+            true,
+        );
+        Ok(result)
     }
 
     pub async fn kv_get_default_scope(
@@ -2102,15 +2616,28 @@ impl AedbInstance {
         key: &[u8],
         consistency: ConsistencyMode,
     ) -> Result<Option<KvEntry>, QueryError> {
+        let snapshot_started = Instant::now();
         let lease = self
             .acquire_snapshot(consistency)
             .await
             .map_err(QueryError::from)?;
-        Ok(lease
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
+        let execute_started = Instant::now();
+        let result = lease
             .view
             .keyspace
             .kv_get(project_id, scope_id, key)
-            .cloned())
+            .cloned();
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
+        self.maybe_log_read_phase(
+            "kv_get",
+            consistency,
+            snapshot_micros,
+            execute_micros,
+            usize::from(result.is_some()),
+            true,
+        );
+        Ok(result)
     }
 
     pub async fn kv_get_no_auth(
@@ -2130,6 +2657,48 @@ impl AedbInstance {
             .await
     }
 
+    pub async fn kv_get_many_no_auth(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        keys: &[Vec<u8>],
+        consistency: ConsistencyMode,
+    ) -> Result<Vec<Option<KvEntry>>, QueryError> {
+        if self.require_authenticated_calls {
+            return Err(QueryError::PermissionDenied {
+                permission: "kv_get_many_no_auth is unavailable in secure mode".into(),
+                scope: "anonymous".into(),
+            });
+        }
+
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot_started = Instant::now();
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
+        let snapshot = &lease.view.keyspace;
+        let execute_started = Instant::now();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            out.push(snapshot.kv_get(project_id, scope_id, key).cloned());
+        }
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
+        self.maybe_log_read_phase(
+            "kv_get_many",
+            consistency,
+            snapshot_micros,
+            execute_micros,
+            keys.len(),
+            true,
+        );
+        Ok(out)
+    }
+
     pub(crate) async fn kv_scan_prefix_unchecked(
         &self,
         project_id: &str,
@@ -2138,14 +2707,17 @@ impl AedbInstance {
         limit: u64,
         consistency: ConsistencyMode,
     ) -> Result<Vec<(Vec<u8>, KvEntry)>, QueryError> {
+        let snapshot_started = Instant::now();
         let lease = self
             .acquire_snapshot(consistency)
             .await
             .map_err(QueryError::from)?;
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
         let page_size = limit.min(self._config.max_scan_rows as u64) as usize;
         let start_bound = Bound::Included(prefix.to_vec());
         let end_bound = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
         let ns = NamespaceId::project_scope(project_id, scope_id);
+        let execute_started = Instant::now();
         let mut entries = Vec::new();
         if let Some(kv) = lease.view.keyspace.namespaces.get(&ns).map(|n| &n.kv) {
             for (k, v) in kv.entries.range((start_bound, end_bound)) {
@@ -2158,6 +2730,15 @@ impl AedbInstance {
                 }
             }
         }
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
+        self.maybe_log_read_phase(
+            "kv_scan_prefix",
+            consistency,
+            snapshot_micros,
+            execute_micros,
+            entries.len(),
+            true,
+        );
         Ok(entries)
     }
 
@@ -2190,16 +2771,18 @@ impl AedbInstance {
         consistency: ConsistencyMode,
         caller: &CallerContext,
     ) -> Result<KvScanResult, QueryError> {
-        ensure_query_caller_allowed(caller)?;
+        ensure_external_caller_allowed(caller)?;
         let effective_consistency = if let Some(c) = &cursor {
             ConsistencyMode::AtSeq(c.snapshot_seq)
         } else {
             consistency
         };
+        let snapshot_started = Instant::now();
         let lease = self
             .acquire_snapshot(effective_consistency)
             .await
             .map_err(QueryError::from)?;
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
         let snapshot = &lease.view.keyspace;
         let catalog = &lease.view.catalog;
         let snapshot_seq = lease.view.seq;
@@ -2229,6 +2812,7 @@ impl AedbInstance {
         let end_bound = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
 
         let ns = NamespaceId::project_scope(project_id, scope_id);
+        let execute_started = Instant::now();
         let mut entries = Vec::new();
         if let Some(kv) = snapshot.namespaces.get(&ns).map(|n| &n.kv) {
             for (k, v) in kv.entries.range((start_bound, end_bound)) {
@@ -2253,6 +2837,7 @@ impl AedbInstance {
         if truncated {
             entries.truncate(page_size);
         }
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
         let next_cursor = if truncated {
             entries.last().map(|(k, _)| KvCursor {
                 snapshot_seq,
@@ -2267,6 +2852,16 @@ impl AedbInstance {
             cursor: next_cursor,
             snapshot_seq,
             truncated,
+        })
+        .inspect(|res| {
+            self.maybe_log_read_phase(
+                "kv_scan_prefix",
+                effective_consistency,
+                snapshot_micros,
+                execute_micros,
+                res.entries.len(),
+                true,
+            );
         })
     }
 
@@ -2303,16 +2898,18 @@ impl AedbInstance {
         consistency: ConsistencyMode,
         caller: &CallerContext,
     ) -> Result<KvScanResult, QueryError> {
-        ensure_query_caller_allowed(caller)?;
+        ensure_external_caller_allowed(caller)?;
         let effective_consistency = if let Some(c) = &cursor {
             ConsistencyMode::AtSeq(c.snapshot_seq)
         } else {
             consistency
         };
+        let snapshot_started = Instant::now();
         let lease = self
             .acquire_snapshot(effective_consistency)
             .await
             .map_err(QueryError::from)?;
+        let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
         let snapshot = &lease.view.keyspace;
         let catalog = &lease.view.catalog;
         let snapshot_seq = lease.view.seq;
@@ -2340,6 +2937,7 @@ impl AedbInstance {
         };
 
         let ns = NamespaceId::project_scope(project_id, scope_id);
+        let execute_started = Instant::now();
         let mut entries = Vec::new();
         if let Some(kv) = snapshot.namespaces.get(&ns).map(|n| &n.kv) {
             for (k, v) in kv.entries.range((adjusted_start, end)) {
@@ -2361,6 +2959,7 @@ impl AedbInstance {
         if truncated {
             entries.truncate(page_size);
         }
+        let execute_micros = execute_started.elapsed().as_micros() as u64;
         let next_cursor = if truncated {
             entries.last().map(|(k, _)| KvCursor {
                 snapshot_seq,
@@ -2376,6 +2975,16 @@ impl AedbInstance {
             snapshot_seq,
             truncated,
         })
+        .inspect(|res| {
+            self.maybe_log_read_phase(
+                "kv_scan_range",
+                effective_consistency,
+                snapshot_micros,
+                execute_micros,
+                res.entries.len(),
+                true,
+            );
+        })
     }
 
     pub async fn kv_scan_all_scopes(
@@ -2386,7 +2995,7 @@ impl AedbInstance {
         consistency: ConsistencyMode,
         caller: &CallerContext,
     ) -> Result<Vec<ScopedKvEntry>, QueryError> {
-        ensure_query_caller_allowed(caller)?;
+        ensure_external_caller_allowed(caller)?;
         let (_, catalog, _) = self.executor.snapshot_state().await;
         let project_read = catalog.has_permission(
             &caller.caller_id,
@@ -2600,6 +3209,2382 @@ impl AedbInstance {
         .await
     }
 
+    pub async fn kv_add_u64_ex(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+        on_overflow: KvU64OverflowPolicy,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvAddU64Ex {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            amount_be,
+            on_missing,
+            on_overflow,
+        })
+        .await
+    }
+
+    pub async fn kv_sub_u64_ex(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+        on_underflow: KvU64UnderflowPolicy,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvSubU64Ex {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            amount_be,
+            on_missing,
+            on_underflow,
+        })
+        .await
+    }
+
+    pub async fn kv_max_u64(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        candidate_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMaxU64 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            candidate_be,
+            on_missing,
+        })
+        .await
+    }
+
+    pub async fn kv_min_u64(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        candidate_be: [u8; 8],
+        on_missing: KvU64MissingPolicy,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMinU64 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            candidate_be,
+            on_missing,
+        })
+        .await
+    }
+
+    pub async fn kv_mutate_u64(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        op: KvU64MutatorOp,
+        operand_be: [u8; 8],
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMutateU64 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op,
+            operand_be,
+            expected_seq: None,
+        })
+        .await
+    }
+
+    pub async fn kv_mutate_u64_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        op: KvU64MutatorOp,
+        operand_be: [u8; 8],
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU64 {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                op,
+                operand_be,
+                expected_seq: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn counter_add_sharded(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        shard_count: u16,
+        shard_hint: u32,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::CounterAdd {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            amount_be,
+            shard_count,
+            shard_hint,
+        })
+        .await
+    }
+
+    pub async fn counter_add_sharded_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        shard_count: u16,
+        shard_hint: u32,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::CounterAdd {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                amount_be,
+                shard_count,
+                shard_hint,
+            },
+        )
+        .await
+    }
+
+    pub async fn counter_read_sharded(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: &[u8],
+        shard_count: u16,
+        consistency: ConsistencyMode,
+    ) -> Result<u64, AedbError> {
+        if shard_count == 0 {
+            return Err(AedbError::Validation(
+                "counter shard_count must be > 0".into(),
+            ));
+        }
+        if shard_count > MAX_COUNTER_SHARDS {
+            return Err(AedbError::Validation(format!(
+                "counter shard_count exceeds maximum {}",
+                MAX_COUNTER_SHARDS
+            )));
+        }
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        lease
+            .view
+            .keyspace
+            .counter_read_sharded(project_id, scope_id, key, shard_count)
+    }
+
+    pub async fn counter_read_sharded_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: &[u8],
+        shard_count: u16,
+        consistency: ConsistencyMode,
+    ) -> Result<u64, AedbError> {
+        if shard_count == 0 {
+            return Err(AedbError::Validation(
+                "counter shard_count must be > 0".into(),
+            ));
+        }
+        if shard_count > MAX_COUNTER_SHARDS {
+            return Err(AedbError::Validation(format!(
+                "counter shard_count exceeds maximum {}",
+                MAX_COUNTER_SHARDS
+            )));
+        }
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease
+            .view
+            .catalog
+            .has_kv_read_permission(&caller.caller_id, project_id, scope_id, key)
+        {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for counter",
+                caller.caller_id
+            )));
+        }
+        lease
+            .view
+            .keyspace
+            .counter_read_sharded(project_id, scope_id, key, shard_count)
+    }
+
+    pub async fn create_accumulator(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        dedupe_retain_commits: Option<u64>,
+        snapshot_every: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.create_accumulator_with_options(
+            project_id,
+            scope_id,
+            accumulator_name,
+            dedupe_retain_commits,
+            snapshot_every,
+            1_000,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_accumulator_with_options(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        dedupe_retain_commits: Option<u64>,
+        snapshot_every: u64,
+        exposure_margin_bps: u32,
+        exposure_ttl_commits: Option<u64>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::Ddl(DdlOperation::CreateAccumulator {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            accumulator_name: accumulator_name.to_string(),
+            if_not_exists: false,
+            value_type: AccumulatorValueType::BigInt,
+            dedupe_retain_commits,
+            snapshot_every,
+            exposure_margin_bps,
+            exposure_ttl_commits,
+        }))
+        .await
+    }
+
+    pub async fn create_accumulator_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        dedupe_retain_commits: Option<u64>,
+        snapshot_every: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.create_accumulator_with_options_as(
+            caller,
+            project_id,
+            scope_id,
+            accumulator_name,
+            dedupe_retain_commits,
+            snapshot_every,
+            1_000,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_accumulator_with_options_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        dedupe_retain_commits: Option<u64>,
+        snapshot_every: u64,
+        exposure_margin_bps: u32,
+        exposure_ttl_commits: Option<u64>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::Ddl(DdlOperation::CreateAccumulator {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                if_not_exists: false,
+                value_type: AccumulatorValueType::BigInt,
+                dedupe_retain_commits,
+                snapshot_every,
+                exposure_margin_bps,
+                exposure_ttl_commits,
+            }),
+        )
+        .await
+    }
+
+    pub async fn drop_accumulator(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::Ddl(DdlOperation::DropAccumulator {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            accumulator_name: accumulator_name.to_string(),
+            if_exists: true,
+        }))
+        .await
+    }
+
+    pub async fn drop_accumulator_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::Ddl(DdlOperation::DropAccumulator {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                if_exists: true,
+            }),
+        )
+        .await
+    }
+
+    pub async fn accumulate(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        delta: i64,
+        dedupe_key: String,
+        order_key: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.accumulate_with_release(
+            project_id,
+            scope_id,
+            accumulator_name,
+            delta,
+            dedupe_key,
+            order_key,
+            None,
+        )
+        .await
+    }
+
+    pub async fn accumulate_with_release(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        delta: i64,
+        dedupe_key: String,
+        order_key: u64,
+        release_exposure_id: Option<String>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::Accumulate {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            accumulator_name: accumulator_name.to_string(),
+            delta,
+            dedupe_key,
+            order_key,
+            release_exposure_id,
+        })
+        .await
+    }
+
+    pub async fn accumulate_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        delta: i64,
+        dedupe_key: String,
+        order_key: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.accumulate_with_release_as(
+            caller,
+            project_id,
+            scope_id,
+            accumulator_name,
+            delta,
+            dedupe_key,
+            order_key,
+            None,
+        )
+        .await
+    }
+
+    pub async fn accumulate_with_release_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        delta: i64,
+        dedupe_key: String,
+        order_key: u64,
+        release_exposure_id: Option<String>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::Accumulate {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                delta,
+                dedupe_key,
+                order_key,
+                release_exposure_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn expose_accumulator(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        amount: i64,
+        exposure_id: String,
+    ) -> Result<CommitResult, AedbError> {
+        if amount <= 0 {
+            return Err(AedbError::Validation("exposure amount must be > 0".into()));
+        }
+        if exposure_id.trim().is_empty() {
+            return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+        }
+        // EXPOSE is a hot-path primitive; prevalidated submit skips prestage mutation checks.
+        self.commit_prevalidated_internal(
+            "expose_accumulator",
+            Mutation::ExposeAccumulator {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                amount,
+                exposure_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn expose_accumulator_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        amount: i64,
+        exposure_id: String,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::ExposeAccumulator {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                amount,
+                exposure_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn expose_accumulator_with_preflight(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        amount: i64,
+        exposure_id: String,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_with_preflight(Mutation::ExposeAccumulator {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            accumulator_name: accumulator_name.to_string(),
+            amount,
+            exposure_id,
+        })
+        .await
+    }
+
+    pub async fn expose_accumulator_many_atomic(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        exposures: Vec<(i64, String)>,
+    ) -> Result<CommitResult, AedbError> {
+        if exposures.is_empty() {
+            return Err(AedbError::Validation(
+                "expose_accumulator_many_atomic requires at least one exposure".into(),
+            ));
+        }
+        for (amount, exposure_id) in &exposures {
+            if *amount <= 0 {
+                return Err(AedbError::Validation("exposure amount must be > 0".into()));
+            }
+            if exposure_id.trim().is_empty() {
+                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+            }
+        }
+        self.commit_envelope_prevalidated_internal(
+            "expose_accumulator_many_atomic",
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: ReadSet::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![Mutation::ExposeAccumulatorBatch {
+                        project_id: project_id.to_string(),
+                        scope_id: scope_id.to_string(),
+                        accumulator_name: accumulator_name.to_string(),
+                        exposures,
+                    }],
+                },
+                base_seq: 0,
+            },
+        )
+        .await
+    }
+
+    pub async fn expose_accumulator_many_atomic_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        exposures: Vec<(i64, String)>,
+    ) -> Result<CommitResult, AedbError> {
+        if exposures.is_empty() {
+            return Err(AedbError::Validation(
+                "expose_accumulator_many_atomic_as requires at least one exposure".into(),
+            ));
+        }
+        for (amount, exposure_id) in &exposures {
+            if *amount <= 0 {
+                return Err(AedbError::Validation("exposure amount must be > 0".into()));
+            }
+            if exposure_id.trim().is_empty() {
+                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+            }
+        }
+        self.commit_as(
+            caller,
+            Mutation::ExposeAccumulatorBatch {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                exposures,
+            },
+        )
+        .await
+    }
+
+    pub async fn release_accumulator_exposure(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        exposure_id: String,
+    ) -> Result<CommitResult, AedbError> {
+        if exposure_id.trim().is_empty() {
+            return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+        }
+        self.commit(Mutation::ReleaseAccumulatorExposure {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            accumulator_name: accumulator_name.to_string(),
+            exposure_id,
+        })
+        .await
+    }
+
+    pub async fn release_accumulator_exposure_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        exposure_id: String,
+    ) -> Result<CommitResult, AedbError> {
+        if exposure_id.trim().is_empty() {
+            return Err(AedbError::Validation("exposure_id cannot be empty".into()));
+        }
+        self.commit_as(
+            caller,
+            Mutation::ReleaseAccumulatorExposure {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                exposure_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn emit_event(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        topic: &str,
+        event_key: String,
+        payload_json: String,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::EmitEvent {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            topic: topic.to_string(),
+            event_key,
+            payload_json,
+        })
+        .await
+    }
+
+    pub async fn emit_event_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        topic: &str,
+        event_key: String,
+        payload_json: String,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::EmitEvent {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                topic: topic.to_string(),
+                event_key,
+                payload_json,
+            },
+        )
+        .await
+    }
+
+    pub async fn accumulator_value(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        Ok(acc.value)
+    }
+
+    pub async fn accumulator_value_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            accumulator_name.as_bytes(),
+        ) {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for accumulator",
+                caller.caller_id
+            )));
+        }
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        Ok(acc.value)
+    }
+
+    pub async fn accumulator_value_strong(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        if let Some(err) = &acc.projector_error {
+            return Err(AedbError::Validation(format!(
+                "accumulator projector unhealthy: {err}"
+            )));
+        }
+        let mut value = acc.value;
+        for (_, delta) in acc.deltas.range((
+            Bound::Excluded(acc.last_applied_order_key),
+            Bound::Unbounded,
+        )) {
+            value = value.checked_add(delta.delta).ok_or(AedbError::Overflow)?;
+        }
+        Ok(value)
+    }
+
+    pub async fn accumulator_value_strong_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            accumulator_name.as_bytes(),
+        ) {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for accumulator",
+                caller.caller_id
+            )));
+        }
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        if let Some(err) = &acc.projector_error {
+            return Err(AedbError::Validation(format!(
+                "accumulator projector unhealthy: {err}"
+            )));
+        }
+        let mut value = acc.value;
+        for (_, delta) in acc.deltas.range((
+            Bound::Excluded(acc.last_applied_order_key),
+            Bound::Unbounded,
+        )) {
+            value = value.checked_add(delta.delta).ok_or(AedbError::Overflow)?;
+        }
+        Ok(value)
+    }
+
+    pub async fn accumulator_lag(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<AccumulatorLag, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        let lag_orders = acc
+            .latest_order_key
+            .saturating_sub(acc.last_applied_order_key);
+        let lag_commits = acc.latest_seq.saturating_sub(acc.materialized_seq);
+        let unapplied_deltas = acc
+            .deltas
+            .range((
+                Bound::Excluded(acc.last_applied_order_key),
+                Bound::Unbounded,
+            ))
+            .count();
+        Ok(AccumulatorLag {
+            latest_order_key: acc.latest_order_key,
+            last_applied_order_key: acc.last_applied_order_key,
+            lag_orders,
+            latest_seq: acc.latest_seq,
+            materialized_seq: acc.materialized_seq,
+            lag_commits,
+            unapplied_deltas,
+            projector_error: acc.projector_error.clone(),
+        })
+    }
+
+    pub async fn accumulator_lag_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<AccumulatorLag, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            accumulator_name.as_bytes(),
+        ) {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for accumulator",
+                caller.caller_id
+            )));
+        }
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        let lag_orders = acc
+            .latest_order_key
+            .saturating_sub(acc.last_applied_order_key);
+        let lag_commits = acc.latest_seq.saturating_sub(acc.materialized_seq);
+        let unapplied_deltas = acc
+            .deltas
+            .range((
+                Bound::Excluded(acc.last_applied_order_key),
+                Bound::Unbounded,
+            ))
+            .count();
+        Ok(AccumulatorLag {
+            latest_order_key: acc.latest_order_key,
+            last_applied_order_key: acc.last_applied_order_key,
+            lag_orders,
+            latest_seq: acc.latest_seq,
+            materialized_seq: acc.materialized_seq,
+            lag_commits,
+            unapplied_deltas,
+            projector_error: acc.projector_error.clone(),
+        })
+    }
+
+    pub async fn accumulator_exposure(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        Ok(acc.total_exposure)
+    }
+
+    pub async fn accumulator_exposure_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            accumulator_name.as_bytes(),
+        ) {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for accumulator",
+                caller.caller_id
+            )));
+        }
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        Ok(acc.total_exposure)
+    }
+
+    pub async fn accumulator_available(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        let projected = self
+            .accumulator_value(project_id, scope_id, accumulator_name, consistency)
+            .await?;
+        let exposure = self
+            .accumulator_exposure(project_id, scope_id, accumulator_name, consistency)
+            .await?;
+        projected.checked_sub(exposure).ok_or(AedbError::Overflow)
+    }
+
+    pub async fn accumulator_available_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<i64, AedbError> {
+        let projected = self
+            .accumulator_value_as(caller, project_id, scope_id, accumulator_name, consistency)
+            .await?;
+        let exposure = self
+            .accumulator_exposure_as(caller, project_id, scope_id, accumulator_name, consistency)
+            .await?;
+        projected.checked_sub(exposure).ok_or(AedbError::Overflow)
+    }
+
+    pub async fn accumulator_exposure_metrics(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<AccumulatorExposureMetrics, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        let available = acc
+            .value
+            .checked_sub(acc.total_exposure)
+            .ok_or(AedbError::Overflow)?;
+        Ok(AccumulatorExposureMetrics {
+            total_exposure: acc.total_exposure,
+            available,
+            rejection_count: acc.exposure_rejections,
+            open_exposure_count: acc.open_exposures.len(),
+        })
+    }
+
+    pub async fn accumulator_exposure_metrics_as(
+        &self,
+        caller: &CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<AccumulatorExposureMetrics, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            accumulator_name.as_bytes(),
+        ) {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for accumulator",
+                caller.caller_id
+            )));
+        }
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        let available = acc
+            .value
+            .checked_sub(acc.total_exposure)
+            .ok_or(AedbError::Overflow)?;
+        Ok(AccumulatorExposureMetrics {
+            total_exposure: acc.total_exposure,
+            available,
+            rejection_count: acc.exposure_rejections,
+            open_exposure_count: acc.open_exposures.len(),
+        })
+    }
+
+    pub async fn read_event_stream(
+        &self,
+        topic_filter: Option<&str>,
+        from_commit_seq_exclusive: u64,
+        limit: usize,
+        consistency: ConsistencyMode,
+    ) -> Result<EventStreamPage, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        self.read_event_stream_internal(
+            topic_filter,
+            from_commit_seq_exclusive,
+            limit,
+            consistency,
+            None,
+        )
+        .await
+    }
+
+    pub async fn read_event_stream_as(
+        &self,
+        caller: &CallerContext,
+        topic_filter: Option<&str>,
+        from_commit_seq_exclusive: u64,
+        limit: usize,
+        consistency: ConsistencyMode,
+    ) -> Result<EventStreamPage, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        self.read_event_stream_internal(
+            topic_filter,
+            from_commit_seq_exclusive,
+            limit,
+            consistency,
+            Some(caller),
+        )
+        .await
+    }
+
+    async fn read_event_stream_internal(
+        &self,
+        topic_filter: Option<&str>,
+        from_commit_seq_exclusive: u64,
+        limit: usize,
+        consistency: ConsistencyMode,
+        caller: Option<&CallerContext>,
+    ) -> Result<EventStreamPage, AedbError> {
+        let lease = self.acquire_snapshot(consistency).await?;
+        let snapshot_seq = lease.view.seq;
+        if limit == 0 {
+            return Ok(EventStreamPage {
+                events: Vec::new(),
+                next_commit_seq: None,
+                snapshot_seq,
+            });
+        }
+        if let Some(caller) = caller {
+            let required = Permission::TableRead {
+                project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+                scope_id: SYSTEM_SCOPE_ID.to_string(),
+                table_name: EVENT_OUTBOX_TABLE.to_string(),
+            };
+            if !lease
+                .view
+                .catalog
+                .has_permission(&caller.caller_id, &required)
+            {
+                return Err(AedbError::PermissionDenied(format!(
+                    "caller={} missing table read permission for system event stream",
+                    caller.caller_id
+                )));
+            }
+        }
+        let Some(table) = lease.view.keyspace.table(
+            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            EVENT_OUTBOX_TABLE,
+        ) else {
+            return Ok(EventStreamPage {
+                events: Vec::new(),
+                next_commit_seq: None,
+                snapshot_seq,
+            });
+        };
+        let mut events = Vec::new();
+        let start_seq = from_commit_seq_exclusive.saturating_add(1);
+        let Ok(start_seq_i64) = i64::try_from(start_seq) else {
+            return Ok(EventStreamPage {
+                events: Vec::new(),
+                next_commit_seq: None,
+                snapshot_seq,
+            });
+        };
+        let start_key = EncodedKey::from_values(&[
+            Value::Integer(start_seq_i64),
+            Value::Text("".into()),
+            Value::Text("".into()),
+        ]);
+        for row in table
+            .rows
+            .range((Bound::Included(start_key), Bound::Unbounded))
+            .map(|(_, row)| row)
+        {
+            if events.len() >= limit {
+                break;
+            }
+            let (
+                Some(Value::Integer(commit_seq_i64)),
+                Some(Value::Timestamp(ts_i64)),
+                Some(Value::Text(project_id)),
+                Some(Value::Text(scope_id)),
+                Some(Value::Text(topic)),
+                Some(Value::Text(event_key)),
+                Some(Value::Json(payload)),
+            ) = (
+                row.values.first(),
+                row.values.get(1),
+                row.values.get(2),
+                row.values.get(3),
+                row.values.get(4),
+                row.values.get(5),
+                row.values.get(6),
+            )
+            else {
+                continue;
+            };
+            let Ok(commit_seq) = u64::try_from(*commit_seq_i64) else {
+                continue;
+            };
+            if let Some(filter_topic) = topic_filter
+                && topic.as_str() != filter_topic
+            {
+                continue;
+            }
+            let Ok(ts_micros) = u64::try_from(*ts_i64) else {
+                continue;
+            };
+            events.push(EventOutboxRecord {
+                commit_seq,
+                ts_micros,
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                topic: topic.to_string(),
+                event_key: event_key.to_string(),
+                payload_json: payload.to_string(),
+            });
+        }
+        let next_commit_seq = events.last().map(|e| e.commit_seq);
+        Ok(EventStreamPage {
+            events,
+            next_commit_seq,
+            snapshot_seq,
+        })
+    }
+
+    pub async fn ack_reactive_processor_checkpoint(
+        &self,
+        processor_name: &str,
+        checkpoint_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        self.commit_prevalidated_internal(
+            "ack_reactive_processor_checkpoint",
+            reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
+        )
+        .await
+    }
+
+    pub async fn ack_reactive_processor_checkpoint_as(
+        &self,
+        caller: CallerContext,
+        processor_name: &str,
+        checkpoint_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        ensure_external_caller_allowed(&caller)?;
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        self.commit_as(
+            caller,
+            reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
+        )
+        .await
+    }
+
+    pub async fn ack_reactive_processor_checkpoint_batched(
+        &self,
+        processor_name: &str,
+        checkpoint_seq: u64,
+        watermark_commits: u64,
+    ) -> Result<Option<CommitResult>, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        if watermark_commits == 0 {
+            return Err(AedbError::Validation(
+                "watermark_commits must be > 0".into(),
+            ));
+        }
+        let cache_key = ReactiveCheckpointAckCacheKey {
+            processor_name: processor_name.to_string(),
+            caller_id: None,
+        };
+        let should_persist = {
+            let cache = self.reactive_processor_ack_watermarks.lock();
+            let last_persisted = cache
+                .get(&cache_key)
+                .map(|s| s.last_persisted_seq)
+                .unwrap_or(0);
+            checkpoint_seq > last_persisted
+                && (last_persisted == 0
+                    || checkpoint_seq.saturating_sub(last_persisted) >= watermark_commits)
+        };
+        if !should_persist {
+            return Ok(None);
+        }
+        let committed = self
+            .commit_prevalidated_internal(
+                "ack_reactive_processor_checkpoint_batched",
+                reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
+            )
+            .await?;
+        {
+            let mut cache = self.reactive_processor_ack_watermarks.lock();
+            let state = cache.entry(cache_key).or_default();
+            state.last_persisted_seq = state.last_persisted_seq.max(checkpoint_seq);
+            state.last_touch_micros = system_now_micros();
+            prune_reactive_ack_cache(&mut cache);
+        }
+        Ok(Some(committed))
+    }
+
+    pub async fn ack_reactive_processor_checkpoint_batched_as(
+        &self,
+        caller: CallerContext,
+        processor_name: &str,
+        checkpoint_seq: u64,
+        watermark_commits: u64,
+    ) -> Result<Option<CommitResult>, AedbError> {
+        ensure_external_caller_allowed(&caller)?;
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        if watermark_commits == 0 {
+            return Err(AedbError::Validation(
+                "watermark_commits must be > 0".into(),
+            ));
+        }
+        let cache_key = ReactiveCheckpointAckCacheKey {
+            processor_name: processor_name.to_string(),
+            caller_id: Some(caller.caller_id.clone()),
+        };
+        let should_persist = {
+            let cache = self.reactive_processor_ack_watermarks.lock();
+            let last_persisted = cache
+                .get(&cache_key)
+                .map(|s| s.last_persisted_seq)
+                .unwrap_or(0);
+            checkpoint_seq > last_persisted
+                && (last_persisted == 0
+                    || checkpoint_seq.saturating_sub(last_persisted) >= watermark_commits)
+        };
+        if !should_persist {
+            return Ok(None);
+        }
+        let committed = self
+            .commit_as(
+                caller,
+                reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
+            )
+            .await?;
+        {
+            let mut cache = self.reactive_processor_ack_watermarks.lock();
+            let state = cache.entry(cache_key).or_default();
+            state.last_persisted_seq = state.last_persisted_seq.max(checkpoint_seq);
+            state.last_touch_micros = system_now_micros();
+            prune_reactive_ack_cache(&mut cache);
+        }
+        Ok(Some(committed))
+    }
+
+    pub async fn reactive_processor_lag(
+        &self,
+        processor_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<ReactiveProcessorLag, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        self.reactive_processor_lag_internal(processor_name, consistency, None)
+            .await
+    }
+
+    async fn reactive_processor_lag_internal(
+        &self,
+        processor_name: &str,
+        consistency: ConsistencyMode,
+        caller: Option<&CallerContext>,
+    ) -> Result<ReactiveProcessorLag, AedbError> {
+        let lease = self.acquire_snapshot(consistency).await?;
+        if let Some(caller) = caller {
+            let required = Permission::TableRead {
+                project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+                scope_id: SYSTEM_SCOPE_ID.to_string(),
+                table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+            };
+            if !lease
+                .view
+                .catalog
+                .has_permission(&caller.caller_id, &required)
+            {
+                return Err(AedbError::PermissionDenied(format!(
+                    "caller={} missing table read permission for reactive processor checkpoints",
+                    caller.caller_id
+                )));
+            }
+        }
+        let mut checkpoint_seq = 0u64;
+        if let Some(table) = lease.view.keyspace.table(
+            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
+        ) {
+            let pk = EncodedKey::from_values(&[Value::Text(processor_name.to_string().into())]);
+            if let Some(row) = table.rows.get(&pk)
+                && let Some(Value::Integer(v)) = row.values.get(1)
+            {
+                checkpoint_seq = u64::try_from(*v).unwrap_or(0);
+            }
+        }
+        let head_seq = lease.view.seq;
+        Ok(ReactiveProcessorLag {
+            processor_name: processor_name.to_string(),
+            checkpoint_seq,
+            head_seq,
+            lag_commits: head_seq.saturating_sub(checkpoint_seq),
+        })
+    }
+
+    pub async fn reactive_processor_lag_as(
+        &self,
+        caller: &CallerContext,
+        processor_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<ReactiveProcessorLag, AedbError> {
+        ensure_external_caller_allowed(caller)?;
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        self.reactive_processor_lag_internal(processor_name, consistency, Some(caller))
+            .await
+    }
+
+    pub async fn reactive_processor_runtime_status(
+        &self,
+        processor_name: &str,
+    ) -> Option<ReactiveProcessorRuntimeStatus> {
+        let (running, stats) = {
+            let runtimes = self.reactive_processor_runtimes.lock().await;
+            let runtime = runtimes.get(processor_name)?;
+            (true, Arc::clone(&runtime.stats))
+        };
+        let mut status = stats.lock().await.clone();
+        status.running = running;
+        Some(status)
+    }
+
+    pub async fn stop_reactive_processor(&self, processor_name: &str) -> Result<(), AedbError> {
+        self.pause_reactive_processor(processor_name).await
+    }
+
+    pub async fn pause_reactive_processor(&self, processor_name: &str) -> Result<(), AedbError> {
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        if let Some((options, _)) = self
+            .load_reactive_processor_registration(processor_name)
+            .await?
+        {
+            self.persist_reactive_processor_registration(processor_name, &options, false)
+                .await?;
+        }
+        let runtime = {
+            let mut runtimes = self.reactive_processor_runtimes.lock().await;
+            runtimes.remove(processor_name)
+        };
+        if let Some(runtime) = runtime {
+            runtime.stop.store(true, Ordering::Release);
+            runtime.join.abort();
+            let _ = runtime.join.await;
+        }
+        Ok(())
+    }
+
+    pub async fn resume_reactive_processor(
+        self: &Arc<Self>,
+        processor_name: &str,
+    ) -> Result<(), AedbError> {
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        {
+            let runtimes = self.reactive_processor_runtimes.lock().await;
+            if runtimes.contains_key(processor_name) {
+                return Ok(());
+            }
+        }
+        let registration = self
+            .load_reactive_processor_registration(processor_name)
+            .await?
+            .ok_or_else(|| AedbError::NotFound {
+                resource_type: ErrorResourceType::Table,
+                resource_id: format!(
+                    "{}.{}.{}:{}",
+                    crate::catalog::SYSTEM_PROJECT_ID,
+                    SYSTEM_SCOPE_ID,
+                    REACTIVE_PROCESSOR_REGISTRY_TABLE,
+                    processor_name
+                ),
+            })?;
+        let handler = {
+            let handlers = self.reactive_processor_handlers.lock();
+            handlers.get(processor_name).cloned().ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "reactive processor handler not registered: {processor_name}"
+                ))
+            })?
+        };
+        let (options, _) = registration;
+        self.start_reactive_processor_with_handler(processor_name, options, handler, true)
+            .await
+    }
+
+    pub async fn list_reactive_processors(
+        &self,
+        consistency: ConsistencyMode,
+    ) -> Result<Vec<ReactiveProcessorInfo>, AedbError> {
+        let mut registrations = self
+            .load_reactive_processor_registrations(consistency)
+            .await?;
+        registrations.sort_by(|a, b| a.processor_name.cmp(&b.processor_name));
+        let running_names: HashSet<String> = {
+            let runtimes = self.reactive_processor_runtimes.lock().await;
+            runtimes.keys().cloned().collect()
+        };
+        Ok(registrations
+            .into_iter()
+            .map(|r| ReactiveProcessorInfo {
+                running: running_names.contains(&r.processor_name),
+                processor_name: r.processor_name,
+                options: r.options,
+                enabled: r.enabled,
+                updated_at_micros: r.updated_at_micros,
+            })
+            .collect())
+    }
+
+    pub async fn reactive_processor_health(
+        &self,
+        processor_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<ReactiveProcessorHealth, AedbError> {
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        let registration = self
+            .load_reactive_processor_registration_record(processor_name, consistency)
+            .await?;
+        let runtime_status = self.reactive_processor_runtime_status(processor_name).await;
+        let lag = self
+            .reactive_processor_lag_internal(processor_name, consistency, None)
+            .await?;
+        let running = runtime_status.as_ref().map(|s| s.running).unwrap_or(false);
+        let enabled = registration.as_ref().map(|r| r.enabled).unwrap_or(running);
+        let status = runtime_status.unwrap_or_else(|| ReactiveProcessorRuntimeStatus {
+            processor_name: processor_name.to_string(),
+            running,
+            ..ReactiveProcessorRuntimeStatus::default()
+        });
+        Ok(ReactiveProcessorHealth {
+            processor_name: processor_name.to_string(),
+            enabled,
+            running,
+            checkpoint_seq: lag.checkpoint_seq,
+            head_seq: lag.head_seq,
+            lag_commits: lag.lag_commits,
+            runs_total: status.runs_total,
+            processed_events_total: status.processed_events_total,
+            failures_total: status.failures_total,
+            retries_total: status.retries_total,
+            dead_lettered_total: status.dead_lettered_total,
+            last_processed_seq: status.last_processed_seq,
+            last_error: status.last_error,
+            last_run_started_micros: status.last_run_started_micros,
+            last_run_completed_micros: status.last_run_completed_micros,
+            last_success_micros: status.last_success_micros,
+            last_failure_micros: status.last_failure_micros,
+            last_retry_micros: status.last_retry_micros,
+            last_sleep_ms: status.last_sleep_ms,
+            last_batch_events: status.last_batch_events,
+        })
+    }
+
+    pub async fn reactive_processor_slo_status(
+        &self,
+        processor_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<ReactiveProcessorSloStatus, AedbError> {
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        let registration = self
+            .load_reactive_processor_registration_record(processor_name, consistency)
+            .await?
+            .ok_or_else(|| AedbError::NotFound {
+                resource_type: ErrorResourceType::Table,
+                resource_id: format!(
+                    "{}.{}.{}:{}",
+                    crate::catalog::SYSTEM_PROJECT_ID,
+                    SYSTEM_SCOPE_ID,
+                    REACTIVE_PROCESSOR_REGISTRY_TABLE,
+                    processor_name
+                ),
+            })?;
+        let health = self
+            .reactive_processor_health(processor_name, consistency)
+            .await?;
+        Ok(Self::build_reactive_processor_slo_status(
+            &registration.options,
+            health,
+        ))
+    }
+
+    pub async fn list_reactive_processor_slo_statuses(
+        &self,
+        consistency: ConsistencyMode,
+    ) -> Result<Vec<ReactiveProcessorSloStatus>, AedbError> {
+        let infos = self.list_reactive_processors(consistency).await?;
+        let mut out = Vec::with_capacity(infos.len());
+        for info in infos {
+            let health = self
+                .reactive_processor_health(&info.processor_name, consistency)
+                .await?;
+            out.push(Self::build_reactive_processor_slo_status(
+                &info.options,
+                health,
+            ));
+        }
+        out.sort_by(|a, b| a.processor_name.cmp(&b.processor_name));
+        Ok(out)
+    }
+
+    pub async fn enforce_reactive_processor_slos(
+        &self,
+        consistency: ConsistencyMode,
+    ) -> Result<(), AedbError> {
+        let statuses = self
+            .list_reactive_processor_slo_statuses(consistency)
+            .await?;
+        let breaches: Vec<ReactiveProcessorSloStatus> =
+            statuses.into_iter().filter(|s| s.breached).collect();
+        if breaches.is_empty() {
+            return Ok(());
+        }
+        let details = breaches
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}: {}",
+                    s.processor_name,
+                    if s.reasons.is_empty() {
+                        "unknown breach".to_string()
+                    } else {
+                        s.reasons.join("; ")
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Err(AedbError::Unavailable {
+            message: format!("reactive processor SLO breach: {details}"),
+        })
+    }
+
+    pub async fn start_reactive_processor<F, Fut>(
+        self: &Arc<Self>,
+        processor_name: &str,
+        options: ReactiveProcessorOptions,
+        handler: F,
+    ) -> Result<(), AedbError>
+    where
+        F: Fn(Arc<AedbInstance>, Vec<EventOutboxRecord>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), AedbError>> + Send + 'static,
+    {
+        let handler: ReactiveProcessorHandler =
+            Arc::new(move |db, events| Box::pin(handler(db, events)));
+        self.start_reactive_processor_with_handler(processor_name, options, handler, true)
+            .await
+    }
+
+    pub async fn register_reactive_processor_handler<F, Fut>(
+        self: &Arc<Self>,
+        processor_name: &str,
+        handler: F,
+    ) -> Result<bool, AedbError>
+    where
+        F: Fn(Arc<AedbInstance>, Vec<EventOutboxRecord>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), AedbError>> + Send + 'static,
+    {
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        let handler: ReactiveProcessorHandler =
+            Arc::new(move |db, events| Box::pin(handler(db, events)));
+        self.reactive_processor_handlers
+            .lock()
+            .insert(processor_name.to_string(), Arc::clone(&handler));
+        let Some((options, enabled)) = self
+            .load_reactive_processor_registration(processor_name)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if !enabled {
+            return Ok(false);
+        }
+        {
+            let runtimes = self.reactive_processor_runtimes.lock().await;
+            if runtimes.contains_key(processor_name) {
+                return Ok(false);
+            }
+        }
+        self.start_reactive_processor_with_handler(processor_name, options, handler, false)
+            .await?;
+        Ok(true)
+    }
+
+    async fn start_reactive_processor_with_handler(
+        self: &Arc<Self>,
+        processor_name: &str,
+        options: ReactiveProcessorOptions,
+        handler: ReactiveProcessorHandler,
+        persist_registry: bool,
+    ) -> Result<(), AedbError> {
+        if processor_name.trim().is_empty() {
+            return Err(AedbError::Validation(
+                "processor_name cannot be empty".into(),
+            ));
+        }
+        if options.max_events_per_run == 0
+            || options.max_bytes_per_run == 0
+            || options.max_run_duration_ms == 0
+            || options.run_interval_ms == 0
+            || options.idle_backoff_ms == 0
+            || options.checkpoint_watermark_commits == 0
+            || (options.max_retries > 0 && options.retry_backoff_ms == 0)
+        {
+            return Err(AedbError::Validation(
+                "reactive processor options must be > 0".into(),
+            ));
+        }
+        let caller = if let Some(raw) = options.caller_id.as_ref() {
+            let caller = CallerContext::new(raw.clone());
+            ensure_external_caller_allowed(&caller)?;
+            Some(caller)
+        } else if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "reactive processor caller_id required in secure mode".into(),
+            ));
+        } else {
+            None
+        };
+        if persist_registry {
+            self.persist_reactive_processor_registration(processor_name, &options, true)
+                .await?;
+        }
+        // Seed checkpoint state so caller-scoped ACKs never race a missing internal table.
+        let _ = self
+            .commit_prevalidated_system_internal(
+                "init_reactive_processor_checkpoint",
+                reactive_processor_checkpoint_mutation(processor_name, 0),
+            )
+            .await?;
+        let stats = Arc::new(AsyncMutex::new(ReactiveProcessorRuntimeStatus {
+            processor_name: processor_name.to_string(),
+            running: true,
+            ..ReactiveProcessorRuntimeStatus::default()
+        }));
+        {
+            let runtimes = self.reactive_processor_runtimes.lock().await;
+            if runtimes.contains_key(processor_name) {
+                return Err(AedbError::Validation(format!(
+                    "reactive processor already running: {processor_name}"
+                )));
+            }
+        }
+        let weak = Arc::downgrade(self);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_loop = Arc::clone(&stop);
+        let processor_name_owned = processor_name.to_string();
+        let options_owned = options.clone();
+        let caller_owned = caller.clone();
+        let stats_loop = Arc::clone(&stats);
+        let handler_loop = Arc::clone(&handler);
+        let join = tokio::spawn(async move {
+            let mut retry: Option<ReactiveProcessorRetryState> = None;
+            loop {
+                if stop_loop.load(Ordering::Acquire) {
+                    break;
+                }
+                let loop_started_micros = system_now_micros();
+                let Some(db) = weak.upgrade() else {
+                    break;
+                };
+                let mut sleep_ms = options_owned.idle_backoff_ms;
+                let mut add_processed = 0u64;
+                let mut add_failures = 0u64;
+                let mut add_retries = 0u64;
+                let mut add_dead_lettered = 0u64;
+                let mut last_processed_seq = 0u64;
+                let mut last_error: Option<String> = None;
+
+                if let Some(pending) = retry.as_mut() {
+                    if Instant::now() < pending.next_retry_at {
+                        let wait_ms = (pending.next_retry_at - Instant::now()).as_millis() as u64;
+                        sleep_ms = wait_ms.max(1).min(options_owned.idle_backoff_ms.max(1));
+                    } else {
+                        match AedbInstance::process_reactive_processor_batch(
+                            Arc::clone(&db),
+                            &processor_name_owned,
+                            caller_owned.as_ref(),
+                            &options_owned,
+                            &handler_loop,
+                            pending.events.clone(),
+                            pending.last_seq,
+                        )
+                        .await
+                        {
+                            Ok((processed, last_seq)) => {
+                                add_processed = processed;
+                                last_processed_seq = last_seq;
+                                last_error = None;
+                                retry = None;
+                                sleep_ms = options_owned.run_interval_ms;
+                            }
+                            Err(err) => {
+                                add_failures = 1;
+                                last_error = Some(err.to_string());
+                                if pending.attempts >= options_owned.max_retries {
+                                    let exhausted = pending.clone();
+                                    let _ = db
+                                        .dead_letter_reactive_processor_batch(
+                                            &processor_name_owned,
+                                            caller_owned.as_ref(),
+                                            &exhausted.events,
+                                            &err.to_string(),
+                                            exhausted.attempts.saturating_add(1),
+                                        )
+                                        .await;
+                                    let _ = if let Some(caller) = caller_owned.as_ref() {
+                                        db.ack_reactive_processor_checkpoint_batched_as(
+                                            caller.clone(),
+                                            &processor_name_owned,
+                                            exhausted.last_seq,
+                                            options_owned.checkpoint_watermark_commits,
+                                        )
+                                        .await
+                                    } else {
+                                        db.ack_reactive_processor_checkpoint_batched(
+                                            &processor_name_owned,
+                                            exhausted.last_seq,
+                                            options_owned.checkpoint_watermark_commits,
+                                        )
+                                        .await
+                                    };
+                                    add_dead_lettered = exhausted.events.len() as u64;
+                                    last_processed_seq = exhausted.last_seq;
+                                    retry = None;
+                                    sleep_ms = options_owned.run_interval_ms;
+                                } else {
+                                    pending.attempts = pending.attempts.saturating_add(1);
+                                    let exp = pending.attempts.saturating_sub(1).min(8);
+                                    let backoff =
+                                        options_owned.retry_backoff_ms.saturating_mul(1u64 << exp);
+                                    pending.last_error = err.to_string();
+                                    pending.next_retry_at =
+                                        Instant::now() + Duration::from_millis(backoff.max(1));
+                                    add_retries = 1;
+                                    sleep_ms = backoff.max(1);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    match AedbInstance::fetch_reactive_processor_batch(
+                        Arc::clone(&db),
+                        &processor_name_owned,
+                        caller_owned.as_ref(),
+                        &options_owned,
+                    )
+                    .await
+                    {
+                        Ok(events) if events.is_empty() => {
+                            if options_owned.run_on_interval {
+                                match AedbInstance::process_reactive_processor_batch(
+                                    Arc::clone(&db),
+                                    &processor_name_owned,
+                                    caller_owned.as_ref(),
+                                    &options_owned,
+                                    &handler_loop,
+                                    Vec::new(),
+                                    0,
+                                )
+                                .await
+                                {
+                                    Ok((_, _)) => {
+                                        last_error = None;
+                                        sleep_ms = options_owned.run_interval_ms;
+                                    }
+                                    Err(err) => {
+                                        add_failures = 1;
+                                        last_error = Some(err.to_string());
+                                        if options_owned.max_retries > 0 {
+                                            add_retries = 1;
+                                            let backoff = options_owned.retry_backoff_ms.max(1);
+                                            retry = Some(ReactiveProcessorRetryState {
+                                                events: Vec::new(),
+                                                last_seq: 0,
+                                                attempts: 1,
+                                                next_retry_at: Instant::now()
+                                                    + Duration::from_millis(backoff),
+                                                last_error: err.to_string(),
+                                            });
+                                            sleep_ms = backoff;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(events) => {
+                            let last_seq = events.last().map(|e| e.commit_seq).unwrap_or(0);
+                            match AedbInstance::process_reactive_processor_batch(
+                                Arc::clone(&db),
+                                &processor_name_owned,
+                                caller_owned.as_ref(),
+                                &options_owned,
+                                &handler_loop,
+                                events.clone(),
+                                last_seq,
+                            )
+                            .await
+                            {
+                                Ok((processed, seq)) => {
+                                    add_processed = processed;
+                                    last_processed_seq = seq;
+                                    sleep_ms = options_owned.run_interval_ms;
+                                }
+                                Err(err) => {
+                                    add_failures = 1;
+                                    last_error = Some(err.to_string());
+                                    if options_owned.max_retries == 0 {
+                                        let _ = db
+                                            .dead_letter_reactive_processor_batch(
+                                                &processor_name_owned,
+                                                caller_owned.as_ref(),
+                                                &events,
+                                                &err.to_string(),
+                                                1,
+                                            )
+                                            .await;
+                                        let _ = if let Some(caller) = caller_owned.as_ref() {
+                                            db.ack_reactive_processor_checkpoint_batched_as(
+                                                caller.clone(),
+                                                &processor_name_owned,
+                                                last_seq,
+                                                options_owned.checkpoint_watermark_commits,
+                                            )
+                                            .await
+                                        } else {
+                                            db.ack_reactive_processor_checkpoint_batched(
+                                                &processor_name_owned,
+                                                last_seq,
+                                                options_owned.checkpoint_watermark_commits,
+                                            )
+                                            .await
+                                        };
+                                        add_dead_lettered = events.len() as u64;
+                                        last_processed_seq = last_seq;
+                                        sleep_ms = options_owned.run_interval_ms;
+                                    } else {
+                                        add_retries = 1;
+                                        let backoff = options_owned.retry_backoff_ms.max(1);
+                                        retry = Some(ReactiveProcessorRetryState {
+                                            events,
+                                            last_seq,
+                                            attempts: 1,
+                                            next_retry_at: Instant::now()
+                                                + Duration::from_millis(backoff),
+                                            last_error: err.to_string(),
+                                        });
+                                        sleep_ms = backoff;
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            add_failures = 1;
+                            last_error = Some(err.to_string());
+                        }
+                    }
+                }
+
+                {
+                    let mut s = stats_loop.lock().await;
+                    s.last_run_started_micros = Some(loop_started_micros);
+                    s.runs_total = s.runs_total.saturating_add(1);
+                    s.processed_events_total =
+                        s.processed_events_total.saturating_add(add_processed);
+                    s.failures_total = s.failures_total.saturating_add(add_failures);
+                    s.retries_total = s.retries_total.saturating_add(add_retries);
+                    s.dead_lettered_total = s.dead_lettered_total.saturating_add(add_dead_lettered);
+                    s.last_sleep_ms = sleep_ms;
+                    s.last_batch_events = add_processed.saturating_add(add_dead_lettered);
+                    if last_processed_seq > 0 {
+                        s.last_processed_seq = s.last_processed_seq.max(last_processed_seq);
+                    }
+                    if let Some(err) = last_error {
+                        s.last_error = Some(err);
+                    } else if add_processed > 0 || add_dead_lettered > 0 {
+                        s.last_error = None;
+                    }
+                    let now = system_now_micros();
+                    s.last_run_completed_micros = Some(now);
+                    if add_processed > 0 || add_dead_lettered > 0 {
+                        s.last_success_micros = Some(now);
+                    }
+                    if add_failures > 0 {
+                        s.last_failure_micros = Some(now);
+                    }
+                    if add_retries > 0 {
+                        s.last_retry_micros = Some(now);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            }
+            let Some(db) = weak.upgrade() else {
+                return;
+            };
+            if let Some(runtime) =
+                db.reactive_processor_runtimes
+                    .try_lock()
+                    .ok()
+                    .and_then(|runtimes| {
+                        runtimes
+                            .get(&processor_name_owned)
+                            .map(|r| Arc::clone(&r.stats))
+                    })
+            {
+                let mut s = runtime.lock().await;
+                s.running = false;
+            }
+        });
+
+        let mut runtimes = self.reactive_processor_runtimes.lock().await;
+        if runtimes.contains_key(processor_name) {
+            stop.store(true, Ordering::Release);
+            join.abort();
+            return Err(AedbError::Validation(format!(
+                "reactive processor already running: {processor_name}"
+            )));
+        }
+        self.reactive_processor_handlers
+            .lock()
+            .insert(processor_name.to_string(), handler);
+        runtimes.insert(
+            processor_name.to_string(),
+            ReactiveProcessorRuntime { stop, join, stats },
+        );
+        Ok(())
+    }
+
+    async fn persist_reactive_processor_registration(
+        &self,
+        processor_name: &str,
+        options: &ReactiveProcessorOptions,
+        enabled: bool,
+    ) -> Result<CommitResult, AedbError> {
+        let mutation = reactive_processor_registry_mutation(processor_name, options, enabled)?;
+        self.commit_prevalidated_system_internal(
+            "persist_reactive_processor_registration",
+            mutation,
+        )
+        .await
+    }
+
+    async fn load_reactive_processor_registration(
+        &self,
+        processor_name: &str,
+    ) -> Result<Option<(ReactiveProcessorOptions, bool)>, AedbError> {
+        self.load_reactive_processor_registration_record(processor_name, ConsistencyMode::AtLatest)
+            .await
+            .map(|opt| opt.map(|r| (r.options, r.enabled)))
+    }
+
+    async fn load_reactive_processor_registration_record(
+        &self,
+        processor_name: &str,
+        consistency: ConsistencyMode,
+    ) -> Result<Option<ReactiveProcessorRegistration>, AedbError> {
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(table) = lease.view.keyspace.table(
+            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            REACTIVE_PROCESSOR_REGISTRY_TABLE,
+        ) else {
+            return Ok(None);
+        };
+        let pk = EncodedKey::from_values(&[Value::Text(processor_name.to_string().into())]);
+        let Some(row) = table.rows.get(&pk) else {
+            return Ok(None);
+        };
+        Self::decode_reactive_processor_registration_row(row)
+    }
+
+    async fn load_reactive_processor_registrations(
+        &self,
+        consistency: ConsistencyMode,
+    ) -> Result<Vec<ReactiveProcessorRegistration>, AedbError> {
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(table) = lease.view.keyspace.table(
+            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            REACTIVE_PROCESSOR_REGISTRY_TABLE,
+        ) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::with_capacity(table.rows.len());
+        for row in table.rows.values() {
+            out.push(
+                Self::decode_reactive_processor_registration_row(row)?.ok_or_else(|| {
+                    AedbError::Validation(
+                        "reactive processor registry row missing processor_name".into(),
+                    )
+                })?,
+            );
+        }
+        Ok(out)
+    }
+
+    fn decode_reactive_processor_registration_row(
+        row: &Row,
+    ) -> Result<Option<ReactiveProcessorRegistration>, AedbError> {
+        let Some(Value::Text(processor_name)) = row.values.first() else {
+            return Ok(None);
+        };
+        let Some(Value::Json(options_json)) = row.values.get(1) else {
+            return Err(AedbError::Validation(
+                "reactive processor registry options missing".into(),
+            ));
+        };
+        let Some(Value::Boolean(enabled)) = row.values.get(2) else {
+            return Err(AedbError::Validation(
+                "reactive processor registry enabled flag missing".into(),
+            ));
+        };
+        let updated_at_micros = match row.values.get(3) {
+            Some(Value::Timestamp(v)) => u64::try_from(*v).unwrap_or(0),
+            _ => 0,
+        };
+        let options: ReactiveProcessorOptions =
+            serde_json::from_str(options_json).map_err(|e| AedbError::Validation(e.to_string()))?;
+        Ok(Some(ReactiveProcessorRegistration {
+            processor_name: processor_name.to_string(),
+            options,
+            enabled: *enabled,
+            updated_at_micros,
+        }))
+    }
+
+    fn build_reactive_processor_slo_status(
+        options: &ReactiveProcessorOptions,
+        health: ReactiveProcessorHealth,
+    ) -> ReactiveProcessorSloStatus {
+        let now = system_now_micros();
+        let reference_ts = health
+            .last_success_micros
+            .or(health.last_run_completed_micros);
+        let stall_ms = reference_ts.map(|ts| now.saturating_sub(ts) / 1_000);
+        let mut reasons = Vec::new();
+        let mut breached = false;
+        if health.enabled {
+            if let Some(max_lag) = options.max_allowed_lag_commits
+                && health.lag_commits > max_lag
+            {
+                breached = true;
+                reasons.push(format!(
+                    "lag_commits={} exceeds max_allowed_lag_commits={}",
+                    health.lag_commits, max_lag
+                ));
+            }
+            if let Some(max_stall) = options.max_allowed_stall_ms {
+                match stall_ms {
+                    Some(stall) if stall > max_stall => {
+                        breached = true;
+                        reasons.push(format!(
+                            "stall_ms={} exceeds max_allowed_stall_ms={}",
+                            stall, max_stall
+                        ));
+                    }
+                    None => {
+                        breached = true;
+                        reasons.push(
+                            "stall_ms unavailable; processor has not produced a completed run"
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ReactiveProcessorSloStatus {
+            processor_name: health.processor_name.clone(),
+            breached,
+            enabled: health.enabled,
+            running: health.running,
+            lag_commits: health.lag_commits,
+            max_allowed_lag_commits: options.max_allowed_lag_commits,
+            stall_ms,
+            max_allowed_stall_ms: options.max_allowed_stall_ms,
+            reasons,
+        }
+    }
+
+    async fn fetch_reactive_processor_batch(
+        db: Arc<Self>,
+        processor_name: &str,
+        caller: Option<&CallerContext>,
+        options: &ReactiveProcessorOptions,
+    ) -> Result<Vec<EventOutboxRecord>, AedbError> {
+        let lag = if let Some(caller) = caller {
+            db.reactive_processor_lag_as(caller, processor_name, ConsistencyMode::AtLatest)
+                .await?
+        } else {
+            db.reactive_processor_lag(processor_name, ConsistencyMode::AtLatest)
+                .await?
+        };
+        let mut from_seq = lag.checkpoint_seq;
+        let deadline = Instant::now() + Duration::from_millis(options.max_run_duration_ms);
+        let mut events = Vec::new();
+        let mut bytes = 0usize;
+        'read: while events.len() < options.max_events_per_run
+            && bytes < options.max_bytes_per_run
+            && Instant::now() < deadline
+        {
+            let limit = (options.max_events_per_run - events.len()).min(128).max(1);
+            let page = if let Some(caller) = caller {
+                db.read_event_stream_as(
+                    caller,
+                    options.topic_filter.as_deref(),
+                    from_seq,
+                    limit,
+                    ConsistencyMode::AtLatest,
+                )
+                .await?
+            } else {
+                db.read_event_stream(
+                    options.topic_filter.as_deref(),
+                    from_seq,
+                    limit,
+                    ConsistencyMode::AtLatest,
+                )
+                .await?
+            };
+            if page.events.is_empty() {
+                break;
+            }
+            for event in page.events {
+                let approx_bytes =
+                    event.payload_json.len() + event.topic.len() + event.event_key.len() + 64;
+                if !events.is_empty()
+                    && bytes.saturating_add(approx_bytes) > options.max_bytes_per_run
+                {
+                    break 'read;
+                }
+                bytes = bytes.saturating_add(approx_bytes);
+                from_seq = event.commit_seq;
+                events.push(event);
+                if events.len() >= options.max_events_per_run
+                    || bytes >= options.max_bytes_per_run
+                    || Instant::now() >= deadline
+                {
+                    break 'read;
+                }
+            }
+            if page.next_commit_seq.is_none() {
+                break;
+            }
+        }
+        Ok(events)
+    }
+
+    async fn process_reactive_processor_batch(
+        db: Arc<Self>,
+        processor_name: &str,
+        caller: Option<&CallerContext>,
+        options: &ReactiveProcessorOptions,
+        handler: &ReactiveProcessorHandler,
+        events: Vec<EventOutboxRecord>,
+        last_seq: u64,
+    ) -> Result<(u64, u64), AedbError> {
+        if events.is_empty() {
+            handler(Arc::clone(&db), events).await?;
+            return Ok((0, last_seq));
+        }
+        let processed = events.len() as u64;
+        handler(Arc::clone(&db), events).await?;
+        let _ = if let Some(caller) = caller {
+            db.ack_reactive_processor_checkpoint_batched_as(
+                caller.clone(),
+                processor_name,
+                last_seq,
+                options.checkpoint_watermark_commits,
+            )
+            .await?
+        } else {
+            db.ack_reactive_processor_checkpoint_batched(
+                processor_name,
+                last_seq,
+                options.checkpoint_watermark_commits,
+            )
+            .await?
+        };
+        Ok((processed, last_seq))
+    }
+
+    async fn dead_letter_reactive_processor_batch(
+        &self,
+        processor_name: &str,
+        caller: Option<&CallerContext>,
+        events: &[EventOutboxRecord],
+        error: &str,
+        attempts: u32,
+    ) -> Result<CommitResult, AedbError> {
+        let mutation = reactive_processor_dlq_mutation(processor_name, events, error, attempts);
+        if let Some(caller) = caller {
+            self.commit_as(caller.clone(), mutation).await
+        } else {
+            self.commit_prevalidated_system_internal("reactive_processor_dead_letter", mutation)
+                .await
+        }
+    }
+
     pub async fn kv_compare_and_swap(
         &self,
         project_id: &str,
@@ -2673,27 +5658,98 @@ impl AedbInstance {
         amount_be: [u8; 32],
         expected_seq: u64,
     ) -> Result<CommitResult, AedbError> {
-        self.commit_envelope(TransactionEnvelope {
-            caller: None,
-            idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::KeyVersion {
+        self.commit(Mutation::KvMutateU256 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op: KvU256MutatorOp::Add,
+            operand_be: amount_be,
+            expected_seq: Some(expected_seq),
+        })
+        .await
+    }
+
+    pub async fn kv_compare_and_add_u64(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMutateU64 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op: KvU64MutatorOp::Add,
+            operand_be: amount_be,
+            expected_seq: Some(expected_seq),
+        })
+        .await
+    }
+
+    pub async fn kv_compare_and_add_u64_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU64 {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
-                key: key.clone(),
-                expected_seq,
-            }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
-                mutations: vec![Mutation::KvIncU256 {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    key,
-                    amount_be,
-                }],
+                key,
+                op: KvU64MutatorOp::Add,
+                operand_be: amount_be,
+                expected_seq: Some(expected_seq),
             },
-            base_seq: self.snapshot_probe(ConsistencyMode::AtLatest).await?,
+        )
+        .await
+    }
+
+    pub async fn kv_compare_and_set_u64(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        value_be: [u8; 8],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMutateU64 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op: KvU64MutatorOp::Set,
+            operand_be: value_be,
+            expected_seq: Some(expected_seq),
         })
+        .await
+    }
+
+    pub async fn kv_compare_and_set_u64_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        value_be: [u8; 8],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU64 {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                op: KvU64MutatorOp::Set,
+                operand_be: value_be,
+                expected_seq: Some(expected_seq),
+            },
+        )
         .await
     }
 
@@ -2706,26 +5762,35 @@ impl AedbInstance {
         amount_be: [u8; 32],
         expected_seq: u64,
     ) -> Result<CommitResult, AedbError> {
-        self.commit_envelope(TransactionEnvelope {
-            caller: Some(caller),
-            idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::KeyVersion {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU256 {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
-                key: key.clone(),
-                expected_seq,
-            }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
-                mutations: vec![Mutation::KvIncU256 {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    key,
-                    amount_be,
-                }],
+                key,
+                op: KvU256MutatorOp::Add,
+                operand_be: amount_be,
+                expected_seq: Some(expected_seq),
             },
-            base_seq: self.snapshot_probe(ConsistencyMode::AtLatest).await?,
+        )
+        .await
+    }
+
+    pub async fn kv_compare_and_set_u256(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        value_be: [u8; 32],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMutateU256 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op: KvU256MutatorOp::Set,
+            operand_be: value_be,
+            expected_seq: Some(expected_seq),
         })
         .await
     }
@@ -2738,27 +5803,121 @@ impl AedbInstance {
         amount_be: [u8; 32],
         expected_seq: u64,
     ) -> Result<CommitResult, AedbError> {
-        self.commit_envelope(TransactionEnvelope {
-            caller: None,
-            idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::KeyVersion {
+        self.commit(Mutation::KvMutateU256 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op: KvU256MutatorOp::Sub,
+            operand_be: amount_be,
+            expected_seq: Some(expected_seq),
+        })
+        .await
+    }
+
+    pub async fn kv_compare_and_sub_u64(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMutateU64 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op: KvU64MutatorOp::Sub,
+            operand_be: amount_be,
+            expected_seq: Some(expected_seq),
+        })
+        .await
+    }
+
+    pub async fn kv_compare_and_sub_u64_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        amount_be: [u8; 8],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU64 {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
-                key: key.clone(),
-                expected_seq,
-            }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
-                mutations: vec![Mutation::KvDecU256 {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    key,
-                    amount_be,
-                }],
+                key,
+                op: KvU64MutatorOp::Sub,
+                operand_be: amount_be,
+                expected_seq: Some(expected_seq),
             },
-            base_seq: self.snapshot_probe(ConsistencyMode::AtLatest).await?,
+        )
+        .await
+    }
+
+    pub async fn kv_compare_and_set_u256_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        value_be: [u8; 32],
+        expected_seq: u64,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU256 {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                op: KvU256MutatorOp::Set,
+                operand_be: value_be,
+                expected_seq: Some(expected_seq),
+            },
+        )
+        .await
+    }
+
+    pub async fn kv_mutate_u256(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        op: KvU256MutatorOp,
+        operand_be: [u8; 32],
+    ) -> Result<CommitResult, AedbError> {
+        self.commit(Mutation::KvMutateU256 {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            op,
+            operand_be,
+            expected_seq: None,
         })
+        .await
+    }
+
+    pub async fn kv_mutate_u256_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        op: KvU256MutatorOp,
+        operand_be: [u8; 32],
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU256 {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                op,
+                operand_be,
+                expected_seq: None,
+            },
+        )
         .await
     }
 
@@ -2771,27 +5930,17 @@ impl AedbInstance {
         amount_be: [u8; 32],
         expected_seq: u64,
     ) -> Result<CommitResult, AedbError> {
-        self.commit_envelope(TransactionEnvelope {
-            caller: Some(caller),
-            idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::KeyVersion {
+        self.commit_as(
+            caller,
+            Mutation::KvMutateU256 {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
-                key: key.clone(),
-                expected_seq,
-            }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
-                mutations: vec![Mutation::KvDecU256 {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    key,
-                    amount_be,
-                }],
+                key,
+                op: KvU256MutatorOp::Sub,
+                operand_be: amount_be,
+                expected_seq: Some(expected_seq),
             },
-            base_seq: self.snapshot_probe(ConsistencyMode::AtLatest).await?,
-        })
+        )
         .await
     }
 
@@ -4601,14 +7750,7 @@ impl AedbInstance {
         consistency: ConsistencyMode,
     ) -> Result<SnapshotReadView, AedbError> {
         match consistency {
-            ConsistencyMode::AtLatest => {
-                let (keyspace, catalog, seq) = self.executor.snapshot_state().await;
-                Ok(SnapshotReadView {
-                    keyspace: Arc::new(keyspace),
-                    catalog: Arc::new(catalog),
-                    seq,
-                })
-            }
+            ConsistencyMode::AtLatest => Ok(self.executor.snapshot_latest_view().await),
             ConsistencyMode::AtSeq(requested) => {
                 match self.executor.snapshot_at_seq(requested).await {
                     Ok(view) => Ok(view),
@@ -4674,14 +7816,31 @@ impl AedbInstance {
         consistency: ConsistencyMode,
     ) -> Result<SnapshotLease, AedbError> {
         let view = self.snapshot_for_consistency(consistency).await?;
+        if matches!(consistency, ConsistencyMode::AtLatest) {
+            let cap = self._config.max_concurrent_snapshots.max(1);
+            let prior = self
+                .latest_snapshot_inflight
+                .fetch_add(1, Ordering::AcqRel);
+            if prior >= cap {
+                self.latest_snapshot_inflight.fetch_sub(1, Ordering::AcqRel);
+                return Err(AedbError::QueueFull);
+            }
+            return Ok(SnapshotLease {
+                manager: None,
+                handle: None,
+                latest_inflight: Some(Arc::clone(&self.latest_snapshot_inflight)),
+                view,
+            });
+        }
         let mut mgr = self.snapshot_manager.lock();
         let handle = mgr.acquire_bounded(view.clone(), self._config.max_concurrent_snapshots)?;
         let checked = mgr
             .get_checked(handle, self._config.max_snapshot_age_ms)?
             .clone();
         Ok(SnapshotLease {
-            manager: Arc::clone(&self.snapshot_manager),
-            handle,
+            manager: Some(Arc::clone(&self.snapshot_manager)),
+            handle: Some(handle),
+            latest_inflight: None,
             view: checked,
         })
     }
@@ -5685,6 +8844,16 @@ impl AedbInstance {
             avg_prestage_validate_micros: core.avg_prestage_validate_micros,
             epoch_process_ops: core.epoch_process_ops,
             avg_epoch_process_micros: core.avg_epoch_process_micros,
+            group_commit_filling_epochs: core.group_commit_filling_epochs,
+            group_commit_flushing_epochs: core.group_commit_flushing_epochs,
+            group_commit_complete_epochs: core.group_commit_complete_epochs,
+            group_commit_flush_reason_max_group_size: core.group_commit_flush_reason_max_group_size,
+            group_commit_flush_reason_max_group_delay: core
+                .group_commit_flush_reason_max_group_delay,
+            group_commit_flush_reason_ingress_drained: core
+                .group_commit_flush_reason_ingress_drained,
+            group_commit_flush_reason_structural_barrier: core
+                .group_commit_flush_reason_structural_barrier,
             durable_wait_ops,
             avg_durable_wait_micros,
             inflight_commits: core.inflight_commits,
@@ -5751,14 +8920,13 @@ impl AedbInstance {
         }
         let mut applied = Vec::new();
         let mut skipped = Vec::new();
-        let existing = self
-            .list_applied_migrations(&project_id, &scope_id)
-            .await?
-            .into_iter()
-            .map(|record| (record.version, record))
-            .collect::<HashMap<_, _>>();
+        let target_versions = migrations.iter().map(|m| m.version).collect::<HashSet<_>>();
+        let existing_by_version = self
+            .list_applied_migrations_for_versions(&project_id, &scope_id, &target_versions)
+            .await?;
+        let mut current_version = self.current_version(&project_id, &scope_id).await?;
         for migration in migrations {
-            if let Some(record) = existing.get(&migration.version) {
+            if let Some(record) = existing_by_version.get(&migration.version) {
                 let checksum = checksum_hex(&migration)?;
                 if checksum != record.checksum_hex {
                     return Err(AedbError::IntegrityError {
@@ -5776,8 +8944,8 @@ impl AedbInstance {
             let name = migration.name.clone();
             self.apply_migration(migration).await?;
             applied.push((version, name, started.elapsed()));
+            current_version = current_version.max(version);
         }
-        let current_version = self.current_version(&project_id, &scope_id).await?;
         Ok(MigrationReport {
             applied,
             skipped,
@@ -5791,7 +8959,7 @@ impl AedbInstance {
         let checksum = checksum_hex(&migration)?;
         let key = migration_key(migration.version);
         for attempt in 0..=MAX_RETRIES_ON_CONFLICT {
-            let (snapshot, _, _) = self.executor.snapshot_state().await;
+            let (snapshot, _, base_seq) = self.executor.snapshot_state().await;
             if let Some(existing) =
                 snapshot.kv_get(&migration.project_id, &migration.scope_id, &key)
             {
@@ -5808,7 +8976,7 @@ impl AedbInstance {
             }
 
             let mut mutations = migration.mutations.clone();
-            let predicted_applied_seq = self.executor.current_seq().await + 1;
+            let predicted_applied_seq = base_seq.saturating_add(1);
             let record = MigrationRecord {
                 version: migration.version,
                 name: migration.name.clone(),
@@ -5878,13 +9046,16 @@ impl AedbInstance {
         let ns = NamespaceId::project_scope(project_id, scope_id);
         let mut out = Vec::new();
         if let Some(namespace) = snapshot.namespaces.get(&ns) {
-            for (k, v) in &namespace.kv.entries {
-                if k.starts_with(b"__migrations/") {
-                    out.push(decode_record(&v.value)?);
+            let prefix = b"__migrations/";
+            let start = Bound::Included(prefix.to_vec());
+            let end = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
+            for (k, v) in namespace.kv.entries.range((start, end)) {
+                if !k.starts_with(prefix) {
+                    break;
                 }
+                out.push(decode_record(&v.value)?);
             }
         }
-        out.sort_by_key(|r| r.version);
         Ok(out)
     }
 
@@ -5901,11 +9072,20 @@ impl AedbInstance {
         project_id: &str,
         scope_id: &str,
     ) -> Result<u64, AedbError> {
-        Ok(self
-            .list_applied_migrations(project_id, scope_id)
-            .await?
-            .last()
-            .map_or(0, |record| record.version))
+        let (snapshot, _, _) = self.executor.snapshot_state().await;
+        let ns = NamespaceId::project_scope(project_id, scope_id);
+        if let Some(namespace) = snapshot.namespaces.get(&ns) {
+            let prefix = b"__migrations/";
+            let start = Bound::Included(prefix.to_vec());
+            let end = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
+            if let Some((key, value)) = namespace.kv.entries.range((start, end)).rev().next() {
+                if let Some(version) = parse_migration_version_from_key(key) {
+                    return Ok(version);
+                }
+                return Ok(decode_record(&value.value)?.version);
+            }
+        }
+        Ok(0)
     }
 
     pub async fn rollback_to_migration(
@@ -6093,6 +9273,54 @@ impl AedbInstance {
 
     pub async fn head_state(&self) -> crate::commit::executor::HeadState {
         self.executor.head_state().await
+    }
+}
+
+fn parse_migration_version_from_key(key: &[u8]) -> Option<u64> {
+    const PREFIX: &[u8] = b"__migrations/";
+    let suffix = key.strip_prefix(PREFIX)?;
+    if suffix.len() != 20 || !suffix.iter().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    std::str::from_utf8(suffix).ok()?.parse::<u64>().ok()
+}
+
+impl AedbInstance {
+    async fn list_applied_migrations_for_versions(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        versions: &HashSet<u64>,
+    ) -> Result<HashMap<u64, MigrationRecord>, AedbError> {
+        if versions.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (snapshot, _, _) = self.executor.snapshot_state().await;
+        let ns = NamespaceId::project_scope(project_id, scope_id);
+        let mut out = HashMap::with_capacity(versions.len());
+        if let Some(namespace) = snapshot.namespaces.get(&ns) {
+            let prefix = b"__migrations/";
+            let start = Bound::Included(prefix.to_vec());
+            let end = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
+            for (k, v) in namespace.kv.entries.range((start, end)) {
+                if !k.starts_with(prefix) {
+                    break;
+                }
+                if let Some(version) = parse_migration_version_from_key(k) {
+                    if !versions.contains(&version) {
+                        continue;
+                    }
+                    let record = decode_record(&v.value)?;
+                    out.insert(version, record);
+                    continue;
+                }
+                let record = decode_record(&v.value)?;
+                if versions.contains(&record.version) {
+                    out.insert(record.version, record);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 

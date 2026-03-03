@@ -1133,6 +1133,13 @@ pub(crate) enum LifecycleEventTemplate {
         scope_id: String,
         table_name: String,
     },
+    AppEventEmitted {
+        project_id: String,
+        scope_id: String,
+        topic: String,
+        event_key: String,
+        payload_json: String,
+    },
 }
 
 impl LifecycleEventTemplate {
@@ -1188,6 +1195,20 @@ impl LifecycleEventTemplate {
                 project_id,
                 scope_id,
                 table_name,
+                seq,
+            },
+            LifecycleEventTemplate::AppEventEmitted {
+                project_id,
+                scope_id,
+                topic,
+                event_key,
+                payload_json,
+            } => LifecycleEvent::AppEventEmitted {
+                project_id,
+                scope_id,
+                topic,
+                event_key,
+                payload_json,
                 seq,
             },
         }
@@ -1253,6 +1274,25 @@ pub(crate) fn lifecycle_template_for_ddl(op: &DdlOperation) -> Option<LifecycleE
             table_name: table_name.clone(),
         }),
         _ => None,
+    }
+}
+
+pub(crate) fn lifecycle_templates_for_mutation(mutation: &Mutation) -> Vec<LifecycleEventTemplate> {
+    match mutation {
+        Mutation::EmitEvent {
+            project_id,
+            scope_id,
+            topic,
+            event_key,
+            payload_json,
+        } => vec![LifecycleEventTemplate::AppEventEmitted {
+            project_id: project_id.clone(),
+            scope_id: scope_id.clone(),
+            topic: topic.clone(),
+            event_key: event_key.clone(),
+            payload_json: payload_json.clone(),
+        }],
+        _ => Vec::new(),
     }
 }
 

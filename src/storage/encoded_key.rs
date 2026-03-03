@@ -54,6 +54,10 @@ fn encode_value(v: &Value, out: &mut SmallVec<[u8; 64]>) {
             let shifted = (*i as u64) ^ 0x8000_0000_0000_0000;
             out.extend_from_slice(&shifted.to_be_bytes());
         }
+        Value::U64(i) => {
+            out.push(0x19);
+            out.extend_from_slice(&i.to_be_bytes());
+        }
         Value::Timestamp(ts) => {
             out.push(0x11);
             let shifted = (*ts as u64) ^ 0x8000_0000_0000_0000;
@@ -125,6 +129,15 @@ mod tests {
         let a = EncodedKey::from_single(&Value::Integer(-1));
         let b = EncodedKey::from_single(&Value::Integer(0));
         let c = EncodedKey::from_single(&Value::Integer(42));
+        assert!(a < b);
+        assert!(b < c);
+    }
+
+    #[test]
+    fn u64_order_is_preserved() {
+        let a = EncodedKey::from_single(&Value::U64(0));
+        let b = EncodedKey::from_single(&Value::U64(1));
+        let c = EncodedKey::from_single(&Value::U64(42));
         assert!(a < b);
         assert!(b < c);
     }

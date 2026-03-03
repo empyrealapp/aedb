@@ -91,6 +91,35 @@ pub struct KvProjectionDef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AccumulatorValueType {
+    BigInt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccumulatorDef {
+    pub project_id: String,
+    pub scope_id: String,
+    pub accumulator_name: String,
+    pub value_type: AccumulatorValueType,
+    #[serde(default)]
+    pub dedupe_retain_commits: Option<u64>,
+    #[serde(default = "default_accumulator_snapshot_every")]
+    pub snapshot_every: u64,
+    #[serde(default = "default_accumulator_exposure_margin_bps")]
+    pub exposure_margin_bps: u32,
+    #[serde(default)]
+    pub exposure_ttl_commits: Option<u64>,
+}
+
+fn default_accumulator_snapshot_every() -> u64 {
+    10_000
+}
+
+fn default_accumulator_exposure_margin_bps() -> u32 {
+    1_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TableAlteration {
     AddColumn(ColumnDef),
     DropColumn { name: String },

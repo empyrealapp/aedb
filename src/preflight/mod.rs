@@ -1,9 +1,15 @@
 use crate::catalog::Catalog;
+use crate::commit::tx::{AssertionActual, ReadAssertion};
 use crate::commit::tx::{
     PreflightPlan, ReadBound, ReadKey, ReadRange, ReadRangeEntry, ReadSet, ReadSetEntry,
     WriteIntent,
 };
-use crate::commit::validation::{Mutation, validate_mutation};
+use crate::commit::validation::{
+    KvIntegerAmount, KvIntegerMissingPolicy, KvIntegerUnderflowPolicy, KvU64MissingPolicy,
+    KvU64MutatorOp, KvU64OverflowPolicy, KvU64UnderflowPolicy, KvU256MissingPolicy,
+    KvU256MutatorOp, KvU256OverflowPolicy, KvU256UnderflowPolicy, Mutation, counter_shard_index,
+    counter_shard_storage_key, validate_mutation,
+};
 use crate::error::AedbError;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
@@ -156,6 +162,333 @@ pub fn preflight(
             }
             PreflightResult::Ok { affected_rows: 1 }
         }
+        Mutation::KvAddU256Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_overflow,
+        } => {
+            let current = match snapshot.kv_get(project_id, scope_id, key) {
+                Some(entry) => match decode_u256(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => match on_missing {
+                    KvU256MissingPolicy::TreatAsZero => U256::zero(),
+                    KvU256MissingPolicy::Reject => {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(
+                                "u256 key missing and policy is Reject".into(),
+                            )
+                            .to_string(),
+                        };
+                    }
+                },
+            };
+            let amount = U256::from_big_endian(amount_be);
+            if current.checked_add(amount).is_none()
+                && matches!(on_overflow, KvU256OverflowPolicy::Reject)
+            {
+                return PreflightResult::Err {
+                    reason: AedbError::Overflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_underflow,
+        } => {
+            let current = match snapshot.kv_get(project_id, scope_id, key) {
+                Some(entry) => match decode_u256(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => match on_missing {
+                    KvU256MissingPolicy::TreatAsZero => U256::zero(),
+                    KvU256MissingPolicy::Reject => {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(
+                                "u256 key missing and policy is Reject".into(),
+                            )
+                            .to_string(),
+                        };
+                    }
+                },
+            };
+            let amount = U256::from_big_endian(amount_be);
+            if current < amount && matches!(on_underflow, KvU256UnderflowPolicy::Reject) {
+                return PreflightResult::Err {
+                    reason: AedbError::Underflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            key,
+            on_missing,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            key,
+            on_missing,
+            ..
+        } => {
+            if snapshot.kv_get(project_id, scope_id, key).is_none()
+                && matches!(on_missing, KvU256MissingPolicy::Reject)
+            {
+                return PreflightResult::Err {
+                    reason: AedbError::Validation("u256 key missing and policy is Reject".into())
+                        .to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            key,
+            op,
+            operand_be,
+            expected_seq,
+        } => {
+            let current_entry = snapshot.kv_get(project_id, scope_id, key);
+            let current_version = current_entry.map(|entry| entry.version).unwrap_or(0);
+            if let Some(expected_seq) = expected_seq
+                && current_version != *expected_seq
+            {
+                return PreflightResult::Err {
+                    reason: AedbError::AssertionFailed {
+                        index: 0,
+                        assertion: Box::new(ReadAssertion::KeyVersion {
+                            project_id: project_id.clone(),
+                            scope_id: scope_id.clone(),
+                            key: key.clone(),
+                            expected_seq: *expected_seq,
+                        }),
+                        actual: Box::new(AssertionActual::Version(current_version)),
+                    }
+                    .to_string(),
+                };
+            }
+            let current_value = match current_entry {
+                Some(entry) => match decode_u256(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => U256::zero(),
+            };
+            let operand = U256::from_big_endian(operand_be);
+            match op {
+                KvU256MutatorOp::Set => {}
+                KvU256MutatorOp::Add if current_value.checked_add(operand).is_none() => {
+                    return PreflightResult::Err {
+                        reason: AedbError::Overflow.to_string(),
+                    };
+                }
+                KvU256MutatorOp::Sub if current_value < operand => {
+                    return PreflightResult::Err {
+                        reason: AedbError::Underflow.to_string(),
+                    };
+                }
+                KvU256MutatorOp::Add | KvU256MutatorOp::Sub => {}
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_overflow,
+        } => {
+            let current = match snapshot.kv_get(project_id, scope_id, key) {
+                Some(entry) => match decode_u64(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => match on_missing {
+                    KvU64MissingPolicy::TreatAsZero => 0u64,
+                    KvU64MissingPolicy::Reject => {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(
+                                "u64 key missing and policy is Reject".into(),
+                            )
+                            .to_string(),
+                        };
+                    }
+                },
+            };
+            let amount = u64::from_be_bytes(*amount_be);
+            if current.checked_add(amount).is_none()
+                && matches!(on_overflow, KvU64OverflowPolicy::Reject)
+            {
+                return PreflightResult::Err {
+                    reason: AedbError::Overflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            on_missing,
+            on_underflow,
+        } => {
+            let current = match snapshot.kv_get(project_id, scope_id, key) {
+                Some(entry) => match decode_u64(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => match on_missing {
+                    KvU64MissingPolicy::TreatAsZero => 0u64,
+                    KvU64MissingPolicy::Reject => {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(
+                                "u64 key missing and policy is Reject".into(),
+                            )
+                            .to_string(),
+                        };
+                    }
+                },
+            };
+            let amount = u64::from_be_bytes(*amount_be);
+            if current < amount && matches!(on_underflow, KvU64UnderflowPolicy::Reject) {
+                return PreflightResult::Err {
+                    reason: AedbError::Underflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            key,
+            amount,
+            on_missing,
+            on_underflow,
+        } => preflight_kv_sub_int_ex(
+            snapshot,
+            project_id,
+            scope_id,
+            key,
+            amount,
+            *on_missing,
+            *on_underflow,
+        ),
+        Mutation::CounterAdd {
+            project_id,
+            scope_id,
+            key,
+            amount_be,
+            shard_count,
+            shard_hint,
+        } => {
+            let shard = counter_shard_index(*shard_hint, *shard_count);
+            let shard_key = counter_shard_storage_key(key, shard);
+            let current = match snapshot.kv_get(project_id, scope_id, &shard_key) {
+                Some(entry) => match decode_u64(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => 0u64,
+            };
+            let amount = u64::from_be_bytes(*amount_be);
+            if current.checked_add(amount).is_none() {
+                return PreflightResult::Err {
+                    reason: AedbError::Overflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            key,
+            on_missing,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            key,
+            on_missing,
+            ..
+        } => {
+            if snapshot.kv_get(project_id, scope_id, key).is_none()
+                && matches!(on_missing, KvU64MissingPolicy::Reject)
+            {
+                return PreflightResult::Err {
+                    reason: AedbError::Validation("u64 key missing and policy is Reject".into())
+                        .to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            key,
+            op,
+            operand_be,
+            expected_seq,
+        } => {
+            let current_entry = snapshot.kv_get(project_id, scope_id, key);
+            let current_version = current_entry.map(|entry| entry.version).unwrap_or(0);
+            if let Some(expected_seq) = expected_seq
+                && current_version != *expected_seq
+            {
+                return PreflightResult::Err {
+                    reason: AedbError::AssertionFailed {
+                        index: 0,
+                        assertion: Box::new(ReadAssertion::KeyVersion {
+                            project_id: project_id.clone(),
+                            scope_id: scope_id.clone(),
+                            key: key.clone(),
+                            expected_seq: *expected_seq,
+                        }),
+                        actual: Box::new(AssertionActual::Version(current_version)),
+                    }
+                    .to_string(),
+                };
+            }
+            let current_value = match current_entry {
+                Some(entry) => match decode_u64(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => 0u64,
+            };
+            let operand = u64::from_be_bytes(*operand_be);
+            match op {
+                KvU64MutatorOp::Set => {}
+                KvU64MutatorOp::Add if current_value.checked_add(operand).is_none() => {
+                    return PreflightResult::Err {
+                        reason: AedbError::Overflow.to_string(),
+                    };
+                }
+                KvU64MutatorOp::Sub if current_value < operand => {
+                    return PreflightResult::Err {
+                        reason: AedbError::Underflow.to_string(),
+                    };
+                }
+                KvU64MutatorOp::Add | KvU64MutatorOp::Sub => {}
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
         Mutation::TableIncU256 {
             project_id,
             scope_id,
@@ -212,6 +545,111 @@ pub fn preflight(
             }
             PreflightResult::Ok { affected_rows: 1 }
         }
+        Mutation::Accumulate { .. } => PreflightResult::Ok { affected_rows: 1 },
+        Mutation::ExposeAccumulator {
+            project_id,
+            scope_id,
+            accumulator_name,
+            amount,
+            exposure_id,
+        } => {
+            let Some(acc) = snapshot.accumulator(project_id, scope_id, accumulator_name) else {
+                return PreflightResult::Err {
+                    reason: AedbError::Validation(format!(
+                        "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                    ))
+                    .to_string(),
+                };
+            };
+            if let Some(existing) = acc.open_exposures.get(exposure_id.as_str()) {
+                if existing.amount == *amount {
+                    return PreflightResult::Ok { affected_rows: 1 };
+                }
+                return PreflightResult::Err {
+                    reason: AedbError::Validation(format!(
+                        "exposure id already exists with different amount: {exposure_id}"
+                    ))
+                    .to_string(),
+                };
+            }
+            let Some(new_total) = acc.total_exposure.checked_add(*amount) else {
+                return PreflightResult::Err {
+                    reason: AedbError::Overflow.to_string(),
+                };
+            };
+            let max_exposure_allowed = if acc.exposure_limit_cache_valid {
+                acc.exposure_limit_cached
+            } else {
+                (((acc.value as i128) * (10_000i128 - acc.exposure_margin_bps as i128)) / 10_000)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+            };
+            if new_total > max_exposure_allowed {
+                return PreflightResult::Err {
+                    reason: AedbError::Validation(format!(
+                        "exposure margin exceeded: requested_total={new_total}, allowed={max_exposure_allowed}"
+                    ))
+                    .to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        Mutation::ExposeAccumulatorBatch {
+            project_id,
+            scope_id,
+            accumulator_name,
+            exposures,
+        } => {
+            let Some(acc) = snapshot.accumulator(project_id, scope_id, accumulator_name) else {
+                return PreflightResult::Err {
+                    reason: AedbError::Validation(format!(
+                        "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                    ))
+                    .to_string(),
+                };
+            };
+            let mut running_total = acc.total_exposure;
+            let max_exposure_allowed = if acc.exposure_limit_cache_valid {
+                acc.exposure_limit_cached
+            } else {
+                (((acc.value as i128) * (10_000i128 - acc.exposure_margin_bps as i128)) / 10_000)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+            };
+            let mut seen = std::collections::HashSet::new();
+            for (amount, exposure_id) in exposures {
+                if let Some(existing) = acc.open_exposures.get(exposure_id.as_str()) {
+                    if existing.amount != *amount {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(format!(
+                                "exposure id already exists with different amount: {exposure_id}"
+                            ))
+                            .to_string(),
+                        };
+                    }
+                    continue;
+                }
+                if !seen.insert(exposure_id) {
+                    continue;
+                }
+                let Some(next) = running_total.checked_add(*amount) else {
+                    return PreflightResult::Err {
+                        reason: AedbError::Overflow.to_string(),
+                    };
+                };
+                running_total = next;
+                if running_total > max_exposure_allowed {
+                    return PreflightResult::Err {
+                        reason: AedbError::Validation(format!(
+                            "exposure margin exceeded: requested_total={running_total}, allowed={max_exposure_allowed}"
+                        ))
+                        .to_string(),
+                    };
+                }
+            }
+            PreflightResult::Ok {
+                affected_rows: exposures.len() as u64,
+            }
+        }
+        Mutation::EmitEvent { .. } => PreflightResult::Ok { affected_rows: 1 },
         _ => PreflightResult::Ok { affected_rows: 1 },
     }
 }
@@ -230,6 +668,7 @@ pub fn preflight_plan(
         Mutation::InsertBatch { rows, .. }
         | Mutation::UpsertBatch { rows, .. }
         | Mutation::UpsertBatchOnConflict { rows, .. } => rows.len(),
+        Mutation::ExposeAccumulatorBatch { exposures, .. } => exposures.len(),
         Mutation::DeleteWhere { limit, .. }
         | Mutation::UpdateWhere { limit, .. }
         | Mutation::UpdateWhereExpr { limit, .. } => limit.unwrap_or(1),
@@ -390,13 +829,46 @@ pub fn preflight_plan(
                 version_at_read: version,
             });
         }
-        Mutation::KvIncU256 { .. } => {
+        Mutation::KvIncU256 { .. }
+        | Mutation::KvAddU256Ex { .. }
+        | Mutation::KvAddU64Ex { .. }
+        | Mutation::CounterAdd { .. } => {
             // Commutative increment executes against current apply-time value.
+        }
+        Mutation::KvMutateU256 {
+            project_id,
+            scope_id,
+            key,
+            op,
+            expected_seq,
+            ..
+        } => {
+            if expected_seq.is_some() || matches!(op, KvU256MutatorOp::Sub) {
+                let version = snapshot
+                    .kv_get(project_id, scope_id, key)
+                    .map(|e| e.version)
+                    .unwrap_or(0);
+                read_set.points.push(ReadSetEntry {
+                    key: ReadKey::KvKey {
+                        project_id: project_id.clone(),
+                        scope_id: scope_id.clone(),
+                        key: key.clone(),
+                    },
+                    version_at_read: version,
+                });
+            }
         }
         Mutation::KvDecU256 {
             project_id,
             scope_id,
             key,
+            ..
+        }
+        | Mutation::KvSubU256Ex {
+            project_id,
+            scope_id,
+            key,
+            on_underflow: KvU256UnderflowPolicy::Reject,
             ..
         } => {
             let version = snapshot
@@ -412,6 +884,76 @@ pub fn preflight_plan(
                 version_at_read: version,
             });
         }
+        Mutation::KvSubU256Ex { .. } => {}
+        Mutation::KvMaxU256 { .. } => {}
+        Mutation::KvMinU256 { .. } => {}
+        Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            key,
+            on_underflow: KvU64UnderflowPolicy::Reject,
+            ..
+        } => {
+            let version = snapshot
+                .kv_get(project_id, scope_id, key)
+                .map(|e| e.version)
+                .unwrap_or(0);
+            read_set.points.push(ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    key: key.clone(),
+                },
+                version_at_read: version,
+            });
+        }
+        Mutation::KvSubU64Ex { .. } => {}
+        Mutation::KvMutateU64 {
+            project_id,
+            scope_id,
+            key,
+            op,
+            expected_seq,
+            ..
+        } => {
+            if expected_seq.is_some() || matches!(op, KvU64MutatorOp::Sub) {
+                let version = snapshot
+                    .kv_get(project_id, scope_id, key)
+                    .map(|e| e.version)
+                    .unwrap_or(0);
+                read_set.points.push(ReadSetEntry {
+                    key: ReadKey::KvKey {
+                        project_id: project_id.clone(),
+                        scope_id: scope_id.clone(),
+                        key: key.clone(),
+                    },
+                    version_at_read: version,
+                });
+            }
+        }
+        Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            key,
+            on_underflow: KvIntegerUnderflowPolicy::Reject,
+            ..
+        } => {
+            let version = snapshot
+                .kv_get(project_id, scope_id, key)
+                .map(|e| e.version)
+                .unwrap_or(0);
+            read_set.points.push(ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: project_id.clone(),
+                    scope_id: scope_id.clone(),
+                    key: key.clone(),
+                },
+                version_at_read: version,
+            });
+        }
+        Mutation::KvSubIntEx { .. } => {}
+        Mutation::KvMaxU64 { .. } => {}
+        Mutation::KvMinU64 { .. } => {}
         Mutation::TableIncU256 {
             project_id,
             scope_id,
@@ -444,6 +986,11 @@ pub fn preflight_plan(
                 version_at_read: version,
             });
         }
+        Mutation::Accumulate { .. } => {}
+        Mutation::ExposeAccumulator { .. } => {}
+        Mutation::ExposeAccumulatorBatch { .. } => {}
+        Mutation::ReleaseAccumulatorExposure { .. } => {}
+        Mutation::EmitEvent { .. } => {}
         Mutation::OrderBookNew {
             project_id,
             scope_id,
@@ -599,6 +1146,80 @@ fn decode_u256(bytes: &[u8]) -> Result<U256, String> {
         return Err(AedbError::Validation("invalid u256 bytes length".into()).to_string());
     }
     Ok(U256::from_big_endian(bytes))
+}
+
+fn preflight_kv_sub_int_ex(
+    snapshot: &KeyspaceSnapshot,
+    project_id: &str,
+    scope_id: &str,
+    key: &[u8],
+    amount: &KvIntegerAmount,
+    on_missing: KvIntegerMissingPolicy,
+    on_underflow: KvIntegerUnderflowPolicy,
+) -> PreflightResult {
+    match amount {
+        KvIntegerAmount::U64(amount_be) => {
+            let current = match snapshot.kv_get(project_id, scope_id, key) {
+                Some(entry) => match decode_u64(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => match on_missing {
+                    KvIntegerMissingPolicy::TreatAsZero => 0u64,
+                    KvIntegerMissingPolicy::Reject => {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(
+                                "u64 key missing and policy is Reject".into(),
+                            )
+                            .to_string(),
+                        };
+                    }
+                },
+            };
+            let amount = u64::from_be_bytes(*amount_be);
+            if current < amount && matches!(on_underflow, KvIntegerUnderflowPolicy::Reject) {
+                return PreflightResult::Err {
+                    reason: AedbError::Underflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+        KvIntegerAmount::U256(amount_be) => {
+            let current = match snapshot.kv_get(project_id, scope_id, key) {
+                Some(entry) => match decode_u256(&entry.value) {
+                    Ok(value) => value,
+                    Err(reason) => return PreflightResult::Err { reason },
+                },
+                None => match on_missing {
+                    KvIntegerMissingPolicy::TreatAsZero => U256::zero(),
+                    KvIntegerMissingPolicy::Reject => {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(
+                                "u256 key missing and policy is Reject".into(),
+                            )
+                            .to_string(),
+                        };
+                    }
+                },
+            };
+            let amount = U256::from_big_endian(amount_be);
+            if current < amount && matches!(on_underflow, KvIntegerUnderflowPolicy::Reject) {
+                return PreflightResult::Err {
+                    reason: AedbError::Underflow.to_string(),
+                };
+            }
+            PreflightResult::Ok { affected_rows: 1 }
+        }
+    }
+}
+
+fn decode_u64(bytes: &[u8]) -> Result<u64, String> {
+    if bytes.len() != 8 {
+        return Err(AedbError::Validation("invalid u64 bytes length".into()).to_string());
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(bytes);
+    Ok(u64::from_be_bytes(out))
 }
 
 fn load_table_u256_field(
