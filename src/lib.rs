@@ -8406,7 +8406,7 @@ impl AedbInstance {
             sha256_file_hex(&backup_dir.join(&checkpoint.filename))?,
         );
 
-        for segment in read_segments(&self.dir)? {
+        for segment in read_segments_for_checkpoint(&self.dir, snapshot_seq)? {
             let src = self.dir.join(&segment.filename);
             let rel = format!("wal_tail/{}", segment.filename);
             let dst = backup_dir.join(&rel);

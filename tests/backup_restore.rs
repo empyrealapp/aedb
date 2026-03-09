@@ -678,3 +678,55 @@ async fn single_file_encrypted_backup_roundtrip_and_wrong_key_fails() {
     .expect_err("wrong key must fail");
     assert!(format!("{err}").contains("decryption failed"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn full_backup_excludes_stale_wal_segments() {
+    let live_dir = tempdir().expect("live dir");
+    let backup_dir = tempdir().expect("backup dir");
+    let config = strict_backup_chain_config();
+
+    let db = AedbInstance::open(config, live_dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    for i in 0..160u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("seed:{i}").into_bytes(),
+            value: vec![u8::try_from(i % 251).unwrap_or(0); 512],
+        })
+        .await
+        .expect("seed write");
+    }
+
+    db.checkpoint_now().await.expect("checkpoint");
+
+    for i in 0..4u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("tail:{i}").into_bytes(),
+            value: vec![u8::try_from(i % 251).unwrap_or(0); 128],
+        })
+        .await
+        .expect("tail write");
+    }
+
+    let live_segments = fs::read_dir(live_dir.path())
+        .expect("read live dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".aedbwal"))
+        .count();
+    assert!(live_segments > 1, "test requires stale wal segments in the live dir");
+
+    let backup = db.backup_full(backup_dir.path()).await.expect("backup");
+    assert_eq!(
+        backup.wal_segments.len(),
+        1,
+        "full backup should keep only the active wal anchor for the checkpointed snapshot"
+    );
+    assert!(
+        live_segments > backup.wal_segments.len(),
+        "backup should exclude stale wal segments from the live dir"
+    );
+}
