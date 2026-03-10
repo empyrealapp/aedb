@@ -12,6 +12,7 @@ use std::sync::mpsc::{self as std_mpsc, Receiver, Sender};
 pub(super) struct ParallelApplyRuntime {
     workers: Arc<Vec<Sender<ParallelTask>>>,
     queued_tasks: Arc<AtomicUsize>,
+    next_worker: Arc<AtomicUsize>,
 }
 
 pub(super) struct ParallelTask {
@@ -39,13 +40,14 @@ impl ParallelApplyRuntime {
         Self {
             workers: Arc::new(workers),
             queued_tasks,
+            next_worker: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub(super) fn submit(&self, task: ParallelTask) -> Result<(), AedbError> {
-        let shard = shard_for_namespace(&task.namespace_id, self.workers.len());
+        let worker = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         self.queued_tasks.fetch_add(1, Ordering::Relaxed);
-        if let Err(e) = self.workers[shard].send(task) {
+        if let Err(e) = self.workers[worker].send(task) {
             self.queued_tasks.fetch_sub(1, Ordering::Relaxed);
             return Err(AedbError::Validation(format!(
                 "parallel runtime unavailable: {e}"
@@ -106,14 +108,4 @@ fn execute_task(task: ParallelTask) -> Result<(), AedbError> {
         .ok_or_else(|| AedbError::Validation("parallel apply namespace missing".into()))?;
     let _ = task.response_tx.send(Ok((task.namespace_id, namespace)));
     Ok(())
-}
-
-fn shard_for_namespace(namespace_id: &NamespaceId, shard_count: usize) -> usize {
-    if shard_count <= 1 {
-        return 0;
-    }
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    namespace_id.hash(&mut h);
-    (h.finish() as usize) % shard_count
 }

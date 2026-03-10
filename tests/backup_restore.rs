@@ -292,6 +292,62 @@ async fn incremental_chain_restore_to_target_seq_is_exact() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incremental_chain_restore_fails_when_chain_cannot_reach_target() {
+    let live_dir = tempdir().expect("live dir");
+    let full_dir = tempdir().expect("full dir");
+    let inc1_dir = tempdir().expect("inc1 dir");
+    let restore_dir = tempdir().expect("restore dir");
+    let config = backup_test_config();
+
+    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    for i in 0..20u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("gap:{i}").into_bytes(),
+            value: i.to_string().into_bytes(),
+        })
+        .await
+        .expect("seed full");
+    }
+    db.backup_full(full_dir.path()).await.expect("full");
+
+    for i in 20..40u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("gap:{i}").into_bytes(),
+            value: i.to_string().into_bytes(),
+        })
+        .await
+        .expect("seed inc");
+    }
+    let inc1 = db
+        .backup_incremental(inc1_dir.path(), full_dir.path())
+        .await
+        .expect("inc1");
+
+    let mut manifest = load_backup_manifest(inc1_dir.path(), config.hmac_key()).expect("manifest");
+    manifest.wal_segments.clear();
+    manifest.file_sha256.clear();
+    write_backup_manifest(inc1_dir.path(), &manifest, config.hmac_key()).expect("rewrite manifest");
+
+    let err = AedbInstance::restore_from_backup_chain(
+        &[full_dir.path().to_path_buf(), inc1_dir.path().to_path_buf()],
+        restore_dir.path(),
+        &config,
+        Some(inc1.wal_head_seq),
+    )
+    .expect_err("restore should fail when chain cannot reach requested target");
+    assert!(
+        err.to_string().contains("replay incomplete"),
+        "unexpected restore error: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incremental_chain_restore_to_target_time_is_exact() {
     let live_dir = tempdir().expect("live dir");
     let full_dir = tempdir().expect("full dir");
@@ -717,7 +773,10 @@ async fn full_backup_excludes_stale_wal_segments() {
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_name().to_string_lossy().ends_with(".aedbwal"))
         .count();
-    assert!(live_segments > 1, "test requires stale wal segments in the live dir");
+    assert!(
+        live_segments > 1,
+        "test requires stale wal segments in the live dir"
+    );
 
     let backup = db.backup_full(backup_dir.path()).await.expect("backup");
     assert_eq!(

@@ -363,6 +363,26 @@ fn primary_key_eq_uses_point_lookup_path() {
 }
 
 #[test]
+fn primary_key_eq_fast_path_preserves_type_validation() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+
+    let err = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .where_(Expr::Eq("id".into(), Value::Text("wrong".into())))
+            .limit(1),
+    )
+    .expect_err("type mismatch should be preserved");
+
+    assert!(matches!(err, QueryError::TypeMismatch { column, .. } if column == "id"));
+}
+
+#[test]
 fn primary_key_with_non_pk_eq_falls_back_to_general_path() {
     let (keyspace, catalog) = setup();
     let snapshot = keyspace.snapshot();
@@ -716,7 +736,66 @@ fn non_join_page_size_is_capped_by_max_scan_rows() {
 }
 
 #[test]
-fn join_scan_bound_is_enforced_when_full_scan_not_allowed() {
+fn aggregate_limit_does_not_bypass_scan_bound() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let err = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["*"])
+            .from("users")
+            .aggregate(Aggregate::Count)
+            .limit(1),
+        &QueryOptions::default(),
+        7,
+        10,
+    )
+    .expect_err("aggregate should still honor scan bound");
+    assert!(matches!(err, QueryError::ScanBoundExceeded { .. }));
+}
+
+#[test]
+fn cursor_does_not_bypass_scan_bound() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let first = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["*"])
+            .from("users")
+            .order_by("id", Order::Asc)
+            .limit(5),
+        &QueryOptions::default(),
+        9,
+        100,
+    )
+    .expect("first page");
+    let err = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["*"])
+            .from("users")
+            .order_by("id", Order::Asc)
+            .limit(5),
+        &QueryOptions {
+            cursor: first.cursor,
+            ..QueryOptions::default()
+        },
+        9,
+        10,
+    )
+    .expect_err("cursor path should still honor scan bound");
+    assert!(matches!(err, QueryError::ScanBoundExceeded { .. }));
+}
+
+#[test]
+fn join_scan_bound_uses_cardinality_aware_estimate_when_right_side_is_primary_key() {
     let (keyspace, mut catalog) = setup();
     catalog
         .create_table(
@@ -750,7 +829,7 @@ fn join_scan_bound_is_enforced_when_full_scan_not_allowed() {
         );
     }
     let snapshot = keyspace.snapshot();
-    let err = execute_query_with_options(
+    let result = execute_query_with_options(
         &snapshot,
         &catalog,
         "A",
@@ -765,8 +844,9 @@ fn join_scan_bound_is_enforced_when_full_scan_not_allowed() {
         1,
         1_000,
     )
-    .expect_err("join scan bound");
-    assert!(matches!(err, QueryError::ScanBoundExceeded { .. }));
+    .expect("primary-key join should stay within scan bound");
+    assert_eq!(result.rows.len(), 10);
+    assert!(result.rows_examined <= 50);
 }
 
 #[test]
@@ -869,6 +949,61 @@ fn inner_join_returns_matching_rows() {
     )
     .expect("join query");
     assert_eq!(result.rows.len(), 50);
+}
+
+#[test]
+fn join_on_right_primary_key_uses_bounded_probe_path() {
+    let (keyspace, mut catalog) = setup();
+    catalog
+        .create_table(
+            "A",
+            "app",
+            "profiles",
+            vec![
+                ColumnDef {
+                    name: "user_id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "country".into(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+            vec!["user_id".into()],
+        )
+        .expect("profiles table");
+    let mut keyspace = keyspace;
+    for i in 0..50 {
+        keyspace.upsert_row(
+            "A",
+            "app",
+            "profiles",
+            vec![Value::Integer(i)],
+            Row::from_values(vec![Value::Integer(i), Value::Text("US".into())]),
+            1,
+        );
+    }
+    let snapshot = keyspace.snapshot();
+    let result = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["u.id", "p.country"])
+            .from("users")
+            .alias("u")
+            .inner_join("profiles", "u.id", "user_id")
+            .with_last_join_alias("p")
+            .limit(100),
+        &QueryOptions::default(),
+        1,
+        100,
+    )
+    .expect("pk join should respect bounded probe path");
+    assert_eq!(result.rows.len(), 50);
+    assert!(result.rows_examined <= 50);
 }
 
 #[test]
@@ -1316,6 +1451,39 @@ fn descending_cursor_pagination_is_stable() {
     for w in all.windows(2) {
         assert!(w[0].values[0] > w[1].values[0]);
     }
+}
+
+#[test]
+fn top_k_sort_matches_full_multi_column_ordering() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+
+    let limited = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id", "age"])
+            .from("users")
+            .order_by("age", Order::Desc)
+            .order_by("id", Order::Asc)
+            .limit(7),
+    )
+    .expect("limited ordered query");
+    let full = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id", "age"])
+            .from("users")
+            .order_by("age", Order::Desc)
+            .order_by("id", Order::Asc),
+    )
+    .expect("full ordered query");
+
+    let expected: Vec<Row> = full.rows.into_iter().take(7).collect();
+    assert_eq!(limited.rows, expected);
 }
 
 #[test]

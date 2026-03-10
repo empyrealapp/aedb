@@ -1,4 +1,4 @@
-use crate::wal::frame::FrameWriter;
+use crate::wal::frame::append_frame_bytes;
 use crate::wal::rotation::RotationReason;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -120,6 +120,7 @@ pub struct SegmentManager {
     prev_hash: [u8; 32],
     active: Option<ActiveSegment>,
     force_rotate: bool,
+    encode_scratch: Vec<u8>,
 }
 
 impl SegmentManager {
@@ -133,6 +134,7 @@ impl SegmentManager {
             prev_hash: [0u8; 32],
             active: None,
             force_rotate: false,
+            encode_scratch: Vec::new(),
         }
     }
 
@@ -207,18 +209,21 @@ impl SegmentManager {
         let estimated_encoded_bytes = frames.iter().fold(0usize, |acc, frame| {
             acc.saturating_add(Self::FRAME_FIXED_BYTES.saturating_add(frame.payload.len()))
         });
-        let mut writer = FrameWriter::new(Vec::<u8>::with_capacity(estimated_encoded_bytes));
-        for frame in frames {
-            writer
-                .append(
-                    frame.seq,
-                    frame.timestamp_micros,
-                    frame.payload_type,
-                    frame.payload,
-                )
-                .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
+        let mut encoded_frames = std::mem::take(&mut self.encode_scratch);
+        encoded_frames.clear();
+        if encoded_frames.capacity() < estimated_encoded_bytes {
+            encoded_frames.reserve(estimated_encoded_bytes - encoded_frames.capacity());
         }
-        let encoded_frames = writer.into_inner();
+        for frame in frames {
+            append_frame_bytes(
+                &mut encoded_frames,
+                frame.seq,
+                frame.timestamp_micros,
+                frame.payload_type,
+                frame.payload,
+            )
+            .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
+        }
         let encoded_size_bytes = encoded_frames.len() as u64;
 
         active.file.write_all(&encoded_frames)?;
@@ -230,6 +235,8 @@ impl SegmentManager {
             active.file.sync_data()?;
         }
         active.commit_count = active.commit_count.saturating_add(frames.len() as u64);
+        encoded_frames.clear();
+        self.encode_scratch = encoded_frames;
         Ok(())
     }
 

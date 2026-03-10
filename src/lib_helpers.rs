@@ -592,6 +592,41 @@ pub(crate) fn parse_cursor_seq(cursor: &str) -> Result<u64, AedbError> {
     Ok(token.snapshot_seq)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SignedQueryCursor {
+    version: u8,
+    raw_cursor: String,
+    mac: [u8; 32],
+}
+
+pub(crate) fn sign_query_cursor(cursor: &str, key: &[u8; 32]) -> Result<String, AedbError> {
+    let payload = SignedQueryCursor {
+        version: 1,
+        raw_cursor: cursor.to_string(),
+        mac: *blake3::keyed_hash(key, cursor.as_bytes()).as_bytes(),
+    };
+    let bytes = rmp_serde::to_vec(&payload).map_err(|e| AedbError::Encode(e.to_string()))?;
+    Ok(hex::encode(bytes))
+}
+
+pub(crate) fn verify_signed_query_cursor(
+    cursor: &str,
+    key: &[u8; 32],
+) -> Result<(String, u64), AedbError> {
+    let bytes = hex::decode(cursor).map_err(|_| AedbError::Decode("invalid cursor".into()))?;
+    let payload: SignedQueryCursor =
+        rmp_serde::from_slice(&bytes).map_err(|_| AedbError::Decode("invalid cursor".into()))?;
+    if payload.version != 1 {
+        return Err(AedbError::Decode("invalid cursor".into()));
+    }
+    let expected = *blake3::keyed_hash(key, payload.raw_cursor.as_bytes()).as_bytes();
+    if payload.mac != expected {
+        return Err(AedbError::Validation("cursor signature mismatch".into()));
+    }
+    let snapshot_seq = parse_cursor_seq(&payload.raw_cursor)?;
+    Ok((payload.raw_cursor, snapshot_seq))
+}
+
 pub(crate) fn should_fallback_to_recovery(err: &AedbError) -> bool {
     match err {
         AedbError::Validation(msg) => {

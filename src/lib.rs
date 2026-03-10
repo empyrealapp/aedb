@@ -91,6 +91,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 const TRUST_MODE_MARKER_FILE: &str = "trust_mode.json";
 
@@ -182,17 +183,39 @@ fn create_private_dir_all(path: &Path) -> Result<(), AedbError> {
     Ok(())
 }
 
+fn derive_cursor_signing_key(config: &AedbConfig, dir: &Path) -> [u8; 32] {
+    let mut material = Vec::new();
+    if let Some(key) = config.hmac_key() {
+        material.extend_from_slice(key);
+        material.extend_from_slice(dir.to_string_lossy().as_bytes());
+    } else {
+        material.extend_from_slice(Uuid::new_v4().as_bytes());
+        material.extend_from_slice(
+            &SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .to_le_bytes(),
+        );
+        material.extend_from_slice(dir.to_string_lossy().as_bytes());
+    }
+    blake3::derive_key("aedb-query-cursor-v1", &material)
+}
+
 pub struct AedbInstance {
     _config: AedbConfig,
     require_authenticated_calls: bool,
     dir: PathBuf,
+    cursor_signing_key: [u8; 32],
     executor: CommitExecutor,
     /// Serializes checkpoint writers without blocking commit/query traffic.
     checkpoint_lock: Arc<AsyncMutex<()>>,
     snapshot_manager: Arc<Mutex<SnapshotManager>>,
     recovery_cache: Arc<Mutex<RecoveryCache>>,
     lifecycle_hooks: Arc<Mutex<Vec<Arc<dyn LifecycleHook>>>>,
+    lifecycle_hooks_present: Arc<AtomicBool>,
     telemetry_hooks: Arc<Mutex<Vec<Arc<dyn QueryCommitTelemetryHook>>>>,
+    telemetry_hooks_present: Arc<AtomicBool>,
     upstream_validation_rejections: Arc<AtomicU64>,
     durable_wait_ops: Arc<AtomicU64>,
     durable_wait_micros: Arc<AtomicU64>,
@@ -1125,17 +1148,21 @@ impl AedbInstance {
         };
         let startup_recovery_micros =
             recovery_start.elapsed().unwrap_or_default().as_micros() as u64;
+        let cursor_signing_key = derive_cursor_signing_key(&config, dir);
 
         Ok(Self {
             _config: config,
             require_authenticated_calls,
             dir: dir.to_path_buf(),
+            cursor_signing_key,
             executor,
             checkpoint_lock: Arc::new(AsyncMutex::new(())),
             snapshot_manager: Arc::new(Mutex::new(SnapshotManager::default())),
             recovery_cache: Arc::new(Mutex::new(RecoveryCache::default())),
             lifecycle_hooks: Arc::new(Mutex::new(Vec::new())),
+            lifecycle_hooks_present: Arc::new(AtomicBool::new(false)),
             telemetry_hooks: Arc::new(Mutex::new(Vec::new())),
+            telemetry_hooks_present: Arc::new(AtomicBool::new(false)),
             upstream_validation_rejections: Arc::new(AtomicU64::new(0)),
             durable_wait_ops: Arc::new(AtomicU64::new(0)),
             durable_wait_micros: Arc::new(AtomicU64::new(0)),
@@ -1485,7 +1512,7 @@ impl AedbInstance {
     }
 
     async fn dispatch_lifecycle_events_for_commit(&self, commit_seq: u64) {
-        if self.lifecycle_hooks.lock().is_empty() {
+        if !self.lifecycle_hooks_present.load(Ordering::Acquire) {
             return;
         }
         let events = match self.read_lifecycle_events_for_commit(commit_seq).await {
@@ -1532,6 +1559,9 @@ impl AedbInstance {
         if events.is_empty() {
             return;
         }
+        if !self.lifecycle_hooks_present.load(Ordering::Acquire) {
+            return;
+        }
         let hooks = self.lifecycle_hooks.lock().clone();
         if hooks.is_empty() {
             return;
@@ -1560,10 +1590,10 @@ impl AedbInstance {
         snapshot_seq: u64,
         result: &Result<QueryResult, QueryError>,
     ) {
-        let hooks = self.telemetry_hooks.lock().clone();
-        if hooks.is_empty() {
+        if !self.telemetry_hooks_present.load(Ordering::Acquire) {
             return;
         }
+        let hooks = self.telemetry_hooks.lock().clone();
         let (rows_examined, ok, error) = match result {
             Ok(res) => (res.rows_examined, true, None),
             Err(err) => (0usize, false, Some(err.to_string())),
@@ -1589,10 +1619,10 @@ impl AedbInstance {
         started: Instant,
         result: &Result<CommitResult, AedbError>,
     ) {
-        let hooks = self.telemetry_hooks.lock().clone();
-        if hooks.is_empty() {
+        if !self.telemetry_hooks_present.load(Ordering::Acquire) {
             return;
         }
+        let hooks = self.telemetry_hooks.lock().clone();
         let (commit_seq, durable_head_seq, ok, error) = match result {
             Ok(res) => (Some(res.commit_seq), Some(res.durable_head_seq), true, None),
             Err(err) => (None, None, false, Some(err.to_string())),
@@ -1637,6 +1667,28 @@ impl AedbInstance {
             ok,
             "aedb read phase timing"
         );
+    }
+
+    fn normalize_query_cursor_options(&self, options: &mut QueryOptions) -> Result<(), QueryError> {
+        let Some(cursor) = options.cursor.take() else {
+            return Ok(());
+        };
+        let (raw_cursor, snapshot_seq) =
+            verify_signed_query_cursor(&cursor, &self.cursor_signing_key)
+                .map_err(QueryError::from)?;
+        options.consistency = ConsistencyMode::AtSeq(snapshot_seq);
+        options.cursor = Some(raw_cursor);
+        Ok(())
+    }
+
+    fn sign_query_result_cursor(&self, result: &mut QueryResult) -> Result<(), QueryError> {
+        let Some(raw_cursor) = result.cursor.take() else {
+            return Ok(());
+        };
+        let signed =
+            sign_query_cursor(&raw_cursor, &self.cursor_signing_key).map_err(QueryError::from)?;
+        result.cursor = Some(signed);
+        Ok(())
     }
 
     pub async fn query(
@@ -1722,14 +1774,11 @@ impl AedbInstance {
             options.async_index = query.use_index.clone();
         }
 
-        if let Some(cursor) = &options.cursor {
-            let token = parse_cursor_seq(cursor).map_err(QueryError::from)?;
-            options.consistency = ConsistencyMode::AtSeq(token);
-        }
+        self.normalize_query_cursor_options(&mut options)?;
 
         let snapshot_started = Instant::now();
-        let lease = self
-            .acquire_snapshot(options.consistency)
+        let view = self
+            .snapshot_for_consistency(options.consistency)
             .await
             .map_err(QueryError::from)?;
         let snapshot_micros = snapshot_started.elapsed().as_micros() as u64;
@@ -1737,7 +1786,7 @@ impl AedbInstance {
         let execute_started = Instant::now();
         let table = query.table.clone();
         let result = execute_query_against_view(
-            &lease.view,
+            &view,
             project_id,
             scope_id,
             query,
@@ -1758,12 +1807,15 @@ impl AedbInstance {
             units,
             result.is_ok(),
         );
+        let mut result = result?;
+        self.sign_query_result_cursor(&mut result)?;
+        let result = Ok(result);
         self.emit_query_telemetry(
             started,
             project_id,
             scope_id,
             &table,
-            lease.view.seq,
+            view.seq,
             &result,
         );
         result
@@ -1924,6 +1976,9 @@ impl AedbInstance {
                 scope: "anonymous".into(),
             });
         }
+
+        let mut options = options;
+        self.normalize_query_cursor_options(&mut options)?;
 
         let lease = self
             .acquire_snapshot(options.consistency)
@@ -3744,23 +3799,13 @@ impl AedbInstance {
                 return Err(AedbError::Validation("exposure_id cannot be empty".into()));
             }
         }
-        self.commit_envelope_prevalidated_internal(
+        self.commit_prevalidated_internal(
             "expose_accumulator_many_atomic",
-            TransactionEnvelope {
-                caller: None,
-                idempotency_key: None,
-                write_class: WriteClass::Standard,
-                assertions: Vec::new(),
-                read_set: ReadSet::default(),
-                write_intent: WriteIntent {
-                    mutations: vec![Mutation::ExposeAccumulatorBatch {
-                        project_id: project_id.to_string(),
-                        scope_id: scope_id.to_string(),
-                        accumulator_name: accumulator_name.to_string(),
-                        exposures,
-                    }],
-                },
-                base_seq: 0,
+            Mutation::ExposeAccumulatorBatch {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                accumulator_name: accumulator_name.to_string(),
+                exposures,
             },
         )
         .await
@@ -3952,28 +3997,15 @@ impl AedbInstance {
             ));
         }
         let lease = self.acquire_snapshot(consistency).await?;
-        let Some(acc) = lease
+        lease
             .view
             .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        if let Some(err) = &acc.projector_error {
-            return Err(AedbError::Validation(format!(
-                "accumulator projector unhealthy: {err}"
-            )));
-        }
-        let mut value = acc.value;
-        for (_, delta) in acc.deltas.range((
-            Bound::Excluded(acc.last_applied_order_key),
-            Bound::Unbounded,
-        )) {
-            value = value.checked_add(delta.delta).ok_or(AedbError::Overflow)?;
-        }
-        Ok(value)
+            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+            .ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })
     }
 
     pub async fn accumulator_value_strong_as(
@@ -3997,28 +4029,15 @@ impl AedbInstance {
                 caller.caller_id
             )));
         }
-        let Some(acc) = lease
+        lease
             .view
             .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        if let Some(err) = &acc.projector_error {
-            return Err(AedbError::Validation(format!(
-                "accumulator projector unhealthy: {err}"
-            )));
-        }
-        let mut value = acc.value;
-        for (_, delta) in acc.deltas.range((
-            Bound::Excluded(acc.last_applied_order_key),
-            Bound::Unbounded,
-        )) {
-            value = value.checked_add(delta.delta).ok_or(AedbError::Overflow)?;
-        }
-        Ok(value)
+            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+            .ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })
     }
 
     pub async fn accumulator_lag(
@@ -4184,13 +4203,33 @@ impl AedbInstance {
         accumulator_name: &str,
         consistency: ConsistencyMode,
     ) -> Result<i64, AedbError> {
-        let projected = self
-            .accumulator_value(project_id, scope_id, accumulator_name, consistency)
-            .await?;
-        let exposure = self
-            .accumulator_exposure(project_id, scope_id, accumulator_name, consistency)
-            .await?;
-        projected.checked_sub(exposure).ok_or(AedbError::Overflow)
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
+        let lease = self.acquire_snapshot(consistency).await?;
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        let effective = lease
+            .view
+            .keyspace
+            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+            .ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })?;
+        effective
+            .checked_sub(acc.total_exposure)
+            .ok_or(AedbError::Overflow)
     }
 
     pub async fn accumulator_available_as(
@@ -4201,13 +4240,40 @@ impl AedbInstance {
         accumulator_name: &str,
         consistency: ConsistencyMode,
     ) -> Result<i64, AedbError> {
-        let projected = self
-            .accumulator_value_as(caller, project_id, scope_id, accumulator_name, consistency)
-            .await?;
-        let exposure = self
-            .accumulator_exposure_as(caller, project_id, scope_id, accumulator_name, consistency)
-            .await?;
-        projected.checked_sub(exposure).ok_or(AedbError::Overflow)
+        ensure_external_caller_allowed(caller)?;
+        let lease = self.acquire_snapshot(consistency).await?;
+        if !lease.view.catalog.has_kv_read_permission(
+            &caller.caller_id,
+            project_id,
+            scope_id,
+            accumulator_name.as_bytes(),
+        ) {
+            return Err(AedbError::PermissionDenied(format!(
+                "caller={} missing kv read permission for accumulator",
+                caller.caller_id
+            )));
+        }
+        let Some(acc) = lease
+            .view
+            .keyspace
+            .accumulator(project_id, scope_id, accumulator_name)
+        else {
+            return Err(AedbError::Validation(format!(
+                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+            )));
+        };
+        let effective = lease
+            .view
+            .keyspace
+            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+            .ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })?;
+        effective
+            .checked_sub(acc.total_exposure)
+            .ok_or(AedbError::Overflow)
     }
 
     pub async fn accumulator_exposure_metrics(
@@ -4232,8 +4298,16 @@ impl AedbInstance {
                 "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
             )));
         };
-        let available = acc
-            .value
+        let effective = lease
+            .view
+            .keyspace
+            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+            .ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })?;
+        let available = effective
             .checked_sub(acc.total_exposure)
             .ok_or(AedbError::Overflow)?;
         Ok(AccumulatorExposureMetrics {
@@ -4274,8 +4348,16 @@ impl AedbInstance {
                 "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
             )));
         };
-        let available = acc
-            .value
+        let effective = lease
+            .view
+            .keyspace
+            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+            .ok_or_else(|| {
+                AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })?;
+        let available = effective
             .checked_sub(acc.total_exposure)
             .ok_or(AedbError::Overflow)?;
         Ok(AccumulatorExposureMetrics {
@@ -4458,11 +4540,11 @@ impl AedbInstance {
                 "processor_name cannot be empty".into(),
             ));
         }
-        self.commit_prevalidated_internal(
-            "ack_reactive_processor_checkpoint",
-            reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
-        )
-        .await
+        let envelope = self
+            .build_reactive_processor_checkpoint_envelope(processor_name, checkpoint_seq)
+            .await?;
+        self.commit_envelope_prevalidated_internal("ack_reactive_processor_checkpoint", envelope)
+            .await
     }
 
     pub async fn ack_reactive_processor_checkpoint_as(
@@ -4477,11 +4559,11 @@ impl AedbInstance {
                 "processor_name cannot be empty".into(),
             ));
         }
-        self.commit_as(
-            caller,
-            reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
-        )
-        .await
+        let mut envelope = self
+            .build_reactive_processor_checkpoint_envelope(processor_name, checkpoint_seq)
+            .await?;
+        envelope.caller = Some(caller);
+        self.commit_envelope(envelope).await
     }
 
     pub async fn ack_reactive_processor_checkpoint_batched(
@@ -4522,10 +4604,13 @@ impl AedbInstance {
         if !should_persist {
             return Ok(None);
         }
+        let envelope = self
+            .build_reactive_processor_checkpoint_envelope(processor_name, checkpoint_seq)
+            .await?;
         let committed = self
-            .commit_prevalidated_internal(
+            .commit_envelope_prevalidated_internal(
                 "ack_reactive_processor_checkpoint_batched",
-                reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
+                envelope,
             )
             .await?;
         {
@@ -4573,11 +4658,12 @@ impl AedbInstance {
         if !should_persist {
             return Ok(None);
         }
+        let mut envelope = self
+            .build_reactive_processor_checkpoint_envelope(processor_name, checkpoint_seq)
+            .await?;
+        envelope.caller = Some(caller);
         let committed = self
-            .commit_as(
-                caller,
-                reactive_processor_checkpoint_mutation(processor_name, checkpoint_seq),
-            )
+            .commit_envelope(envelope)
             .await?;
         {
             let mut cache = self.reactive_processor_ack_watermarks.lock();
@@ -4587,6 +4673,66 @@ impl AedbInstance {
             prune_reactive_ack_cache(&mut cache);
         }
         Ok(Some(committed))
+    }
+
+    async fn build_reactive_processor_checkpoint_envelope(
+        &self,
+        processor_name: &str,
+        checkpoint_seq: u64,
+    ) -> Result<TransactionEnvelope, AedbError> {
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
+        let checkpoint_key = Value::Text(processor_name.to_string().into());
+        let checkpoint_pk = EncodedKey::from_values(std::slice::from_ref(&checkpoint_key));
+        let checkpoint_table = lease.view.keyspace.table(
+            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
+        );
+        let current_checkpoint = checkpoint_table
+            .and_then(|table| table.rows.get(&checkpoint_pk))
+            .and_then(|row| row.values.get(1))
+            .and_then(|v| match v {
+                Value::Integer(i) => u64::try_from(*i).ok(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if checkpoint_seq < current_checkpoint {
+            return Err(AedbError::Validation(format!(
+                "checkpoint_seq {checkpoint_seq} regresses current checkpoint {current_checkpoint}"
+            )));
+        }
+        let checkpoint_version = checkpoint_table
+            .and_then(|table| table.row_versions.get(&checkpoint_pk))
+            .copied()
+            .unwrap_or(0);
+        let primary_key = vec![checkpoint_key.clone()];
+        let read_set = ReadSet {
+            points: vec![ReadSetEntry {
+                key: ReadKey::TableRow {
+                    project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+                    scope_id: SYSTEM_SCOPE_ID.to_string(),
+                    table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+                    primary_key,
+                },
+                version_at_read: checkpoint_version,
+            }],
+            ranges: Vec::new(),
+        };
+
+        Ok(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set,
+            write_intent: WriteIntent {
+                mutations: vec![reactive_processor_checkpoint_mutation(
+                    processor_name,
+                    checkpoint_seq,
+                )],
+            },
+            base_seq: lease.view.seq,
+        })
     }
 
     pub async fn reactive_processor_lag(
@@ -7926,20 +8072,26 @@ impl AedbInstance {
 
     pub fn add_lifecycle_hook(&self, hook: Arc<dyn LifecycleHook>) {
         self.lifecycle_hooks.lock().push(hook);
+        self.lifecycle_hooks_present.store(true, Ordering::Release);
     }
 
     pub fn remove_lifecycle_hook(&self, hook: &Arc<dyn LifecycleHook>) {
         let mut hooks = self.lifecycle_hooks.lock();
         hooks.retain(|existing| !Arc::ptr_eq(existing, hook));
+        self.lifecycle_hooks_present
+            .store(!hooks.is_empty(), Ordering::Release);
     }
 
     pub fn add_telemetry_hook(&self, hook: Arc<dyn QueryCommitTelemetryHook>) {
         self.telemetry_hooks.lock().push(hook);
+        self.telemetry_hooks_present.store(true, Ordering::Release);
     }
 
     pub fn remove_telemetry_hook(&self, hook: &Arc<dyn QueryCommitTelemetryHook>) {
         let mut hooks = self.telemetry_hooks.lock();
         hooks.retain(|existing| !Arc::ptr_eq(existing, hook));
+        self.telemetry_hooks_present
+            .store(!hooks.is_empty(), Ordering::Release);
     }
 
     pub async fn backup_full_to_remote(
@@ -8349,34 +8501,44 @@ impl AedbInstance {
         // Anchor checkpoint to a stable committed horizon.
         let seq = self.executor.durable_head_seq_now();
         let lease = self.acquire_snapshot(ConsistencyMode::AtSeq(seq)).await?;
-        let snapshot = lease.view.keyspace.as_ref();
-        let catalog = lease.view.catalog.as_ref();
+        let snapshot = Arc::clone(&lease.view.keyspace);
+        let catalog = Arc::clone(&lease.view.catalog);
         let mut idempotency = self.executor.idempotency_snapshot().await;
         idempotency.retain(|_, record| record.commit_seq <= seq);
-        let checkpoint = write_checkpoint_with_key(
-            snapshot,
-            catalog,
-            seq,
-            &self.dir,
-            self._config.checkpoint_key(),
-            self._config.checkpoint_key_id.clone(),
-            idempotency,
-            self._config.checkpoint_compression_level,
-        )?;
+        let dir = self.dir.clone();
+        let checkpoint_key = self._config.checkpoint_key().copied();
+        let checkpoint_key_id = self._config.checkpoint_key_id.clone();
+        let compression_level = self._config.checkpoint_compression_level;
+        let manifest_hmac_key = self._config.hmac_key().map(|key| key.to_vec());
+        tokio::task::spawn_blocking(move || -> Result<(), AedbError> {
+            let checkpoint = write_checkpoint_with_key(
+                snapshot.as_ref(),
+                catalog.as_ref(),
+                seq,
+                &dir,
+                checkpoint_key.as_ref(),
+                checkpoint_key_id,
+                idempotency,
+                compression_level,
+            )?;
 
-        let segments = read_segments_for_checkpoint(&self.dir, seq)?;
-        let active_segment_seq = segments
-            .last()
-            .map(|segment| segment.segment_seq)
-            .unwrap_or(seq.saturating_add(1));
-        let manifest = Manifest {
-            durable_seq: seq,
-            visible_seq: seq,
-            active_segment_seq,
-            checkpoints: vec![checkpoint],
-            segments,
-        };
-        write_manifest_atomic_signed(&manifest, &self.dir, self._config.hmac_key())?;
+            let segments = read_segments_for_checkpoint(&dir, seq)?;
+            let active_segment_seq = segments
+                .last()
+                .map(|segment| segment.segment_seq)
+                .unwrap_or(seq.saturating_add(1));
+            let manifest = Manifest {
+                durable_seq: seq,
+                visible_seq: seq,
+                active_segment_seq,
+                checkpoints: vec![checkpoint],
+                segments,
+            };
+            write_manifest_atomic_signed(&manifest, &dir, manifest_hmac_key.as_deref())?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))??;
         Ok(seq)
     }
 
@@ -8593,6 +8755,11 @@ impl AedbInstance {
             if current_seq >= effective_target {
                 break;
             }
+        }
+        if current_seq != effective_target {
+            return Err(AedbError::Validation(format!(
+                "backup chain replay incomplete: restored seq {current_seq}, expected {effective_target}"
+            )));
         }
         let restored_seq = current_seq;
         let cp = write_checkpoint_with_key(
@@ -9323,6 +9490,7 @@ impl ReadTx<'_> {
         query: Query,
         mut options: QueryOptions,
     ) -> Result<QueryResult, QueryError> {
+        self.db.normalize_query_cursor_options(&mut options)?;
         options.consistency = ConsistencyMode::AtSeq(self.lease.view.seq);
         let started = Instant::now();
         let table = query.table.clone();
@@ -9335,6 +9503,9 @@ impl ReadTx<'_> {
             self.caller.as_ref(),
             self.db._config.max_scan_rows,
         );
+        let mut result = result?;
+        self.db.sign_query_result_cursor(&mut result)?;
+        let result = Ok(result);
         self.db.emit_query_telemetry(
             started,
             project_id,
@@ -9383,6 +9554,7 @@ impl ReadTx<'_> {
         query: Query,
         mut options: QueryOptions,
     ) -> Result<QueryDiagnostics, QueryError> {
+        self.db.normalize_query_cursor_options(&mut options)?;
         options.consistency = ConsistencyMode::AtSeq(self.lease.view.seq);
         explain_query_against_view(
             &self.lease.view,

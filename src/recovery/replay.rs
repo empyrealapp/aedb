@@ -108,6 +108,7 @@ fn apply_payload(
                     IdempotencyRecord {
                         commit_seq,
                         recorded_at_micros: timestamp_micros,
+                        request_fingerprint: wal_payload.request_fingerprint,
                     },
                 );
             }

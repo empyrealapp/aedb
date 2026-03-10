@@ -62,11 +62,23 @@ pub fn apply_mutation(
                 .get(&(ns.clone(), table_name.clone()))
                 .ok_or_else(|| AedbError::Validation("table missing".into()))?
                 .clone();
+            let primary_key_indices = primary_key_column_indices(&schema)?;
             for row in rows {
-                let primary_key = extract_primary_key_from_row(&schema, &row)?;
-                apply_insert_once(
+                let primary_key =
+                    extract_primary_key_from_row_with_indices(&row, &schema, &primary_key_indices)?;
+                if keyspace
+                    .get_row(&project_id, &scope_id, &table_name, &primary_key)
+                    .is_some()
+                {
+                    return Err(AedbError::DuplicatePK {
+                        table: table_name.clone(),
+                        key: format!("{primary_key:?}"),
+                    });
+                }
+                apply_upsert_once_with_schema(
                     catalog,
                     keyspace,
+                    &schema,
                     &project_id,
                     &scope_id,
                     &table_name,
@@ -108,11 +120,14 @@ pub fn apply_mutation(
                 .get(&(ns.clone(), table_name.clone()))
                 .ok_or_else(|| AedbError::Validation("table missing".into()))?
                 .clone();
+            let primary_key_indices = primary_key_column_indices(&schema)?;
             for row in rows {
-                let primary_key = extract_primary_key_from_row(&schema, &row)?;
-                apply_upsert_once(
+                let primary_key =
+                    extract_primary_key_from_row_with_indices(&row, &schema, &primary_key_indices)?;
+                apply_upsert_once_with_schema(
                     catalog,
                     keyspace,
+                    &schema,
                     &project_id,
                     &scope_id,
                     &table_name,
@@ -1165,18 +1180,37 @@ pub fn apply_mutation_trusted_if_eligible(
                 Some(schema) => schema.clone(),
                 None => return Some(Err(AedbError::Validation("table missing".into()))),
             };
+            let primary_key_indices = match primary_key_column_indices(&schema) {
+                Ok(indices) => indices,
+                Err(err) => return Some(Err(err)),
+            };
             let mut result = Ok(());
             for row in rows {
-                let primary_key = match extract_primary_key_from_row(&schema, &row) {
+                let primary_key = match extract_primary_key_from_row_with_indices(
+                    &row,
+                    &schema,
+                    &primary_key_indices,
+                ) {
                     Ok(pk) => pk,
                     Err(err) => {
                         result = Err(err);
                         break;
                     }
                 };
-                if let Err(err) = apply_insert_once(
+                if keyspace
+                    .get_row(&project_id, &scope_id, &table_name, &primary_key)
+                    .is_some()
+                {
+                    result = Err(AedbError::DuplicatePK {
+                        table: table_name.clone(),
+                        key: format!("{primary_key:?}"),
+                    });
+                    break;
+                }
+                if let Err(err) = apply_upsert_once_with_schema(
                     catalog,
                     keyspace,
+                    &schema,
                     &project_id,
                     &scope_id,
                     &table_name,
@@ -1217,6 +1251,10 @@ pub fn apply_mutation_trusted_if_eligible(
                 Some(schema) => schema.clone(),
                 None => return Some(Err(AedbError::Validation("table missing".into()))),
             };
+            let primary_key_indices = match primary_key_column_indices(&schema) {
+                Ok(indices) => indices,
+                Err(err) => return Some(Err(err)),
+            };
             if !table_allows_trusted_fast_upsert(
                 catalog,
                 &schema,
@@ -1228,7 +1266,11 @@ pub fn apply_mutation_trusted_if_eligible(
             }
             let mut result = Ok(());
             for row in rows {
-                let primary_key = match extract_primary_key_from_row(&schema, &row) {
+                let primary_key = match extract_primary_key_from_row_with_indices(
+                    &row,
+                    &schema,
+                    &primary_key_indices,
+                ) {
                     Ok(pk) => pk,
                     Err(err) => {
                         result = Err(err);
@@ -2011,9 +2053,16 @@ fn apply_insert_once(
             key: format!("{primary_key:?}"),
         });
     }
-    apply_upsert_once(
+    let ns = namespace_key(project_id, scope_id);
+    let schema = catalog
+        .tables
+        .get(&(ns, table_name.to_string()))
+        .ok_or_else(|| AedbError::Validation("table missing".into()))?
+        .clone();
+    apply_upsert_once_with_schema(
         catalog,
         keyspace,
+        &schema,
         project_id,
         scope_id,
         table_name,
@@ -2031,7 +2080,7 @@ fn apply_upsert_once(
     scope_id: &str,
     table_name: &str,
     primary_key: Vec<Value>,
-    mut row: Row,
+    row: Row,
     commit_seq: u64,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
@@ -2040,14 +2089,69 @@ fn apply_upsert_once(
         .get(&(ns, table_name.to_string()))
         .ok_or_else(|| AedbError::Validation("table missing".into()))?
         .clone();
-    let old_row = keyspace
-        .get_row(project_id, scope_id, table_name, &primary_key)
-        .cloned();
-    apply_default_constraints(&schema, &mut row)?;
-    validate_row_constraints(
+    apply_upsert_once_with_schema(
         catalog,
         keyspace,
         &schema,
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+        row,
+        commit_seq,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_upsert_once_with_schema(
+    catalog: &mut Catalog,
+    keyspace: &mut Keyspace,
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: Vec<Value>,
+    row: Row,
+    commit_seq: u64,
+) -> Result<(), AedbError> {
+    let encoded_pk = EncodedKey::from_values(&primary_key);
+    let old_row = keyspace
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
+        .cloned();
+    apply_upsert_once_with_schema_and_old_row(
+        catalog,
+        keyspace,
+        schema,
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+        encoded_pk,
+        old_row,
+        row,
+        commit_seq,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_upsert_once_with_schema_and_old_row(
+    catalog: &mut Catalog,
+    keyspace: &mut Keyspace,
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: Vec<Value>,
+    encoded_pk: EncodedKey,
+    old_row: Option<Row>,
+    mut row: Row,
+    commit_seq: u64,
+) -> Result<(), AedbError> {
+    apply_default_constraints(schema, &mut row)?;
+    validate_row_constraints(
+        catalog,
+        keyspace,
+        schema,
         project_id,
         scope_id,
         table_name,
@@ -2057,21 +2161,14 @@ fn apply_upsert_once(
     )?;
     if let Some(before) = &old_row {
         handle_referencing_foreign_keys_on_update(
-            catalog, keyspace, project_id, scope_id, table_name, &schema, before, &row, commit_seq,
+            catalog, keyspace, project_id, scope_id, table_name, schema, before, &row, commit_seq,
         )?;
     }
-    keyspace.upsert_row(
-        project_id,
-        scope_id,
-        table_name,
-        primary_key.clone(),
-        row.clone(),
-        commit_seq,
-    );
+    keyspace.table_mut(project_id, scope_id, table_name);
     maintain_secondary_indexes(
         catalog,
         keyspace,
-        &schema,
+        schema,
         project_id,
         scope_id,
         table_name,
@@ -2079,19 +2176,40 @@ fn apply_upsert_once(
         old_row.as_ref(),
         Some(&row),
     )?;
+    keyspace.upsert_row_by_encoded_pk(
+        project_id, scope_id, table_name, encoded_pk, row, commit_seq,
+    );
     Ok(())
 }
 
 fn extract_primary_key_from_row(schema: &TableSchema, row: &Row) -> Result<Vec<Value>, AedbError> {
-    let mut primary_key = Vec::with_capacity(schema.primary_key.len());
-    for pk_name in &schema.primary_key {
-        let column_index = schema
-            .columns
-            .iter()
-            .position(|c| c.name == *pk_name)
-            .ok_or_else(|| {
-                AedbError::Validation(format!("primary key column missing: {pk_name}"))
-            })?;
+    let indices = primary_key_column_indices(schema)?;
+    extract_primary_key_from_row_with_indices(row, schema, &indices)
+}
+
+fn primary_key_column_indices(schema: &TableSchema) -> Result<Vec<usize>, AedbError> {
+    schema
+        .primary_key
+        .iter()
+        .map(|pk_name| {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == *pk_name)
+                .ok_or_else(|| {
+                    AedbError::Validation(format!("primary key column missing: {pk_name}"))
+                })
+        })
+        .collect()
+}
+
+fn extract_primary_key_from_row_with_indices(
+    row: &Row,
+    schema: &TableSchema,
+    indices: &[usize],
+) -> Result<Vec<Value>, AedbError> {
+    let mut primary_key = Vec::with_capacity(indices.len());
+    for (pk_name, column_index) in schema.primary_key.iter().zip(indices.iter().copied()) {
         let value = row.values.get(column_index).ok_or_else(|| {
             AedbError::Validation(format!(
                 "primary key column value missing from row: {pk_name}"
@@ -2499,6 +2617,29 @@ fn apply_delete_internal(
             resource_id: format!("{project_id}.{scope_id}.{table_name}"),
         })?
         .clone();
+    apply_delete_internal_with_schema(
+        catalog,
+        keyspace,
+        &schema,
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+        commit_seq,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_delete_internal_with_schema(
+    catalog: &Catalog,
+    keyspace: &mut Keyspace,
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: &[Value],
+    commit_seq: u64,
+) -> Result<(), AedbError> {
     let Some(old_row) = keyspace
         .get_row(project_id, scope_id, table_name, primary_key)
         .cloned()
@@ -2514,7 +2655,7 @@ fn apply_delete_internal(
     maintain_secondary_indexes(
         catalog,
         keyspace,
-        &schema,
+        schema,
         project_id,
         scope_id,
         table_name,
@@ -2548,21 +2689,28 @@ fn apply_delete_where_internal(
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let compiled = compile_expr(predicate, &columns, table_name)
         .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
-    let mut to_delete = Vec::new();
+    let mut to_delete: Vec<EncodedKey> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for row in table.rows.values() {
+        for (encoded_pk, row) in &table.rows {
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
-            to_delete.push(extract_primary_key_from_row(&schema, row)?);
+            to_delete.push(encoded_pk.clone());
             if limit.is_some_and(|max| to_delete.len() >= max) {
                 break;
             }
         }
     }
-    for pk in to_delete {
-        apply_delete_internal(
-            catalog, keyspace, project_id, scope_id, table_name, &pk, commit_seq,
+    for encoded_pk in to_delete {
+        apply_delete_internal_encoded_with_schema(
+            catalog,
+            keyspace,
+            &schema,
+            project_id,
+            scope_id,
+            table_name,
+            &encoded_pk,
+            commit_seq,
         )?;
     }
     Ok(())
@@ -2589,6 +2737,7 @@ fn apply_update_where_internal(
             resource_id: format!("{project_id}.{scope_id}.{table_name}"),
         })?
         .clone();
+    let primary_key_indices = primary_key_column_indices(&schema)?;
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let compiled = compile_expr(predicate, &columns, table_name)
         .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
@@ -2602,32 +2751,37 @@ fn apply_update_where_internal(
         };
         update_indices.push((column_index, value.clone()));
     }
-    let mut staged = Vec::new();
+    let mut staged: Vec<Row> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
         for row in table.rows.values() {
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
-            let primary_key = extract_primary_key_from_row(&schema, row)?;
-            let mut next_row = row.clone();
-            for (column_index, value) in &update_indices {
-                next_row.values[*column_index] = value.clone();
-            }
-            staged.push((primary_key, next_row));
+            staged.push(row.clone());
             if limit.is_some_and(|max| staged.len() >= max) {
                 break;
             }
         }
     }
-    for (primary_key, row) in staged {
-        apply_upsert_once(
+    for old_row in staged {
+        let primary_key =
+            extract_primary_key_from_row_with_indices(&old_row, &schema, &primary_key_indices)?;
+        let encoded_pk = EncodedKey::from_values(&primary_key);
+        let mut next_row = old_row.clone();
+        for (column_index, value) in &update_indices {
+            next_row.values[*column_index] = value.clone();
+        }
+        apply_upsert_once_with_schema_and_old_row(
             catalog,
             keyspace,
+            &schema,
             project_id,
             scope_id,
             table_name,
             primary_key,
-            row,
+            encoded_pk,
+            Some(old_row),
+            next_row,
             commit_seq,
         )?;
     }
@@ -2655,6 +2809,7 @@ fn apply_update_where_expr_internal(
             resource_id: format!("{project_id}.{scope_id}.{table_name}"),
         })?
         .clone();
+    let primary_key_indices = primary_key_column_indices(&schema)?;
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let compiled = compile_expr(predicate, &columns, table_name)
         .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
@@ -2684,33 +2839,38 @@ fn apply_update_where_expr_internal(
         };
         update_indices.push((column_index, resolved));
     }
-    let mut staged = Vec::new();
+    let mut staged: Vec<Row> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
         for row in table.rows.values() {
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
-            let primary_key = extract_primary_key_from_row(&schema, row)?;
-            let mut next_row = row.clone();
-            for (column_index, expr) in &update_indices {
-                let next_value = evaluate_table_update_expr(expr, &next_row, *column_index)?;
-                next_row.values[*column_index] = next_value;
-            }
-            staged.push((primary_key, next_row));
+            staged.push(row.clone());
             if limit.is_some_and(|max| staged.len() >= max) {
                 break;
             }
         }
     }
-    for (primary_key, row) in staged {
-        apply_upsert_once(
+    for old_row in staged {
+        let primary_key =
+            extract_primary_key_from_row_with_indices(&old_row, &schema, &primary_key_indices)?;
+        let encoded_pk = EncodedKey::from_values(&primary_key);
+        let mut next_row = old_row.clone();
+        for (column_index, expr) in &update_indices {
+            let next_value = evaluate_table_update_expr(expr, &next_row, *column_index)?;
+            next_row.values[*column_index] = next_value;
+        }
+        apply_upsert_once_with_schema_and_old_row(
             catalog,
             keyspace,
+            &schema,
             project_id,
             scope_id,
             table_name,
             primary_key,
-            row,
+            encoded_pk,
+            Some(old_row),
+            next_row,
             commit_seq,
         )?;
     }
@@ -2933,13 +3093,36 @@ fn apply_delete_internal_encoded(
         .get(&(ns.clone(), table_name.to_string()))
         .ok_or_else(|| AedbError::Validation("table missing".into()))?
         .clone();
+    apply_delete_internal_encoded_with_schema(
+        catalog,
+        keyspace,
+        &schema,
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+        commit_seq,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_delete_internal_encoded_with_schema(
+    catalog: &Catalog,
+    keyspace: &mut Keyspace,
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: &EncodedKey,
+    commit_seq: u64,
+) -> Result<(), AedbError> {
     let Some(old_row) = keyspace
         .get_row_by_encoded(project_id, scope_id, table_name, primary_key)
         .cloned()
     else {
         return Ok(());
     };
-    let primary_values = extract_primary_key_from_row(&schema, &old_row)?;
+    let primary_values = extract_primary_key_from_row(schema, &old_row)?;
     handle_referencing_foreign_keys(
         catalog, keyspace, project_id, scope_id, table_name, &old_row, commit_seq,
     )?;
@@ -2948,7 +3131,7 @@ fn apply_delete_internal_encoded(
     maintain_secondary_indexes(
         catalog,
         keyspace,
-        &schema,
+        schema,
         project_id,
         scope_id,
         table_name,
@@ -3050,14 +3233,6 @@ fn apply_upsert_on_conflict_once(
                 &final_row,
                 commit_seq,
             )?;
-            keyspace.upsert_row_by_encoded_pk(
-                &project_id,
-                &scope_id,
-                &table_name,
-                existing_pk.clone(),
-                final_row.clone(),
-                commit_seq,
-            );
             maintain_secondary_indexes(
                 catalog,
                 keyspace,
@@ -3069,6 +3244,14 @@ fn apply_upsert_on_conflict_once(
                 Some(&existing_row),
                 Some(&final_row),
             )?;
+            keyspace.upsert_row_by_encoded_pk(
+                &project_id,
+                &scope_id,
+                &table_name,
+                existing_pk,
+                final_row,
+                commit_seq,
+            );
         }
     } else {
         validate_row_constraints(
@@ -3082,14 +3265,7 @@ fn apply_upsert_on_conflict_once(
             &row,
             None,
         )?;
-        keyspace.upsert_row(
-            &project_id,
-            &scope_id,
-            &table_name,
-            proposed_pk.clone(),
-            row.clone(),
-            commit_seq,
-        );
+        keyspace.table_mut(&project_id, &scope_id, &table_name);
         maintain_secondary_indexes(
             catalog,
             keyspace,
@@ -3101,6 +3277,14 @@ fn apply_upsert_on_conflict_once(
             None,
             Some(&row),
         )?;
+        keyspace.upsert_row(
+            &project_id,
+            &scope_id,
+            &table_name,
+            proposed_pk,
+            row,
+            commit_seq,
+        );
     }
     Ok(())
 }

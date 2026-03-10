@@ -26,7 +26,7 @@ pub(super) fn validate_query(schema: &TableSchema, query: &Query) -> Result<(), 
     Ok(())
 }
 
-fn validate_expr_types(
+pub(super) fn validate_expr_types(
     schema: &TableSchema,
     expr: &crate::query::plan::Expr,
 ) -> Result<(), QueryError> {

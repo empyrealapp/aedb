@@ -75,12 +75,12 @@ impl VersionStore {
         });
     }
 
-    pub fn publish_delta(&mut self, seq: u64, delta: CommitDelta) {
+    pub fn publish_delta(&mut self, seq: u64, delta: Arc<CommitDelta>) {
         self.versions.push_back(Version {
             seq,
             keyspace: None,
             catalog: None,
-            delta: Some(Arc::new(delta)),
+            delta: Some(delta),
             created_at: Instant::now(),
             ref_count: Arc::new(AtomicU64::new(0)),
         });
@@ -273,5 +273,34 @@ fn snapshot_to_keyspace(snapshot: &KeyspaceSnapshot) -> Keyspace {
         primary_index_backend: snapshot.primary_index_backend,
         namespaces: snapshot.namespaces.clone(),
         async_indexes: snapshot.async_indexes.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommitDelta, VersionStore};
+    use crate::commit::validation::Mutation;
+    use crate::storage::keyspace::Keyspace;
+    use std::sync::Arc;
+
+    #[test]
+    fn publish_delta_reuses_shared_arc_instance() {
+        let mut store = VersionStore::new(8, 0);
+        store.bootstrap(0, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
+        let delta = Arc::new(CommitDelta {
+            seq: 7,
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        });
+
+        store.publish_delta(7, Arc::clone(&delta));
+        let deltas = store.deltas_since(0, 7).expect("delta range");
+
+        assert_eq!(deltas.len(), 1);
+        assert!(Arc::ptr_eq(&delta, &deltas[0]));
     }
 }

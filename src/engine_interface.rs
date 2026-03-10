@@ -1,13 +1,15 @@
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{SYSTEM_PROJECT_ID, namespace_key};
 use crate::commit::tx::{
-    AssertionActual, ReadAssertion, ReadSet, TransactionEnvelope, WriteClass, WriteIntent,
+    AssertionActual, ReadAssertion, ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope,
+    WriteClass, WriteIntent,
 };
 use crate::commit::validation::Mutation;
 use crate::error::AedbError;
 use crate::query::plan::ConsistencyMode;
 use crate::storage::encoded_key::EncodedKey;
 use crate::{AedbInstance, CommitResult, EventOutboxRecord};
+use crate::{catalog::Catalog, catalog::schema::TableSchema};
 use std::collections::HashMap;
 use std::ops::Bound;
 
@@ -108,6 +110,12 @@ pub struct ProcessorContext<'a> {
     checkpoint_seq: u64,
 }
 
+struct KeyedStateSnapshot {
+    row: Option<Row>,
+    version: u64,
+    snapshot_seq: u64,
+}
+
 impl AedbInstance {
     pub async fn commit_effect_batch(
         &self,
@@ -142,8 +150,7 @@ impl AedbInstance {
             .collect();
 
         let mut mutations = Vec::with_capacity(batch.effects.len() + batch.events.len());
-        let mut keyed_state_pk_len_cache: HashMap<String, usize> = HashMap::new();
-        let ns = namespace_key(project_id, scope_id);
+        let mut keyed_state_pk_index_cache: HashMap<String, usize> = HashMap::new();
         for effect in batch.effects {
             match effect {
                 EffectOperation::Accumulate {
@@ -185,28 +192,34 @@ impl AedbInstance {
                     key,
                     value,
                 } => {
-                    let pk_len = if let Some(v) = keyed_state_pk_len_cache.get(&keyed_state) {
-                        *v
-                    } else {
-                        let schema = preflight_lease
-                            .view
-                            .catalog
-                            .tables
-                            .get(&(ns.clone(), keyed_state.clone()))
-                            .ok_or_else(|| {
-                                AedbError::Validation(format!(
-                                    "table not found: {project_id}.{scope_id}.{keyed_state}"
-                                ))
-                            })?;
-                        let v = schema.primary_key.len();
-                        keyed_state_pk_len_cache.insert(keyed_state.clone(), v);
-                        v
-                    };
-                    if pk_len != 1 {
-                        return Err(AedbError::Validation(format!(
-                            "keyed_state write requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
-                        )));
-                    }
+                    let pk_index =
+                        if let Some(pk_index) = keyed_state_pk_index_cache.get(&keyed_state) {
+                            *pk_index
+                        } else {
+                            let schema = keyed_state_schema(
+                                &preflight_lease.view.catalog,
+                                project_id,
+                                scope_id,
+                                &keyed_state,
+                                "write",
+                            )?;
+                            let pk_index = keyed_state_primary_key_index(
+                                schema,
+                                project_id,
+                                scope_id,
+                                &keyed_state,
+                            )?;
+                            keyed_state_pk_index_cache.insert(keyed_state.clone(), pk_index);
+                            pk_index
+                        };
+                    validate_keyed_state_row_matches_key(
+                        pk_index,
+                        project_id,
+                        scope_id,
+                        &keyed_state,
+                        &key,
+                        &value,
+                    )?;
                     mutations.push(Mutation::Upsert {
                         project_id: project_id.to_string(),
                         scope_id: scope_id.to_string(),
@@ -216,27 +229,21 @@ impl AedbInstance {
                     });
                 }
                 EffectOperation::Delete { keyed_state, key } => {
-                    let pk_len = if let Some(v) = keyed_state_pk_len_cache.get(&keyed_state) {
-                        *v
-                    } else {
-                        let schema = preflight_lease
-                            .view
-                            .catalog
-                            .tables
-                            .get(&(ns.clone(), keyed_state.clone()))
-                            .ok_or_else(|| {
-                                AedbError::Validation(format!(
-                                    "table not found: {project_id}.{scope_id}.{keyed_state}"
-                                ))
-                            })?;
-                        let v = schema.primary_key.len();
-                        keyed_state_pk_len_cache.insert(keyed_state.clone(), v);
-                        v
-                    };
-                    if pk_len != 1 {
-                        return Err(AedbError::Validation(format!(
-                            "keyed_state delete requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
-                        )));
+                    if !keyed_state_pk_index_cache.contains_key(&keyed_state) {
+                        let schema = keyed_state_schema(
+                            &preflight_lease.view.catalog,
+                            project_id,
+                            scope_id,
+                            &keyed_state,
+                            "delete",
+                        )?;
+                        let pk_index = keyed_state_primary_key_index(
+                            schema,
+                            project_id,
+                            scope_id,
+                            &keyed_state,
+                        )?;
+                        keyed_state_pk_index_cache.insert(keyed_state.clone(), pk_index);
                     }
                     mutations.push(Mutation::Delete {
                         project_id: project_id.to_string(),
@@ -305,27 +312,22 @@ impl AedbInstance {
         consistency: ConsistencyMode,
     ) -> Result<Option<Row>, AedbError> {
         let lease = self.acquire_snapshot(consistency).await?;
-        let ns = namespace_key(project_id, scope_id);
-        let schema = lease
-            .view
-            .catalog
-            .tables
-            .get(&(ns, keyed_state.to_string()))
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "table not found: {project_id}.{scope_id}.{keyed_state}"
-                ))
-            })?;
-        if schema.primary_key.len() != 1 {
-            return Err(AedbError::Validation(format!(
-                "keyed_state read requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
-            )));
-        }
-        let Some(table) = lease.view.keyspace.table(project_id, scope_id, keyed_state) else {
-            return Ok(None);
-        };
-        let encoded = EncodedKey::from_values(&[key]);
-        Ok(table.rows.get(&encoded).cloned())
+        let _ = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "read",
+        )?;
+        let snapshot = keyed_state_snapshot_from_table(
+            &lease.view.keyspace,
+            lease.view.seq,
+            project_id,
+            scope_id,
+            keyed_state,
+            key,
+        );
+        Ok(snapshot.row)
     }
 
     pub async fn keyed_state_read_field(
@@ -338,35 +340,29 @@ impl AedbInstance {
         consistency: ConsistencyMode,
     ) -> Result<Option<Value>, AedbError> {
         let lease = self.acquire_snapshot(consistency).await?;
-        let ns = namespace_key(project_id, scope_id);
-        let schema = lease
-            .view
-            .catalog
-            .tables
-            .get(&(ns, keyed_state.to_string()))
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "table not found: {project_id}.{scope_id}.{keyed_state}"
-                ))
-            })?;
+        let schema = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "read_field",
+        )?;
         let Some(col_idx) = schema.columns.iter().position(|c| c.name == field) else {
             return Err(AedbError::Validation(format!(
                 "unknown field in keyed_state: {project_id}.{scope_id}.{keyed_state}.{field}"
             )));
         };
-        if schema.primary_key.len() != 1 {
-            return Err(AedbError::Validation(format!(
-                "keyed_state read_field requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
-            )));
-        }
-        let Some(table) = lease.view.keyspace.table(project_id, scope_id, keyed_state) else {
-            return Ok(None);
-        };
-        let encoded = EncodedKey::from_values(&[key]);
-        let Some(row) = table.rows.get(&encoded) else {
-            return Ok(None);
-        };
-        Ok(row.values.get(col_idx).cloned())
+        let snapshot = keyed_state_snapshot_from_table(
+            &lease.view.keyspace,
+            lease.view.seq,
+            project_id,
+            scope_id,
+            keyed_state,
+            key,
+        );
+        Ok(snapshot
+            .row
+            .and_then(|row| row.values.get(col_idx).cloned()))
     }
 
     pub async fn keyed_state_write(
@@ -377,6 +373,23 @@ impl AedbInstance {
         key: Value,
         value: Row,
     ) -> Result<CommitResult, AedbError> {
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
+        let schema = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "write",
+        )?;
+        let pk_index = keyed_state_primary_key_index(schema, project_id, scope_id, keyed_state)?;
+        validate_keyed_state_row_matches_key(
+            pk_index,
+            project_id,
+            scope_id,
+            keyed_state,
+            &key,
+            &value,
+        )?;
         self.commit(Mutation::Upsert {
             project_id: project_id.to_string(),
             scope_id: scope_id.to_string(),
@@ -394,6 +407,14 @@ impl AedbInstance {
         keyed_state: &str,
         key: Value,
     ) -> Result<CommitResult, AedbError> {
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
+        let _ = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "delete",
+        )?;
         self.commit(Mutation::Delete {
             project_id: project_id.to_string(),
             scope_id: scope_id.to_string(),
@@ -414,25 +435,62 @@ impl AedbInstance {
     where
         F: FnOnce(Option<Row>) -> Result<Option<Row>, AedbError>,
     {
-        let current = self
-            .keyed_state_read(
-                project_id,
-                scope_id,
-                keyed_state,
-                key.clone(),
-                ConsistencyMode::AtLatest,
-            )
-            .await?;
-        match update_fn(current)? {
-            Some(next) => {
-                self.keyed_state_write(project_id, scope_id, keyed_state, key, next)
-                    .await
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
+        let schema = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "update",
+        )?;
+        let pk_index = keyed_state_primary_key_index(schema, project_id, scope_id, keyed_state)?;
+        let snapshot = keyed_state_snapshot_from_table(
+            &lease.view.keyspace,
+            lease.view.seq,
+            project_id,
+            scope_id,
+            keyed_state,
+            key.clone(),
+        );
+        let assertion = keyed_state_assertion(project_id, scope_id, keyed_state, &key, &snapshot);
+        let next = update_fn(snapshot.row)?;
+        let mutation = match next {
+            Some(row) => {
+                validate_keyed_state_row_matches_key(
+                    pk_index,
+                    project_id,
+                    scope_id,
+                    keyed_state,
+                    &key,
+                    &row,
+                )?;
+                Mutation::Upsert {
+                    project_id: project_id.to_string(),
+                    scope_id: scope_id.to_string(),
+                    table_name: keyed_state.to_string(),
+                    primary_key: vec![key],
+                    row,
+                }
             }
-            None => {
-                self.keyed_state_delete(project_id, scope_id, keyed_state, key)
-                    .await
-            }
-        }
+            None => Mutation::Delete {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                table_name: keyed_state.to_string(),
+                primary_key: vec![key],
+            },
+        };
+        self.commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: vec![assertion],
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![mutation],
+            },
+            base_seq: snapshot.snapshot_seq,
+        })
+        .await
     }
 
     pub async fn keyed_state_query_index(
@@ -447,6 +505,13 @@ impl AedbInstance {
             return Ok(Vec::new());
         }
         let lease = self.acquire_snapshot(consistency).await?;
+        let _ = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "query_index",
+        )?;
         let Some(table) = lease.view.keyspace.table(project_id, scope_id, keyed_state) else {
             return Err(AedbError::Validation(format!(
                 "table not found: {project_id}.{scope_id}.{keyed_state}"
@@ -482,22 +547,13 @@ impl AedbInstance {
         consistency: ConsistencyMode,
     ) -> Result<Option<usize>, AedbError> {
         let lease = self.acquire_snapshot(consistency).await?;
-        let ns = namespace_key(project_id, scope_id);
-        let schema = lease
-            .view
-            .catalog
-            .tables
-            .get(&(ns, keyed_state.to_string()))
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "table not found: {project_id}.{scope_id}.{keyed_state}"
-                ))
-            })?;
-        if schema.primary_key.len() != 1 {
-            return Err(AedbError::Validation(format!(
-                "keyed_state rank requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
-            )));
-        }
+        let _ = keyed_state_schema(
+            &lease.view.catalog,
+            project_id,
+            scope_id,
+            keyed_state,
+            "rank",
+        )?;
         let Some(table) = lease.view.keyspace.table(project_id, scope_id, keyed_state) else {
             return Err(AedbError::Validation(format!(
                 "table not found: {project_id}.{scope_id}.{keyed_state}"
@@ -619,8 +675,39 @@ impl AedbInstance {
         &self,
         processor_id: &str,
         checkpoint_seq: u64,
-        mut mutations: Vec<Mutation>,
+        mutations: Vec<Mutation>,
     ) -> Result<CommitResult, AedbError> {
+        let envelope = self
+            .build_processor_commit_envelope(processor_id, checkpoint_seq, mutations)
+            .await?;
+        self.commit_envelope_prevalidated_internal("processor_commit", envelope)
+            .await
+    }
+
+    pub fn processor_context<'a>(
+        &'a self,
+        project_id: &str,
+        scope_id: &str,
+        processor_id: &str,
+        source_event: &str,
+    ) -> ProcessorContext<'a> {
+        ProcessorContext {
+            db: self,
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            processor_id: processor_id.to_string(),
+            source_event: source_event.to_string(),
+            pending: Vec::new(),
+            checkpoint_seq: 0,
+        }
+    }
+
+    async fn build_processor_commit_envelope(
+        &self,
+        processor_id: &str,
+        checkpoint_seq: u64,
+        mut mutations: Vec<Mutation>,
+    ) -> Result<TransactionEnvelope, AedbError> {
         if processor_id.trim().is_empty() {
             return Err(AedbError::Validation("processor_id cannot be empty".into()));
         }
@@ -631,22 +718,24 @@ impl AedbInstance {
         }
 
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
-        let checkpoint_pk =
-            EncodedKey::from_values(&[Value::Text(processor_id.to_string().into())]);
-        let current_checkpoint = lease
-            .view
-            .keyspace
-            .table(
-                SYSTEM_PROJECT_ID,
-                SYSTEM_SCOPE_ID,
-                REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
-            )
+        let checkpoint_key = Value::Text(processor_id.to_string().into());
+        let checkpoint_pk = EncodedKey::from_values(std::slice::from_ref(&checkpoint_key));
+        let checkpoint_table = lease.view.keyspace.table(
+            SYSTEM_PROJECT_ID,
+            SYSTEM_SCOPE_ID,
+            REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
+        );
+        let current_checkpoint = checkpoint_table
             .and_then(|table| table.rows.get(&checkpoint_pk))
             .and_then(|row| row.values.get(1))
             .and_then(|v| match v {
                 Value::Integer(i) => u64::try_from(*i).ok(),
                 _ => None,
             })
+            .unwrap_or(0);
+        let checkpoint_version = checkpoint_table
+            .and_then(|table| table.row_versions.get(&checkpoint_pk))
+            .copied()
             .unwrap_or(0);
         let head_seq = lease.view.seq;
 
@@ -667,46 +756,38 @@ impl AedbInstance {
                 project_id: SYSTEM_PROJECT_ID.to_string(),
                 scope_id: SYSTEM_SCOPE_ID.to_string(),
                 table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
-                primary_key: vec![Value::Text(processor_id.to_string().into())],
+                primary_key: vec![checkpoint_key.clone()],
                 row: Row::from_values(vec![
-                    Value::Text(processor_id.to_string().into()),
+                    checkpoint_key.clone(),
                     Value::Integer(bounded_checkpoint as i64),
                     Value::Timestamp(crate::system_now_micros() as i64),
                 ]),
             });
         }
 
-        self.commit_envelope_prevalidated_internal(
-            "processor_commit",
-            TransactionEnvelope {
-                caller: None,
-                idempotency_key: None,
-                write_class: WriteClass::Standard,
-                assertions: Vec::new(),
-                read_set: ReadSet::default(),
-                write_intent: WriteIntent { mutations },
-                base_seq: head_seq,
-            },
-        )
-        .await
-    }
+        let primary_key = vec![checkpoint_key];
+        let read_set = ReadSet {
+            points: vec![ReadSetEntry {
+                key: ReadKey::TableRow {
+                    project_id: SYSTEM_PROJECT_ID.to_string(),
+                    scope_id: SYSTEM_SCOPE_ID.to_string(),
+                    table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+                    primary_key,
+                },
+                version_at_read: checkpoint_version,
+            }],
+            ranges: Vec::new(),
+        };
 
-    pub fn processor_context<'a>(
-        &'a self,
-        project_id: &str,
-        scope_id: &str,
-        processor_id: &str,
-        source_event: &str,
-    ) -> ProcessorContext<'a> {
-        ProcessorContext {
-            db: self,
-            project_id: project_id.to_string(),
-            scope_id: scope_id.to_string(),
-            processor_id: processor_id.to_string(),
-            source_event: source_event.to_string(),
-            pending: Vec::new(),
-            checkpoint_seq: 0,
-        }
+        Ok(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set,
+            write_intent: WriteIntent { mutations },
+            base_seq: head_seq,
+        })
     }
 }
 
@@ -783,16 +864,26 @@ impl<'a> ProcessorContext<'a> {
     where
         F: FnOnce(Option<Row>) -> Result<Option<Row>, AedbError>,
     {
-        let current = self
-            .db
-            .keyed_state_read(
-                &self.project_id,
-                &self.scope_id,
-                keyed_state,
-                key.clone(),
-                ConsistencyMode::AtLatest,
-            )
-            .await?;
+        let current = match pending_keyed_state_row(
+            &self.pending,
+            &self.project_id,
+            &self.scope_id,
+            keyed_state,
+            &key,
+        ) {
+            Some(row) => row,
+            None => {
+                self.db
+                    .keyed_state_read(
+                        &self.project_id,
+                        &self.scope_id,
+                        keyed_state,
+                        key.clone(),
+                        ConsistencyMode::AtLatest,
+                    )
+                    .await?
+            }
+        };
         match update_fn(current)? {
             Some(next) => self.write(keyed_state, key, next),
             None => self.delete(keyed_state, key),
@@ -890,8 +981,356 @@ impl<'a> ProcessorContext<'a> {
     }
 
     pub async fn commit(self) -> Result<CommitResult, AedbError> {
+        let lease = self.db.acquire_snapshot(ConsistencyMode::AtLatest).await?;
+        let mut keyed_state_pk_index_cache: HashMap<String, usize> = HashMap::new();
+        for mutation in &self.pending {
+            match mutation {
+                Mutation::Upsert {
+                    project_id,
+                    scope_id,
+                    table_name,
+                    primary_key,
+                    row,
+                } if project_id == &self.project_id && scope_id == &self.scope_id => {
+                    let pk_index = if let Some(pk_index) = keyed_state_pk_index_cache.get(table_name)
+                    {
+                        *pk_index
+                    } else {
+                        let schema = keyed_state_schema(
+                            &lease.view.catalog,
+                            project_id,
+                            scope_id,
+                            table_name,
+                            "processor_commit",
+                        )?;
+                        let pk_index =
+                            keyed_state_primary_key_index(schema, project_id, scope_id, table_name)?;
+                        keyed_state_pk_index_cache.insert(table_name.clone(), pk_index);
+                        pk_index
+                    };
+                    if primary_key.len() != 1 {
+                        return Err(AedbError::Validation(format!(
+                            "keyed_state processor_commit requires single-column key: {project_id}.{scope_id}.{table_name}"
+                        )));
+                    }
+                    validate_keyed_state_row_matches_key(
+                        pk_index,
+                        project_id,
+                        scope_id,
+                        table_name,
+                        &primary_key[0],
+                        row,
+                    )?;
+                }
+                Mutation::Delete {
+                    project_id,
+                    scope_id,
+                    table_name,
+                    primary_key,
+                } if project_id == &self.project_id && scope_id == &self.scope_id => {
+                    if !keyed_state_pk_index_cache.contains_key(table_name) {
+                        let schema = keyed_state_schema(
+                            &lease.view.catalog,
+                            project_id,
+                            scope_id,
+                            table_name,
+                            "processor_commit",
+                        )?;
+                        let pk_index =
+                            keyed_state_primary_key_index(schema, project_id, scope_id, table_name)?;
+                        keyed_state_pk_index_cache.insert(table_name.clone(), pk_index);
+                    }
+                    if primary_key.len() != 1 {
+                        return Err(AedbError::Validation(format!(
+                            "keyed_state processor_commit requires single-column key: {project_id}.{scope_id}.{table_name}"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
         self.db
             .processor_commit(&self.processor_id, self.checkpoint_seq, self.pending)
             .await
+    }
+}
+
+fn keyed_state_schema<'a>(
+    catalog: &'a Catalog,
+    project_id: &str,
+    scope_id: &str,
+    keyed_state: &str,
+    operation: &str,
+) -> Result<&'a TableSchema, AedbError> {
+    let ns = namespace_key(project_id, scope_id);
+    let schema = catalog
+        .tables
+        .get(&(ns, keyed_state.to_string()))
+        .ok_or_else(|| {
+            AedbError::Validation(format!(
+                "table not found: {project_id}.{scope_id}.{keyed_state}"
+            ))
+        })?;
+    if schema.primary_key.len() != 1 {
+        return Err(AedbError::Validation(format!(
+            "keyed_state {operation} requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
+        )));
+    }
+    Ok(schema)
+}
+
+fn keyed_state_snapshot_from_table(
+    keyspace: &crate::storage::keyspace::KeyspaceSnapshot,
+    snapshot_seq: u64,
+    project_id: &str,
+    scope_id: &str,
+    keyed_state: &str,
+    key: Value,
+) -> KeyedStateSnapshot {
+    let encoded = EncodedKey::from_values(&[key.clone()]);
+    let table = keyspace.table(project_id, scope_id, keyed_state);
+    let row = table.and_then(|table| table.rows.get(&encoded).cloned());
+    let version = table
+        .and_then(|table| table.row_versions.get(&encoded).copied())
+        .unwrap_or(0);
+    KeyedStateSnapshot {
+        row,
+        version,
+        snapshot_seq,
+    }
+}
+
+fn keyed_state_assertion(
+    project_id: &str,
+    scope_id: &str,
+    keyed_state: &str,
+    key: &Value,
+    snapshot: &KeyedStateSnapshot,
+) -> ReadAssertion {
+    let primary_key = vec![key.clone()];
+    if snapshot.row.is_some() {
+        ReadAssertion::RowVersion {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            table_name: keyed_state.to_string(),
+            primary_key,
+            expected_seq: snapshot.version,
+        }
+    } else {
+        ReadAssertion::RowExists {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            table_name: keyed_state.to_string(),
+            primary_key,
+            expected: false,
+        }
+    }
+}
+
+fn keyed_state_primary_key_index(
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    keyed_state: &str,
+) -> Result<usize, AedbError> {
+    let pk_name = schema
+        .primary_key
+        .first()
+        .ok_or_else(|| AedbError::Validation(format!(
+            "keyed_state write requires single-column primary key: {project_id}.{scope_id}.{keyed_state}"
+        )))?;
+    schema
+        .columns
+        .iter()
+        .position(|column| column.name == *pk_name)
+        .ok_or_else(|| {
+            AedbError::Validation(format!(
+                "primary key column missing: {project_id}.{scope_id}.{keyed_state}.{pk_name}"
+            ))
+        })
+}
+
+fn validate_keyed_state_row_matches_key(
+    pk_index: usize,
+    project_id: &str,
+    scope_id: &str,
+    keyed_state: &str,
+    key: &Value,
+    row: &Row,
+) -> Result<(), AedbError> {
+    let row_key = row.values.get(pk_index).ok_or_else(|| {
+        AedbError::Validation(format!(
+            "row missing keyed_state primary key column: {project_id}.{scope_id}.{keyed_state}"
+        ))
+    })?;
+    if row_key != key {
+        return Err(AedbError::Validation(format!(
+            "keyed_state key does not match row primary key column: {project_id}.{scope_id}.{keyed_state}"
+        )));
+    }
+    Ok(())
+}
+
+fn pending_keyed_state_row(
+    pending: &[Mutation],
+    project_id: &str,
+    scope_id: &str,
+    keyed_state: &str,
+    key: &Value,
+) -> Option<Option<Row>> {
+    pending.iter().rev().find_map(|mutation| match mutation {
+        Mutation::Upsert {
+            project_id: mutation_project,
+            scope_id: mutation_scope,
+            table_name,
+            primary_key,
+            row,
+        } if mutation_project == project_id
+            && mutation_scope == scope_id
+            && table_name == keyed_state
+            && primary_key.len() == 1
+            && primary_key[0] == *key =>
+        {
+            Some(Some(row.clone()))
+        }
+        Mutation::Delete {
+            project_id: mutation_project,
+            scope_id: mutation_scope,
+            table_name,
+            primary_key,
+        } if mutation_project == project_id
+            && mutation_scope == scope_id
+            && table_name == keyed_state
+            && primary_key.len() == 1
+            && primary_key[0] == *key =>
+        {
+            Some(None)
+        }
+        _ => None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::DdlOperation;
+    use crate::catalog::schema::ColumnDef;
+    use crate::catalog::types::ColumnType;
+    use tempfile::tempdir;
+
+    fn user_state_columns() -> Vec<ColumnDef> {
+        vec![
+            ColumnDef {
+                name: "user_id".to_string(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "points".to_string(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+        ]
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn processor_commit_rejects_stale_checkpoint_row_version() {
+        let dir = tempdir().expect("tempdir");
+        let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+
+        db.create_project("arcana").await.expect("project");
+        db.create_scope("arcana", "game").await.expect("scope");
+        db.commit_ddl(DdlOperation::CreateTable {
+            project_id: "arcana".into(),
+            scope_id: "game".into(),
+            table_name: "user_state".into(),
+            owner_id: None,
+            columns: user_state_columns(),
+            primary_key: vec!["user_id".into()],
+            if_not_exists: false,
+        })
+        .await
+        .expect("create table");
+        db.commit_ddl(DdlOperation::CreateScope {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+            scope_id: SYSTEM_SCOPE_ID.into(),
+            owner_id: None,
+            if_not_exists: true,
+        })
+        .await
+        .expect("create system scope");
+        db.commit_ddl(DdlOperation::CreateTable {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+            scope_id: SYSTEM_SCOPE_ID.into(),
+            table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.into(),
+            owner_id: None,
+            columns: vec![
+                ColumnDef {
+                    name: "processor_name".to_string(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "checkpoint_seq".to_string(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "updated_at".to_string(),
+                    col_type: ColumnType::Timestamp,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["processor_name".into()],
+            if_not_exists: true,
+        })
+        .await
+        .expect("create checkpoint table");
+
+        let stale = db
+            .build_processor_commit_envelope(
+                "points_processor",
+                0,
+                vec![Mutation::Upsert {
+                    project_id: "arcana".into(),
+                    scope_id: "game".into(),
+                    table_name: "user_state".into(),
+                    primary_key: vec![Value::Text("u1".into())],
+                    row: Row::from_values(vec![Value::Text("u1".into()), Value::Integer(5)]),
+                }],
+            )
+            .await
+            .expect("stale envelope");
+
+        db.processor_commit("points_processor", 1, Vec::new())
+            .await
+            .expect("advance checkpoint");
+
+        let err = db
+            .commit_envelope_prevalidated_internal("processor_commit_test", stale)
+            .await
+            .expect_err("stale processor commit must fail");
+        assert!(matches!(err, AedbError::Conflict(_)));
+
+        let lag = db
+            .reactive_processor_lag("points_processor", ConsistencyMode::AtLatest)
+            .await
+            .expect("lag");
+        assert_eq!(lag.checkpoint_seq, 1);
+
+        let row = db
+            .keyed_state_read(
+                "arcana",
+                "game",
+                "user_state",
+                Value::Text("u1".into()),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("read row");
+        assert!(
+            row.is_none(),
+            "stale processor commit must not apply its user-state mutation"
+        );
     }
 }

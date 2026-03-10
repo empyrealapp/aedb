@@ -204,7 +204,12 @@ fn evaluate_assertion(
             let Some(acc) = keyspace.accumulator(project_id, scope_id, accumulator_name) else {
                 return Ok(Some(AssertionActual::Missing));
             };
-            let available = acc.value.saturating_sub(acc.total_exposure);
+            let effective_value = keyspace
+                .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+                .ok_or_else(|| {
+                    AedbError::Validation("accumulator disappeared during assertion".into())
+                })?;
+            let available = effective_value.saturating_sub(acc.total_exposure);
             if available >= *min_amount {
                 Ok(None)
             } else {
@@ -225,8 +230,13 @@ fn evaluate_assertion(
             let Some(acc) = keyspace.accumulator(project_id, scope_id, accumulator_name) else {
                 return Ok(Some(AssertionActual::Missing));
             };
+            let effective_value = keyspace
+                .accumulator_effective_value(project_id, scope_id, accumulator_name)?
+                .ok_or_else(|| {
+                    AedbError::Validation("accumulator disappeared during assertion".into())
+                })?;
             let allowed_ratio_bps = 10_000i128 - acc.exposure_margin_bps as i128;
-            let allowed_total = ((acc.value as i128 * allowed_ratio_bps) / 10_000)
+            let allowed_total = ((effective_value as i128 * allowed_ratio_bps) / 10_000)
                 .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
             let projected = acc.total_exposure.saturating_add(*additional_exposure);
             if projected <= allowed_total {

@@ -4,6 +4,7 @@ use aedb::commit::validation::Mutation;
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::offline;
+use aedb::permission::{CallerContext, Permission};
 use aedb::query::plan::ConsistencyMode;
 use tempfile::tempdir;
 
@@ -68,7 +69,7 @@ async fn security_idempotency_survives_restart_exactly_once() {
     let key = IdempotencyKey([4u8; 16]);
     let envelope = TransactionEnvelope {
         caller: None,
-        idempotency_key: Some(key),
+        idempotency_key: Some(key.clone()),
         write_class: WriteClass::Economic,
         assertions: Vec::new(),
         read_set: ReadSet::default(),
@@ -101,6 +102,116 @@ async fn security_idempotency_survives_restart_exactly_once() {
         .await
         .expect("idempotent retry after restart");
     assert_eq!(third.commit_seq, first.commit_seq);
+}
+
+#[tokio::test]
+async fn security_idempotency_rejects_same_key_for_different_request() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let key = IdempotencyKey([6u8; 16]);
+    let first = TransactionEnvelope {
+        caller: None,
+        idempotency_key: Some(key.clone()),
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"idem-mismatch".to_vec(),
+                value: b"v1".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    };
+    db.commit_envelope(first).await.expect("first commit");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: Some(key),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"idem-mismatch".to_vec(),
+                    value: b"v2".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("reusing key for different payload must fail");
+    assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
+async fn security_idempotency_rejects_same_key_for_different_caller() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    for caller_id in ["alice", "bob"] {
+        db.commit(Mutation::Ddl(
+            aedb::catalog::DdlOperation::GrantPermission {
+                actor_id: None,
+                delegable: false,
+                caller_id: caller_id.into(),
+                permission: Permission::KvWrite {
+                    project_id: "p".into(),
+                    scope_id: Some("app".into()),
+                    prefix: None,
+                },
+            },
+        ))
+        .await
+        .expect("grant kv write");
+    }
+
+    let key = IdempotencyKey([7u8; 16]);
+    let first = TransactionEnvelope {
+        caller: Some(CallerContext::new("alice")),
+        idempotency_key: Some(key.clone()),
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"idem-caller".to_vec(),
+                value: b"v1".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    };
+    db.commit_envelope(first).await.expect("first commit");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: Some(CallerContext::new("bob")),
+            idempotency_key: Some(key),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"idem-caller".to_vec(),
+                    value: b"v1".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("reusing key across callers must fail");
+    assert!(matches!(err, AedbError::Validation(_)));
 }
 
 #[tokio::test]

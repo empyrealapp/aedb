@@ -264,6 +264,11 @@ pub fn execute_query_with_options(
         })?;
     let table = snapshot.table(project_id, scope_id, &query.table);
     let mut materialized_seq = None;
+    if let Some(result) =
+        try_primary_key_point_query(schema, table, &query, &cursor_state, snapshot_seq)?
+    {
+        return Ok(result);
+    }
     validate_query(schema, &query)?;
 
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -274,11 +279,6 @@ pub fn execute_query_with_options(
             .unwrap_or(max_scan_rows.min(100))
     });
     let effective_page_size = page_size.min(max_scan_rows);
-    if let Some(result) =
-        try_primary_key_point_query(schema, table, &query, &cursor_state, snapshot_seq)?
-    {
-        return Ok(result);
-    }
 
     let estimated_rows: usize;
     let row_source: Box<dyn Iterator<Item = Row> + Send> =
@@ -290,10 +290,9 @@ pub fn execute_query_with_options(
                 })?;
             materialized_seq = Some(projection.materialized_seq);
             estimated_rows = projection.rows.len();
-            let rows = projection.rows.clone();
-            Box::new(rows.into_iter().map(|(_, row)| row))
+            let rows: Vec<Row> = projection.rows.values().cloned().collect();
+            Box::new(rows.into_iter())
         } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
-            let table_rows = table.rows.clone();
             let indexed_pks = indexed_pks_for_predicate(
                 catalog,
                 project_id,
@@ -305,24 +304,29 @@ pub fn execute_query_with_options(
             match indexed_pks {
                 Some(pks) => {
                     estimated_rows = pks.len();
-                    Box::new(
-                        pks.into_iter()
-                            .filter_map(move |pk| table_rows.get(&pk).cloned()),
-                    )
+                    let rows: Vec<Row> = pks
+                        .into_iter()
+                        .filter_map(|pk| table.rows.get(&pk).cloned())
+                        .collect();
+                    Box::new(rows.into_iter())
                 }
                 None => {
                     estimated_rows = table.rows.len();
-                    let rows = table.rows.clone();
-                    Box::new(rows.into_iter().map(|(_, row)| row))
+                    let rows: Vec<Row> = table.rows.values().cloned().collect();
+                    Box::new(rows.into_iter())
                 }
             }
         } else {
-            let rows = table.map(|t| t.rows.clone()).unwrap_or_default();
+            let rows: Vec<Row> = table
+                .map(|t| t.rows.values().cloned().collect())
+                .unwrap_or_default();
             estimated_rows = rows.len();
-            Box::new(rows.into_iter().map(|(_, row)| row))
+            Box::new(rows.into_iter())
         };
 
-    if estimated_rows > max_scan_rows && query.limit.is_none() && options.cursor.is_none() {
+    if estimated_rows > max_scan_rows
+        && query_requires_full_evaluation(&query, cursor_state.is_some())
+    {
         return Err(QueryError::ScanBoundExceeded {
             estimated_rows: estimated_rows as u64,
             max_scan_rows: max_scan_rows as u64,
@@ -517,6 +521,14 @@ pub fn execute_query_with_options(
     })
 }
 
+fn query_requires_full_evaluation(query: &Query, has_cursor: bool) -> bool {
+    has_cursor
+        || !query.group_by.is_empty()
+        || !query.aggregates.is_empty()
+        || query.having.is_some()
+        || query.limit.is_none()
+}
+
 fn try_primary_key_point_query(
     schema: &TableSchema,
     table: Option<&crate::storage::keyspace::TableData>,
@@ -547,6 +559,7 @@ fn try_primary_key_point_query(
     let Some(predicate) = query.predicate.as_ref() else {
         return Ok(None);
     };
+    validate::validate_expr_types(schema, predicate)?;
     let Some(primary_key) = extract_primary_key_values(predicate, &schema.primary_key) else {
         return Ok(None);
     };

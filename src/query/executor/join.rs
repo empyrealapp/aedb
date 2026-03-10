@@ -8,6 +8,7 @@ use crate::catalog::types::{Row, Value};
 use crate::query::error::QueryError;
 use crate::query::operators::{AggregateOperator, Operator, ScanOperator, compile_expr};
 use crate::query::plan::{JoinType, Query, QueryOptions};
+use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
 use std::collections::HashMap;
 
@@ -66,18 +67,7 @@ pub(super) fn execute_join_query(
                 table: jt.clone(),
             })?;
         let join_alias = join.alias.clone().unwrap_or(jt.clone());
-        let join_rows: Vec<&Row> = snapshot
-            .table(&jp, &js, &jt)
-            .map(|t| t.rows.values().collect())
-            .unwrap_or_default();
-        if !options.allow_full_scan
-            && rows.len().saturating_mul(join_rows.len().max(1)) > max_scan_rows
-        {
-            return Err(QueryError::ScanBoundExceeded {
-                estimated_rows: rows.len().saturating_mul(join_rows.len().max(1)) as u64,
-                max_scan_rows: max_scan_rows as u64,
-            });
-        }
+        let join_table = snapshot.table(&jp, &js, &jt);
         let join_col_offset = columns.len();
         let mut next_columns = columns.clone();
         next_columns.extend(
@@ -118,10 +108,33 @@ pub(super) fn execute_join_query(
                 (Some(left_idx), Some(right_idx))
             }
         };
+        let can_probe_right_primary_key =
+            matches!(join.join_type, JoinType::Inner | JoinType::Left)
+                && right_idx
+                    .map(|idx| is_single_column_primary_key_join(join_schema, idx))
+                    .unwrap_or(false);
+        let estimated_join_rows = if matches!(join.join_type, JoinType::Cross) {
+            rows.len()
+                .saturating_mul(join_table.map(|table| table.rows.len()).unwrap_or(0).max(1))
+        } else if can_probe_right_primary_key {
+            rows.len()
+        } else {
+            rows.len()
+                .saturating_mul(join_table.map(|table| table.rows.len()).unwrap_or(0).max(1))
+        };
+        if !options.allow_full_scan && estimated_join_rows > max_scan_rows {
+            return Err(QueryError::ScanBoundExceeded {
+                estimated_rows: estimated_join_rows as u64,
+                max_scan_rows: max_scan_rows as u64,
+            });
+        }
 
         let mut joined = Vec::new();
         match join.join_type {
             JoinType::Cross => {
+                let join_rows: Vec<&Row> = join_table
+                    .map(|table| table.rows.values().collect())
+                    .unwrap_or_default();
                 for left in &rows {
                     for right in &join_rows {
                         let mut values = left.values.clone();
@@ -137,26 +150,54 @@ pub(super) fn execute_join_query(
                 let left_idx = left_idx.ok_or_else(|| QueryError::InvalidQuery {
                     reason: "join requires left join key".into(),
                 })?;
-                // Hash join for equality predicates.
-                let mut right_map: HashMap<Value, Vec<&Row>> = HashMap::new();
-                for right in &join_rows {
-                    right_map
-                        .entry(right.values[right_idx].clone())
-                        .or_default()
-                        .push(right);
-                }
-                for left in &rows {
-                    let key = left.values[left_idx].clone();
-                    if let Some(matches) = right_map.get(&key) {
-                        for right in matches {
+                if can_probe_right_primary_key {
+                    for left in &rows {
+                        let key = left.values[left_idx].clone();
+                        let matched = join_table.and_then(|table| {
+                            let encoded = EncodedKey::from_values(&[key]);
+                            table.rows.get(&encoded)
+                        });
+                        if let Some(right) = matched {
                             let mut values = left.values.clone();
                             values.extend(right.values.clone());
                             joined.push(Row { values });
+                        } else if matches!(join.join_type, JoinType::Left) {
+                            let mut values = left.values.clone();
+                            values.extend(std::iter::repeat_n(
+                                Value::Null,
+                                join_schema.columns.len(),
+                            ));
+                            joined.push(Row { values });
                         }
-                    } else if matches!(join.join_type, JoinType::Left) {
-                        let mut values = left.values.clone();
-                        values.extend(std::iter::repeat_n(Value::Null, join_schema.columns.len()));
-                        joined.push(Row { values });
+                    }
+                } else {
+                    let join_rows: Vec<&Row> = join_table
+                        .map(|table| table.rows.values().collect())
+                        .unwrap_or_default();
+                    // Hash join for non-PK equality predicates.
+                    let mut right_map: HashMap<Value, Vec<&Row>> = HashMap::new();
+                    for right in &join_rows {
+                        right_map
+                            .entry(right.values[right_idx].clone())
+                            .or_default()
+                            .push(right);
+                    }
+                    for left in &rows {
+                        let key = left.values[left_idx].clone();
+                        if let Some(matches) = right_map.get(&key) {
+                            for right in matches {
+                                let mut values = left.values.clone();
+                                values.extend(right.values.clone());
+                                joined.push(Row { values });
+                            }
+                        } else if matches!(join.join_type, JoinType::Left) {
+                            let mut values = left.values.clone();
+                            values.extend(std::iter::repeat_n(
+                                Value::Null,
+                                join_schema.columns.len(),
+                            ));
+                            joined.push(Row { values });
+                        }
                     }
                 }
             }
@@ -167,6 +208,9 @@ pub(super) fn execute_join_query(
                 let right_idx = right_idx.ok_or_else(|| QueryError::InvalidQuery {
                     reason: "join requires right join key".into(),
                 })?;
+                let join_rows: Vec<&Row> = join_table
+                    .map(|table| table.rows.values().collect())
+                    .unwrap_or_default();
                 let mut left_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                 for left in &rows {
                     left_map
@@ -376,4 +420,18 @@ pub(super) fn resolve_table_ref(
         scope_id.to_string(),
         table_ref.to_string(),
     )
+}
+
+fn is_single_column_primary_key_join(
+    join_schema: &crate::catalog::schema::TableSchema,
+    right_idx: usize,
+) -> bool {
+    if join_schema.primary_key.len() != 1 {
+        return false;
+    }
+    join_schema
+        .columns
+        .get(right_idx)
+        .map(|column| column.name == join_schema.primary_key[0])
+        .unwrap_or(false)
 }
