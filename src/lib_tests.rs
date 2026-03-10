@@ -26,6 +26,7 @@ use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -8302,6 +8303,79 @@ async fn snapshot_probe_remains_live_under_snapshot_capacity_pressure() {
     })
     .await
     .expect("snapshot probes timed out under snapshot pressure");
+}
+
+#[tokio::test]
+async fn checkpoint_now_completes_under_hot_load() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        ..AedbConfig::default()
+    };
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let writer_db = Arc::clone(&db);
+    let writer_stop = Arc::clone(&stop);
+    let writes_ref = Arc::clone(&writes);
+    let writer = tokio::spawn(async move {
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let _ = writer_db
+                .commit(Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: format!("checkpoint-hot:{i}").into_bytes(),
+                    value: i.to_string().into_bytes(),
+                })
+                .await;
+            writes_ref.fetch_add(1, Ordering::Relaxed);
+            i = i.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let reader_db = Arc::clone(&db);
+    let reader_stop = Arc::clone(&stop);
+    let reads_ref = Arc::clone(&reads);
+    let reader = tokio::spawn(async move {
+        while !reader_stop.load(Ordering::Relaxed) {
+            let _ = reader_db.snapshot_probe(ConsistencyMode::AtLatest).await;
+            reads_ref.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let writes_before = writes.load(Ordering::Relaxed);
+    let reads_before = reads.load(Ordering::Relaxed);
+
+    let checkpoint_seq = tokio::time::timeout(Duration::from_secs(10), db.checkpoint_now())
+        .await
+        .expect("checkpoint_now timed out")
+        .expect("checkpoint_now");
+    assert!(checkpoint_seq >= 1);
+
+    let writes_after = writes.load(Ordering::Relaxed);
+    let reads_after = reads.load(Ordering::Relaxed);
+    assert!(writes_after > writes_before, "writes stalled during checkpoint");
+    assert!(reads_after > reads_before, "reads stalled during checkpoint");
+
+    stop.store(true, Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer join timed out")
+        .expect("writer join");
+    tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("reader join timed out")
+        .expect("reader join");
 }
 
 #[tokio::test]

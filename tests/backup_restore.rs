@@ -304,6 +304,89 @@ async fn incremental_chain_restore_to_target_seq_is_exact() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backup_incremental_is_hot_and_completes_without_stalling() {
+    let live_dir = tempdir().expect("live dir");
+    let full_dir = tempdir().expect("full dir");
+    let inc_dir = tempdir().expect("inc dir");
+    let config = backup_test_config();
+
+    let db = Arc::new(AedbInstance::open(config.clone(), live_dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    for i in 0..512u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("seed:{i}").into_bytes(),
+            value: vec![u8::try_from(i % 251).unwrap_or(0); 256],
+        })
+        .await
+        .expect("seed write");
+    }
+
+    db.backup_full(full_dir.path()).await.expect("full backup");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let write_count = Arc::new(AtomicU64::new(0));
+    let read_count = Arc::new(AtomicU64::new(0));
+
+    let writer_db = Arc::clone(&db);
+    let writer_stop = Arc::clone(&stop);
+    let writer_count_ref = Arc::clone(&write_count);
+    let writer = tokio::spawn(async move {
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let _ = writer_db
+                .commit(Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: format!("inc-hot:{i}").into_bytes(),
+                    value: i.to_string().into_bytes(),
+                })
+                .await;
+            writer_count_ref.fetch_add(1, Ordering::Relaxed);
+            i = i.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let reader_db = Arc::clone(&db);
+    let reader_stop = Arc::clone(&stop);
+    let reader_count_ref = Arc::clone(&read_count);
+    let reader = tokio::spawn(async move {
+        while !reader_stop.load(Ordering::Relaxed) {
+            let _ = reader_db.snapshot_probe(ConsistencyMode::AtLatest).await;
+            reader_count_ref.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let writes_before = write_count.load(Ordering::Relaxed);
+    let reads_before = read_count.load(Ordering::Relaxed);
+
+    timeout(Duration::from_secs(10), db.backup_incremental(inc_dir.path(), full_dir.path()))
+        .await
+        .expect("incremental backup timed out")
+        .expect("incremental backup");
+
+    let writes_after = write_count.load(Ordering::Relaxed);
+    let reads_after = read_count.load(Ordering::Relaxed);
+    assert!(writes_after > writes_before, "writes stalled during incremental backup");
+    assert!(reads_after > reads_before, "reads stalled during incremental backup");
+
+    stop.store(true, Ordering::Relaxed);
+    timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer join timed out")
+        .expect("writer join");
+    timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("reader join timed out")
+        .expect("reader join");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn incremental_chain_restore_fails_when_chain_cannot_reach_target() {
     let live_dir = tempdir().expect("live dir");
     let full_dir = tempdir().expect("full dir");
