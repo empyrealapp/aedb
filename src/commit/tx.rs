@@ -1,5 +1,6 @@
 use crate::catalog::types::Value;
 use crate::commit::validation::{CompareOp, Mutation};
+use crate::error::AedbError;
 use crate::permission::CallerContext;
 use crate::query::plan::Expr;
 use serde::{Deserialize, Serialize};
@@ -179,12 +180,16 @@ pub struct WalCommitPayload {
     pub mutations: Vec<Mutation>,
     pub assertions: Vec<ReadAssertion>,
     pub idempotency_key: Option<IdempotencyKey>,
+    #[serde(default)]
+    pub request_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IdempotencyRecord {
     pub commit_seq: u64,
     pub recorded_at_micros: u64,
+    #[serde(default)]
+    pub request_fingerprint: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +202,31 @@ pub struct TransactionEnvelope {
     pub read_set: ReadSet,
     pub write_intent: WriteIntent,
     pub base_seq: u64,
+}
+
+#[derive(Serialize)]
+struct IdempotencyFingerprintPayload<'a> {
+    caller: Option<&'a CallerContext>,
+    write_class: WriteClass,
+    assertions: &'a [ReadAssertion],
+    read_set: &'a ReadSet,
+    write_intent: &'a WriteIntent,
+    base_seq: u64,
+}
+
+impl TransactionEnvelope {
+    pub fn request_fingerprint(&self) -> Result<[u8; 32], AedbError> {
+        let payload = IdempotencyFingerprintPayload {
+            caller: self.caller.as_ref(),
+            write_class: self.write_class,
+            assertions: &self.assertions,
+            read_set: &self.read_set,
+            write_intent: &self.write_intent,
+            base_seq: self.base_seq,
+        };
+        let encoded = rmp_serde::to_vec(&payload).map_err(|e| AedbError::Encode(e.to_string()))?;
+        Ok(*blake3::hash(&encoded).as_bytes())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

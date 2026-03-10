@@ -2,12 +2,10 @@ use crate::catalog::types::{Row, Value};
 use crate::query::error::QueryError;
 use crate::query::plan::{Aggregate, Expr, Order};
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::Arc;
 
 const EXPR_CACHE_SHARDS: usize = 16;
 const EXPR_CACHE_TOTAL_CAPACITY: usize = 256;
@@ -53,17 +51,11 @@ impl ExprCompileLruCache {
 
     fn get(&mut self, expr: &Expr, columns: &[String], table: &str) -> Option<CompiledExpr> {
         let stamp = self.next_stamp();
-        for (key, entry) in &mut self.map {
-            if key.2 != table || key.1.len() != columns.len() {
-                continue;
-            }
-            if key.0 == *expr && key.1.as_slice() == columns {
-                entry.stamp = stamp;
-                self.order.push_back((stamp, key.clone()));
-                return Some(entry.value.clone());
-            }
-        }
-        None
+        let lookup_key = (expr.clone(), columns.to_vec(), table.to_string());
+        let entry = self.map.get_mut(&lookup_key)?;
+        entry.stamp = stamp;
+        self.order.push_back((stamp, lookup_key));
+        Some(entry.value.clone())
     }
 
     fn put(&mut self, key: ExprCacheKey, value: CompiledExpr) {
@@ -455,95 +447,36 @@ impl SortOperator {
                     examined: 0,
                 };
             }
-            #[derive(Clone)]
-            struct TopKRow {
-                row: Row,
-                sort_key_columns: Arc<Vec<usize>>,
-                orders: Arc<Vec<Order>>,
-            }
-
-            impl Ord for TopKRow {
-                fn cmp(&self, other: &Self) -> Ordering {
-                    if self.sort_key_columns.len() == 1 {
-                        let column_index = self.sort_key_columns[0];
-                        let cmp =
-                            self.row.values[column_index].cmp(&other.row.values[column_index]);
-                        return match self.orders[0] {
-                            Order::Asc => cmp,
-                            Order::Desc => cmp.reverse(),
-                        };
-                    }
-                    for (column_index, order) in
-                        self.sort_key_columns.iter().zip(self.orders.iter())
-                    {
-                        let cmp =
-                            self.row.values[*column_index].cmp(&other.row.values[*column_index]);
-                        let ord = match order {
-                            Order::Asc => cmp,
-                            Order::Desc => cmp.reverse(),
-                        };
-                        if !ord.is_eq() {
-                            return ord;
-                        }
-                    }
-                    Ordering::Equal
-                }
-            }
-
-            impl PartialOrd for TopKRow {
-                fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                    Some(self.cmp(other))
-                }
-            }
-
-            impl PartialEq for TopKRow {
-                fn eq(&self, other: &Self) -> bool {
-                    self.cmp(other).is_eq()
-                }
-            }
-
-            impl Eq for TopKRow {}
-
             let sort_key_columns: Vec<usize> = order_by
                 .iter()
                 .map(|(column_index, _)| *column_index)
                 .collect();
-            let sort_key_columns = Arc::new(sort_key_columns);
-            let sort_orders =
-                Arc::new(order_by.iter().map(|(_, order)| *order).collect::<Vec<_>>());
-            let mut heap: BinaryHeap<TopKRow> = BinaryHeap::with_capacity(limit);
+            let sort_orders = order_by.iter().map(|(_, order)| *order).collect::<Vec<_>>();
+            let mut heap = TopKHeap::with_capacity(limit, sort_key_columns, sort_orders);
             while let Some(rows) = child.next_batch(OPERATOR_BUILD_BATCH_SIZE) {
                 for row in rows {
                     if heap.len() < limit {
-                        heap.push(TopKRow {
-                            row,
-                            sort_key_columns: Arc::clone(&sort_key_columns),
-                            orders: Arc::clone(&sort_orders),
-                        });
+                        heap.push(row);
                         continue;
                     }
                     let should_insert = heap.peek().is_some_and(|worst_of_best| {
                         compare_rows_with_order_by(
                             &row,
-                            &worst_of_best.row,
-                            sort_key_columns.as_ref(),
-                            sort_orders.as_ref(),
+                            worst_of_best,
+                            &heap.sort_key_columns,
+                            &heap.sort_orders,
                         )
                         .is_lt()
                     });
                     // Keep only the best N rows under the requested ORDER BY.
                     if should_insert {
                         let _ = heap.pop();
-                        heap.push(TopKRow {
-                            row,
-                            sort_key_columns: Arc::clone(&sort_key_columns),
-                            orders: Arc::clone(&sort_orders),
-                        });
+                        heap.push(row);
                     }
                 }
             }
             let examined = child.rows_examined();
-            let mut rows = heap.into_iter().map(|entry| entry.row).collect::<Vec<_>>();
+            let mut rows = heap.into_rows();
             rows.sort_by(compare_rows);
             return Self {
                 rows,
@@ -562,6 +495,96 @@ impl SortOperator {
             rows,
             row_index: 0,
             examined,
+        }
+    }
+}
+
+struct TopKHeap {
+    rows: Vec<Row>,
+    sort_key_columns: Vec<usize>,
+    sort_orders: Vec<Order>,
+}
+
+impl TopKHeap {
+    fn with_capacity(
+        capacity: usize,
+        sort_key_columns: Vec<usize>,
+        sort_orders: Vec<Order>,
+    ) -> Self {
+        Self {
+            rows: Vec::with_capacity(capacity),
+            sort_key_columns,
+            sort_orders,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn peek(&self) -> Option<&Row> {
+        self.rows.first()
+    }
+
+    fn push(&mut self, row: Row) {
+        self.rows.push(row);
+        self.sift_up(self.rows.len() - 1);
+    }
+
+    fn pop(&mut self) -> Option<Row> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let last = self.rows.len() - 1;
+        self.rows.swap(0, last);
+        let root = self.rows.pop();
+        if !self.rows.is_empty() {
+            self.sift_down(0);
+        }
+        root
+    }
+
+    fn into_rows(self) -> Vec<Row> {
+        self.rows
+    }
+
+    fn compare_indices(&self, left: usize, right: usize) -> Ordering {
+        compare_rows_with_order_by(
+            &self.rows[left],
+            &self.rows[right],
+            &self.sort_key_columns,
+            &self.sort_orders,
+        )
+    }
+
+    fn sift_up(&mut self, mut index: usize) {
+        while index > 0 {
+            let parent = (index - 1) / 2;
+            if !self.compare_indices(index, parent).is_gt() {
+                break;
+            }
+            self.rows.swap(index, parent);
+            index = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut heap_index: usize) {
+        let row_count = self.rows.len();
+        loop {
+            let left = heap_index * 2 + 1;
+            let right = left + 1;
+            if left >= row_count {
+                break;
+            }
+            let mut largest = left;
+            if right < row_count && self.compare_indices(right, left).is_gt() {
+                largest = right;
+            }
+            if !self.compare_indices(largest, heap_index).is_gt() {
+                break;
+            }
+            self.rows.swap(heap_index, largest);
+            heap_index = largest;
         }
     }
 }

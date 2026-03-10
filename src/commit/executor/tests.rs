@@ -62,8 +62,10 @@ fn request_with_mutations(mutations: Vec<Mutation>) -> CommitRequest {
         base_seq: 0,
     };
     let write_partitions = super::derive_write_partitions(&envelope.write_intent.mutations);
+    let mutation_count = envelope.write_intent.mutations.len();
     CommitRequest {
         envelope,
+        mutation_count,
         encoded_len: 0,
         enqueue_micros: 0,
         prevalidated: false,
@@ -91,8 +93,10 @@ fn request_with_assertions_and_mutations(
     };
     let write_partitions = super::derive_write_partitions(&envelope.write_intent.mutations);
     let read_partitions = super::derive_read_partitions(&envelope);
+    let mutation_count = envelope.write_intent.mutations.len();
     CommitRequest {
         envelope,
+        mutation_count,
         encoded_len: 0,
         enqueue_micros: 0,
         prevalidated: false,
@@ -102,6 +106,66 @@ fn request_with_assertions_and_mutations(
         defer_count: 0,
         result_tx,
     }
+}
+
+#[test]
+fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
+    let validation_catalog = Arc::new(parking_lot::RwLock::new(Catalog::default()));
+    let envelope = TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![
+                Mutation::Ddl(DdlOperation::CreateProject {
+                    project_id: "p".into(),
+                    owner_id: None,
+                    if_not_exists: false,
+                }),
+                Mutation::Ddl(DdlOperation::CreateTable {
+                    owner_id: None,
+                    if_not_exists: false,
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    table_name: "users".into(),
+                    columns: vec![
+                        ColumnDef {
+                            name: "id".into(),
+                            col_type: ColumnType::Integer,
+                            nullable: false,
+                        },
+                        ColumnDef {
+                            name: "name".into(),
+                            col_type: ColumnType::Text,
+                            nullable: false,
+                        },
+                    ],
+                    primary_key: vec!["id".into()],
+                }),
+                Mutation::Upsert {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    table_name: "users".into(),
+                    primary_key: vec![Value::Integer(7)],
+                    row: Row {
+                        values: vec![Value::Integer(7), Value::Text("bench".into())],
+                    },
+                },
+            ],
+        },
+        base_seq: 0,
+    };
+
+    let (write_partitions, read_partitions) =
+        super::pre_stage_validate(&validation_catalog, &envelope).expect("prestage validate");
+
+    assert!(read_partitions.is_empty());
+    assert!(
+        write_partitions.iter().any(|token| token.starts_with("tr:p::app:users:")),
+        "expected staged table row partition token, got {write_partitions:?}"
+    );
 }
 
 fn scope_of(req: &CommitRequest) -> &str {
@@ -128,6 +192,227 @@ fn canonical_partition_order_is_sorted() {
         ordered,
         vec!["p::a".to_string(), "p::m".to_string(), "p::z".to_string()]
     );
+}
+
+#[test]
+fn shard_for_envelope_ignores_kv_key_bytes_within_same_scope() {
+    let left = TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"a".to_vec(),
+                value: b"1".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    };
+    let right = TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"b".to_vec(),
+                value: b"2".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    };
+
+    let shard_count = 8;
+    assert_eq!(
+        super::shard_for_envelope(&left, shard_count),
+        super::shard_for_envelope(&right, shard_count)
+    );
+}
+
+#[test]
+fn single_write_partition_token_matches_general_kv_partition_derivation() {
+    let mutation = Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"bench:key".to_vec(),
+        value: b"v".to_vec(),
+    };
+
+    let fast = super::single_write_partition_token(&mutation).expect("fast token");
+    let derived = super::derive_write_partitions(std::slice::from_ref(&mutation));
+
+    assert_eq!(derived.len(), 1);
+    assert!(derived.contains(&fast));
+}
+
+#[test]
+fn transaction_envelope_size_hint_bounds_multi_mutation_payload() {
+    let envelope = TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"bench:coord:a".to_vec(),
+                    value: vec![1u8; 16],
+                },
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "other".into(),
+                    key: b"bench:coord:b".to_vec(),
+                    value: vec![2u8; 16],
+                },
+                Mutation::Upsert {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    table_name: "users".into(),
+                    primary_key: vec![Value::Integer(42)],
+                    row: Row {
+                        values: vec![
+                            Value::Integer(42),
+                            Value::Text("bench".into()),
+                            Value::Integer(25),
+                        ],
+                    },
+                },
+            ],
+        },
+        base_seq: 0,
+    };
+
+    let estimate = super::estimate_transaction_envelope_size_upper_bound(&envelope)
+        .expect("size hint should cover simple envelope");
+    let encoded = rmp_serde::to_vec(&envelope).expect("encode envelope");
+
+    assert!(
+        estimate >= encoded.len(),
+        "upper bound {} must cover encoded size {}",
+        estimate,
+        encoded.len()
+    );
+}
+
+#[tokio::test]
+async fn latest_snapshot_view_refreshes_lazily_after_commit() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::new(dir.path()).expect("executor");
+    let initial = exec.snapshot_latest_view().await;
+    assert_eq!(initial.seq, 0);
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("create project");
+
+    let refreshed = exec.snapshot_latest_view().await;
+    assert!(refreshed.seq > initial.seq);
+}
+
+#[test]
+fn write_partitions_after_lifecycle_reuses_request_when_unchanged() {
+    let request = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"alpha".to_vec(),
+        value: b"1".to_vec(),
+    }]);
+    let reused = super::internals::write_partitions_after_lifecycle(
+        &Catalog::default(),
+        &request,
+        &request.envelope.write_intent.mutations,
+        false,
+    );
+    assert_eq!(reused, request.write_partitions);
+
+    let expanded_mutations = vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"alpha".to_vec(),
+            value: b"1".to_vec(),
+        },
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "other".into(),
+            key: b"beta".to_vec(),
+            value: b"2".to_vec(),
+        },
+    ];
+    let expanded = super::internals::write_partitions_after_lifecycle(
+        &Catalog::default(),
+        &request,
+        &expanded_mutations,
+        true,
+    );
+    assert_ne!(expanded, request.write_partitions);
+    assert!(expanded.len() > request.write_partitions.len());
+}
+
+#[test]
+fn wal_payload_encoding_is_stable_with_capacity_hints() {
+    let mutations = vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"alpha".to_vec(),
+            value: vec![1u8; 32],
+        },
+        Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            primary_key: vec![Value::Integer(7)],
+            row: Row {
+                values: vec![
+                    Value::Integer(7),
+                    Value::Text("bench".into()),
+                    Value::Integer(25),
+                ],
+            },
+        },
+    ];
+    let assertions = vec![ReadAssertion::KeyExists {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"beta".to_vec(),
+        expected: false,
+    }];
+    let key = crate::commit::tx::IdempotencyKey([9u8; 16]);
+    let fingerprint = [5u8; 32];
+
+    let baseline = super::internals::encode_wal_payload_from_parts(
+        &mutations,
+        &assertions,
+        Some(&key),
+        Some(&fingerprint),
+        None,
+    )
+    .expect("baseline encode");
+    let hinted = super::internals::encode_wal_payload_from_parts(
+        &mutations,
+        &assertions,
+        Some(&key),
+        Some(&fingerprint),
+        Some(1024),
+    )
+    .expect("hinted encode");
+
+    assert_eq!(baseline, hinted);
 }
 
 #[test]
@@ -526,6 +811,176 @@ async fn parallel_worker_panic_rejects_entire_epoch_without_state_publish() {
     assert!(state.keyspace.kv_get("p", "other", b"pp:b").is_none());
 }
 
+#[tokio::test]
+async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_updates() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+    exec.submit(Mutation::Ddl(DdlOperation::CreateAccumulator {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        accumulator_name: "house_balance".into(),
+        if_not_exists: false,
+        value_type: crate::catalog::schema::AccumulatorValueType::BigInt,
+        dedupe_retain_commits: Some(10_000),
+        snapshot_every: 1_000,
+        exposure_margin_bps: 1_000,
+        exposure_ttl_commits: Some(10_000),
+    }))
+    .await
+    .expect("accumulator");
+
+    let req_a = request_with_mutations(vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"user:u1".to_vec(),
+            value: b"v1".to_vec(),
+        },
+        Mutation::Accumulate {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            accumulator_name: "house_balance".into(),
+            delta: 5,
+            dedupe_key: "tx-a".into(),
+            order_key: 1,
+            release_exposure_id: None,
+        },
+    ]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"user:u2".to_vec(),
+        value: b"v2".to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|o| matches!(o.result, Ok(_))),
+        "all disjoint same-namespace writes should succeed"
+    );
+
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"user:u1")
+            .map(|entry| entry.value.as_slice()),
+        Some(&b"v1"[..])
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"user:u2")
+            .map(|entry| entry.value.as_slice()),
+        Some(&b"v2"[..])
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .accumulator_effective_value("p", "app", "house_balance")
+            .expect("effective value")
+            .expect("accumulator"),
+        5
+    );
+}
+
+#[tokio::test]
+async fn same_table_different_rows_can_merge_after_parallel_apply() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+    exec.submit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        owner_id: None,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+        if_not_exists: false,
+    }))
+    .await
+    .expect("table");
+
+    let req_a = request_with_mutations(vec![Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: base_row(1, "alice"),
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        primary_key: vec![Value::Integer(2)],
+        row: base_row(2, "bob"),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(epoch.outcomes.iter().all(|o| matches!(o.result, Ok(_))));
+    assert_eq!(
+        state
+            .keyspace
+            .get_row("p", "app", "users", &[Value::Integer(1)])
+            .cloned(),
+        Some(base_row(1, "alice"))
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .get_row("p", "app", "users", &[Value::Integer(2)])
+            .cloned(),
+        Some(base_row(2, "bob"))
+    );
+}
+
 #[test]
 fn derive_write_partitions_uses_collision_free_namespace_key() {
     let partitions = super::derive_write_partitions(&[
@@ -571,6 +1026,58 @@ fn derive_write_partitions_is_table_granular_within_scope() {
     let ns = namespace_key("p", "app");
     assert!(partitions.contains(&format!("t:{ns}:users")));
     assert!(partitions.contains(&format!("t:{ns}:orders")));
+}
+
+#[test]
+fn derive_write_partitions_uses_row_tokens_for_point_table_mutations() {
+    let mut catalog = Catalog::default();
+    catalog
+        .apply_ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        })
+        .expect("project");
+    catalog
+        .apply_ddl(DdlOperation::CreateTable {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            owner_id: None,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+            if_not_exists: false,
+        })
+        .expect("table");
+
+    let partitions = super::derive_write_partitions_with_fk_expansion(
+        &catalog,
+        &[Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: base_row(1, "a"),
+        }],
+    );
+    let ns = namespace_key("p", "app");
+    assert_eq!(partitions.len(), 1);
+    assert!(
+        partitions
+            .iter()
+            .any(|token| token.starts_with(&format!("tr:{ns}:users:")))
+    );
 }
 
 #[test]
@@ -659,8 +1166,10 @@ fn assertion_read_dependency_conflicts_with_write_token_in_epoch_selection() {
     };
     let write_partitions = super::derive_write_partitions(&envelope.write_intent.mutations);
     let read_partitions = super::derive_read_partitions(&envelope);
+    let mutation_count = envelope.write_intent.mutations.len();
     let candidate = CommitRequest {
         envelope,
+        mutation_count,
         encoded_len: 0,
         enqueue_micros: 0,
         prevalidated: false,

@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -59,6 +59,7 @@ pub struct HeadState {
 
 struct CommitRequest {
     envelope: TransactionEnvelope,
+    mutation_count: usize,
     encoded_len: usize,
     enqueue_micros: u64,
     prevalidated: bool,
@@ -70,7 +71,7 @@ struct CommitRequest {
 }
 
 struct PostApplyTask {
-    delta: CommitDelta,
+    delta: Arc<CommitDelta>,
 }
 
 const GLOBAL_PARTITION_TOKEN: &str = "__global__";
@@ -85,7 +86,7 @@ struct SequencedCommit {
     commit_ts_micros: u64,
     payload_type: u8,
     payload: Vec<u8>,
-    delta: CommitDelta,
+    delta: Arc<CommitDelta>,
 }
 
 #[derive(Default)]
@@ -151,18 +152,186 @@ fn estimate_prevalidated_single_mutation_size_upper_bound(mutation: &Mutation) -
     }
 }
 
+fn estimate_value_size_upper_bound(value: &Value) -> usize {
+    match value {
+        Value::Text(v) | Value::Json(v) => 16 + v.len(),
+        Value::Blob(v) => 16 + v.len(),
+        Value::U256(_) | Value::I256(_) => 48,
+        Value::Float(_) | Value::U64(_) | Value::Integer(_) | Value::Timestamp(_) => 16,
+        Value::Boolean(_) | Value::U8(_) | Value::Null => 8,
+    }
+}
+
+fn estimate_values_size_upper_bound(values: &[Value]) -> usize {
+    16 + values
+        .iter()
+        .map(estimate_value_size_upper_bound)
+        .sum::<usize>()
+}
+
+fn estimate_row_size_upper_bound(row: &Row) -> usize {
+    estimate_values_size_upper_bound(&row.values)
+}
+
+const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 384;
+const MUTATION_OVERHEAD_UPPER_BOUND: usize = 192;
+
+fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
+    match mutation {
+        Mutation::KvSet {
+            project_id,
+            scope_id,
+            key,
+            value,
+        } => Some(
+            MUTATION_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + key.len()
+                + value.len(),
+        ),
+        Mutation::KvDel {
+            project_id,
+            scope_id,
+            key,
+        } => Some(
+            MUTATION_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + key.len(),
+        ),
+        Mutation::KvIncU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvDecU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMinU256 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        } => Some(
+            MUTATION_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + key.len()
+                + 48,
+        ),
+        Mutation::KvAddU64Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvSubU64Ex {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMaxU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | Mutation::KvMinU64 {
+            project_id,
+            scope_id,
+            key,
+            ..
+        } => Some(
+            MUTATION_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + key.len()
+                + 24,
+        ),
+        Mutation::Upsert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        }
+        | Mutation::Insert {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            row,
+        } => Some(
+            MUTATION_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + table_name.len()
+                + estimate_values_size_upper_bound(primary_key)
+                + estimate_row_size_upper_bound(row),
+        ),
+        Mutation::Delete {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+        } => Some(
+            MUTATION_OVERHEAD_UPPER_BOUND
+                + project_id.len()
+                + scope_id.len()
+                + table_name.len()
+                + estimate_values_size_upper_bound(primary_key),
+        ),
+        _ => estimate_prevalidated_single_mutation_size_upper_bound(mutation),
+    }
+}
+
+fn estimate_single_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
+    estimate_mutation_size_upper_bound(mutation)?
+        .checked_add(ENVELOPE_OVERHEAD_UPPER_BOUND)
+}
+
+fn estimate_transaction_envelope_size_upper_bound(envelope: &TransactionEnvelope) -> Option<usize> {
+    if envelope.caller.is_some()
+        || envelope.idempotency_key.is_some()
+        || !envelope.assertions.is_empty()
+        || !envelope.read_set.points.is_empty()
+        || !envelope.read_set.ranges.is_empty()
+    {
+        return None;
+    }
+    envelope
+        .write_intent
+        .mutations
+        .iter()
+        .try_fold(ENVELOPE_OVERHEAD_UPPER_BOUND, |acc, mutation| {
+            acc.checked_add(estimate_mutation_size_upper_bound(mutation)?)
+        })
+}
+
 struct InternalSequencedCommit {
     seq: u64,
     commit_ts_micros: u64,
     payload_type: u8,
     payload: Vec<u8>,
-    delta: CommitDelta,
+    delta: Arc<CommitDelta>,
 }
 
 struct EpochOutcome {
     request: CommitRequest,
     result: Result<CommitResult, AedbError>,
-    post_apply_delta: Option<CommitDelta>,
+    post_apply_delta: Option<Arc<CommitDelta>>,
 }
 
 #[derive(Default)]
@@ -254,6 +423,8 @@ pub struct CommitExecutor {
     config: Arc<AedbConfig>,
     state: Arc<Mutex<ExecutorState>>,
     latest_snapshot_view: Arc<RwLock<SnapshotReadView>>,
+    latest_snapshot_generation: Arc<AtomicU64>,
+    cached_snapshot_generation: Arc<AtomicU64>,
     durable_notify: Arc<Notify>,
     current_seq: Arc<AtomicU64>,
     visible_head_seq: Arc<AtomicU64>,
@@ -358,6 +529,20 @@ pub struct ExecutorRuntimeState {
 }
 
 impl CommitExecutor {
+    fn snapshot_view_from_state(state: &ExecutorState) -> SnapshotReadView {
+        SnapshotReadView {
+            keyspace: Arc::new(state.keyspace.snapshot()),
+            catalog: Arc::new(state.catalog.snapshot()),
+            seq: state.visible_head_seq,
+        }
+    }
+
+    fn catalog_requires_post_apply_refresh(catalog: &Catalog) -> bool {
+        !catalog.async_indexes.is_empty()
+            || !catalog.kv_projections.is_empty()
+            || !catalog.accumulators.is_empty()
+    }
+
     pub fn new(wal_dir: &Path) -> Result<Self, AedbError> {
         let config = AedbConfig::default();
         Self::with_state(
@@ -389,6 +574,8 @@ impl CommitExecutor {
         let initial_epoch_min_commits = adaptive_epoch.current_min_commits();
         let initial_epoch_max_wait_us = adaptive_epoch.current_max_wait_us();
         let global_unique_index = GlobalUniqueIndexState::from_snapshot(&catalog, &keyspace)?;
+        let initial_post_apply_refresh_needed =
+            Self::catalog_requires_post_apply_refresh(&catalog);
         let mut version_store = VersionStore::new(config.max_versions, config.min_version_age_ms);
         version_store.bootstrap(current_seq, keyspace.snapshot(), catalog.snapshot());
         let initial_latest_snapshot_view = version_store.acquire_latest()?.into_view();
@@ -435,6 +622,10 @@ impl CommitExecutor {
         let start_instant = Instant::now();
         let last_wal_sync_elapsed_us = Arc::new(AtomicU64::new(0));
         let last_full_snapshot_micros = Arc::new(AtomicU64::new(initial_last_full_snapshot_micros));
+        let latest_snapshot_generation = Arc::new(AtomicU64::new(0));
+        let cached_snapshot_generation = Arc::new(AtomicU64::new(0));
+        let post_apply_refresh_needed =
+            Arc::new(AtomicBool::new(initial_post_apply_refresh_needed));
         let background_tasks = Arc::new(StdMutex::new(Vec::new()));
         telemetry
             .adaptive_epoch_min_commits
@@ -449,11 +640,11 @@ impl CommitExecutor {
                 tokio_mpsc::channel::<PostApplyTask>(max_inflight_commits * 2);
             post_apply_txs.push(post_tx);
             let post_state = Arc::clone(&state);
-            let post_latest_snapshot_view = Arc::clone(&latest_snapshot_view);
+            let post_latest_snapshot_generation = Arc::clone(&latest_snapshot_generation);
             let handle = tokio::spawn(async move {
                 while let Some(task) = post_rx.recv().await {
                     let mut s = post_state.lock().await;
-                    if let Ok(changed) = refresh_async_indexes(&mut s, Some(&task.delta))
+                    if let Ok(changed) = refresh_async_indexes(&mut s, Some(task.delta.as_ref()))
                         && changed
                     {
                         let seq = s.visible_head_seq.max(task.delta.seq);
@@ -461,9 +652,7 @@ impl CommitExecutor {
                         let catalog_snapshot = s.catalog.snapshot();
                         s.version_store
                             .publish_full(seq, keyspace_snapshot, catalog_snapshot);
-                        if let Ok(view) = s.version_store.acquire_latest() {
-                            *post_latest_snapshot_view.write() = view.into_view();
-                        }
+                        post_latest_snapshot_generation.fetch_add(1, Ordering::Release);
                     }
                 }
             });
@@ -486,7 +675,8 @@ impl CommitExecutor {
         let loop_last_wal_sync_elapsed_us = Arc::clone(&last_wal_sync_elapsed_us);
         let loop_start_instant = start_instant;
         let loop_last_full_snapshot_micros = Arc::clone(&last_full_snapshot_micros);
-        let loop_latest_snapshot_view = Arc::clone(&latest_snapshot_view);
+        let loop_latest_snapshot_generation = Arc::clone(&latest_snapshot_generation);
+        let loop_post_apply_refresh_needed = Arc::clone(&post_apply_refresh_needed);
         let apply_handle = tokio::spawn(async move {
             let mut pending = VecDeque::new();
             let mut ingress_closed = false;
@@ -657,15 +847,17 @@ impl CommitExecutor {
                 }
                 if catalog_changed {
                     *loop_validation_catalog.write() = s.catalog.clone();
+                    loop_post_apply_refresh_needed.store(
+                        CommitExecutor::catalog_requires_post_apply_refresh(&s.catalog),
+                        Ordering::Release,
+                    );
                 }
                 loop_current_seq.store(s.current_seq, Ordering::Release);
                 loop_visible_head.store(s.visible_head_seq, Ordering::Release);
                 loop_durable_head.store(s.durable_head_seq, Ordering::Release);
                 loop_last_full_snapshot_micros
                     .store(s.last_full_snapshot_micros, Ordering::Release);
-                if let Ok(view) = s.version_store.acquire_latest() {
-                    *loop_latest_snapshot_view.write() = view.into_view();
-                }
+                loop_latest_snapshot_generation.fetch_add(1, Ordering::Release);
                 let durable_advanced = s.durable_head_seq > durable_before;
                 drop(s);
                 if durable_advanced {
@@ -673,7 +865,9 @@ impl CommitExecutor {
                 }
 
                 for outcome in outcomes {
-                    if let Some(delta) = outcome.post_apply_delta {
+                    if loop_post_apply_refresh_needed.load(Ordering::Acquire)
+                        && let Some(delta) = outcome.post_apply_delta
+                    {
                         let post_shard =
                             shard_for_envelope(&outcome.request.envelope, loop_post_txs.len());
                         if let Some(tx) = loop_post_txs.get(post_shard) {
@@ -708,7 +902,7 @@ impl CommitExecutor {
                             epoch_commit_count,
                             epoch_wal_append_ops = epoch_result.wal_append_ops,
                             epoch_wal_sync_ops = epoch_result.wal_sync_ops,
-                            mutation_count = outcome.request.envelope.write_intent.mutations.len(),
+                            mutation_count = outcome.request.mutation_count,
                             write_class = ?outcome.request.envelope.write_class,
                             prevalidated = outcome.request.prevalidated,
                             has_error = outcome.result.is_err(),
@@ -800,19 +994,28 @@ impl CommitExecutor {
                             .iter()
                             .any(mutation_requires_fk_expansion)
                         {
-                            let catalog = pre_validation_catalog.read().snapshot();
-                            derive_write_partitions_with_fk_expansion(
+                            let catalog = pre_validation_catalog.read();
+                            derive_write_partitions_for_envelope(
                                 &catalog,
                                 &req.envelope.write_intent.mutations,
                             )
                         } else {
-                            derive_write_partitions(&req.envelope.write_intent.mutations)
+                            if let [mutation] = req.envelope.write_intent.mutations.as_slice() {
+                                if let Some(token) = single_write_partition_token(mutation) {
+                                    let mut out = HashSet::with_capacity(1);
+                                    out.insert(token);
+                                    out
+                                } else {
+                                    derive_write_partitions(&req.envelope.write_intent.mutations)
+                                }
+                            } else {
+                                derive_write_partitions(&req.envelope.write_intent.mutations)
+                            }
                         };
                         (write_partitions, derive_read_partitions(&req.envelope))
                     } else {
                         let prevalidate_started = Instant::now();
-                        let result =
-                            pre_stage_validate(&pre_validation_catalog, &req.envelope).await;
+                        let result = pre_stage_validate(&pre_validation_catalog, &req.envelope);
                         prevalidate_elapsed_us =
                             Some(prevalidate_started.elapsed().as_micros() as u64);
                         match result {
@@ -938,6 +1141,8 @@ impl CommitExecutor {
             config,
             state,
             latest_snapshot_view,
+            latest_snapshot_generation,
+            cached_snapshot_generation,
             durable_notify,
             current_seq: current_seq_atomic,
             visible_head_seq,
@@ -952,7 +1157,24 @@ impl CommitExecutor {
     }
 
     pub async fn submit(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
-        self.submit_as(None, mutation).await
+        let fast_size_hint = estimate_single_mutation_size_upper_bound(&mutation);
+        self.submit_envelope_with_mode_size_hint(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![mutation],
+                },
+                base_seq: 0,
+            },
+            false,
+            false,
+            fast_size_hint,
+        )
+        .await
     }
 
     pub(crate) async fn submit_prevalidated(
@@ -984,7 +1206,11 @@ impl CommitExecutor {
         caller: Option<CallerContext>,
         mutation: Mutation,
     ) -> Result<CommitResult, AedbError> {
-        self.submit_envelope(TransactionEnvelope {
+        let fast_size_hint = caller
+            .is_none()
+            .then(|| estimate_single_mutation_size_upper_bound(&mutation))
+            .flatten();
+        self.submit_envelope_with_mode_size_hint(TransactionEnvelope {
             caller,
             idempotency_key: None,
             write_class: WriteClass::Standard,
@@ -996,7 +1222,7 @@ impl CommitExecutor {
             // No read set/assertions in single-mutation submit path.
             // A fixed base_seq avoids an extra state lock on the hot write path.
             base_seq: 0,
-        })
+        }, false, false, fast_size_hint)
         .await
     }
 
@@ -1054,11 +1280,12 @@ impl CommitExecutor {
         prevalidated: bool,
         assertions_engine_verified: bool,
     ) -> Result<CommitResult, AedbError> {
+        let encoded_size_hint = estimate_transaction_envelope_size_upper_bound(&envelope);
         self.submit_envelope_with_mode_size_hint(
             envelope,
             prevalidated,
             assertions_engine_verified,
-            None,
+            encoded_size_hint,
         )
         .await
     }
@@ -1122,58 +1349,82 @@ impl CommitExecutor {
             .get(shard)
             .ok_or_else(|| AedbError::Validation("no ingress shard available".into()))?
             .clone();
-        let send_result = tokio::time::timeout(
-            std::time::Duration::from_millis(config.commit_timeout_ms),
-            ingress_tx.send(CommitRequest {
-                envelope,
-                encoded_len: encoded_size_bytes,
-                enqueue_micros: now_micros(),
-                prevalidated,
-                assertions_engine_verified,
-                write_partitions: HashSet::new(),
-                read_partitions: HashSet::new(),
-                defer_count: 0,
-                result_tx,
-            }),
-        )
-        .await;
-        match send_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.queued_bytes
-                    .fetch_sub(encoded_size_bytes, Ordering::Relaxed);
-                self.telemetry
-                    .queued_commits
-                    .fetch_sub(1, Ordering::Relaxed);
-                return Err(AedbError::Validation(format!("commit queue closed: {e}")));
+        let request = CommitRequest {
+            mutation_count: envelope.write_intent.mutations.len(),
+            envelope,
+            encoded_len: encoded_size_bytes,
+            enqueue_micros: now_micros(),
+            prevalidated,
+            assertions_engine_verified,
+            write_partitions: HashSet::new(),
+            read_partitions: HashSet::new(),
+            defer_count: 0,
+            result_tx,
+        };
+        match ingress_tx.try_send(request) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                let send_result = tokio::time::timeout(
+                    std::time::Duration::from_millis(config.commit_timeout_ms),
+                    ingress_tx.send(request),
+                )
+                .await;
+                match send_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        self.queued_bytes
+                            .fetch_sub(encoded_size_bytes, Ordering::Relaxed);
+                        self.telemetry
+                            .queued_commits
+                            .fetch_sub(1, Ordering::Relaxed);
+                        return Err(AedbError::Validation(format!("commit queue closed: {e}")));
+                    }
+                    Err(_) => {
+                        self.queued_bytes
+                            .fetch_sub(encoded_size_bytes, Ordering::Relaxed);
+                        self.telemetry
+                            .queued_commits
+                            .fetch_sub(1, Ordering::Relaxed);
+                        self.telemetry
+                            .timeout_rejections
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(AedbError::Timeout);
+                    }
+                }
             }
-            Err(_) => {
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_request)) => {
                 self.queued_bytes
                     .fetch_sub(encoded_size_bytes, Ordering::Relaxed);
                 self.telemetry
                     .queued_commits
                     .fetch_sub(1, Ordering::Relaxed);
-                self.telemetry
-                    .timeout_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(AedbError::Timeout);
+                return Err(AedbError::Validation("commit queue closed".into()));
             }
         }
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(config.commit_timeout_ms),
-            result_rx,
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => Err(AedbError::Validation(format!(
-                "commit result channel closed: {e}"
-            ))),
-            Err(_) => {
-                self.telemetry
-                    .timeout_rejections
-                    .fetch_add(1, Ordering::Relaxed);
-                Err(AedbError::Timeout)
+        let mut result_rx = result_rx;
+        match result_rx.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(config.commit_timeout_ms),
+                    result_rx,
+                )
+                .await
+                {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => Err(AedbError::Validation(format!(
+                        "commit result channel closed: {e}"
+                    ))),
+                    Err(_) => {
+                        self.telemetry
+                            .timeout_rejections
+                            .fetch_add(1, Ordering::Relaxed);
+                        Err(AedbError::Timeout)
+                    }
+                }
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                Err(AedbError::Validation("commit result channel closed".into()))
             }
         }
     }
@@ -1208,28 +1459,27 @@ impl CommitExecutor {
     }
 
     pub async fn snapshot_state(&self) -> (KeyspaceSnapshot, Catalog, u64) {
-        let mut state = self.state.lock().await;
-        match state.version_store.acquire_latest() {
-            Ok(view) => {
-                let view = view.into_view();
-                ((*view.keyspace).clone(), (*view.catalog).clone(), view.seq)
-            }
-            Err(err) => {
-                warn!(
-                    error = ?err,
-                    "version store latest view unavailable; falling back to executor state snapshot"
-                );
-                (
-                    state.keyspace.snapshot(),
-                    state.catalog.snapshot(),
-                    state.visible_head_seq,
-                )
-            }
-        }
+        let state = self.state.lock().await;
+        (
+            state.keyspace.snapshot(),
+            state.catalog.snapshot(),
+            state.visible_head_seq,
+        )
     }
 
     pub async fn snapshot_latest_view(&self) -> SnapshotReadView {
-        self.latest_snapshot_view.read().clone()
+        let current_generation = self.latest_snapshot_generation.load(Ordering::Acquire);
+        if self.cached_snapshot_generation.load(Ordering::Acquire) == current_generation {
+            return self.latest_snapshot_view.read().clone();
+        }
+
+        let state = self.state.lock().await;
+        let current_generation = self.latest_snapshot_generation.load(Ordering::Acquire);
+        let view = Self::snapshot_view_from_state(&state);
+        *self.latest_snapshot_view.write() = view.clone();
+        self.cached_snapshot_generation
+            .store(current_generation, Ordering::Release);
+        view
     }
 
     pub async fn snapshot_at_seq(&self, seq: u64) -> Result<SnapshotReadView, AedbError> {

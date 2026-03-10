@@ -26,6 +26,7 @@ use std::fs;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
@@ -3389,6 +3390,29 @@ async fn lifecycle_hooks_receive_post_commit_events_for_applied_ddl() {
 }
 
 #[tokio::test]
+async fn removing_last_lifecycle_hook_disables_dispatch() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook: Arc<dyn LifecycleHook> = Arc::new(RecordingLifecycleHook {
+        events: Arc::clone(&events),
+    });
+    db.add_lifecycle_hook(Arc::clone(&hook));
+    db.remove_lifecycle_hook(&hook);
+
+    db.commit_ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        project_id: "arcana".into(),
+        if_not_exists: true,
+    })
+    .await
+    .expect("create project");
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert!(events.lock().expect("events lock").is_empty());
+}
+
+#[tokio::test]
 async fn lifecycle_outbox_persists_applied_events() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -3491,6 +3515,33 @@ async fn event_outbox_and_reactive_processor_checkpoint_lag_work() {
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: Some("system".into()),
+        if_not_exists: true,
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+        scope_id: "app".into(),
+        table_name: "reactive_processor_checkpoints".into(),
+        columns: vec![
+            ColumnDef {
+                name: "processor_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "checkpoint_seq".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "updated_at_micros".into(),
+                col_type: ColumnType::Timestamp,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["processor_name".into()],
+    }))
+    .await
+    .expect("create processor checkpoint table");
 
     let first = db
         .emit_event(
@@ -3544,6 +3595,33 @@ async fn reactive_processor_checkpoint_ack_batches_by_watermark() {
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: Some("system".into()),
+        if_not_exists: true,
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+        scope_id: "app".into(),
+        table_name: "reactive_processor_checkpoints".into(),
+        columns: vec![
+            ColumnDef {
+                name: "processor_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "checkpoint_seq".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "updated_at_micros".into(),
+                col_type: ColumnType::Timestamp,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["processor_name".into()],
+    }))
+    .await
+    .expect("create processor checkpoint table");
 
     let first = db
         .emit_event(
@@ -3600,6 +3678,155 @@ async fn reactive_processor_checkpoint_ack_batches_by_watermark() {
     assert_eq!(lag.processor_name, "points_processor");
     assert_eq!(lag.checkpoint_seq, first.commit_seq + 2);
     assert!(lag.head_seq >= second.commit_seq);
+}
+
+#[tokio::test]
+async fn reactive_processor_checkpoint_ack_rejects_regression() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("arcana").await.expect("project");
+    db.create_scope("arcana", "app").await.expect("scope");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: Some("system".into()),
+        if_not_exists: true,
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+        scope_id: "app".into(),
+        table_name: "reactive_processor_checkpoints".into(),
+        columns: vec![
+            ColumnDef {
+                name: "processor_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "checkpoint_seq".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "updated_at_micros".into(),
+                col_type: ColumnType::Timestamp,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["processor_name".into()],
+    }))
+    .await
+    .expect("create processor checkpoint table");
+
+    let first = db
+        .emit_event(
+            "arcana",
+            "app",
+            "hand_settled",
+            "hand_1".into(),
+            r#"{"user_id":"u1","wager":100,"pnl":-100}"#.into(),
+        )
+        .await
+        .expect("emit first event");
+    let second = db
+        .emit_event(
+            "arcana",
+            "app",
+            "hand_settled",
+            "hand_2".into(),
+            r#"{"user_id":"u2","wager":75,"pnl":50}"#.into(),
+        )
+        .await
+        .expect("emit second event");
+
+    db.ack_reactive_processor_checkpoint("points_processor", second.commit_seq)
+        .await
+        .expect("persist newer checkpoint");
+
+    let err = db
+        .ack_reactive_processor_checkpoint("points_processor", first.commit_seq)
+        .await
+        .expect_err("checkpoint regression must fail");
+    assert!(matches!(err, AedbError::Validation(_)));
+
+    let lag = db
+        .reactive_processor_lag("points_processor", ConsistencyMode::AtLatest)
+        .await
+        .expect("lag");
+    assert_eq!(lag.checkpoint_seq, second.commit_seq);
+}
+
+#[tokio::test]
+async fn reactive_processor_checkpoint_batched_rejects_stale_persist_after_concurrent_advance() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("arcana").await.expect("project");
+    db.create_scope("arcana", "app").await.expect("scope");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: Some("system".into()),
+        if_not_exists: true,
+        project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+        scope_id: "app".into(),
+        table_name: "reactive_processor_checkpoints".into(),
+        columns: vec![
+            ColumnDef {
+                name: "processor_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "checkpoint_seq".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "updated_at_micros".into(),
+                col_type: ColumnType::Timestamp,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["processor_name".into()],
+    }))
+    .await
+    .expect("create processor checkpoint table");
+
+    let first = db
+        .emit_event(
+            "arcana",
+            "app",
+            "hand_settled",
+            "hand_1".into(),
+            r#"{"user_id":"u1","wager":100,"pnl":-100}"#.into(),
+        )
+        .await
+        .expect("emit first event");
+    let second = db
+        .emit_event(
+            "arcana",
+            "app",
+            "hand_settled",
+            "hand_2".into(),
+            r#"{"user_id":"u2","wager":75,"pnl":50}"#.into(),
+        )
+        .await
+        .expect("emit second event");
+
+    let stale = db
+        .build_reactive_processor_checkpoint_envelope("points_processor", first.commit_seq)
+        .await
+        .expect("stale envelope");
+
+    db.ack_reactive_processor_checkpoint("points_processor", second.commit_seq)
+        .await
+        .expect("persist newer checkpoint");
+
+    let err = db
+        .commit_envelope_prevalidated_internal("stale_reactive_ack_test", stale)
+        .await
+        .expect_err("stale asserted ack must fail");
+    assert!(matches!(err, AedbError::Conflict(_)));
+
+    let lag = db
+        .reactive_processor_lag("points_processor", ConsistencyMode::AtLatest)
+        .await
+        .expect("lag");
+    assert_eq!(lag.checkpoint_seq, second.commit_seq);
 }
 
 #[tokio::test]
@@ -7015,6 +7242,166 @@ async fn multi_update_transaction_envelope_updates_table_and_kv() {
 }
 
 #[tokio::test]
+async fn transaction_envelope_can_commit_table_kv_and_accumulator_atomically() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ledger".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "amount".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "status".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("ledger table");
+    db.create_accumulator("p", "app", "house_balance", Some(86_400), 10_000)
+        .await
+        .expect("create accumulator");
+
+    let envelope = TransactionEnvelope {
+        caller: None,
+        idempotency_key: Some(IdempotencyKey([11u8; 16])),
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: Default::default(),
+        write_intent: WriteIntent {
+            mutations: vec![
+                Mutation::Upsert {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    table_name: "ledger".into(),
+                    primary_key: vec![Value::Integer(1)],
+                    row: Row::from_values(vec![
+                        Value::Integer(1),
+                        Value::Integer(75),
+                        Value::Text("posted".into()),
+                    ]),
+                },
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"ledger:last".to_vec(),
+                    value: b"1".to_vec(),
+                },
+                Mutation::Accumulate {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    accumulator_name: "house_balance".into(),
+                    delta: 75,
+                    dedupe_key: "txn-acc-1".into(),
+                    order_key: 1,
+                    release_exposure_id: None,
+                },
+            ],
+        },
+        base_seq: db.head_state().await.visible_head_seq,
+    };
+
+    let result = db
+        .commit_envelope(envelope.clone())
+        .await
+        .expect("mixed transaction envelope");
+    assert!(
+        result.commit_seq > 0,
+        "transaction must advance the commit sequence"
+    );
+
+    let row = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["amount", "status"])
+                .from("ledger")
+                .where_(Expr::Eq("id".into(), Value::Integer(1)))
+                .limit(1),
+        )
+        .await
+        .expect("query ledger row");
+    assert_eq!(row.rows.len(), 1);
+    assert_eq!(row.rows[0].values[0], Value::Integer(75));
+    assert_eq!(row.rows[0].values[1], Value::Text("posted".into()));
+
+    let marker = db
+        .kv_get_no_auth("p", "app", b"ledger:last", ConsistencyMode::AtLatest)
+        .await
+        .expect("read kv marker");
+    assert_eq!(
+        marker.as_ref().map(|entry| entry.value.as_slice()),
+        Some(b"1".as_slice())
+    );
+
+    let projected = db
+        .accumulator_value("p", "app", "house_balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("projected accumulator value");
+    let strong = db
+        .accumulator_value_strong("p", "app", "house_balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("strong accumulator value");
+    assert_eq!(strong, 75);
+    assert!(
+        projected <= strong,
+        "projected value must not exceed strong value"
+    );
+
+    let replay = db
+        .commit_envelope(envelope)
+        .await
+        .expect("idempotent replay");
+    assert_eq!(
+        replay.idempotency,
+        crate::commit::executor::IdempotencyOutcome::Duplicate,
+        "second commit must be treated as replay"
+    );
+
+    let stable_row = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["amount", "status"])
+                .from("ledger")
+                .where_(Expr::Eq("id".into(), Value::Integer(1)))
+                .limit(1),
+        )
+        .await
+        .expect("query stable row");
+    assert_eq!(stable_row.rows[0].values[0], Value::Integer(75));
+    assert_eq!(stable_row.rows[0].values[1], Value::Text("posted".into()));
+    let stable_marker = db
+        .kv_get_no_auth("p", "app", b"ledger:last", ConsistencyMode::AtLatest)
+        .await
+        .expect("read stable marker");
+    assert_eq!(
+        stable_marker.as_ref().map(|entry| entry.value.as_slice()),
+        Some(b"1".as_slice())
+    );
+    let stable_strong = db
+        .accumulator_value_strong("p", "app", "house_balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("stable strong accumulator value");
+    assert_eq!(stable_strong, 75);
+}
+
+#[tokio::test]
 async fn checkpoint_now_allows_commits_while_running() {
     let dir = tempdir().expect("temp");
     let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
@@ -7855,6 +8242,140 @@ async fn snapshot_probe_returns_snapshot_seq() {
         .await
         .expect("probe");
     assert!(seq >= 1);
+}
+
+#[tokio::test]
+async fn snapshot_probe_does_not_consume_snapshot_slot() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_concurrent_snapshots: 1,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let _lease = db
+        .acquire_snapshot(ConsistencyMode::AtLatest)
+        .await
+        .expect("lease");
+
+    let seq = db
+        .snapshot_probe(ConsistencyMode::AtLatest)
+        .await
+        .expect("probe");
+    assert!(seq >= 1);
+}
+
+#[tokio::test]
+async fn snapshot_probe_remains_live_under_snapshot_capacity_pressure() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_concurrent_snapshots: 1,
+        ..AedbConfig::default()
+    };
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let _lease = db
+        .acquire_snapshot(ConsistencyMode::AtLatest)
+        .await
+        .expect("lease");
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..128 {
+                let seq = db
+                    .snapshot_probe(ConsistencyMode::AtLatest)
+                    .await
+                    .expect("probe");
+                assert!(seq >= 1);
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for task in tasks {
+            task.await.expect("probe task");
+        }
+    })
+    .await
+    .expect("snapshot probes timed out under snapshot pressure");
+}
+
+#[tokio::test]
+async fn checkpoint_now_completes_under_hot_load() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        ..AedbConfig::default()
+    };
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reads = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    let writer_db = Arc::clone(&db);
+    let writer_stop = Arc::clone(&stop);
+    let writes_ref = Arc::clone(&writes);
+    let writer = tokio::spawn(async move {
+        let mut i = 0u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let _ = writer_db
+                .commit(Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: format!("checkpoint-hot:{i}").into_bytes(),
+                    value: i.to_string().into_bytes(),
+                })
+                .await;
+            writes_ref.fetch_add(1, Ordering::Relaxed);
+            i = i.saturating_add(1);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let reader_db = Arc::clone(&db);
+    let reader_stop = Arc::clone(&stop);
+    let reads_ref = Arc::clone(&reads);
+    let reader = tokio::spawn(async move {
+        while !reader_stop.load(Ordering::Relaxed) {
+            let _ = reader_db.snapshot_probe(ConsistencyMode::AtLatest).await;
+            reads_ref.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let writes_before = writes.load(Ordering::Relaxed);
+    let reads_before = reads.load(Ordering::Relaxed);
+
+    let checkpoint_seq = tokio::time::timeout(Duration::from_secs(10), db.checkpoint_now())
+        .await
+        .expect("checkpoint_now timed out")
+        .expect("checkpoint_now");
+    assert!(checkpoint_seq >= 1);
+
+    let writes_after = writes.load(Ordering::Relaxed);
+    let reads_after = reads.load(Ordering::Relaxed);
+    assert!(writes_after > writes_before, "writes stalled during checkpoint");
+    assert!(reads_after > reads_before, "reads stalled during checkpoint");
+
+    stop.store(true, Ordering::Relaxed);
+    tokio::time::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer join timed out")
+        .expect("writer join");
+    tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("reader join timed out")
+        .expect("reader join");
 }
 
 #[tokio::test]
@@ -8744,6 +9265,56 @@ async fn telemetry_sql_and_remote_adapter_paths_work() {
     let commit_count = hook.commits.lock().expect("commit telemetry").len();
     assert!(query_count >= 1);
     assert!(commit_count >= 1);
+}
+
+#[tokio::test]
+async fn removing_last_telemetry_hook_disables_commit_and_query_callbacks() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    let hook = Arc::new(RecordingTelemetryHook {
+        queries: Arc::new(std::sync::Mutex::new(Vec::new())),
+        commits: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let hook_trait: Arc<dyn QueryCommitTelemetryHook> = hook.clone();
+    db.add_telemetry_hook(hook_trait.clone());
+    db.remove_telemetry_hook(&hook_trait);
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"telemetry:disabled".to_vec(),
+        value: b"ok".to_vec(),
+    })
+    .await
+    .expect("commit");
+    let _ = db
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["id"]).from("items").limit(1),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query");
+
+    assert!(hook.queries.lock().expect("query telemetry").is_empty());
+    assert!(hook.commits.lock().expect("commit telemetry").is_empty());
 }
 
 #[tokio::test]

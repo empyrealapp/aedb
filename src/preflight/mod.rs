@@ -577,12 +577,30 @@ pub fn preflight(
                     reason: AedbError::Overflow.to_string(),
                 };
             };
-            let max_exposure_allowed = if acc.exposure_limit_cache_valid {
-                acc.exposure_limit_cached
-            } else {
-                (((acc.value as i128) * (10_000i128 - acc.exposure_margin_bps as i128)) / 10_000)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+            let effective_value = match snapshot.accumulator_effective_value(
+                project_id,
+                scope_id,
+                accumulator_name,
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return PreflightResult::Err {
+                        reason: AedbError::Validation(format!(
+                            "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                        ))
+                        .to_string(),
+                    };
+                }
+                Err(err) => {
+                    return PreflightResult::Err {
+                        reason: err.to_string(),
+                    };
+                }
             };
+            let max_exposure_allowed =
+                (((effective_value as i128) * (10_000i128 - acc.exposure_margin_bps as i128))
+                    / 10_000)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
             if new_total > max_exposure_allowed {
                 return PreflightResult::Err {
                     reason: AedbError::Validation(format!(
@@ -608,13 +626,31 @@ pub fn preflight(
                 };
             };
             let mut running_total = acc.total_exposure;
-            let max_exposure_allowed = if acc.exposure_limit_cache_valid {
-                acc.exposure_limit_cached
-            } else {
-                (((acc.value as i128) * (10_000i128 - acc.exposure_margin_bps as i128)) / 10_000)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64
+            let effective_value = match snapshot.accumulator_effective_value(
+                project_id,
+                scope_id,
+                accumulator_name,
+            ) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return PreflightResult::Err {
+                        reason: AedbError::Validation(format!(
+                            "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                        ))
+                        .to_string(),
+                    };
+                }
+                Err(err) => {
+                    return PreflightResult::Err {
+                        reason: err.to_string(),
+                    };
+                }
             };
-            let mut seen = std::collections::HashSet::new();
+            let max_exposure_allowed =
+                (((effective_value as i128) * (10_000i128 - acc.exposure_margin_bps as i128))
+                    / 10_000)
+                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+            let mut seen = std::collections::HashMap::new();
             for (amount, exposure_id) in exposures {
                 if let Some(existing) = acc.open_exposures.get(exposure_id.as_str()) {
                     if existing.amount != *amount {
@@ -627,7 +663,15 @@ pub fn preflight(
                     }
                     continue;
                 }
-                if !seen.insert(exposure_id) {
+                if let Some(seen_amount) = seen.get(exposure_id.as_str()) {
+                    if *seen_amount != *amount {
+                        return PreflightResult::Err {
+                            reason: AedbError::Validation(format!(
+                                "duplicate exposure id with different amount in batch: {exposure_id}"
+                            ))
+                            .to_string(),
+                        };
+                    }
                     continue;
                 }
                 let Some(next) = running_total.checked_add(*amount) else {
@@ -636,6 +680,7 @@ pub fn preflight(
                     };
                 };
                 running_total = next;
+                seen.insert(exposure_id.as_str(), *amount);
                 if running_total > max_exposure_allowed {
                     return PreflightResult::Err {
                         reason: AedbError::Validation(format!(

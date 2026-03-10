@@ -144,6 +144,13 @@ let lag = db
     .accumulator_lag("casino", "app", "house_balance", ConsistencyMode::AtLatest)
     .await?;
 
+// Safety model:
+// - accumulator_value(...) is the projected/materialized value and may lag.
+// - accumulator_value_strong(...), accumulator_available(...), exposure assertions,
+//   and expose_accumulator(...) evaluate against the effective value
+//   (materialized value + unapplied deltas in the same snapshot).
+// Use the strong/effective APIs for credit, reserve, and risk decisions.
+
 // Optional circuit-breaker controls (basis points + orphan TTL in commit units)
 db.create_accumulator_with_options(
     "casino",
@@ -476,6 +483,16 @@ Security acceptance gate (mandatory profile):
 ```bash
 ./scripts/security_gate.sh
 ```
+
+Production readiness gate:
+
+```bash
+./scripts/production_readiness_gate.sh
+```
+
+Production rollout guidance:
+
+- [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md)
 
 ## License
 

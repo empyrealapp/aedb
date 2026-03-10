@@ -123,6 +123,10 @@ pub struct AccumulatorData {
     pub materialized_seq: u64,
     pub latest_seq: u64,
     #[serde(default)]
+    pub pending_delta_sum: i128,
+    #[serde(default)]
+    pub pending_delta_sum_cache_valid: bool,
+    #[serde(default)]
     pub applied_since_snapshot: u64,
     #[serde(default)]
     pub projector_error: Option<String>,
@@ -157,6 +161,47 @@ fn default_exposure_margin_bps() -> u32 {
 fn compute_exposure_limit(value: i64, exposure_margin_bps: u32) -> i64 {
     let allowed_ratio_bps = 10_000i128 - exposure_margin_bps as i128;
     ((value as i128 * allowed_ratio_bps) / 10_000).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn unapplied_delta_sum(accumulator: &AccumulatorData) -> Result<i128, crate::error::AedbError> {
+    if accumulator.pending_delta_sum_cache_valid {
+        return Ok(accumulator.pending_delta_sum);
+    }
+    let mut pending = 0i128;
+    for (_, delta) in accumulator.deltas.range((
+        std::ops::Bound::Excluded(accumulator.last_applied_order_key),
+        std::ops::Bound::Unbounded,
+    )) {
+        pending = pending
+            .checked_add(delta.delta as i128)
+            .ok_or(crate::error::AedbError::Overflow)?;
+    }
+    Ok(pending)
+}
+
+fn effective_accumulator_value(
+    accumulator: &AccumulatorData,
+) -> Result<i64, crate::error::AedbError> {
+    if let Some(err) = &accumulator.projector_error {
+        return Err(crate::error::AedbError::Validation(format!(
+            "accumulator projector unhealthy: {err}"
+        )));
+    }
+    let pending = unapplied_delta_sum(accumulator)?;
+    let combined = (accumulator.value as i128)
+        .checked_add(pending)
+        .ok_or(crate::error::AedbError::Overflow)?;
+    i64::try_from(combined).map_err(|_| crate::error::AedbError::Overflow)
+}
+
+fn refresh_exposure_limit_cache(
+    accumulator: &mut AccumulatorData,
+) -> Result<(), crate::error::AedbError> {
+    let effective_value = effective_accumulator_value(accumulator)?;
+    accumulator.exposure_limit_cached =
+        compute_exposure_limit(effective_value, accumulator.exposure_margin_bps);
+    accumulator.exposure_limit_cache_valid = true;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -287,6 +332,19 @@ impl Keyspace {
         ));
     }
 
+    pub fn take_async_projection(
+        &mut self,
+        ns_id: &NamespaceId,
+        table_name: &str,
+        index_name: &str,
+    ) -> Option<AsyncProjectionData> {
+        Arc::make_mut(&mut self.async_indexes).remove(&(
+            ns_id.clone(),
+            table_name.to_string(),
+            index_name.to_string(),
+        ))
+    }
+
     /// Inserts a namespace into the keyspace (copy-on-write).
     pub fn insert_namespace(&mut self, ns_id: NamespaceId, namespace: Namespace) {
         Arc::make_mut(&mut self.namespaces).insert(ns_id, namespace);
@@ -382,11 +440,15 @@ impl Keyspace {
         if !table.rows.contains_key(&encoded_pk) {
             table.structural_version = commit_seq;
         }
-        table.rows.insert(encoded_pk.clone(), row.clone());
+        if use_cache {
+            table.rows.insert(encoded_pk.clone(), row.clone());
+            table.row_cache.insert(encoded_pk.clone(), row);
+        } else {
+            table.rows.insert(encoded_pk.clone(), row);
+        }
         table.row_versions.insert(encoded_pk.clone(), commit_seq);
         table.pk_hash.insert(encoded_pk.clone(), ());
         if use_cache {
-            table.row_cache.insert(encoded_pk.clone(), row);
             table.row_versions_cache.insert(encoded_pk, commit_seq);
         }
     }
@@ -405,11 +467,15 @@ impl Keyspace {
         if !table.rows.contains_key(&encoded_pk) {
             table.structural_version = commit_seq;
         }
-        table.rows.insert(encoded_pk.clone(), row.clone());
+        if use_cache {
+            table.rows.insert(encoded_pk.clone(), row.clone());
+            table.row_cache.insert(encoded_pk.clone(), row);
+        } else {
+            table.rows.insert(encoded_pk.clone(), row);
+        }
         table.row_versions.insert(encoded_pk.clone(), commit_seq);
         table.pk_hash.insert(encoded_pk.clone(), ());
         if use_cache {
-            table.row_cache.insert(encoded_pk.clone(), row);
             table.row_versions_cache.insert(encoded_pk, commit_seq);
         }
     }
@@ -635,6 +701,22 @@ impl Keyspace {
             .or_default()
     }
 
+    fn accumulator_mut_existing(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+    ) -> Result<&mut AccumulatorData, crate::error::AedbError> {
+        self.namespace_mut(NamespaceId::project_scope(project_id, scope_id))
+            .accumulators
+            .get_mut(accumulator_name)
+            .ok_or_else(|| {
+                crate::error::AedbError::Validation(format!(
+                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
+                ))
+            })
+    }
+
     pub fn create_accumulator(
         &mut self,
         project_id: &str,
@@ -663,7 +745,7 @@ impl Keyspace {
         order_key: u64,
         commit_seq: u64,
     ) -> Result<AccumulatorAppendResult, crate::error::AedbError> {
-        let accumulator = self.accumulator_mut(project_id, scope_id, accumulator_name);
+        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
         if let Some(existing) = accumulator.dedupe.get(dedupe_key) {
             if existing.order_key == order_key && existing.delta == delta {
                 return Ok(AccumulatorAppendResult::DuplicateNoop);
@@ -678,8 +760,30 @@ impl Keyspace {
                 accumulator.latest_order_key
             )));
         }
+        let next_pending_delta_sum = accumulator
+            .pending_delta_sum
+            .checked_add(delta as i128)
+            .ok_or(crate::error::AedbError::Overflow)?;
+        let next_exposure_limit = if accumulator.projector_error.is_none() {
+            (accumulator.value as i128)
+                .checked_add(next_pending_delta_sum)
+                .and_then(|next_effective| i64::try_from(next_effective).ok())
+                .map(|next_effective| {
+                    compute_exposure_limit(next_effective, accumulator.exposure_margin_bps)
+                })
+        } else {
+            None
+        };
         accumulator.latest_order_key = order_key;
         accumulator.latest_seq = commit_seq;
+        accumulator.pending_delta_sum = next_pending_delta_sum;
+        accumulator.pending_delta_sum_cache_valid = true;
+        if let Some(next_exposure_limit) = next_exposure_limit {
+            accumulator.exposure_limit_cached = next_exposure_limit;
+            accumulator.exposure_limit_cache_valid = true;
+        } else {
+            accumulator.exposure_limit_cache_valid = false;
+        }
         accumulator.deltas.insert(
             order_key,
             AccumulatorDeltaRecord {
@@ -714,11 +818,13 @@ impl Keyspace {
                 "exposure amount must be > 0".into(),
             ));
         }
-        let accumulator = self.accumulator_mut(project_id, scope_id, accumulator_name);
-        if !accumulator.exposure_limit_cache_valid {
-            accumulator.exposure_limit_cached =
-                compute_exposure_limit(accumulator.value, accumulator.exposure_margin_bps);
-            accumulator.exposure_limit_cache_valid = true;
+        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
+        if !accumulator.exposure_limit_cache_valid || !accumulator.pending_delta_sum_cache_valid {
+            refresh_exposure_limit_cache(accumulator)?;
+        } else if let Some(err) = &accumulator.projector_error {
+            return Err(crate::error::AedbError::Validation(format!(
+                "accumulator projector unhealthy: {err}"
+            )));
         }
         if let Some(existing) = accumulator.open_exposures.get(exposure_id) {
             if existing.amount == amount {
@@ -759,11 +865,13 @@ impl Keyspace {
         exposures: &[(i64, String)],
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let accumulator = self.accumulator_mut(project_id, scope_id, accumulator_name);
-        if !accumulator.exposure_limit_cache_valid {
-            accumulator.exposure_limit_cached =
-                compute_exposure_limit(accumulator.value, accumulator.exposure_margin_bps);
-            accumulator.exposure_limit_cache_valid = true;
+        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
+        if !accumulator.exposure_limit_cache_valid || !accumulator.pending_delta_sum_cache_valid {
+            refresh_exposure_limit_cache(accumulator)?;
+        } else if let Some(err) = &accumulator.projector_error {
+            return Err(crate::error::AedbError::Validation(format!(
+                "accumulator projector unhealthy: {err}"
+            )));
         }
         let max_exposure_allowed = accumulator.exposure_limit_cached;
         let mut running_total = accumulator.total_exposure;
@@ -832,8 +940,8 @@ impl Keyspace {
         accumulator_name: &str,
         exposure_id: &str,
     ) -> Result<(), crate::error::AedbError> {
-        let accumulator = self.accumulator_mut(project_id, scope_id, accumulator_name);
-        let Some(record) = accumulator.open_exposures.remove(exposure_id) else {
+        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
+        let Some(record) = accumulator.open_exposures.get(exposure_id) else {
             return Err(crate::error::AedbError::Validation(format!(
                 "release requested for unknown exposure id: {exposure_id}"
             )));
@@ -841,7 +949,9 @@ impl Keyspace {
         if accumulator.total_exposure < record.amount {
             return Err(crate::error::AedbError::Underflow);
         }
-        accumulator.total_exposure -= record.amount;
+        let record_amount = record.amount;
+        accumulator.open_exposures.remove(exposure_id);
+        accumulator.total_exposure -= record_amount;
         accumulator.exposure_rebuild_required = false;
         Ok(())
     }
@@ -852,7 +962,7 @@ impl Keyspace {
         scope_id: &str,
         accumulator_name: &str,
     ) -> Result<(), crate::error::AedbError> {
-        let accumulator = self.accumulator_mut(project_id, scope_id, accumulator_name);
+        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
         let mut total = 0i64;
         for (_, rec) in &accumulator.open_exposures {
             total = total
@@ -862,6 +972,18 @@ impl Keyspace {
         accumulator.total_exposure = total;
         accumulator.exposure_rebuild_required = false;
         Ok(())
+    }
+
+    pub fn accumulator_effective_value(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+    ) -> Result<Option<i64>, crate::error::AedbError> {
+        let Some(accumulator) = self.accumulator(project_id, scope_id, accumulator_name) else {
+            return Ok(None);
+        };
+        effective_accumulator_value(accumulator).map(Some)
     }
 
     pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<&KvEntry> {
@@ -1633,6 +1755,18 @@ impl KeyspaceSnapshot {
             .and_then(|ns| ns.accumulators.get(accumulator_name))
     }
 
+    pub fn accumulator_effective_value(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        accumulator_name: &str,
+    ) -> Result<Option<i64>, crate::error::AedbError> {
+        let Some(accumulator) = self.accumulator(project_id, scope_id, accumulator_name) else {
+            return Ok(None);
+        };
+        effective_accumulator_value(accumulator).map(Some)
+    }
+
     pub fn async_index(
         &self,
         project_id: &str,
@@ -1727,9 +1861,10 @@ fn estimate_value_bytes(v: &Value) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{Keyspace, NamespaceId};
+    use super::{Keyspace, NamespaceId, OpenExposureRecord};
     use crate::catalog::types::{Row, Value};
     use crate::config::PrimaryIndexBackend;
+    use crate::error::AedbError;
     use crate::storage::encoded_key::EncodedKey;
 
     fn row(values: Vec<Value>) -> Row {
@@ -1899,5 +2034,52 @@ mod tests {
         let refs = ks.kv_scan_prefix_ref("p", "app", b"ob:", 10);
         assert_eq!(refs.len(), 3);
         assert!(refs.iter().all(|(k, _)| k.starts_with(b"ob:")));
+    }
+
+    #[test]
+    fn accumulator_release_underflow_does_not_drop_open_exposure() {
+        let mut ks = Keyspace::default();
+        ks.create_accumulator("p", "app", "house", 1_000);
+        let acc = ks.accumulator_mut("p", "app", "house");
+        acc.total_exposure = 5;
+        acc.open_exposures.insert(
+            "hand-1".into(),
+            OpenExposureRecord {
+                amount: 10,
+                opened_at_seq: 1,
+            },
+        );
+
+        let err = ks
+            .release_accumulator_exposure("p", "app", "house", "hand-1")
+            .expect_err("corrupt exposure totals must fail");
+        assert!(matches!(err, AedbError::Underflow));
+
+        let acc = ks.accumulator("p", "app", "house").expect("accumulator");
+        assert_eq!(acc.total_exposure, 5);
+        assert!(acc.open_exposures.contains_key("hand-1"));
+    }
+
+    #[test]
+    fn accumulator_append_rejects_pending_sum_overflow() {
+        let mut ks = Keyspace::default();
+        ks.create_accumulator("p", "app", "house", 1_000);
+        let acc = ks.accumulator_mut("p", "app", "house");
+        acc.latest_order_key = 7;
+        acc.latest_seq = 9;
+        acc.pending_delta_sum = i128::MAX;
+        acc.pending_delta_sum_cache_valid = true;
+
+        let err = ks
+            .append_accumulator_delta("p", "app", "house", 1, "tx-1", 8, 1)
+            .expect_err("pending sum overflow must not saturate");
+        assert!(matches!(err, AedbError::Overflow));
+
+        let acc = ks.accumulator("p", "app", "house").expect("accumulator");
+        assert_eq!(acc.latest_order_key, 7);
+        assert_eq!(acc.latest_seq, 9);
+        assert_eq!(acc.pending_delta_sum, i128::MAX);
+        assert!(acc.deltas.is_empty());
+        assert!(acc.dedupe.is_empty());
     }
 }

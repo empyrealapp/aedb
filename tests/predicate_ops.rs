@@ -205,4 +205,37 @@ async fn query_page_stable_uses_pk_order_for_cursor_paging() {
     assert_eq!(page1.rows[0].values[0], Value::Integer(1));
     assert_eq!(page1.rows[1].values[0], Value::Integer(2));
     assert!(page1.cursor.is_some());
+
+    let page2 = db
+        .query_page_stable(
+            "p",
+            "app",
+            Query::select(&["id"]).from("users"),
+            page1.cursor.clone(),
+            2,
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect("page2");
+    assert_eq!(page2.rows.len(), 1);
+    assert_eq!(page2.rows[0].values[0], Value::Integer(3));
+
+    let mut tampered = page1.cursor.expect("cursor");
+    let last = tampered.pop().expect("cursor char");
+    tampered.push(if last == '0' { '1' } else { '0' });
+    let err = db
+        .query_page_stable(
+            "p",
+            "app",
+            Query::select(&["id"]).from("users"),
+            Some(tampered),
+            2,
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect_err("tampered cursor must be rejected");
+    assert!(
+        err.to_string().contains("cursor"),
+        "unexpected cursor error: {err}"
+    );
 }

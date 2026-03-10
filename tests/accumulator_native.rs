@@ -3,6 +3,7 @@ use aedb::catalog::DdlOperation;
 use aedb::commit::validation::Mutation;
 use aedb::error::AedbError;
 use aedb::permission::{CallerContext, Permission};
+use aedb::preflight::PreflightResult;
 use aedb::query::plan::ConsistencyMode;
 use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
@@ -363,6 +364,63 @@ async fn accumulator_exposure_margin_enforced_and_release_is_idempotent() {
 }
 
 #[tokio::test]
+async fn accumulator_exposure_uses_strong_value_not_stale_projection() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_accumulator_with_options(
+        "p",
+        "app",
+        "house_balance",
+        Some(1_000),
+        10_000,
+        1_000,
+        None,
+    )
+    .await
+    .expect("create accumulator");
+
+    db.accumulate("p", "app", "house_balance", 1_000, "seed".into(), 1)
+        .await
+        .expect("seed");
+    wait_for_projected(&db, "p", "app", "house_balance", 1_000).await;
+
+    db.accumulate("p", "app", "house_balance", -900, "loss".into(), 2)
+        .await
+        .expect("loss");
+
+    let err = db
+        .expose_accumulator("p", "app", "house_balance", 101, "hand-stale".into())
+        .await
+        .expect_err("exposure should be checked against strong value");
+    assert!(matches!(err, AedbError::Validation(_)));
+
+    let available = db
+        .accumulator_available("p", "app", "house_balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("available");
+    assert_eq!(available, 100);
+
+    let metrics = db
+        .accumulator_exposure_metrics("p", "app", "house_balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("metrics");
+    assert_eq!(metrics.available, 100);
+
+    let preflight_err = db
+        .expose_accumulator_with_preflight(
+            "p",
+            "app",
+            "house_balance",
+            101,
+            "hand-preflight".into(),
+        )
+        .await
+        .expect_err("preflight should also use the strong value");
+    assert!(matches!(preflight_err, AedbError::Validation(_)));
+}
+
+#[tokio::test]
 async fn accumulator_release_without_exposure_is_rejected() {
     let dir = tempdir().expect("temp dir");
     let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
@@ -541,4 +599,33 @@ async fn accumulator_expose_many_atomic_reserves_all_or_none() {
         .await
         .expect("exposure unchanged");
     assert_eq!(exposure_after, 50);
+}
+
+#[tokio::test]
+async fn accumulator_batch_preflight_rejects_duplicate_ids_with_different_amounts() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_accumulator("p", "app", "house_balance", Some(1_000), 10_000)
+        .await
+        .expect("create accumulator");
+    db.accumulate("p", "app", "house_balance", 100, "seed".into(), 1)
+        .await
+        .expect("seed");
+    wait_for_projected(&db, "p", "app", "house_balance", 100).await;
+
+    let preflight = db
+        .preflight(Mutation::ExposeAccumulatorBatch {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            accumulator_name: "house_balance".into(),
+            exposures: vec![(20, "dup".into()), (21, "dup".into())],
+        })
+        .await;
+
+    assert!(matches!(
+        preflight,
+        PreflightResult::Err { ref reason }
+            if reason.contains("duplicate exposure id with different amount in batch")
+    ));
 }
