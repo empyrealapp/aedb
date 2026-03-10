@@ -1429,13 +1429,15 @@ pub(crate) fn segment_seq_from_name(name: &str) -> Option<u64> {
 
 pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, AedbError> {
     let file = File::open(path)?;
-    if file.metadata()?.len() <= SEGMENT_HEADER_SIZE as u64 {
+    let size_bytes = file.metadata()?.len();
+    if size_bytes <= SEGMENT_HEADER_SIZE as u64 {
         return Ok(None);
     }
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     let mut header = [0u8; SEGMENT_HEADER_SIZE];
     reader.read_exact(&mut header)?;
-    let mut frame_reader = FrameReader::new(reader);
+    let payload_size_bytes = size_bytes.saturating_sub(SEGMENT_HEADER_SIZE as u64);
+    let mut frame_reader = FrameReader::new(reader.take(payload_size_bytes));
     let mut min_seq = u64::MAX;
     let mut max_seq = 0u64;
     loop {
@@ -1457,6 +1459,13 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
         return Ok(None);
     }
     Ok(Some((min_seq, max_seq)))
+}
+
+pub(crate) fn copy_file_prefix(src: &Path, dst: &Path, size_bytes: u64) -> Result<(), AedbError> {
+    let mut reader = File::open(src)?;
+    let mut writer = File::create(dst)?;
+    std::io::copy(&mut reader.by_ref().take(size_bytes), &mut writer)?;
+    Ok(())
 }
 
 pub(crate) fn validate_backup_chain(chain: &[(PathBuf, BackupManifest)]) -> Result<(), AedbError> {

@@ -12,6 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tempfile::tempdir;
+use tokio::time::{Duration, timeout};
 
 type CommitLog = Arc<tokio::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
 
@@ -125,6 +126,7 @@ async fn backup_full_is_hot_and_restore_is_consistent_at_backup_head() {
                 writer_log.lock().await.push((committed.commit_seq, key));
             }
             i = i.saturating_add(1);
+            tokio::task::yield_now().await;
         }
     });
 
@@ -135,6 +137,7 @@ async fn backup_full_is_hot_and_restore_is_consistent_at_backup_head() {
         while !reader_stop.load(Ordering::Relaxed) {
             let _ = reader_db.snapshot_probe(ConsistencyMode::AtLatest).await;
             reader_count_ref.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
         }
     });
 
@@ -142,9 +145,9 @@ async fn backup_full_is_hot_and_restore_is_consistent_at_backup_head() {
     let writes_before = write_count.load(Ordering::Relaxed);
     let reads_before = read_count.load(Ordering::Relaxed);
 
-    let backup = db
-        .backup_full(backup_dir.path())
+    let backup = timeout(Duration::from_secs(10), db.backup_full(backup_dir.path()))
         .await
+        .expect("backup full timed out")
         .expect("backup full");
     let writes_after = write_count.load(Ordering::Relaxed);
     let reads_after = read_count.load(Ordering::Relaxed);
@@ -153,10 +156,19 @@ async fn backup_full_is_hot_and_restore_is_consistent_at_backup_head() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     stop.store(true, Ordering::Relaxed);
-    writer.await.expect("writer join");
-    reader.await.expect("reader join");
+    timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer join timed out")
+        .expect("writer join");
+    timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("reader join timed out")
+        .expect("reader join");
 
-    db.shutdown().await.expect("graceful shutdown");
+    timeout(Duration::from_secs(5), db.shutdown())
+        .await
+        .expect("shutdown timed out")
+        .expect("graceful shutdown");
     drop(db);
 
     let restored_seq =

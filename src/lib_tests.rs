@@ -8244,6 +8244,67 @@ async fn snapshot_probe_returns_snapshot_seq() {
 }
 
 #[tokio::test]
+async fn snapshot_probe_does_not_consume_snapshot_slot() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_concurrent_snapshots: 1,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let _lease = db
+        .acquire_snapshot(ConsistencyMode::AtLatest)
+        .await
+        .expect("lease");
+
+    let seq = db
+        .snapshot_probe(ConsistencyMode::AtLatest)
+        .await
+        .expect("probe");
+    assert!(seq >= 1);
+}
+
+#[tokio::test]
+async fn snapshot_probe_remains_live_under_snapshot_capacity_pressure() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_concurrent_snapshots: 1,
+        ..AedbConfig::default()
+    };
+    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+
+    let _lease = db
+        .acquire_snapshot(ConsistencyMode::AtLatest)
+        .await
+        .expect("lease");
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..128 {
+                let seq = db
+                    .snapshot_probe(ConsistencyMode::AtLatest)
+                    .await
+                    .expect("probe");
+                assert!(seq >= 1);
+                tokio::task::yield_now().await;
+            }
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        for task in tasks {
+            task.await.expect("probe task");
+        }
+    })
+    .await
+    .expect("snapshot probes timed out under snapshot pressure");
+}
+
+#[tokio::test]
 async fn at_checkpoint_falls_back_when_version_evicted() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {

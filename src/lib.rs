@@ -8572,7 +8572,7 @@ impl AedbInstance {
             let src = self.dir.join(&segment.filename);
             let rel = format!("wal_tail/{}", segment.filename);
             let dst = backup_dir.join(&rel);
-            fs::copy(src, &dst)?;
+            copy_file_prefix(&src, &dst, segment.size_bytes)?;
             wal_segments.push(segment.filename);
             file_sha256.insert(rel, sha256_file_hex(&dst)?);
         }
@@ -8642,7 +8642,7 @@ impl AedbInstance {
             }
             let rel = format!("wal_tail/{}", segment.filename);
             let dst = backup_dir.join(&rel);
-            fs::copy(src, &dst)?;
+            copy_file_prefix(&src, &dst, segment.size_bytes)?;
             wal_segments.push(segment.filename);
             file_sha256.insert(rel, sha256_file_hex(&dst)?);
         }
@@ -8934,8 +8934,7 @@ impl AedbInstance {
     }
 
     pub async fn snapshot_probe(&self, consistency: ConsistencyMode) -> Result<u64, AedbError> {
-        let lease = self.acquire_snapshot(consistency).await?;
-        Ok(lease.view.seq)
+        Ok(self.snapshot_for_consistency(consistency).await?.seq)
     }
 
     pub fn metrics(&self) -> ExecutorMetrics {
