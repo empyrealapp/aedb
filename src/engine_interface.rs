@@ -992,22 +992,23 @@ impl<'a> ProcessorContext<'a> {
                     primary_key,
                     row,
                 } if project_id == &self.project_id && scope_id == &self.scope_id => {
-                    let pk_index = if let Some(pk_index) = keyed_state_pk_index_cache.get(table_name)
-                    {
-                        *pk_index
-                    } else {
-                        let schema = keyed_state_schema(
-                            &lease.view.catalog,
-                            project_id,
-                            scope_id,
-                            table_name,
-                            "processor_commit",
-                        )?;
-                        let pk_index =
-                            keyed_state_primary_key_index(schema, project_id, scope_id, table_name)?;
-                        keyed_state_pk_index_cache.insert(table_name.clone(), pk_index);
-                        pk_index
-                    };
+                    let pk_index =
+                        if let Some(pk_index) = keyed_state_pk_index_cache.get(table_name) {
+                            *pk_index
+                        } else {
+                            let schema = keyed_state_schema(
+                                &lease.view.catalog,
+                                project_id,
+                                scope_id,
+                                table_name,
+                                "processor_commit",
+                            )?;
+                            let pk_index = keyed_state_primary_key_index(
+                                schema, project_id, scope_id, table_name,
+                            )?;
+                            keyed_state_pk_index_cache.insert(table_name.clone(), pk_index);
+                            pk_index
+                        };
                     if primary_key.len() != 1 {
                         return Err(AedbError::Validation(format!(
                             "keyed_state processor_commit requires single-column key: {project_id}.{scope_id}.{table_name}"
@@ -1036,8 +1037,9 @@ impl<'a> ProcessorContext<'a> {
                             table_name,
                             "processor_commit",
                         )?;
-                        let pk_index =
-                            keyed_state_primary_key_index(schema, project_id, scope_id, table_name)?;
+                        let pk_index = keyed_state_primary_key_index(
+                            schema, project_id, scope_id, table_name,
+                        )?;
                         keyed_state_pk_index_cache.insert(table_name.clone(), pk_index);
                     }
                     if primary_key.len() != 1 {
@@ -1087,7 +1089,7 @@ fn keyed_state_snapshot_from_table(
     keyed_state: &str,
     key: Value,
 ) -> KeyedStateSnapshot {
-    let encoded = EncodedKey::from_values(&[key.clone()]);
+    let encoded = EncodedKey::from_values(std::slice::from_ref(&key));
     let table = keyspace.table(project_id, scope_id, keyed_state);
     let row = table.and_then(|table| table.rows.get(&encoded).cloned());
     let version = table

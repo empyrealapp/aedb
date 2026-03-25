@@ -22,6 +22,9 @@ pub fn write_manifest_atomic_signed(
     let prev = dir.join("manifest.json.prev");
     let sig = dir.join("manifest.hmac");
     let sig_prev = dir.join("manifest.hmac.prev");
+    let bytes =
+        serde_json::to_vec_pretty(manifest).map_err(|e| AedbError::Encode(e.to_string()))?;
+    let signature = signing_key.map(|key| hmac_hex(key, &bytes)).transpose()?;
 
     if primary.exists() {
         let data = fs::read(&primary)?;
@@ -30,25 +33,28 @@ pub fn write_manifest_atomic_signed(
     }
 
     let mut tmp = NamedTempFile::new_in(dir)?;
-    let bytes =
-        serde_json::to_vec_pretty(manifest).map_err(|e| AedbError::Encode(e.to_string()))?;
     tmp.write_all(&bytes)?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
-    tmp.persist(&primary).map_err(|e| AedbError::Io(e.error))?;
-    if let Some(key) = signing_key {
+    if let Some(signature) = signature {
         if sig.exists() {
             let data = fs::read(&sig)?;
             fs::write(&sig_prev, data)?;
             fsync_file(&sig_prev)?;
         }
-        let signature = hmac_hex(key, &bytes)?;
-        fs::write(&sig, signature)?;
+        let mut sig_tmp = NamedTempFile::new_in(dir)?;
+        sig_tmp.write_all(signature.as_bytes())?;
+        sig_tmp.flush()?;
+        sig_tmp.as_file().sync_all()?;
+        sig_tmp.persist(&sig).map_err(|e| AedbError::Io(e.error))?;
+        tmp.persist(&primary).map_err(|e| AedbError::Io(e.error))?;
         fsync_file(&sig)?;
     } else {
+        tmp.persist(&primary).map_err(|e| AedbError::Io(e.error))?;
         let _ = fs::remove_file(&sig);
         let _ = fs::remove_file(&sig_prev);
     }
+    fsync_file(&primary)?;
     fsync_dir(dir)?;
     Ok(())
 }
@@ -309,6 +315,44 @@ mod tests {
         std::fs::write(dir.path().join("manifest.hmac"), "bad").expect("corrupt sig");
         std::fs::write(dir.path().join("manifest.hmac.prev"), "bad").expect("corrupt sig prev");
         assert!(load_manifest_signed(dir.path(), Some(key)).is_err());
+    }
+
+    #[test]
+    fn signed_manifest_loads_previous_copy_when_primary_hmac_is_newer_than_manifest() {
+        let dir = tempdir().expect("temp");
+        let key = b"super-secret-key";
+        let m2 = Manifest {
+            durable_seq: 2,
+            visible_seq: 2,
+            active_segment_seq: 2,
+            checkpoints: vec![],
+            segments: vec![],
+        };
+        let m3 = Manifest {
+            durable_seq: 3,
+            visible_seq: 3,
+            active_segment_seq: 3,
+            checkpoints: vec![],
+            segments: vec![],
+        };
+        write_manifest_atomic_signed(&m2, dir.path(), Some(key)).expect("write signed");
+        let m2_bytes = serde_json::to_vec_pretty(&m2).expect("serialize m2");
+        let m3_bytes = serde_json::to_vec_pretty(&m3).expect("serialize m3");
+
+        std::fs::write(dir.path().join("manifest.json.prev"), &m2_bytes).expect("write prev");
+        std::fs::write(
+            dir.path().join("manifest.hmac.prev"),
+            super::hmac_hex(key, &m2_bytes).expect("sign prev"),
+        )
+        .expect("write prev sig");
+        std::fs::write(
+            dir.path().join("manifest.hmac"),
+            super::hmac_hex(key, &m3_bytes).expect("sign newer primary"),
+        )
+        .expect("write mismatched primary sig");
+
+        let loaded = load_manifest_signed(dir.path(), Some(key)).expect("fallback to prev");
+        assert_eq!(loaded, m2);
     }
 
     #[test]

@@ -60,7 +60,7 @@ use crate::order_book::{
     read_spread, read_top_n, scoped_instrument, u256_from_be,
 };
 use crate::permission::{CallerContext, Permission};
-use crate::preflight::{PreflightResult, preflight, preflight_plan};
+use crate::preflight::{PreflightResult, preflight_plan_with_config, preflight_with_config};
 use crate::query::error::QueryError;
 use crate::query::executor::{QueryResult, execute_query_with_options};
 use crate::query::plan::{ConsistencyMode, Expr, Order, Query, QueryOptions};
@@ -74,8 +74,11 @@ use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, KvEntry, NamespaceId};
 use crate::wal::frame::{FrameError, FrameReader};
 use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
+use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::File;
@@ -88,12 +91,14 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 const TRUST_MODE_MARKER_FILE: &str = "trust_mode.json";
+const TRUST_MODE_MARKER_HMAC_FILE: &str = "trust_mode.hmac";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct TrustModeMarker {
@@ -107,25 +112,90 @@ fn trust_mode_marker_path(dir: &Path) -> PathBuf {
     dir.join(TRUST_MODE_MARKER_FILE)
 }
 
-fn load_trust_mode_marker(dir: &Path) -> Result<Option<TrustModeMarker>, AedbError> {
+fn trust_mode_marker_hmac_path(dir: &Path) -> PathBuf {
+    dir.join(TRUST_MODE_MARKER_HMAC_FILE)
+}
+
+fn hmac_hex(key: &[u8], bytes: &[u8]) -> Result<String, AedbError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| AedbError::InvalidConfig {
+        message: format!("invalid hmac key: {e}"),
+    })?;
+    mac.update(bytes);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+fn verify_trust_mode_marker_hmac(dir: &Path, key: &[u8], bytes: &[u8]) -> Result<(), AedbError> {
+    let expected = fs::read_to_string(trust_mode_marker_hmac_path(dir)).map_err(|_| {
+        AedbError::IntegrityError {
+            message: "trust mode marker hmac missing".into(),
+        }
+    })?;
+    let expected_bytes = hex::decode(expected.trim()).map_err(|_| AedbError::IntegrityError {
+        message: "trust mode marker hmac must be hex".into(),
+    })?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| AedbError::InvalidConfig {
+        message: format!("invalid hmac key: {e}"),
+    })?;
+    mac.update(bytes);
+    mac.verify_slice(&expected_bytes)
+        .map_err(|_| AedbError::IntegrityError {
+            message: "trust mode marker hmac mismatch".into(),
+        })
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AedbError> {
+    use std::io::Write as _;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| AedbError::Validation(format!("path has no parent: {}", path.display())))?;
+    let mut tmp = NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| AedbError::Io(e.error))?;
+    fs::File::open(path)?.sync_all()?;
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+fn load_trust_mode_marker(
+    dir: &Path,
+    signing_key: Option<&[u8]>,
+) -> Result<Option<TrustModeMarker>, AedbError> {
     let path = trust_mode_marker_path(dir);
     if !path.exists() {
         return Ok(None);
     }
     let bytes = fs::read(&path)?;
+    if let Some(key) = signing_key {
+        verify_trust_mode_marker_hmac(dir, key, &bytes)?;
+    }
     let marker: TrustModeMarker =
         serde_json::from_slice(&bytes).map_err(|e| AedbError::Validation(e.to_string()))?;
     Ok(Some(marker))
 }
 
-fn persist_trust_mode_marker(dir: &Path, marker: &TrustModeMarker) -> Result<(), AedbError> {
+fn persist_trust_mode_marker(
+    dir: &Path,
+    marker: &TrustModeMarker,
+    signing_key: Option<&[u8]>,
+) -> Result<(), AedbError> {
     let bytes = serde_json::to_vec(marker).map_err(|e| AedbError::Encode(e.to_string()))?;
-    fs::write(trust_mode_marker_path(dir), bytes)?;
+    write_atomic(&trust_mode_marker_path(dir), &bytes)?;
+    let hmac_path = trust_mode_marker_hmac_path(dir);
+    if let Some(key) = signing_key {
+        let signature = hmac_hex(key, &bytes)?;
+        write_atomic(&hmac_path, signature.as_bytes())?;
+    } else if hmac_path.exists() {
+        fs::remove_file(&hmac_path)?;
+        fs::File::open(dir)?.sync_all()?;
+    }
     Ok(())
 }
 
 fn enforce_and_record_trust_mode(dir: &Path, config: &AedbConfig) -> Result<(), AedbError> {
-    let mut marker = load_trust_mode_marker(dir)?.unwrap_or_default();
+    let mut marker = load_trust_mode_marker(dir, config.hmac_key())?.unwrap_or_default();
     if config.strict_recovery()
         && (marker.ever_non_strict_recovery || marker.ever_hash_chain_disabled)
     {
@@ -145,7 +215,7 @@ fn enforce_and_record_trust_mode(dir: &Path, config: &AedbConfig) -> Result<(), 
         changed = true;
     }
     if changed {
-        persist_trust_mode_marker(dir, &marker)?;
+        persist_trust_mode_marker(dir, &marker, config.hmac_key())?;
     }
     Ok(())
 }
@@ -171,10 +241,8 @@ fn create_private_dir_all(path: &Path) -> Result<(), AedbError> {
             )));
         }
         let mut perms = metadata.permissions();
-        if perms.mode() != 0o700 {
-            perms.set_mode(0o700);
-            fs::set_permissions(path, perms)?;
-        }
+        perms.set_mode(0o700);
+        fs::set_permissions(path, perms)?;
     }
     #[cfg(not(unix))]
     {
@@ -190,16 +258,46 @@ fn derive_cursor_signing_key(config: &AedbConfig, dir: &Path) -> [u8; 32] {
         material.extend_from_slice(dir.to_string_lossy().as_bytes());
     } else {
         material.extend_from_slice(Uuid::new_v4().as_bytes());
-        material.extend_from_slice(
-            &SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .to_le_bytes(),
-        );
         material.extend_from_slice(dir.to_string_lossy().as_bytes());
     }
     blake3::derive_key("aedb-query-cursor-v1", &material)
+}
+
+fn reclaim_eligible_wal_segments(
+    dir: &Path,
+    snapshot_manager: &Arc<Mutex<SnapshotManager>>,
+    manifest_hmac_key: Option<&[u8]>,
+) -> Result<usize, AedbError> {
+    let manifest = match crate::manifest::atomic::load_manifest_signed(dir, manifest_hmac_key) {
+        Ok(manifest) => manifest,
+        Err(_) => return Ok(0),
+    };
+    let Some(checkpointed_through_seq) = manifest.checkpoints.last().map(|cp| cp.seq) else {
+        return Ok(0);
+    };
+    let segments = read_segments(dir)?;
+    let segment_seqs: Vec<u64> = segments.iter().map(|segment| segment.segment_seq).collect();
+    let eligible = {
+        let mgr = snapshot_manager.lock();
+        mgr.eligible_segment_reclaims(
+            &segment_seqs,
+            checkpointed_through_seq,
+            manifest.active_segment_seq,
+        )
+    };
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+
+    let mut reclaimed = 0usize;
+    for seq in eligible {
+        let path = dir.join(format!("segment_{seq:016}.aedbwal"));
+        if path.exists() {
+            fs::remove_file(&path)?;
+            reclaimed = reclaimed.saturating_add(1);
+        }
+    }
+    Ok(reclaimed)
 }
 
 pub struct AedbInstance {
@@ -226,6 +324,8 @@ pub struct AedbInstance {
     reactive_processor_runtimes: Arc<AsyncMutex<HashMap<String, ReactiveProcessorRuntime>>>,
     startup_recovery_micros: u64,
     startup_recovered_seq: u64,
+    wal_gc_shutdown: Arc<AtomicBool>,
+    wal_gc_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 const SYSTEM_SCOPE_ID: &str = "app";
@@ -277,7 +377,7 @@ fn should_log_read_phase(total_micros: u64) -> bool {
         return false;
     }
     let n = READ_PHASE_LOG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    n % settings.sample_every == 0
+    n.is_multiple_of(settings.sample_every)
 }
 
 fn system_now_micros() -> u64 {
@@ -1038,6 +1138,15 @@ impl Drop for SnapshotLease {
     }
 }
 
+impl Drop for AedbInstance {
+    fn drop(&mut self) {
+        self.wal_gc_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.wal_gc_thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl AedbInstance {
     pub fn open_production(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
         validate_arcana_config(&config)?;
@@ -1076,8 +1185,11 @@ impl AedbInstance {
             max_snapshot_age_ms = config.max_snapshot_age_ms,
             max_concurrent_snapshots = config.max_concurrent_snapshots,
             max_scan_rows = config.max_scan_rows,
+            max_batch_rows = config.max_batch_rows,
             max_kv_key_bytes = config.max_kv_key_bytes,
             max_kv_value_bytes = config.max_kv_value_bytes,
+            max_table_value_bytes = config.max_table_value_bytes,
+            max_event_payload_bytes = config.max_event_payload_bytes,
             max_memory_estimate_bytes = config.max_memory_estimate_bytes,
             epoch_max_wait_us = config.epoch_max_wait_us,
             epoch_min_commits = config.epoch_min_commits,
@@ -1094,6 +1206,11 @@ impl AedbInstance {
             global_unique_index_enabled = config.global_unique_index_enabled,
             partition_lock_timeout_ms = config.partition_lock_timeout_ms,
             epoch_apply_timeout_ms = config.epoch_apply_timeout_ms,
+            max_versions = config.max_versions,
+            version_store_full_snapshot_interval_deltas =
+                config.version_store_full_snapshot_interval_deltas,
+            min_version_age_ms = config.min_version_age_ms,
+            version_gc_interval_ms = config.version_gc_interval_ms,
             checkpoint_encryption_enabled = config.checkpoint_encryption_key.is_some(),
             checkpoint_key_id = config.checkpoint_key_id.as_deref().unwrap_or(""),
             checkpoint_compression_level = config.checkpoint_compression_level,
@@ -1149,6 +1266,29 @@ impl AedbInstance {
         let startup_recovery_micros =
             recovery_start.elapsed().unwrap_or_default().as_micros() as u64;
         let cursor_signing_key = derive_cursor_signing_key(&config, dir);
+        let snapshot_manager = Arc::new(Mutex::new(SnapshotManager::default()));
+        let wal_gc_shutdown = Arc::new(AtomicBool::new(false));
+        let wal_gc_dir = dir.to_path_buf();
+        let wal_gc_hmac_key = config.hmac_key().map(|key| key.to_vec());
+        let wal_gc_snapshot_manager = Arc::clone(&snapshot_manager);
+        let wal_gc_shutdown_thread = Arc::clone(&wal_gc_shutdown);
+        let wal_gc_interval_ms = config.version_gc_interval_ms.max(1);
+        let wal_gc_thread = std::thread::spawn(move || {
+            while !wal_gc_shutdown_thread.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(wal_gc_interval_ms));
+                {
+                    let mut mgr = wal_gc_snapshot_manager.lock();
+                    let _ = mgr.gc();
+                }
+                if let Err(err) = reclaim_eligible_wal_segments(
+                    &wal_gc_dir,
+                    &wal_gc_snapshot_manager,
+                    wal_gc_hmac_key.as_deref(),
+                ) {
+                    warn!(error = ?err, "wal segment gc failed");
+                }
+            }
+        });
 
         Ok(Self {
             _config: config,
@@ -1157,7 +1297,7 @@ impl AedbInstance {
             cursor_signing_key,
             executor,
             checkpoint_lock: Arc::new(AsyncMutex::new(())),
-            snapshot_manager: Arc::new(Mutex::new(SnapshotManager::default())),
+            snapshot_manager,
             recovery_cache: Arc::new(Mutex::new(RecoveryCache::default())),
             lifecycle_hooks: Arc::new(Mutex::new(Vec::new())),
             lifecycle_hooks_present: Arc::new(AtomicBool::new(false)),
@@ -1172,6 +1312,8 @@ impl AedbInstance {
             reactive_processor_runtimes: Arc::new(AsyncMutex::new(HashMap::new())),
             startup_recovery_micros,
             startup_recovered_seq,
+            wal_gc_shutdown,
+            wal_gc_thread: Some(wal_gc_thread),
         })
     }
 
@@ -1233,6 +1375,17 @@ impl AedbInstance {
                 "authenticated caller required; use commit_as in secure mode".into(),
             ));
         }
+        let result = self.executor.submit_envelope_prevalidated(envelope).await;
+        self.emit_commit_telemetry(op_name, started, &result);
+        result
+    }
+
+    async fn commit_envelope_prevalidated_system_internal(
+        &self,
+        op_name: &'static str,
+        envelope: TransactionEnvelope,
+    ) -> Result<CommitResult, AedbError> {
+        let started = Instant::now();
         let result = self.executor.submit_envelope_prevalidated(envelope).await;
         self.emit_commit_telemetry(op_name, started, &result);
         result
@@ -1810,14 +1963,7 @@ impl AedbInstance {
         let mut result = result?;
         self.sign_query_result_cursor(&mut result)?;
         let result = Ok(result);
-        self.emit_query_telemetry(
-            started,
-            project_id,
-            scope_id,
-            &table,
-            view.seq,
-            &result,
-        );
+        self.emit_query_telemetry(started, project_id, scope_id, &table, view.seq, &result);
         result
     }
 
@@ -2228,7 +2374,6 @@ impl AedbInstance {
     ) -> Result<QueryResult, QueryError> {
         let (query, mut options) = adapter.execute_read_only(project_id, scope_id, sql)?;
         options.consistency = consistency;
-        options.allow_full_scan = true;
         self.query_with_options(project_id, scope_id, query, options)
             .await
     }
@@ -2244,7 +2389,6 @@ impl AedbInstance {
     ) -> Result<QueryResult, QueryError> {
         let (query, mut options) = adapter.execute_read_only(project_id, scope_id, sql)?;
         options.consistency = consistency;
-        options.allow_full_scan = true;
         self.query_with_options_as(Some(caller), project_id, scope_id, query, options)
             .await
     }
@@ -3045,15 +3189,18 @@ impl AedbInstance {
         caller: &CallerContext,
     ) -> Result<Vec<ScopedKvEntry>, QueryError> {
         ensure_external_caller_allowed(caller)?;
-        let (_, catalog, _) = self.executor.snapshot_state().await;
-        let project_read = catalog.has_permission(
+        let lease = self
+            .acquire_snapshot(consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let project_read = lease.view.catalog.has_permission(
             &caller.caller_id,
             &Permission::KvRead {
                 project_id: project_id.to_string(),
                 scope_id: None,
                 prefix: None,
             },
-        ) || catalog.has_permission(
+        ) || lease.view.catalog.has_permission(
             &caller.caller_id,
             &Permission::ProjectAdmin {
                 project_id: project_id.to_string(),
@@ -3065,10 +3212,6 @@ impl AedbInstance {
                 scope: caller.caller_id.clone(),
             });
         }
-        let lease = self
-            .acquire_snapshot(consistency)
-            .await
-            .map_err(QueryError::from)?;
         let snapshot = &lease.view.keyspace;
         let mut out = Vec::new();
         for (ns_id, ns) in snapshot.namespaces.iter() {
@@ -3396,6 +3539,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn counter_add_sharded_as(
         &self,
         caller: CallerContext,
@@ -3640,6 +3784,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accumulate_with_release(
         &self,
         project_id: &str,
@@ -3662,6 +3807,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accumulate_as(
         &self,
         caller: CallerContext,
@@ -3685,6 +3831,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accumulate_with_release_as(
         &self,
         caller: CallerContext,
@@ -4559,11 +4706,17 @@ impl AedbInstance {
                 "processor_name cannot be empty".into(),
             ));
         }
+        self.ensure_reactive_processor_checkpoint_write_allowed(&caller)
+            .await?;
         let mut envelope = self
             .build_reactive_processor_checkpoint_envelope(processor_name, checkpoint_seq)
             .await?;
         envelope.caller = Some(caller);
-        self.commit_envelope(envelope).await
+        self.commit_envelope_prevalidated_system_internal(
+            "ack_reactive_processor_checkpoint_as",
+            envelope,
+        )
+        .await
     }
 
     pub async fn ack_reactive_processor_checkpoint_batched(
@@ -4658,12 +4811,17 @@ impl AedbInstance {
         if !should_persist {
             return Ok(None);
         }
+        self.ensure_reactive_processor_checkpoint_write_allowed(&caller)
+            .await?;
         let mut envelope = self
             .build_reactive_processor_checkpoint_envelope(processor_name, checkpoint_seq)
             .await?;
         envelope.caller = Some(caller);
         let committed = self
-            .commit_envelope(envelope)
+            .commit_envelope_prevalidated_system_internal(
+                "ack_reactive_processor_checkpoint_batched_as",
+                envelope,
+            )
             .await?;
         {
             let mut cache = self.reactive_processor_ack_watermarks.lock();
@@ -4673,6 +4831,26 @@ impl AedbInstance {
             prune_reactive_ack_cache(&mut cache);
         }
         Ok(Some(committed))
+    }
+
+    async fn ensure_reactive_processor_checkpoint_write_allowed(
+        &self,
+        caller: &CallerContext,
+    ) -> Result<(), AedbError> {
+        let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
+        let required = Permission::TableWrite {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            scope_id: SYSTEM_SCOPE_ID.to_string(),
+            table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
+        };
+        if !lease
+            .view
+            .catalog
+            .has_permission(&caller.caller_id, &required)
+        {
+            return Err(AedbError::PermissionDenied("permission denied".into()));
+        }
+        Ok(())
     }
 
     async fn build_reactive_processor_checkpoint_envelope(
@@ -5627,7 +5805,7 @@ impl AedbInstance {
             && bytes < options.max_bytes_per_run
             && Instant::now() < deadline
         {
-            let limit = (options.max_events_per_run - events.len()).min(128).max(1);
+            let limit = (options.max_events_per_run - events.len()).clamp(1, 128);
             let page = if let Some(caller) = caller {
                 db.read_event_stream_as(
                     caller,
@@ -7970,12 +8148,12 @@ impl AedbInstance {
 
     pub async fn preflight(&self, mutation: Mutation) -> PreflightResult {
         let (snapshot, catalog, _) = self.executor.snapshot_state().await;
-        preflight(&snapshot, &catalog, &mutation)
+        preflight_with_config(&snapshot, &catalog, &mutation, &self._config)
     }
 
     pub async fn preflight_plan(&self, mutation: Mutation) -> crate::commit::tx::PreflightPlan {
         let (snapshot, catalog, base_seq) = self.executor.snapshot_state().await;
-        preflight_plan(&snapshot, &catalog, &mutation, base_seq)
+        preflight_plan_with_config(&snapshot, &catalog, &mutation, base_seq, &self._config)
     }
 
     pub async fn preflight_as(
@@ -7986,7 +8164,12 @@ impl AedbInstance {
         ensure_external_caller_allowed(caller)?;
         let (snapshot, catalog, _) = self.executor.snapshot_state().await;
         validate_permissions(&catalog, Some(caller), &mutation)?;
-        Ok(preflight(&snapshot, &catalog, &mutation))
+        Ok(preflight_with_config(
+            &snapshot,
+            &catalog,
+            &mutation,
+            &self._config,
+        ))
     }
 
     pub async fn preflight_plan_as(
@@ -7997,7 +8180,13 @@ impl AedbInstance {
         ensure_external_caller_allowed(caller)?;
         let (snapshot, catalog, base_seq) = self.executor.snapshot_state().await;
         validate_permissions(&catalog, Some(caller), &mutation)?;
-        Ok(preflight_plan(&snapshot, &catalog, &mutation, base_seq))
+        Ok(preflight_plan_with_config(
+            &snapshot,
+            &catalog,
+            &mutation,
+            base_seq,
+            &self._config,
+        ))
     }
 
     pub async fn commit_ddl(&self, op: DdlOperation) -> Result<DdlResult, AedbError> {
@@ -8562,7 +8751,7 @@ impl AedbInstance {
         )?;
 
         let mut wal_segments = Vec::new();
-        let mut file_sha256 = HashMap::new();
+        let mut file_sha256 = BTreeMap::new();
         file_sha256.insert(
             checkpoint.filename.clone(),
             sha256_file_hex(&backup_dir.join(&checkpoint.filename))?,
@@ -8630,7 +8819,7 @@ impl AedbInstance {
             .unwrap_or_default()
             .as_micros() as u64;
         let mut wal_segments = Vec::new();
-        let mut file_sha256 = HashMap::new();
+        let mut file_sha256 = BTreeMap::new();
 
         for segment in read_segments(&self.dir)? {
             let src = self.dir.join(&segment.filename);
@@ -8691,6 +8880,7 @@ impl AedbInstance {
         target_seq: Option<u64>,
     ) -> Result<u64, AedbError> {
         let chain = load_verified_backup_chain(backup_dirs, config)?;
+        validate_backup_chain_compatibility(&chain, config.strict_recovery())?;
         if data_dir.exists() && fs::read_dir(data_dir)?.next().is_some() {
             return Err(AedbError::Validation(
                 "restore target directory must be empty".into(),
@@ -8790,7 +8980,13 @@ impl AedbInstance {
         target_time_micros: u64,
     ) -> Result<u64, AedbError> {
         let chain = load_verified_backup_chain(backup_dirs, config)?;
-        let target_seq = resolve_target_seq_for_time(&chain, target_time_micros)?;
+        validate_backup_chain_compatibility(&chain, config.strict_recovery())?;
+        let target_seq = resolve_target_seq_for_time(
+            &chain,
+            target_time_micros,
+            config.hash_chain_required,
+            config.strict_recovery(),
+        )?;
         Self::restore_from_backup_chain(backup_dirs, data_dir, config, Some(target_seq))
     }
 
@@ -9221,7 +9417,7 @@ impl AedbInstance {
             let prefix = b"__migrations/";
             let start = Bound::Included(prefix.to_vec());
             let end = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
-            if let Some((key, value)) = namespace.kv.entries.range((start, end)).rev().next() {
+            if let Some((key, value)) = namespace.kv.entries.range((start, end)).next_back() {
                 if let Some(version) = parse_migration_version_from_key(key) {
                     return Ok(version);
                 }
@@ -9636,15 +9832,7 @@ impl ReadTx<'_> {
             use_index: query.use_index.clone(),
         };
         let count_result = self
-            .query_with_options(
-                project_id,
-                scope_id,
-                count_query,
-                QueryOptions {
-                    allow_full_scan: true,
-                    ..QueryOptions::default()
-                },
-            )
+            .query_with_options(project_id, scope_id, count_query, QueryOptions::default())
             .await?;
         let total_count = count_result
             .rows
@@ -9657,18 +9845,17 @@ impl ReadTx<'_> {
             .unwrap_or(0);
 
         if let Some(offset) = offset {
+            let requested_rows = offset.saturating_add(page_size.max(1));
+            if requested_rows > self.db._config.max_scan_rows {
+                return Err(QueryError::ScanBoundExceeded {
+                    estimated_rows: requested_rows as u64,
+                    max_scan_rows: self.db._config.max_scan_rows as u64,
+                });
+            }
             let mut full_query = query.clone();
-            full_query.limit = None;
+            full_query.limit = Some(requested_rows);
             let full = self
-                .query_with_options(
-                    project_id,
-                    scope_id,
-                    full_query,
-                    QueryOptions {
-                        allow_full_scan: true,
-                        ..QueryOptions::default()
-                    },
-                )
+                .query_with_options(project_id, scope_id, full_query, QueryOptions::default())
                 .await?;
             let rows = full
                 .rows
@@ -9737,7 +9924,7 @@ impl ReadTx<'_> {
             }),
             ..hydrate_query
         };
-        let page_size = self.db._config.max_scan_rows.min(100).max(1);
+        let page_size = self.db._config.max_scan_rows.clamp(1, 100);
         let mut hydrate_query = ensure_stable_order_from_catalog(
             project_id,
             scope_id,

@@ -14,7 +14,7 @@ use crate::permission::Permission;
 use crate::query::plan::Expr;
 use im::HashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap as StdHashMap};
+use std::collections::{BTreeSet, HashMap as StdHashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,7 @@ fn default_accumulator_exposure_margin_bps() -> u32 {
 struct PermissionCacheEntry {
     allowed: bool,
     expires_at: Instant,
+    last_accessed_at: Instant,
 }
 
 type PermissionCacheMap = StdHashMap<(String, Permission), PermissionCacheEntry>;
@@ -57,6 +58,8 @@ pub struct Catalog {
     /// Shared across clones to maintain cache effectiveness.
     #[serde(skip)]
     permission_check_cache: Arc<RwLock<PermissionCacheMap>>,
+    #[serde(skip)]
+    permission_cache_order: Arc<RwLock<VecDeque<(String, Permission)>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -248,6 +251,7 @@ impl Default for Catalog {
             permission_grants: HashMap::new(),
             read_policies: HashMap::new(),
             permission_check_cache: Arc::new(RwLock::new(PermissionCacheMap::new())),
+            permission_cache_order: Arc::new(RwLock::new(VecDeque::new())),
         }
     }
 }
@@ -280,27 +284,62 @@ impl Catalog {
         if let Ok(mut cache) = self.permission_check_cache.write() {
             cache.retain(|(cached_caller_id, _), _| cached_caller_id != caller_id);
         }
+        if let Ok(mut order) = self.permission_cache_order.write() {
+            order.retain(|(cached_caller_id, _)| cached_caller_id != caller_id);
+        }
     }
 
     fn permission_cache_get(&self, key: &(String, Permission), now: Instant) -> Option<bool> {
-        self.permission_check_cache
-            .read()
-            .ok()
-            .and_then(|cache| cache.get(key).cloned())
-            .filter(|entry| entry.expires_at > now)
-            .map(|entry| entry.allowed)
+        let mut cache = self.permission_check_cache.write().ok()?;
+        let entry = cache.get_mut(key)?;
+        if entry.expires_at <= now {
+            cache.remove(key);
+            drop(cache);
+            if let Ok(mut order) = self.permission_cache_order.write() {
+                order.retain(|candidate| candidate != key);
+            }
+            return None;
+        }
+        entry.last_accessed_at = now;
+        Some(entry.allowed)
     }
 
     fn permission_cache_put(&self, key: (String, Permission), allowed: bool, now: Instant) {
         if let Ok(mut cache) = self.permission_check_cache.write() {
-            if cache.len() >= Self::PERMISSION_CACHE_MAX_ENTRIES {
-                cache.clear();
+            let mut order = self.permission_cache_order.write().ok();
+            if !cache.contains_key(&key) && cache.len() >= Self::PERMISSION_CACHE_MAX_ENTRIES {
+                let evicted = if let Some(order) = order.as_mut() {
+                    let mut evicted = None;
+                    while let Some(candidate) = order.pop_front() {
+                        if let Some(entry) = cache.get(&candidate) {
+                            if entry.expires_at <= now {
+                                cache.remove(&candidate);
+                                continue;
+                            }
+                            evicted = Some(candidate);
+                            break;
+                        }
+                    }
+                    evicted
+                } else {
+                    cache
+                        .iter()
+                        .min_by_key(|(_, entry)| entry.last_accessed_at)
+                        .map(|(candidate, _)| candidate.clone())
+                };
+                if let Some(evicted) = evicted {
+                    cache.remove(&evicted);
+                }
+            }
+            if let Some(order) = order.as_mut() {
+                order.push_back(key.clone());
             }
             cache.insert(
                 key,
                 PermissionCacheEntry {
                     allowed,
                     expires_at: now + Self::PERMISSION_CACHE_TTL,
+                    last_accessed_at: now,
                 },
             );
         }
@@ -687,11 +726,11 @@ impl Catalog {
             return false;
         };
 
-        let is_global_admin = granted.contains(&Permission::GlobalAdmin);
-        let allowed = is_global_admin || granted.contains(required);
+        let source = resolve_permission_grant(granted, required);
+        let allowed = source.is_some();
 
         // Log GlobalAdmin usage for audit trail (break-glass access)
-        if is_global_admin {
+        if matches!(source, Some(PermissionGrantSource::GlobalAdmin)) {
             // Log at WARN level since GlobalAdmin bypasses normal authorization
             tracing::warn!(
                 caller_id = caller_id,
@@ -1080,6 +1119,7 @@ impl Catalog {
         }
         let mut add_unique_index: Option<(String, Vec<String>, u128)> = None;
         let mut drop_unique_index: Option<String> = None;
+        let mut check_fk_cycle = false;
         let table = self
             .tables
             .get_mut(&key)
@@ -1170,10 +1210,22 @@ impl Catalog {
                     return Err(AedbError::Validation("foreign key already exists".into()));
                 }
                 table.foreign_keys.push(fk);
+                check_fk_cycle = true;
             }
             TableAlteration::DropForeignKey { name } => {
                 table.foreign_keys.retain(|fk| fk.name != name);
             }
+        }
+        let _ = table;
+        if check_fk_cycle && foreign_key_graph_has_cycle(self) {
+            let table = self
+                .tables
+                .get_mut(&key)
+                .ok_or_else(|| AedbError::Validation("table missing after fk update".into()))?;
+            table.foreign_keys.pop();
+            return Err(AedbError::Validation(
+                "foreign key cycle detected; cascading cycles are not allowed".into(),
+            ));
         }
         if let Some((index_name, columns, columns_bitmask)) = add_unique_index {
             self.indexes.insert(
@@ -1895,6 +1947,124 @@ impl Catalog {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionGrantSource {
+    Direct,
+    Hierarchical,
+    GlobalAdmin,
+}
+
+fn resolve_permission_grant(
+    granted: &BTreeSet<Permission>,
+    required: &Permission,
+) -> Option<PermissionGrantSource> {
+    if granted.contains(&Permission::GlobalAdmin) {
+        return Some(PermissionGrantSource::GlobalAdmin);
+    }
+    if granted.contains(required) {
+        return Some(PermissionGrantSource::Direct);
+    }
+    granted
+        .iter()
+        .any(|permission| permission_implies(permission, required))
+        .then_some(PermissionGrantSource::Hierarchical)
+}
+
+fn permission_implies(granted: &Permission, required: &Permission) -> bool {
+    match granted {
+        Permission::ProjectAdmin { project_id } => match required {
+            Permission::ProjectAdmin {
+                project_id: required_project_id,
+            }
+            | Permission::TableDdl {
+                project_id: required_project_id,
+            }
+            | Permission::ScopeAdmin {
+                project_id: required_project_id,
+                ..
+            }
+            | Permission::TableRead {
+                project_id: required_project_id,
+                ..
+            }
+            | Permission::TableWrite {
+                project_id: required_project_id,
+                ..
+            }
+            | Permission::IndexRead {
+                project_id: required_project_id,
+                ..
+            } => project_id == required_project_id,
+            _ => false,
+        },
+        Permission::ScopeAdmin {
+            project_id,
+            scope_id,
+        } => match required {
+            Permission::ScopeAdmin {
+                project_id: required_project_id,
+                scope_id: required_scope_id,
+            }
+            | Permission::TableRead {
+                project_id: required_project_id,
+                scope_id: required_scope_id,
+                ..
+            }
+            | Permission::TableWrite {
+                project_id: required_project_id,
+                scope_id: required_scope_id,
+                ..
+            }
+            | Permission::IndexRead {
+                project_id: required_project_id,
+                scope_id: required_scope_id,
+                ..
+            } => project_id == required_project_id && scope_id == required_scope_id,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn foreign_key_graph_has_cycle(catalog: &Catalog) -> bool {
+    fn visit(
+        node: &(String, String),
+        catalog: &Catalog,
+        visiting: &mut BTreeSet<(String, String)>,
+        visited: &mut BTreeSet<(String, String)>,
+    ) -> bool {
+        if visited.contains(node) {
+            return false;
+        }
+        if !visiting.insert(node.clone()) {
+            return true;
+        }
+        if let Some(schema) = catalog.tables.get(node) {
+            for fk in &schema.foreign_keys {
+                let target = (
+                    namespace_key(&fk.references_project_id, &fk.references_scope_id),
+                    fk.references_table.clone(),
+                );
+                if visit(&target, catalog, visiting, visited) {
+                    return true;
+                }
+            }
+        }
+        visiting.remove(node);
+        visited.insert(node.clone());
+        false
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for node in catalog.tables.keys() {
+        if visit(node, catalog, &mut visiting, &mut visited) {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_kv_read_prefixes<'a>(
     permissions: impl Iterator<Item = &'a Permission>,
     project_id: &str,
@@ -2140,6 +2310,7 @@ mod tests {
         ColumnDef, ForeignKey, ForeignKeyAction, IndexType, TableAlteration,
     };
     use crate::catalog::types::ColumnType;
+    use crate::error::AedbError;
     use crate::permission::Permission;
 
     fn users_columns() -> Vec<ColumnDef> {
@@ -2317,6 +2488,52 @@ mod tests {
             .expect("metadata");
         assert!(meta.delegable);
         assert_eq!(meta.granted_by, "system");
+    }
+
+    #[test]
+    fn alter_table_rejects_foreign_key_cycles() {
+        let mut c = Catalog::default();
+        c.create_project("A").expect("project");
+        c.create_scope("A", "app").expect("scope");
+        c.create_table("A", "app", "parents", users_columns(), vec!["id".into()])
+            .expect("parents");
+        c.create_table("A", "app", "children", users_columns(), vec!["id".into()])
+            .expect("children");
+        c.alter_table(
+            "A",
+            "app",
+            "children",
+            TableAlteration::AddForeignKey(ForeignKey {
+                name: "child_parent".into(),
+                columns: vec!["id".into()],
+                references_project_id: "A".into(),
+                references_scope_id: "app".into(),
+                references_table: "parents".into(),
+                references_columns: vec!["id".into()],
+                on_delete: ForeignKeyAction::Cascade,
+                on_update: ForeignKeyAction::Cascade,
+            }),
+        )
+        .expect("first fk");
+
+        let err = c
+            .alter_table(
+                "A",
+                "app",
+                "parents",
+                TableAlteration::AddForeignKey(ForeignKey {
+                    name: "parent_child".into(),
+                    columns: vec!["id".into()],
+                    references_project_id: "A".into(),
+                    references_scope_id: "app".into(),
+                    references_table: "children".into(),
+                    references_columns: vec!["id".into()],
+                    on_delete: ForeignKeyAction::Cascade,
+                    on_update: ForeignKeyAction::Cascade,
+                }),
+            )
+            .expect_err("cycle should be rejected");
+        assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("foreign key cycle")));
     }
 
     #[test]

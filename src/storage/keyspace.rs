@@ -735,6 +735,7 @@ impl Keyspace {
         namespace.accumulators.remove(accumulator_name);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_accumulator_delta(
         &mut self,
         project_id: &str,
@@ -1213,6 +1214,7 @@ impl Keyspace {
         Ok(next)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_add_u256_ex(
         &mut self,
         project_id: &str,
@@ -1244,6 +1246,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_sub_u256_ex(
         &mut self,
         project_id: &str,
@@ -1359,6 +1362,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_add_u64_ex(
         &mut self,
         project_id: &str,
@@ -1420,6 +1424,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_sub_u64_ex(
         &mut self,
         project_id: &str,
@@ -1451,6 +1456,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_sub_int_ex(
         &mut self,
         project_id: &str,
@@ -1495,6 +1501,7 @@ impl Keyspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn counter_add_sharded(
         &mut self,
         project_id: &str,
@@ -1843,7 +1850,15 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, crate::error::AedbError> {
 }
 
 fn estimate_row_bytes(row: &Row) -> usize {
-    row.values.iter().map(estimate_value_bytes).sum::<usize>() + 16
+    const ROW_BASE_OVERHEAD_BYTES: usize = 48;
+    const VALUE_SLOT_OVERHEAD_BYTES: usize = 16;
+
+    row.values
+        .iter()
+        .map(estimate_value_bytes)
+        .sum::<usize>()
+        .saturating_add(ROW_BASE_OVERHEAD_BYTES)
+        .saturating_add(row.values.len().saturating_mul(VALUE_SLOT_OVERHEAD_BYTES))
 }
 
 fn estimate_value_bytes(v: &Value) -> usize {

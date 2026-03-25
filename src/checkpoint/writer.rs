@@ -2,7 +2,8 @@ use crate::catalog::Catalog;
 use crate::commit::tx::{IdempotencyKey, IdempotencyRecord};
 use crate::error::AedbError;
 use crate::storage::keyspace::KeyspaceSnapshot;
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::rand_core::RngCore;
+use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -64,7 +65,7 @@ pub fn write_checkpoint_with_key(
 
     let created_at_micros = now_micros();
     let payload = if let Some(key) = encryption_key {
-        encrypt_checkpoint_payload(&compressed, key, seq, created_at_micros)?
+        encrypt_checkpoint_payload(&compressed, key)?
     } else {
         let hash = Sha256::digest(&compressed);
         let mut out = compressed.clone();
@@ -91,23 +92,12 @@ pub fn write_checkpoint_with_key(
     })
 }
 
-fn encrypt_checkpoint_payload(
-    plaintext: &[u8],
-    key: &[u8; 32],
-    seq: u64,
-    created_at_micros: u64,
-) -> Result<Vec<u8>, AedbError> {
+fn encrypt_checkpoint_payload(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AedbError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AedbError::Validation(format!("invalid encryption key: {e}")))?;
 
-    // Construct 96-bit nonce from seq (64-bit) + timestamp_hash (32-bit)
-    // Use full timestamp in hash to avoid collision if same seq created far apart in time
     let mut nonce_bytes = [0u8; 12];
-    nonce_bytes[..8].copy_from_slice(&seq.to_be_bytes());
-
-    // Hash the full timestamp to get 32 bits, avoiding truncation collision risk
-    let timestamp_hash = Sha256::digest(created_at_micros.to_be_bytes());
-    nonce_bytes[8..].copy_from_slice(&timestamp_hash[..4]);
+    OsRng.fill_bytes(&mut nonce_bytes);
 
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher

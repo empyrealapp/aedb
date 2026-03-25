@@ -3,7 +3,12 @@ use crate::error::AedbError;
 use serde::{Deserialize, Serialize};
 
 /// Maximum nesting depth for expressions to prevent stack overflow
-const MAX_EXPR_DEPTH: usize = 32;
+pub(crate) const MAX_EXPR_DEPTH: usize = 32;
+pub(crate) const MAX_EXPR_IN_LIST_VALUES: usize = 10_000;
+pub(crate) const MAX_LIKE_PATTERN_BYTES: usize = 256;
+pub(crate) const MAX_ORDER_BY_COLUMNS: usize = 32;
+pub(crate) const MAX_GROUP_BY_COLUMNS: usize = 32;
+pub(crate) const MAX_AGGREGATES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {

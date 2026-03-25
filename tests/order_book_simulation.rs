@@ -36,6 +36,20 @@ fn decode_u256_bytes_to_u64(bytes: &[u8]) -> Result<u64, AedbError> {
     Ok(u64::from_be_bytes(out))
 }
 
+fn append_len_prefixed_segment(out: &mut Vec<u8>, segment: &str) {
+    out.extend_from_slice(&(segment.len() as u64).to_be_bytes());
+    out.extend_from_slice(segment.as_bytes());
+}
+
+fn order_book_prefix(asset: &str, suffix: &[u8]) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(16 + asset.len() + suffix.len());
+    prefix.extend_from_slice(b"ob:");
+    append_len_prefixed_segment(&mut prefix, asset);
+    prefix.extend_from_slice(suffix);
+    prefix
+}
+
+#[allow(clippy::too_many_arguments)]
 fn request(
     instrument: &str,
     owner: &str,
@@ -151,7 +165,7 @@ async fn validate_asset_read_consistency(db: &AedbInstance, asset: &str) -> Resu
         .kv_scan_prefix_no_auth(
             "p",
             "app",
-            format!("ob:{asset}:ord:").as_bytes(),
+            &order_book_prefix(asset, b":ord:"),
             2_000_000,
             ConsistencyMode::AtLatest,
         )
@@ -175,7 +189,7 @@ async fn validate_asset_read_consistency(db: &AedbInstance, asset: &str) -> Resu
             .kv_scan_prefix_no_auth(
                 "p",
                 "app",
-                format!("ob:{asset}:plqty:{}:", side as u8).as_bytes(),
+                &order_book_prefix(asset, format!(":plqty:{}:", side as u8).as_bytes()),
                 2_000_000,
                 ConsistencyMode::AtLatest,
             )
@@ -408,7 +422,7 @@ async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) -> Result<
             .kv_scan_prefix_no_auth(
                 "p",
                 "app",
-                format!("ob:{asset}:ord:").as_bytes(),
+                &order_book_prefix(asset, b":ord:"),
                 1_000_000,
                 ConsistencyMode::AtLatest,
             )
@@ -444,7 +458,7 @@ async fn assert_book_invariants(db: &AedbInstance, assets: &[String]) -> Result<
                 .kv_scan_prefix_no_auth(
                     "p",
                     "app",
-                    format!("ob:{asset}:plqty:{}:", side as u8).as_bytes(),
+                    &order_book_prefix(asset, format!(":plqty:{}:", side as u8).as_bytes()),
                     1_000_000,
                     ConsistencyMode::AtLatest,
                 )
@@ -480,7 +494,7 @@ async fn assert_trade_and_report_parity(
             .kv_scan_prefix_no_auth(
                 "p",
                 "app",
-                format!("ob:{asset}:ord:").as_bytes(),
+                &order_book_prefix(asset, b":ord:"),
                 2_000_000,
                 ConsistencyMode::AtLatest,
             )
@@ -496,7 +510,7 @@ async fn assert_trade_and_report_parity(
             .kv_scan_prefix_no_auth(
                 "p",
                 "app",
-                format!("ob:{asset}:trade:").as_bytes(),
+                &order_book_prefix(asset, b":trade:"),
                 2_000_000,
                 ConsistencyMode::AtLatest,
             )
@@ -530,7 +544,7 @@ async fn assert_trade_and_report_parity(
             .kv_scan_prefix_no_auth(
                 "p",
                 "app",
-                format!("ob:{asset}:report:").as_bytes(),
+                &order_book_prefix(asset, b":report:"),
                 2_000_000,
                 ConsistencyMode::AtLatest,
             )

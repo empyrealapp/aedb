@@ -4,18 +4,20 @@ use crate::catalog::{Catalog, namespace_key};
 use crate::commit::tx::{AssertionActual, ReadAssertion};
 use crate::commit::validation::CompareOp;
 use crate::error::AedbError;
-use crate::query::plan::Expr;
+use crate::query::plan::{Expr, MAX_EXPR_IN_LIST_VALUES, MAX_LIKE_PATTERN_BYTES};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::Keyspace;
 use primitive_types::U256;
 use std::cmp::Ordering;
+
+const MAX_ASSERTION_DEPTH: usize = 16;
 
 pub fn validate_assertions(
     catalog: &Catalog,
     assertions: &[ReadAssertion],
 ) -> Result<(), AedbError> {
     for assertion in assertions {
-        validate_assertion(catalog, assertion)?;
+        validate_assertion(catalog, assertion, 1)?;
     }
     Ok(())
 }
@@ -24,9 +26,10 @@ pub fn evaluate_assertions(
     catalog: &Catalog,
     keyspace: &Keyspace,
     assertions: &[ReadAssertion],
+    max_scan_rows: usize,
 ) -> Result<(), AedbError> {
     for (index, assertion) in assertions.iter().enumerate() {
-        match evaluate_assertion(catalog, keyspace, assertion)? {
+        match evaluate_assertion(catalog, keyspace, assertion, 1, max_scan_rows)? {
             None => {}
             Some(actual) => {
                 return Err(AedbError::AssertionFailed {
@@ -40,7 +43,17 @@ pub fn evaluate_assertions(
     Ok(())
 }
 
-fn validate_assertion(catalog: &Catalog, assertion: &ReadAssertion) -> Result<(), AedbError> {
+fn validate_assertion(
+    catalog: &Catalog,
+    assertion: &ReadAssertion,
+    depth: usize,
+) -> Result<(), AedbError> {
+    if depth > MAX_ASSERTION_DEPTH {
+        return Err(AedbError::Validation(format!(
+            "assertion depth {} exceeds maximum allowed depth of {}",
+            depth, MAX_ASSERTION_DEPTH
+        )));
+    }
     match assertion {
         ReadAssertion::AccumulatorAvailableAtLeast {
             project_id,
@@ -181,11 +194,11 @@ fn validate_assertion(catalog: &Catalog, assertion: &ReadAssertion) -> Result<()
         }
         ReadAssertion::All(assertions) | ReadAssertion::Any(assertions) => {
             for inner in assertions {
-                validate_assertion(catalog, inner)?;
+                validate_assertion(catalog, inner, depth + 1)?;
             }
             Ok(())
         }
-        ReadAssertion::Not(inner) => validate_assertion(catalog, inner),
+        ReadAssertion::Not(inner) => validate_assertion(catalog, inner, depth + 1),
     }
 }
 
@@ -193,7 +206,15 @@ fn evaluate_assertion(
     catalog: &Catalog,
     keyspace: &Keyspace,
     assertion: &ReadAssertion,
+    depth: usize,
+    max_scan_rows: usize,
 ) -> Result<Option<AssertionActual>, AedbError> {
+    if depth > MAX_ASSERTION_DEPTH {
+        return Err(AedbError::Validation(format!(
+            "assertion depth {} exceeds maximum allowed depth of {}",
+            depth, MAX_ASSERTION_DEPTH
+        )));
+    }
     match assertion {
         ReadAssertion::AccumulatorAvailableAtLeast {
             project_id,
@@ -379,12 +400,9 @@ fn evaluate_assertion(
             let count = keyspace
                 .table_by_namespace_key(&ns, table_name)
                 .map(|table| {
-                    table
-                        .rows
-                        .values()
-                        .filter(|row| match_filter(row, schema, filter).unwrap_or(false))
-                        .count() as u64
+                    count_matching_rows(table.rows.values(), schema, filter, max_scan_rows)
                 })
+                .transpose()?
                 .unwrap_or(0);
             if compare_ord(count.cmp(threshold), *op) {
                 Ok(None)
@@ -408,9 +426,13 @@ fn evaluate_assertion(
             let ns = namespace_key(project_id, scope_id);
             let sum = match keyspace.table_by_namespace_key(&ns, table_name) {
                 None => zero_for_threshold(threshold),
-                Some(table) => {
-                    sum_rows_for_column(table.rows.values(), schema, column_idx, filter)?
-                }
+                Some(table) => sum_rows_for_column(
+                    table.rows.values(),
+                    schema,
+                    column_idx,
+                    filter,
+                    max_scan_rows,
+                )?,
             };
             if compare_values(&sum, threshold, *op) {
                 Ok(None)
@@ -420,7 +442,9 @@ fn evaluate_assertion(
         }
         ReadAssertion::All(assertions) => {
             for assertion in assertions {
-                if let Some(actual) = evaluate_assertion(catalog, keyspace, assertion)? {
+                if let Some(actual) =
+                    evaluate_assertion(catalog, keyspace, assertion, depth + 1, max_scan_rows)?
+                {
                     return Ok(Some(actual));
                 }
             }
@@ -429,17 +453,19 @@ fn evaluate_assertion(
         ReadAssertion::Any(assertions) => {
             let mut last_actual = AssertionActual::Missing;
             for assertion in assertions {
-                match evaluate_assertion(catalog, keyspace, assertion)? {
+                match evaluate_assertion(catalog, keyspace, assertion, depth + 1, max_scan_rows)? {
                     None => return Ok(None),
                     Some(actual) => last_actual = actual,
                 }
             }
             Ok(Some(last_actual))
         }
-        ReadAssertion::Not(assertion) => match evaluate_assertion(catalog, keyspace, assertion)? {
-            None => Ok(Some(AssertionActual::Bool(true))),
-            Some(_) => Ok(None),
-        },
+        ReadAssertion::Not(assertion) => {
+            match evaluate_assertion(catalog, keyspace, assertion, depth + 1, max_scan_rows)? {
+                None => Ok(Some(AssertionActual::Bool(true))),
+                Some(_) => Ok(None),
+            }
+        }
     }
 }
 
@@ -510,7 +536,23 @@ fn validate_filter_columns(schema: &TableSchema, expr: &Expr) -> Result<(), Aedb
         | Expr::IsNotNull(col)
         | Expr::Like(col, _) => {
             if schema.columns.iter().any(|c| c.name == *col) {
-                Ok(())
+                match expr {
+                    Expr::In(_, values) if values.len() > MAX_EXPR_IN_LIST_VALUES => {
+                        Err(AedbError::Validation(format!(
+                            "IN list has {} values, exceeds maximum of {}",
+                            values.len(),
+                            MAX_EXPR_IN_LIST_VALUES
+                        )))
+                    }
+                    Expr::Like(_, pattern) if pattern.len() > MAX_LIKE_PATTERN_BYTES => {
+                        Err(AedbError::Validation(format!(
+                            "LIKE pattern is {} bytes, exceeds maximum of {}",
+                            pattern.len(),
+                            MAX_LIKE_PATTERN_BYTES
+                        )))
+                    }
+                    _ => Ok(()),
+                }
             } else {
                 Err(AedbError::Validation(format!("column not found: {col}")))
             }
@@ -548,12 +590,14 @@ fn sum_rows_for_column<'a>(
     schema: &TableSchema,
     column_idx: usize,
     filter: &Option<Expr>,
+    max_scan_rows: usize,
 ) -> Result<Value, AedbError> {
     let col_type = &schema.columns[column_idx].col_type;
     match col_type {
         ColumnType::U8 | ColumnType::U64 | ColumnType::Integer | ColumnType::Timestamp => {
             let mut sum: i64 = 0;
-            for row in rows {
+            for (scanned, row) in rows.enumerate() {
+                ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
@@ -581,7 +625,8 @@ fn sum_rows_for_column<'a>(
         }
         ColumnType::Float => {
             let mut sum = 0.0f64;
-            for row in rows {
+            for (scanned, row) in rows.enumerate() {
+                ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
@@ -593,7 +638,8 @@ fn sum_rows_for_column<'a>(
         }
         ColumnType::U256 => {
             let mut sum = U256::zero();
-            for row in rows {
+            for (scanned, row) in rows.enumerate() {
+                ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
@@ -610,6 +656,35 @@ fn sum_rows_for_column<'a>(
             "unsupported column type for SumCompare".into(),
         )),
     }
+}
+
+fn count_matching_rows<'a>(
+    rows: impl Iterator<Item = &'a Row>,
+    schema: &TableSchema,
+    filter: &Option<Expr>,
+    max_scan_rows: usize,
+) -> Result<u64, AedbError> {
+    let mut count = 0u64;
+    for (scanned, row) in rows.enumerate() {
+        ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+        if match_filter(row, schema, filter)? {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn ensure_assertion_scan_budget(
+    scanned_rows: usize,
+    max_scan_rows: usize,
+) -> Result<(), AedbError> {
+    if scanned_rows > max_scan_rows {
+        return Err(AedbError::Validation(format!(
+            "assertion scan bound exceeded: scanned_rows={}, max_scan_rows={}",
+            scanned_rows, max_scan_rows
+        )));
+    }
+    Ok(())
 }
 
 fn zero_for_threshold(threshold: &Value) -> Value {

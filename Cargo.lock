@@ -38,6 +38,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smallvec",
+ "subtle",
  "tempfile",
  "thiserror",
  "tokio",

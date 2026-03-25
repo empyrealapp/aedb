@@ -242,16 +242,10 @@ fn segment_paths_for_replay(
             };
             let actual = sha256_prefix_hex(&path, hash_len)?;
             if actual != segment.sha256_hex {
-                if config.strict_recovery() && !is_active_segment {
-                    return Err(AedbError::Validation(format!(
-                        "manifest wal segment sha256 mismatch: {}",
-                        segment.filename
-                    )));
-                }
-                warn!(
-                    filename = %segment.filename,
-                    "recovery: wal segment sha256 mismatch on active/permissive segment, skipping integrity check"
-                );
+                return Err(AedbError::Validation(format!(
+                    "manifest wal segment sha256 mismatch: {}",
+                    segment.filename
+                )));
             }
         }
         let replay_limit_path = path.clone();
@@ -368,15 +362,23 @@ fn sha256_prefix_hex(path: &Path, bytes_to_hash: u64) -> Result<String, AedbErro
 #[cfg(test)]
 mod tests {
     use super::recover_with_config;
-    use crate::catalog::DdlOperation;
     use crate::catalog::schema::ColumnDef;
     use crate::catalog::types::{ColumnType, Row, Value};
+    use crate::catalog::{Catalog, DdlOperation};
     use crate::checkpoint::writer::CheckpointMeta;
     use crate::checkpoint::writer::write_checkpoint;
     use crate::commit::executor::CommitExecutor;
+    use crate::commit::tx::WalCommitPayload;
     use crate::commit::validation::Mutation;
     use crate::manifest::atomic::write_manifest_atomic;
     use crate::manifest::schema::{Manifest, SegmentMeta};
+    use crate::recovery::replay::replay_segments;
+    use crate::storage::keyspace::Keyspace;
+    use crate::wal::frame::append_frame_bytes;
+    use crate::wal::segment::SegmentHeader;
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::io::Write;
     use tempfile::tempdir;
 
     fn non_strict_config() -> crate::config::AedbConfig {
@@ -446,6 +448,63 @@ mod tests {
                 .get_row("p", "app", "users", &[Value::Integer(99)])
                 .is_some()
         );
+    }
+
+    #[test]
+    fn permissive_replay_skips_unknown_frame_and_recovers_later_frames() {
+        let dir = tempdir().expect("temp");
+        let segment_path = dir.path().join("segment-000001.wal");
+        let mut file = File::create(&segment_path).expect("segment file");
+        file.write_all(&SegmentHeader::new(1, 1, [0u8; 32]).to_bytes())
+            .expect("header");
+
+        let create_p = rmp_serde::to_vec(&WalCommitPayload {
+            mutations: vec![Mutation::Ddl(DdlOperation::CreateProject {
+                owner_id: None,
+                if_not_exists: true,
+                project_id: "p".into(),
+            })],
+            assertions: Vec::new(),
+            idempotency_key: None,
+            request_fingerprint: None,
+        })
+        .expect("payload p");
+        let create_q = rmp_serde::to_vec(&WalCommitPayload {
+            mutations: vec![Mutation::Ddl(DdlOperation::CreateProject {
+                owner_id: None,
+                if_not_exists: true,
+                project_id: "q".into(),
+            })],
+            assertions: Vec::new(),
+            idempotency_key: None,
+            request_fingerprint: None,
+        })
+        .expect("payload q");
+        let mut frame_bytes = Vec::new();
+        append_frame_bytes(&mut frame_bytes, 1, 1, 0x02, &create_p).expect("frame 1");
+        append_frame_bytes(&mut frame_bytes, 2, 2, 0x7f, b"invalid").expect("frame 2");
+        append_frame_bytes(&mut frame_bytes, 3, 3, 0x02, &create_q).expect("frame 3");
+        file.write_all(&frame_bytes).expect("frames");
+        file.flush().expect("flush");
+
+        let mut keyspace = Keyspace::default();
+        let mut catalog = Catalog::default();
+        let mut idempotency = HashMap::new();
+        let max_seq = replay_segments(
+            &[segment_path],
+            0,
+            None,
+            None,
+            false,
+            false,
+            &mut keyspace,
+            &mut catalog,
+            &mut idempotency,
+        )
+        .expect("permissive replay");
+        assert_eq!(max_seq, 3);
+        assert!(catalog.projects.contains_key("p"));
+        assert!(catalog.projects.contains_key("q"));
     }
 
     #[tokio::test]

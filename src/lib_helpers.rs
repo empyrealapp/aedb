@@ -1,4 +1,5 @@
 use super::*;
+use subtle::ConstantTimeEq;
 
 pub(crate) fn ensure_stable_order_from_catalog(
     project_id: &str,
@@ -211,8 +212,8 @@ pub(crate) fn authorize_and_bind_query_for_caller(
     };
     if !catalog.has_permission(&caller.caller_id, &required) {
         return Err(QueryError::PermissionDenied {
-            permission: format!("{required:?}"),
-            scope: caller.caller_id.clone(),
+            permission: "permission denied".into(),
+            scope: String::new(),
         });
     }
     for join in &query.joins {
@@ -225,8 +226,8 @@ pub(crate) fn authorize_and_bind_query_for_caller(
         };
         if !catalog.has_permission(&caller.caller_id, &join_required) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("{join_required:?}"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
     }
@@ -374,9 +375,22 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
             message: "max_scan_rows must be > 0".into(),
         });
     }
-    if config.max_kv_key_bytes == 0 || config.max_kv_value_bytes == 0 {
+    if config.max_batch_rows == 0 {
         return Err(AedbError::InvalidConfig {
-            message: "max_kv_key_bytes/max_kv_value_bytes must be > 0".into(),
+            message: "max_batch_rows must be > 0".into(),
+        });
+    }
+    if config.max_event_payload_bytes == 0 {
+        return Err(AedbError::InvalidConfig {
+            message: "max_event_payload_bytes must be > 0".into(),
+        });
+    }
+    if config.max_kv_key_bytes == 0
+        || config.max_kv_value_bytes == 0
+        || config.max_table_value_bytes == 0
+    {
+        return Err(AedbError::InvalidConfig {
+            message: "max_kv_key_bytes/max_kv_value_bytes/max_table_value_bytes must be > 0".into(),
         });
     }
     if config.prestage_shards == 0 {
@@ -433,7 +447,10 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
             message: "partition_lock_timeout_ms and epoch_apply_timeout_ms must be > 0".into(),
         });
     }
-    if config.max_versions == 0 || config.version_gc_interval_ms == 0 {
+    if config.max_versions == 0
+        || config.version_store_full_snapshot_interval_deltas == 0
+        || config.version_gc_interval_ms == 0
+    {
         return Err(AedbError::InvalidConfig {
             message: "version store limits must be > 0".into(),
         });
@@ -554,16 +571,17 @@ pub(crate) fn parse_cursor_seq(cursor: &str) -> Result<u64, AedbError> {
     if cursor.len() < 2 {
         return Err(AedbError::Decode("invalid cursor".into()));
     }
-    let mut bytes = Vec::with_capacity(cursor.len() / 2);
-    let chars: Vec<char> = cursor.chars().collect();
-    if !chars.len().is_multiple_of(2) {
+    let encoded = cursor.as_bytes();
+    if !encoded.len().is_multiple_of(2) {
         return Err(AedbError::Decode("invalid cursor".into()));
     }
-    for i in (0..chars.len()).step_by(2) {
-        let pair = [chars[i], chars[i + 1]].iter().collect::<String>();
-        let b = u8::from_str_radix(&pair, 16)
-            .map_err(|_| AedbError::Decode("invalid cursor".into()))?;
-        bytes.push(b);
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for chunk in encoded.chunks_exact(2) {
+        let hi = decode_hex_nibble(chunk[0])
+            .ok_or_else(|| AedbError::Decode("invalid cursor".into()))?;
+        let lo = decode_hex_nibble(chunk[1])
+            .ok_or_else(|| AedbError::Decode("invalid cursor".into()))?;
+        bytes.push((hi << 4) | lo);
     }
     #[derive(serde::Deserialize)]
     struct CursorSeq {
@@ -590,6 +608,15 @@ pub(crate) fn parse_cursor_seq(cursor: &str) -> Result<u64, AedbError> {
         token.remaining_limit,
     );
     Ok(token.snapshot_seq)
+}
+
+fn decode_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -620,7 +647,7 @@ pub(crate) fn verify_signed_query_cursor(
         return Err(AedbError::Decode("invalid cursor".into()));
     }
     let expected = *blake3::keyed_hash(key, payload.raw_cursor.as_bytes()).as_bytes();
-    if payload.mac != expected {
+    if payload.mac.ct_eq(&expected).unwrap_u8() != 1 {
         return Err(AedbError::Validation("cursor signature mismatch".into()));
     }
     let snapshot_seq = parse_cursor_seq(&payload.raw_cursor)?;
@@ -648,6 +675,9 @@ pub(crate) fn bind_policy_expr(expr: &Expr, caller_id: &str) -> Expr {
             _ => value.clone(),
         }
     }
+    fn bind_like_pattern(pattern: &str, caller_id: &str) -> String {
+        pattern.replace("$caller_id", caller_id)
+    }
     match expr {
         Expr::Eq(col, v) => Expr::Eq(col.clone(), bind_value(v, caller_id)),
         Expr::Ne(col, v) => Expr::Ne(col.clone(), bind_value(v, caller_id)),
@@ -666,7 +696,7 @@ pub(crate) fn bind_policy_expr(expr: &Expr, caller_id: &str) -> Expr {
         ),
         Expr::IsNull(col) => Expr::IsNull(col.clone()),
         Expr::IsNotNull(col) => Expr::IsNotNull(col.clone()),
-        Expr::Like(col, pattern) => Expr::Like(col.clone(), pattern.clone()),
+        Expr::Like(col, pattern) => Expr::Like(col.clone(), bind_like_pattern(pattern, caller_id)),
         Expr::And(lhs, rhs) => Expr::And(
             Box::new(bind_policy_expr(lhs, caller_id)),
             Box::new(bind_policy_expr(rhs, caller_id)),
@@ -830,8 +860,8 @@ pub(crate) fn apply_table_update_exprs(
 
 pub(crate) fn query_error_to_aedb(error: QueryError) -> AedbError {
     match error {
-        QueryError::PermissionDenied { permission, scope } => {
-            AedbError::PermissionDenied(format!("{permission} (scope={scope})"))
+        QueryError::PermissionDenied { .. } => {
+            AedbError::PermissionDenied("permission denied".into())
         }
         other => AedbError::Validation(other.to_string()),
     }
@@ -1464,7 +1494,10 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
 pub(crate) fn copy_file_prefix(src: &Path, dst: &Path, size_bytes: u64) -> Result<(), AedbError> {
     let mut reader = File::open(src)?;
     let mut writer = File::create(dst)?;
-    std::io::copy(&mut reader.by_ref().take(size_bytes), &mut writer)?;
+    std::io::copy(
+        &mut std::io::Read::by_ref(&mut reader).take(size_bytes),
+        &mut writer,
+    )?;
     Ok(())
 }
 
@@ -1522,9 +1555,43 @@ pub(crate) fn load_verified_backup_chain(
     Ok(chain)
 }
 
+pub(crate) fn validate_backup_chain_compatibility(
+    chain: &[(PathBuf, BackupManifest)],
+    strict_recovery: bool,
+) -> Result<(), AedbError> {
+    let current = parse_aedb_version(env!("CARGO_PKG_VERSION"))?;
+    for (dir, manifest) in chain {
+        let backup = parse_aedb_version(&manifest.aedb_version)?;
+        if backup.major != current.major || backup.minor != current.minor {
+            return Err(AedbError::Validation(format!(
+                "backup {} was created by incompatible AEDB version {}",
+                dir.display(),
+                manifest.aedb_version
+            )));
+        }
+        if backup.patch > current.patch {
+            return Err(AedbError::Validation(format!(
+                "backup {} was created by newer AEDB version {}",
+                dir.display(),
+                manifest.aedb_version
+            )));
+        }
+        if strict_recovery && backup.patch < current.patch {
+            return Err(AedbError::Validation(format!(
+                "strict restore requires matching AEDB patch version; backup {} uses {}",
+                dir.display(),
+                manifest.aedb_version
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_target_seq_for_time(
     chain: &[(PathBuf, BackupManifest)],
     target_time_micros: u64,
+    hash_chain_required: bool,
+    strict_recovery: bool,
 ) -> Result<u64, AedbError> {
     let Some((_, full)) = chain.first() else {
         return Err(AedbError::Validation("backup chain cannot be empty".into()));
@@ -1540,7 +1607,12 @@ pub(crate) fn resolve_target_seq_for_time(
                 .and_then(|n| segment_seq_from_name(&n.to_string_lossy()))
                 .unwrap_or(0)
         });
-        for wal in wal_paths {
+        let valid_prefix_len = crate::recovery::scanner::validated_hash_chain_prefix_len(
+            &wal_paths,
+            hash_chain_required,
+            strict_recovery,
+        )?;
+        for wal in wal_paths.into_iter().take(valid_prefix_len) {
             let file = File::open(&wal)?;
             if file.metadata()?.len() <= SEGMENT_HEADER_SIZE as u64 {
                 continue;
@@ -1577,6 +1649,43 @@ pub(crate) fn resolve_target_seq_for_time(
         }
     }
     Ok(best_seq)
+}
+
+#[derive(Clone, Copy)]
+struct AedbVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+fn parse_aedb_version(raw: &str) -> Result<AedbVersion, AedbError> {
+    let numeric = raw.split_once('-').map_or(raw, |(prefix, _)| prefix);
+    let mut parts = numeric.split('.');
+    let major = parts
+        .next()
+        .ok_or_else(|| AedbError::Validation(format!("invalid AEDB version: {raw}")))?
+        .parse::<u64>()
+        .map_err(|_| AedbError::Validation(format!("invalid AEDB version: {raw}")))?;
+    let minor = parts
+        .next()
+        .ok_or_else(|| AedbError::Validation(format!("invalid AEDB version: {raw}")))?
+        .parse::<u64>()
+        .map_err(|_| AedbError::Validation(format!("invalid AEDB version: {raw}")))?;
+    let patch = parts
+        .next()
+        .ok_or_else(|| AedbError::Validation(format!("invalid AEDB version: {raw}")))?
+        .parse::<u64>()
+        .map_err(|_| AedbError::Validation(format!("invalid AEDB version: {raw}")))?;
+    if parts.next().is_some() {
+        return Err(AedbError::Validation(format!(
+            "invalid AEDB version: {raw}"
+        )));
+    }
+    Ok(AedbVersion {
+        major,
+        minor,
+        patch,
+    })
 }
 
 pub(crate) fn verify_hash_chain_batch(

@@ -1236,6 +1236,44 @@ async fn project_owner_and_delegable_grants_control_authz_delegation() {
 }
 
 #[tokio::test]
+async fn permission_denied_messages_do_not_leak_table_names() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("prod").await.expect("project");
+    create_table(
+        &db,
+        "prod",
+        "app",
+        "users",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    let err = db
+        .commit_as(
+            CallerContext::new("mallory"),
+            Mutation::Upsert {
+                project_id: "prod".into(),
+                scope_id: "app".into(),
+                table_name: "users".into(),
+                primary_key: vec![Value::Integer(1)],
+                row: Row::from_values(vec![Value::Integer(1)]),
+            },
+        )
+        .await
+        .expect_err("permission denied");
+    let rendered = err.to_string();
+    assert!(!rendered.contains("users"));
+    assert!(!rendered.contains("prod"));
+    assert!(!rendered.contains("app"));
+}
+
+#[tokio::test]
 async fn kv_permission_overlap_revoke_precedence_is_explicit() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -1956,6 +1994,84 @@ async fn read_policies_filter_rows_for_caller_and_can_be_cleared() {
 }
 
 #[tokio::test]
+async fn read_policy_like_patterns_substitute_caller_id() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "users".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("table");
+    for (id, owner) in [
+        (1_i64, "reader-alpha"),
+        (2, "reader-beta"),
+        (3, "other-alpha"),
+    ] {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![Value::Integer(id), Value::Text(owner.into())]),
+        })
+        .await
+        .expect("seed row");
+    }
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "reader".into(),
+        permission: Permission::TableRead {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant read");
+    db.set_read_policy(
+        "p",
+        "app",
+        "users",
+        Expr::Like("owner".into(), "$caller_id%".into()),
+    )
+    .await
+    .expect("set read policy");
+
+    let rows = db
+        .query_with_options_as(
+            Some(&CallerContext::new("reader")),
+            "p",
+            "app",
+            Query::select(&["*"]).from("users").limit(10),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("filtered query")
+        .rows;
+
+    assert_eq!(rows.len(), 2);
+}
+
+#[tokio::test]
 async fn read_policy_applies_to_joined_tables() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -2520,8 +2636,7 @@ async fn secure_profile_rejects_short_hmac_key() {
 fn arcana_profile_rejects_short_hmac_key() {
     let weak = AedbConfig::default().with_hmac_key(vec![9u8; 16]);
     let err = crate::lib_helpers::validate_arcana_config(&weak)
-        .err()
-        .expect("short hmac key must be rejected");
+        .expect_err("short hmac key must be rejected");
     assert!(matches!(err, AedbError::InvalidConfig { .. }));
 }
 
@@ -2538,14 +2653,18 @@ fn low_latency_profile_uses_batch_durability_with_strict_recovery() {
 
 #[test]
 fn checkpoint_compression_level_is_validated() {
-    let mut cfg = AedbConfig::default();
-    cfg.checkpoint_compression_level = 23;
+    let cfg = AedbConfig {
+        checkpoint_compression_level: 23,
+        ..AedbConfig::default()
+    };
     let err = crate::lib_helpers::validate_config(&cfg)
-        .err()
-        .expect("out-of-range compression level must be rejected");
+        .expect_err("out-of-range compression level must be rejected");
     assert!(matches!(err, AedbError::InvalidConfig { .. }));
 
-    cfg.checkpoint_compression_level = 1;
+    let cfg = AedbConfig {
+        checkpoint_compression_level: 1,
+        ..AedbConfig::default()
+    };
     crate::lib_helpers::validate_config(&cfg).expect("valid compression level");
 }
 
@@ -4957,6 +5076,116 @@ async fn idempotency_prunes_by_commit_window() {
 }
 
 #[test]
+fn wal_segment_gc_reclaims_checkpoint_covered_segments() {
+    let dir = tempdir().expect("temp");
+    for seq in 1_u64..=4 {
+        std::fs::write(
+            dir.path().join(format!("segment_{seq:016}.aedbwal")),
+            format!("segment-{seq}"),
+        )
+        .expect("write segment");
+    }
+    let manifest = crate::manifest::schema::Manifest {
+        durable_seq: 50,
+        visible_seq: 50,
+        active_segment_seq: 4,
+        checkpoints: vec![crate::checkpoint::writer::CheckpointMeta {
+            filename: "checkpoint_0000000000000050.aedb.zst".into(),
+            seq: 50,
+            sha256_hex: "00".repeat(32),
+            created_at_micros: 1,
+            key_id: None,
+        }],
+        segments: Vec::new(),
+    };
+    crate::manifest::atomic::write_manifest_atomic_signed(&manifest, dir.path(), None)
+        .expect("write manifest");
+    let snapshot_manager = Arc::new(parking_lot::Mutex::new(
+        crate::snapshot::gc::SnapshotManager::default(),
+    ));
+
+    let reclaimed =
+        super::reclaim_eligible_wal_segments(dir.path(), &snapshot_manager, None).expect("gc");
+
+    assert_eq!(reclaimed, 3);
+    assert!(!dir.path().join("segment_0000000000000001.aedbwal").exists());
+    assert!(!dir.path().join("segment_0000000000000002.aedbwal").exists());
+    assert!(!dir.path().join("segment_0000000000000003.aedbwal").exists());
+    assert!(dir.path().join("segment_0000000000000004.aedbwal").exists());
+}
+
+#[tokio::test]
+async fn idempotency_prunes_by_time_window() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(
+        AedbConfig {
+            idempotency_window_commits: 100,
+            idempotency_window_seconds: 1,
+            ..AedbConfig::default()
+        },
+        dir.path(),
+    )
+    .expect("open");
+    db.create_project("p").await.expect("project");
+
+    let first = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: Some(IdempotencyKey([9u8; 16])),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"time".to_vec(),
+                    value: b"v1".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect("first commit");
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"tick".to_vec(),
+        value: b"v2".to_vec(),
+    })
+    .await
+    .expect("advance and prune");
+
+    let retried = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: Some(IdempotencyKey([9u8; 16])),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"time".to_vec(),
+                    value: b"v3".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect("retried commit");
+
+    assert!(
+        retried.commit_seq > first.commit_seq,
+        "idempotency record should expire by time window"
+    );
+}
+
+#[test]
 fn open_rejects_invalid_config() {
     let dir = tempdir().expect("temp");
     let bad = AedbConfig {
@@ -5648,6 +5877,7 @@ async fn secure_multi_agent_user_perspective_invariants_hold() {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn req(
         instrument: &str,
         owner: &str,
@@ -8017,7 +8247,7 @@ async fn benchmark_durability_knob_sweep() {
         Profile {
             name: "baseline_10ms_1mb_no_coalesce",
             batch_interval_ms: 10,
-            batch_max_bytes: 1 * 1024 * 1024,
+            batch_max_bytes: 1024 * 1024,
             coalesce_enabled: false,
             coalesce_window_us: 0,
         },
@@ -8364,8 +8594,14 @@ async fn checkpoint_now_completes_under_hot_load() {
 
     let writes_after = writes.load(Ordering::Relaxed);
     let reads_after = reads.load(Ordering::Relaxed);
-    assert!(writes_after > writes_before, "writes stalled during checkpoint");
-    assert!(reads_after > reads_before, "reads stalled during checkpoint");
+    assert!(
+        writes_after > writes_before,
+        "writes stalled during checkpoint"
+    );
+    assert!(
+        reads_after > reads_before,
+        "reads stalled during checkpoint"
+    );
 
     stop.store(true, Ordering::Relaxed);
     tokio::time::timeout(Duration::from_secs(5), writer)
@@ -8809,8 +9045,30 @@ impl ReadOnlySqlAdapter for EchoSqlAdapter {
         if sql.trim() == "select id from items" {
             Ok((
                 Query::select(&["id"]).from("items"),
-                QueryOptions::default(),
+                QueryOptions {
+                    allow_full_scan: true,
+                    ..QueryOptions::default()
+                },
             ))
+        } else {
+            Err(QueryError::InvalidQuery {
+                reason: "unsupported sql".into(),
+            })
+        }
+    }
+}
+
+struct RestrictiveSqlAdapter;
+
+impl ReadOnlySqlAdapter for RestrictiveSqlAdapter {
+    fn execute_read_only(
+        &self,
+        _project_id: &str,
+        _scope_id: &str,
+        sql: &str,
+    ) -> Result<(Query, QueryOptions), QueryError> {
+        if sql.trim() == "select * from items" {
+            Ok((Query::select(&["*"]).from("items"), QueryOptions::default()))
         } else {
             Err(QueryError::InvalidQuery {
                 reason: "unsupported sql".into(),
@@ -9268,6 +9526,128 @@ async fn telemetry_sql_and_remote_adapter_paths_work() {
 }
 
 #[tokio::test]
+async fn strict_restore_rejects_older_backup_version() {
+    let dir = tempdir().expect("data dir");
+    let backup_dir = tempdir().expect("backup dir");
+    let config = AedbConfig::production([7u8; 32]);
+    let db = AedbInstance::open_secure(config.clone(), dir.path()).expect("open secure");
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "arcana".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        system,
+        Mutation::Ddl(DdlOperation::CreateScope {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+        }),
+    )
+    .await
+    .expect("create scope");
+    db.backup_full(backup_dir.path())
+        .await
+        .expect("backup full");
+
+    let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
+        .expect("manifest");
+    manifest.aedb_version = "0.1.0".into();
+    crate::backup::write_backup_manifest(backup_dir.path(), &manifest, config.hmac_key())
+        .expect("rewrite manifest");
+
+    let restore_dir = tempdir().expect("restore dir");
+    let err = AedbInstance::restore_from_backup_chain(
+        &[backup_dir.path().to_path_buf()],
+        restore_dir.path(),
+        &config,
+        None,
+    )
+    .expect_err("strict restore must reject older backup version");
+    assert!(format!("{err}").contains("matching AEDB patch version"));
+}
+
+#[tokio::test]
+async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
+    let dir = tempdir().expect("data dir");
+    let backup_dir = tempdir().expect("backup dir");
+    let restore_dir = tempdir().expect("restore dir");
+    let config = AedbConfig::production([8u8; 32]);
+    let db = AedbInstance::open_secure(config.clone(), dir.path()).expect("open secure");
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "arcana".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateScope {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+        }),
+    )
+    .await
+    .expect("create scope");
+    db.commit_as(
+        system,
+        Mutation::KvSet {
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        },
+    )
+    .await
+    .expect("write kv");
+    db.backup_full(backup_dir.path())
+        .await
+        .expect("backup full");
+
+    let manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
+        .expect("manifest");
+    let wal_name = manifest.wal_segments.first().expect("wal segment");
+    let wal_path = backup_dir.path().join("wal_tail").join(wal_name);
+    let mut wal_bytes = fs::read(&wal_path).expect("read wal");
+    wal_bytes[0] ^= 0xFF;
+    fs::write(&wal_path, wal_bytes).expect("corrupt wal");
+    let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
+        .expect("manifest");
+    manifest.file_sha256.insert(
+        format!("wal_tail/{wal_name}"),
+        crate::backup::sha256_file_hex(&wal_path).expect("rehash corrupted wal"),
+    );
+    crate::backup::write_backup_manifest(backup_dir.path(), &manifest, config.hmac_key())
+        .expect("rewrite manifest");
+
+    let err = AedbInstance::restore_from_backup_chain_at_time(
+        &[backup_dir.path().to_path_buf()],
+        restore_dir.path(),
+        &config,
+        u64::MAX,
+    )
+    .expect_err("time restore must reject invalid hash chain");
+    assert!(
+        format!("{err}").contains("bad segment header")
+            || format!("{err}").contains("segment hash chain mismatch")
+    );
+}
+
+#[tokio::test]
 async fn removing_last_telemetry_hook_disables_commit_and_query_callbacks() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -9315,6 +9695,48 @@ async fn removing_last_telemetry_hook_disables_commit_and_query_callbacks() {
 
     assert!(hook.queries.lock().expect("query telemetry").is_empty());
     assert!(hook.commits.lock().expect("commit telemetry").is_empty());
+}
+
+#[tokio::test]
+async fn query_sql_read_only_respects_adapter_scan_policy() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "items".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1)]),
+    })
+    .await
+    .expect("seed");
+
+    let err = db
+        .query_sql_read_only(
+            &RestrictiveSqlAdapter,
+            "p",
+            "app",
+            "select * from items",
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect_err("adapter should not be forced into full scan mode");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
 }
 
 #[tokio::test]
@@ -10284,5 +10706,961 @@ async fn strict_open_rejects_directory_previously_opened_in_non_strict_mode() {
     assert!(
         matches!(err, AedbError::Validation(ref msg) if msg.contains("strict open denied")),
         "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn strict_open_rejects_tampered_trust_mode_marker() {
+    let dir = tempdir().expect("temp");
+    let mut permissive = AedbConfig::production([9u8; 32]);
+    permissive.recovery_mode = RecoveryMode::Permissive;
+    permissive.hash_chain_required = false;
+
+    let db = AedbInstance::open(permissive, dir.path()).expect("open permissive");
+    db.shutdown().await.expect("shutdown permissive");
+
+    fs::write(
+        dir.path().join("trust_mode.json"),
+        r#"{"ever_non_strict_recovery":false,"ever_hash_chain_disabled":false}"#,
+    )
+    .expect("tamper trust mode marker");
+
+    let err = match AedbInstance::open(AedbConfig::production([9u8; 32]), dir.path()) {
+        Ok(db) => {
+            db.shutdown().await.expect("shutdown unexpected strict db");
+            panic!("tampered trust marker should fail closed");
+        }
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, AedbError::IntegrityError { ref message } if message.contains("trust mode marker hmac mismatch")),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn list_with_total_respects_scan_bounds_for_count_queries() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_scan_rows: 3,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    for id in 1_i64..=5_i64 {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![
+                Value::Integer(id),
+                Value::Text(format!("item-{id}").into()),
+            ]),
+        })
+        .await
+        .expect("insert item");
+    }
+
+    let err = db
+        .list_with_total(
+            "p",
+            "app",
+            Query::select(&["id"]).from("items"),
+            None,
+            None,
+            2,
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect_err("count query should respect scan bounds");
+    assert!(matches!(
+        err,
+        QueryError::ScanBoundExceeded {
+            estimated_rows: 5,
+            max_scan_rows: 3
+        }
+    ));
+}
+
+#[tokio::test]
+async fn delete_where_rejects_deep_predicate_trees() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    let mut predicate = Expr::IsNotNull("id".into());
+    for _ in 0..40 {
+        predicate = predicate.and(Expr::IsNotNull("id".into()));
+    }
+
+    let err = db
+        .commit(Mutation::DeleteWhere {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            predicate,
+            limit: None,
+        })
+        .await
+        .expect_err("deep predicate should be rejected");
+    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("expression depth")));
+}
+
+#[tokio::test]
+async fn insert_batch_rejects_duplicate_primary_keys_within_same_batch() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "users",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    let err = db
+        .insert_batch(
+            "p",
+            "app",
+            "users",
+            vec![
+                Row::from_values(vec![Value::Integer(1), Value::Text("alice".into())]),
+                Row::from_values(vec![Value::Integer(1), Value::Text("alice-dup".into())]),
+            ],
+        )
+        .await
+        .expect_err("duplicate PKs in one batch should fail before apply");
+    assert!(matches!(err, AedbError::DuplicatePK { .. }));
+
+    let rows = db
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["id", "name"]).from("users").limit(10),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query users");
+    assert!(
+        rows.rows.is_empty(),
+        "failed batch must not partially apply"
+    );
+}
+
+#[tokio::test]
+async fn delete_where_respects_scan_budget() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_scan_rows: 3,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    for id in 1_i64..=5_i64 {
+        db.commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![Value::Integer(id)]),
+        })
+        .await
+        .expect("insert item");
+    }
+
+    let err = db
+        .commit(Mutation::DeleteWhere {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            predicate: Expr::IsNotNull("id".into()),
+            limit: None,
+        })
+        .await
+        .expect_err("delete_where should honor scan budget");
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("mutation scan bound exceeded"))
+    );
+
+    for id in 1_i64..=5_i64 {
+        let row = db
+            .query_with_options(
+                "p",
+                "app",
+                Query::select(&["id"])
+                    .from("items")
+                    .where_(Expr::Eq("id".into(), Value::Integer(id)))
+                    .limit(1),
+                QueryOptions::default(),
+            )
+            .await
+            .expect("query item by id");
+        assert_eq!(row.rows.len(), 1, "row {id} should still exist");
+    }
+}
+
+#[tokio::test]
+async fn count_compare_assertions_respect_scan_budget() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_scan_rows: 3,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    for id in 1_i64..=5_i64 {
+        db.commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![Value::Integer(id)]),
+        })
+        .await
+        .expect("insert item");
+    }
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::CountCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "items".into(),
+                filter: None,
+                op: crate::commit::validation::CompareOp::Eq,
+                threshold: 5,
+            }],
+            read_set: Default::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"guard".to_vec(),
+                    value: b"1".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("assertion scan should be bounded");
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("assertion scan bound exceeded"))
+    );
+}
+
+#[tokio::test]
+async fn preflight_uses_instance_config_limits() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_kv_value_bytes: 4,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let result = db
+        .preflight(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"k".to_vec(),
+            value: b"too-large".to_vec(),
+        })
+        .await;
+    assert!(
+        matches!(result, crate::preflight::PreflightResult::Err { reason } if reason.contains("value too large"))
+    );
+}
+
+#[tokio::test]
+async fn queries_reject_oversized_in_lists_and_like_patterns() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    let oversized_in = db
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["id"]).from("items").where_(Expr::In(
+                "id".into(),
+                (0..10_001).map(Value::Integer).collect(),
+            )),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("oversized IN list should be rejected");
+    assert!(
+        matches!(oversized_in, QueryError::InvalidQuery { reason } if reason.contains("IN list"))
+    );
+
+    let oversized_like = db
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["name"])
+                .from("items")
+                .where_(Expr::Like("name".into(), "a".repeat(257))),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("oversized LIKE should be rejected");
+    assert!(
+        matches!(oversized_like, QueryError::InvalidQuery { reason } if reason.contains("LIKE pattern"))
+    );
+}
+
+#[tokio::test]
+async fn project_and_scope_admin_grants_allow_table_writes() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "project-admin".into(),
+        permission: Permission::ProjectAdmin {
+            project_id: "p".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant project admin");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "scope-admin".into(),
+        permission: Permission::ScopeAdmin {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant scope admin");
+
+    db.commit_as(
+        CallerContext::new("project-admin"),
+        Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![Value::Integer(1)]),
+        },
+    )
+    .await
+    .expect("project admin insert");
+    db.commit_as(
+        CallerContext::new("scope-admin"),
+        Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(2)],
+            row: Row::from_values(vec![Value::Integer(2)]),
+        },
+    )
+    .await
+    .expect("scope admin insert");
+}
+
+#[tokio::test]
+async fn delete_where_respects_row_level_read_policy() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "owner".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    for (id, owner) in [(1_i64, "alice"), (2_i64, "bob")] {
+        db.commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![Value::Integer(id), Value::Text(owner.into())]),
+        })
+        .await
+        .expect("seed item");
+    }
+
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        caller_id: "alice".into(),
+        permission: Permission::TableWrite {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+        },
+        actor_id: None,
+        delegable: false,
+    }))
+    .await
+    .expect("grant table write");
+    db.set_read_policy(
+        "p",
+        "app",
+        "items",
+        Expr::Eq("owner".into(), Value::Text("$caller_id".into())),
+    )
+    .await
+    .expect("set policy");
+
+    db.commit_as(
+        CallerContext::new("alice"),
+        Mutation::DeleteWhere {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            predicate: Expr::IsNotNull("id".into()),
+            limit: None,
+        },
+    )
+    .await
+    .expect("delete visible rows only");
+
+    let remaining = db
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["id", "owner"]).from("items").limit(10),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query remaining rows");
+    assert_eq!(remaining.rows.len(), 1, "one row should remain");
+    assert_eq!(remaining.rows[0].values[0], Value::Integer(2));
+    assert_eq!(remaining.rows[0].values[1], Value::Text("bob".into()));
+}
+
+#[tokio::test]
+async fn idempotency_keys_are_scoped_to_caller() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    for caller_id in ["alice", "bob"] {
+        db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+            caller_id: caller_id.into(),
+            permission: Permission::KvWrite {
+                project_id: "p".into(),
+                scope_id: Some("app".into()),
+                prefix: None,
+            },
+            actor_id: None,
+            delegable: false,
+        }))
+        .await
+        .expect("grant kv write");
+    }
+
+    let key = IdempotencyKey([7u8; 16]);
+    let alice = db
+        .commit_envelope(TransactionEnvelope {
+            caller: Some(CallerContext::new("alice")),
+            idempotency_key: Some(key.clone()),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: Default::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"alice".to_vec(),
+                    value: b"1".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect("alice commit");
+    let bob = db
+        .commit_envelope(TransactionEnvelope {
+            caller: Some(CallerContext::new("bob")),
+            idempotency_key: Some(key),
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: Default::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"bob".to_vec(),
+                    value: b"1".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect("bob commit");
+
+    assert!(matches!(
+        alice.idempotency,
+        crate::commit::executor::IdempotencyOutcome::Applied
+    ));
+    assert!(matches!(
+        bob.idempotency,
+        crate::commit::executor::IdempotencyOutcome::Applied
+    ));
+    assert_ne!(alice.commit_seq, bob.commit_seq);
+}
+
+#[tokio::test]
+async fn batch_mutations_respect_max_batch_rows() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_batch_rows: 3,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    let rows = (1_i64..=4_i64)
+        .map(|id| Row::from_values(vec![Value::Integer(id)]))
+        .collect::<Vec<_>>();
+    let insert_err = db
+        .commit(Mutation::InsertBatch {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            rows: rows.clone(),
+        })
+        .await
+        .expect_err("insert batch should be bounded");
+    assert!(matches!(insert_err, AedbError::Validation(ref msg) if msg.contains("max_batch_rows")));
+
+    let upsert_err = db
+        .commit(Mutation::UpsertBatch {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            rows,
+        })
+        .await
+        .expect_err("upsert batch should be bounded");
+    assert!(matches!(upsert_err, AedbError::Validation(ref msg) if msg.contains("max_batch_rows")));
+}
+
+#[tokio::test]
+async fn emit_event_respects_max_event_payload_bytes() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_event_payload_bytes: 16,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+
+    let err = db
+        .emit_event(
+            "p",
+            "app",
+            "topic",
+            "event-1".into(),
+            "{\"payload\":\"1234567890\"}".into(),
+        )
+        .await
+        .expect_err("event payload should be bounded");
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("max_event_payload_bytes"))
+    );
+}
+
+#[tokio::test]
+async fn float_columns_reject_non_finite_values() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "metrics",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "value".into(),
+                col_type: ColumnType::Float,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    let err = db
+        .commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "metrics".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![Value::Integer(1), Value::Float(f64::NAN)]),
+        })
+        .await
+        .expect_err("nan should be rejected");
+    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("non-finite float")));
+}
+
+#[tokio::test]
+async fn table_values_respect_max_table_value_bytes() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_table_value_bytes: 8,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "docs",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "body".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    let err = db
+        .commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "docs".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![
+                Value::Integer(1),
+                Value::Text("too-large-body".into()),
+            ]),
+        })
+        .await
+        .expect_err("oversized cell should be rejected");
+    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("max_table_value_bytes")));
+}
+
+#[tokio::test]
+async fn managed_system_tables_reject_direct_user_mutations() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+
+    let err = db
+        .commit(Mutation::Upsert {
+            project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+            scope_id: "app".into(),
+            table_name: "reactive_processor_checkpoints".into(),
+            primary_key: vec![Value::Text("processor".into())],
+            row: Row {
+                values: vec![
+                    Value::Text("processor".into()),
+                    Value::Integer(42),
+                    Value::Timestamp(1),
+                ],
+            },
+        })
+        .await
+        .expect_err("managed system tables must reject direct writes");
+
+    assert!(
+        matches!(err, AedbError::Validation(message) if message.contains("managed and read-only"))
+    );
+}
+
+#[tokio::test]
+async fn cascade_delete_respects_max_depth() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+
+    for depth in 0..=9 {
+        let table = format!("t{depth}");
+        create_table(
+            &db,
+            "p",
+            "app",
+            &table,
+            vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "parent_id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: true,
+                },
+            ],
+            vec!["id"],
+        )
+        .await;
+        if depth > 0 {
+            db.commit_ddl(DdlOperation::AlterTable {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: table.clone(),
+                alteration: crate::catalog::schema::TableAlteration::AddForeignKey(
+                    crate::catalog::schema::ForeignKey {
+                        name: format!("fk_t{depth}_to_t{}", depth - 1),
+                        columns: vec!["parent_id".into()],
+                        references_project_id: "p".into(),
+                        references_scope_id: "app".into(),
+                        references_table: format!("t{}", depth - 1),
+                        references_columns: vec!["id".into()],
+                        on_delete: crate::catalog::schema::ForeignKeyAction::Cascade,
+                        on_update: crate::catalog::schema::ForeignKeyAction::Cascade,
+                    },
+                ),
+            })
+            .await
+            .expect("add fk");
+        }
+        db.commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: table,
+            primary_key: vec![Value::Integer(depth as i64)],
+            row: Row::from_values(vec![
+                Value::Integer(depth as i64),
+                if depth == 0 {
+                    Value::Null
+                } else {
+                    Value::Integer((depth - 1) as i64)
+                },
+            ]),
+        })
+        .await
+        .expect("insert row");
+    }
+
+    let err = db
+        .commit(Mutation::Delete {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "t0".into(),
+            primary_key: vec![Value::Integer(0)],
+        })
+        .await
+        .expect_err("cascade depth should be bounded");
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("cascade delete depth exceeded"))
+    );
+}
+
+#[tokio::test]
+async fn memory_limit_is_enforced_before_wal_commit() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_memory_estimate_bytes: 500,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
+        vec!["id"],
+    )
+    .await;
+
+    let err = db
+        .commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![Value::Integer(1)]),
+        })
+        .await
+        .expect_err("memory limit should reject commit");
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("memory estimate exceeded before WAL commit"))
+    );
+
+    let rows = db
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["id"]).from("items").limit(10),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query rows");
+    assert!(
+        rows.rows.is_empty(),
+        "rejected commit must leave no row behind"
     );
 }

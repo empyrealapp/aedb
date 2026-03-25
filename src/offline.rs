@@ -5,6 +5,7 @@ use crate::error::AedbError;
 use crate::manifest::atomic::write_manifest_atomic_signed;
 use crate::manifest::schema::Manifest;
 use crate::recovery::{RecoveredState, recover_with_config};
+use crate::storage::index::extract_index_key_encoded;
 use crate::storage::keyspace::{NamespaceId, SecondaryIndexStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -401,6 +402,84 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                     ns_id
                 ));
             }
+            let schema_key = match ns_id {
+                NamespaceId::Project(namespace) => Some((namespace.clone(), table_name.clone())),
+                NamespaceId::System | NamespaceId::Global => None,
+            };
+            if let Some(schema_key) = schema_key
+                && let Some(schema) = recovered.catalog.tables.get(&schema_key)
+            {
+                for (index_name, index) in &table_data.indexes {
+                    let mut expected = index.store.clone();
+                    match &mut expected {
+                        SecondaryIndexStore::BTree(entries) => entries.clear(),
+                        SecondaryIndexStore::Hash(entries) => entries.clear(),
+                        SecondaryIndexStore::UniqueHash(entries) => entries.clear(),
+                    }
+                    for (encoded_pk, row) in &table_data.rows {
+                        match index.should_include_row(row, schema, table_name) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(err) => {
+                                violations.push(format!(
+                                    "index {index_name} predicate evaluation failed in namespace={:?} table={table_name}: {err}",
+                                    ns_id
+                                ));
+                                continue;
+                            }
+                        }
+                        let index_def = match recovered.catalog.indexes.get(&(
+                            schema_key.0.clone(),
+                            table_name.clone(),
+                            index_name.clone(),
+                        )) {
+                            Some(index_def) => index_def,
+                            None => {
+                                violations.push(format!(
+                                    "index definition missing for namespace={:?} table={table_name} index={index_name}",
+                                    ns_id
+                                ));
+                                continue;
+                            }
+                        };
+                        let index_key = match extract_index_key_encoded(
+                            row,
+                            schema,
+                            &index_def.columns,
+                        ) {
+                            Ok(key) => key,
+                            Err(err) => {
+                                violations.push(format!(
+                                        "index key extraction failed for namespace={:?} table={table_name} index={index_name}: {err}",
+                                        ns_id
+                                    ));
+                                continue;
+                            }
+                        };
+                        match &mut expected {
+                            SecondaryIndexStore::BTree(entries) => {
+                                let mut pks = entries.get(&index_key).cloned().unwrap_or_default();
+                                pks.insert(encoded_pk.clone());
+                                entries.insert(index_key, pks);
+                            }
+                            SecondaryIndexStore::Hash(entries) => {
+                                let mut pks = entries.get(&index_key).cloned().unwrap_or_default();
+                                pks.insert(encoded_pk.clone());
+                                entries.insert(index_key, pks);
+                            }
+                            SecondaryIndexStore::UniqueHash(entries) => {
+                                entries.insert(index_key, encoded_pk.clone());
+                            }
+                        }
+                    }
+                    if expected != index.store {
+                        violations.push(format!(
+                            "secondary index mismatch in namespace={:?} table={table_name} index={index_name}",
+                            ns_id
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -522,4 +601,111 @@ pub fn now_micros() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_invariants;
+    use crate::catalog::schema::{ColumnDef, IndexDef, IndexType, TableSchema};
+    use crate::catalog::types::{ColumnType, Row, Value};
+    use crate::recovery::RecoveredState;
+    use crate::storage::encoded_key::EncodedKey;
+    use crate::storage::keyspace::{
+        Keyspace, Namespace, NamespaceId, SecondaryIndex, SecondaryIndexStore, TableData,
+    };
+    use im::{HashMap as ImHashMap, OrdMap};
+    use std::collections::HashMap;
+
+    #[test]
+    fn check_invariants_detects_secondary_index_mismatch() {
+        let namespace = "p::app".to_string();
+        let pk = EncodedKey::from_values(&[Value::Integer(1)]);
+        let row = Row::from_values(vec![Value::Integer(1), Value::Text("alice".into())]);
+
+        let mut table = TableData {
+            rows: OrdMap::new(),
+            row_versions: OrdMap::new(),
+            structural_version: 0,
+            pk_hash: ImHashMap::new(),
+            row_cache: ImHashMap::new(),
+            row_versions_cache: ImHashMap::new(),
+            indexes: ImHashMap::new(),
+        };
+        table.rows.insert(pk.clone(), row.clone());
+        table.row_versions.insert(pk.clone(), 1);
+        table.pk_hash.insert(pk.clone(), ());
+        table.row_cache.insert(pk.clone(), row);
+        table.row_versions_cache.insert(pk.clone(), 1);
+        table.indexes.insert(
+            "by_owner".into(),
+            SecondaryIndex {
+                store: SecondaryIndexStore::BTree(OrdMap::new()),
+                columns_bitmask: 0,
+                partial_filter: None,
+            },
+        );
+
+        let mut ns = Namespace {
+            id: NamespaceId::Project(namespace.clone()),
+            ..Namespace::default()
+        };
+        ns.tables.insert("users".into(), table);
+
+        let mut keyspace = Keyspace::default();
+        keyspace.insert_namespace(NamespaceId::Project(namespace.clone()), ns);
+
+        let mut catalog = crate::catalog::Catalog::default();
+        catalog.tables.insert(
+            (namespace.clone(), "users".into()),
+            TableSchema {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "users".into(),
+                owner_id: None,
+                columns: vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "owner".into(),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                ],
+                primary_key: vec!["id".into()],
+                constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+            },
+        );
+        catalog.indexes.insert(
+            (namespace, "users".into(), "by_owner".into()),
+            IndexDef {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "users".into(),
+                index_name: "by_owner".into(),
+                columns: vec!["owner".into()],
+                index_type: IndexType::BTree,
+                columns_bitmask: 0,
+                partial_filter: None,
+            },
+        );
+
+        let report = check_invariants(&RecoveredState {
+            keyspace,
+            catalog,
+            current_seq: 1,
+            idempotency: HashMap::new(),
+        });
+
+        assert!(!report.ok);
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("secondary index mismatch"))
+        );
+    }
 }

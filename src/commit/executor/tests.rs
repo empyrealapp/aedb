@@ -13,6 +13,9 @@ use crate::commit::tx::{
 use crate::commit::validation::{ConflictAction, ConflictTarget, Mutation, UpdateExpr};
 use crate::config::AedbConfig;
 use crate::error::AedbError;
+use crate::order_book::{
+    ExecInstruction, OrderRequest, OrderSide, OrderType, SelfTradePrevention, TimeInForce,
+};
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
@@ -159,11 +162,14 @@ fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
     };
 
     let (write_partitions, read_partitions) =
-        super::pre_stage_validate(&validation_catalog, &envelope).expect("prestage validate");
+        super::pre_stage_validate(&validation_catalog, &envelope, &AedbConfig::default())
+            .expect("prestage validate");
 
     assert!(read_partitions.is_empty());
     assert!(
-        write_partitions.iter().any(|token| token.starts_with("tr:p::app:users:")),
+        write_partitions
+            .iter()
+            .any(|token| token.starts_with("tr:p::app:users:")),
         "expected staged table row partition token, got {write_partitions:?}"
     );
 }
@@ -874,7 +880,7 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
     let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
     assert_eq!(epoch.outcomes.len(), 2);
     assert!(
-        epoch.outcomes.iter().all(|o| matches!(o.result, Ok(_))),
+        epoch.outcomes.iter().all(|o| o.result.is_ok()),
         "all disjoint same-namespace writes should succeed"
     );
 
@@ -964,7 +970,7 @@ async fn same_table_different_rows_can_merge_after_parallel_apply() {
     let mut state = exec.state.lock().await;
     let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
     assert_eq!(epoch.outcomes.len(), 2);
-    assert!(epoch.outcomes.iter().all(|o| matches!(o.result, Ok(_))));
+    assert!(epoch.outcomes.iter().all(|o| o.result.is_ok()));
     assert_eq!(
         state
             .keyspace
@@ -1391,6 +1397,42 @@ fn parallel_single_partition_candidate_allows_multi_key_same_namespace() {
         &request.envelope.write_intent.mutations,
         &Catalog::default(),
     ));
+}
+
+#[test]
+fn order_book_mutations_are_not_parallel_apply_candidates() {
+    let request = request_with_mutations(vec![Mutation::OrderBookNew {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        request: OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "cid-1".into(),
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    }]);
+
+    assert!(
+        !super::is_parallel_single_partition_apply_candidate(
+            &request,
+            &request.envelope.write_intent.mutations,
+            &Catalog::default(),
+        ),
+        "order-book mutations should serialize until explicit barrier ordering exists"
+    );
 }
 
 #[tokio::test]
