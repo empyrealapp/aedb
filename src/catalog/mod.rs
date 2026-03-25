@@ -322,7 +322,8 @@ impl Catalog {
                     }
                     evicted
                 } else {
-                    cache.iter()
+                    cache
+                        .iter()
                         .min_by_key(|(_, entry)| entry.last_accessed_at)
                         .map(|(candidate, _)| candidate.clone())
                 };

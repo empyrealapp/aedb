@@ -92,10 +92,7 @@ pub fn write_checkpoint_with_key(
     })
 }
 
-fn encrypt_checkpoint_payload(
-    plaintext: &[u8],
-    key: &[u8; 32],
-) -> Result<Vec<u8>, AedbError> {
+fn encrypt_checkpoint_payload(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AedbError> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| AedbError::Validation(format!("invalid encryption key: {e}")))?;
 

@@ -20,6 +20,7 @@ fn decode_u64_u256(be: [u8; 32]) -> u64 {
     u64::from_be_bytes(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn order_req(
     instrument: &str,
     owner: &str,

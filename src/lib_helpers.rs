@@ -390,8 +390,7 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
         || config.max_table_value_bytes == 0
     {
         return Err(AedbError::InvalidConfig {
-            message: "max_kv_key_bytes/max_kv_value_bytes/max_table_value_bytes must be > 0"
-                .into(),
+            message: "max_kv_key_bytes/max_kv_value_bytes/max_table_value_bytes must be > 0".into(),
         });
     }
     if config.prestage_shards == 0 {
@@ -861,7 +860,9 @@ pub(crate) fn apply_table_update_exprs(
 
 pub(crate) fn query_error_to_aedb(error: QueryError) -> AedbError {
     match error {
-        QueryError::PermissionDenied { .. } => AedbError::PermissionDenied("permission denied".into()),
+        QueryError::PermissionDenied { .. } => {
+            AedbError::PermissionDenied("permission denied".into())
+        }
         other => AedbError::Validation(other.to_string()),
     }
 }
@@ -1493,7 +1494,10 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
 pub(crate) fn copy_file_prefix(src: &Path, dst: &Path, size_bytes: u64) -> Result<(), AedbError> {
     let mut reader = File::open(src)?;
     let mut writer = File::create(dst)?;
-    std::io::copy(&mut std::io::Read::by_ref(&mut reader).take(size_bytes), &mut writer)?;
+    std::io::copy(
+        &mut std::io::Read::by_ref(&mut reader).take(size_bytes),
+        &mut writer,
+    )?;
     Ok(())
 }
 

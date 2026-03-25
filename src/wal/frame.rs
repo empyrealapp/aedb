@@ -91,7 +91,8 @@ impl<W: Write> FrameWriter<W> {
             .saturating_add(PAYLOAD_TYPE_SIZE_BYTES)
             .saturating_add(payload.len())
             .saturating_add(CRC32C_SIZE_BYTES);
-        let frame_length = u32::try_from(frame_body_size_bytes).map_err(|_| FrameError::Corruption)?;
+        let frame_length =
+            u32::try_from(frame_body_size_bytes).map_err(|_| FrameError::Corruption)?;
         let len_bytes = frame_length.to_be_bytes();
         let seq_bytes = commit_seq.to_be_bytes();
         let ts_bytes = timestamp_micros.to_be_bytes();

@@ -109,20 +109,18 @@ fn apply_keyspace_only_mutation(
             scope_id,
             key,
             value,
-        } => Some(Ok(keyspace.kv_set(
-            project_id,
-            scope_id,
-            key.clone(),
-            value.clone(),
-            commit_seq,
-        ))),
+        } => Some({
+            keyspace.kv_set(project_id, scope_id, key.clone(), value.clone(), commit_seq);
+            Ok(())
+        }),
         Mutation::KvDel {
             project_id,
             scope_id,
             key,
-        } => Some(Ok({
+        } => Some({
             let _ = keyspace.kv_del(project_id, scope_id, key, commit_seq);
-        })),
+            Ok(())
+        }),
         Mutation::KvIncU256 {
             project_id,
             scope_id,
@@ -460,10 +458,8 @@ pub(super) fn pre_stage_validate(
         }
     }
     let partition_catalog = staged_catalog.as_ref().unwrap_or(&catalog);
-    let write_partitions = derive_write_partitions_for_envelope(
-        partition_catalog,
-        &envelope.write_intent.mutations,
-    );
+    let write_partitions =
+        derive_write_partitions_for_envelope(partition_catalog, &envelope.write_intent.mutations);
     let read_partitions = derive_read_partitions(envelope);
     Ok((write_partitions, read_partitions))
 }
@@ -1547,7 +1543,6 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-            ..EpochProcessResult::default()
         };
     }
 
@@ -1605,7 +1600,6 @@ pub(super) fn process_commit_epoch(
                 wal_sync_micros,
                 sync_executed,
                 catalog_changed,
-                ..EpochProcessResult::default()
             };
         }
     }
@@ -1682,7 +1676,6 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-            ..EpochProcessResult::default()
         };
     }
     let append_started = Instant::now();
@@ -1758,7 +1751,6 @@ pub(super) fn process_commit_epoch(
                 wal_sync_micros,
                 sync_executed,
                 catalog_changed,
-                ..EpochProcessResult::default()
             };
         }
         wal_sync_ops = wal_sync_ops.saturating_add(1);
@@ -1894,7 +1886,6 @@ pub(super) fn process_commit_epoch(
         wal_sync_micros,
         sync_executed,
         catalog_changed,
-        ..EpochProcessResult::default()
     }
 }
 
@@ -2632,8 +2623,7 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         | Mutation::KvMutateU64 { .. }
         | Mutation::Accumulate { .. }
         | Mutation::ExposeAccumulator { .. }
-        | Mutation::ExposeAccumulatorBatch { .. }
-        => true,
+        | Mutation::ExposeAccumulatorBatch { .. } => true,
         Mutation::Insert {
             project_id,
             scope_id,
@@ -3098,6 +3088,7 @@ pub(super) struct CoordinatorApplyOptions<'a> {
     pub max_scan_rows: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_via_coordinator(
     catalog: &mut Catalog,
     keyspace: &mut Keyspace,
@@ -4127,10 +4118,7 @@ pub(super) fn now_micros() -> u64 {
         .as_micros() as u64
 }
 
-fn scoped_idempotency_key(
-    caller: Option<&CallerContext>,
-    key: &IdempotencyKey,
-) -> IdempotencyKey {
+fn scoped_idempotency_key(caller: Option<&CallerContext>, key: &IdempotencyKey) -> IdempotencyKey {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"aedb:idempotency:v1");
     match caller {

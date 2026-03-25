@@ -16,8 +16,8 @@ use crate::order_book::{
     apply_set_instrument_halted, u256_from_be,
 };
 use crate::permission::{CallerContext, Permission};
-use crate::query::plan::Expr;
 use crate::query::operators::{compile_expr, eval_compiled_expr_public};
+use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::index::extract_index_key_encoded;
 use crate::storage::keyspace::{
@@ -2661,14 +2661,7 @@ fn apply_delete_internal_with_schema(
     };
 
     handle_referencing_foreign_keys(
-        catalog,
-        keyspace,
-        project_id,
-        scope_id,
-        table_name,
-        &old_row,
-        commit_seq,
-        0,
+        catalog, keyspace, project_id, scope_id, table_name, &old_row, commit_seq, 0,
     )?;
 
     let removed = keyspace.delete_row(project_id, scope_id, table_name, primary_key, commit_seq);
@@ -3182,6 +3175,7 @@ fn handle_referencing_foreign_keys(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_delete_internal_encoded(
     catalog: &Catalog,
     keyspace: &mut Keyspace,

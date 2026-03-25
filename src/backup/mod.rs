@@ -205,8 +205,9 @@ pub fn extract_backup_archive(
                 "backup archive path exceeds max length".into(),
             ));
         }
-        let path_len = usize::try_from(path_len_u32)
-            .map_err(|_| AedbError::Validation("backup archive path exceeds platform limits".into()))?;
+        let path_len = usize::try_from(path_len_u32).map_err(|_| {
+            AedbError::Validation("backup archive path exceeds platform limits".into())
+        })?;
         let mut path_bytes = vec![0u8; path_len];
         reader.read_exact(&mut path_bytes)?;
         let rel = String::from_utf8(path_bytes)
@@ -220,8 +221,9 @@ pub fn extract_backup_archive(
                 "backup archive payload exceeds max size".into(),
             ));
         }
-        let payload_len = usize::try_from(payload_len_u64)
-            .map_err(|_| AedbError::Validation("backup archive payload exceeds platform limits".into()))?;
+        let payload_len = usize::try_from(payload_len_u64).map_err(|_| {
+            AedbError::Validation("backup archive payload exceeds platform limits".into())
+        })?;
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload)?;
 
@@ -420,9 +422,12 @@ fn resolve_backup_output_path(dir: &Path, rel: &str) -> Result<std::path::PathBu
     let parent = out.parent().ok_or_else(|| {
         AedbError::Validation("backup archive output path must have parent".into())
     })?;
-    ensure_no_symlink_components(dir, parent.strip_prefix(dir).map_err(|_| {
-        AedbError::Validation("backup path escapes backup directory".into())
-    })?)?;
+    ensure_no_symlink_components(
+        dir,
+        parent
+            .strip_prefix(dir)
+            .map_err(|_| AedbError::Validation("backup path escapes backup directory".into()))?,
+    )?;
     fs::create_dir_all(parent)?;
     let canonical_parent = fs::canonicalize(parent)?;
     if !canonical_parent.starts_with(&base) {

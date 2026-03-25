@@ -152,7 +152,7 @@ async fn security_idempotency_rejects_same_key_for_different_request() {
 }
 
 #[tokio::test]
-async fn security_idempotency_rejects_same_key_for_different_caller() {
+async fn security_idempotency_is_scoped_to_caller() {
     let dir = tempdir().expect("temp dir");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
@@ -190,9 +190,9 @@ async fn security_idempotency_rejects_same_key_for_different_caller() {
         },
         base_seq: 0,
     };
-    db.commit_envelope(first).await.expect("first commit");
+    let first = db.commit_envelope(first).await.expect("first commit");
 
-    let err = db
+    let second = db
         .commit_envelope(TransactionEnvelope {
             caller: Some(CallerContext::new("bob")),
             idempotency_key: Some(key),
@@ -210,8 +210,16 @@ async fn security_idempotency_rejects_same_key_for_different_caller() {
             base_seq: 0,
         })
         .await
-        .expect_err("reusing key across callers must fail");
-    assert!(matches!(err, AedbError::Validation(_)));
+        .expect("same key under different caller should apply independently");
+    assert!(matches!(
+        first.idempotency,
+        aedb::commit::executor::IdempotencyOutcome::Applied
+    ));
+    assert!(matches!(
+        second.idempotency,
+        aedb::commit::executor::IdempotencyOutcome::Applied
+    ));
+    assert_ne!(first.commit_seq, second.commit_seq);
 }
 
 #[tokio::test]

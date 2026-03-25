@@ -399,7 +399,9 @@ fn evaluate_assertion(
             let ns = namespace_key(project_id, scope_id);
             let count = keyspace
                 .table_by_namespace_key(&ns, table_name)
-                .map(|table| count_matching_rows(table.rows.values(), schema, filter, max_scan_rows))
+                .map(|table| {
+                    count_matching_rows(table.rows.values(), schema, filter, max_scan_rows)
+                })
                 .transpose()?
                 .unwrap_or(0);
             if compare_ord(count.cmp(threshold), *op) {
@@ -424,15 +426,13 @@ fn evaluate_assertion(
             let ns = namespace_key(project_id, scope_id);
             let sum = match keyspace.table_by_namespace_key(&ns, table_name) {
                 None => zero_for_threshold(threshold),
-                Some(table) => {
-                    sum_rows_for_column(
-                        table.rows.values(),
-                        schema,
-                        column_idx,
-                        filter,
-                        max_scan_rows,
-                    )?
-                }
+                Some(table) => sum_rows_for_column(
+                    table.rows.values(),
+                    schema,
+                    column_idx,
+                    filter,
+                    max_scan_rows,
+                )?,
             };
             if compare_values(&sum, threshold, *op) {
                 Ok(None)
@@ -674,7 +674,10 @@ fn count_matching_rows<'a>(
     Ok(count)
 }
 
-fn ensure_assertion_scan_budget(scanned_rows: usize, max_scan_rows: usize) -> Result<(), AedbError> {
+fn ensure_assertion_scan_budget(
+    scanned_rows: usize,
+    max_scan_rows: usize,
+) -> Result<(), AedbError> {
     if scanned_rows > max_scan_rows {
         return Err(AedbError::Validation(format!(
             "assertion scan bound exceeded: scanned_rows={}, max_scan_rows={}",

@@ -242,16 +242,10 @@ fn segment_paths_for_replay(
             };
             let actual = sha256_prefix_hex(&path, hash_len)?;
             if actual != segment.sha256_hex {
-                if config.strict_recovery() && !is_active_segment {
-                    return Err(AedbError::Validation(format!(
-                        "manifest wal segment sha256 mismatch: {}",
-                        segment.filename
-                    )));
-                }
-                warn!(
-                    filename = %segment.filename,
-                    "recovery: wal segment sha256 mismatch on active/permissive segment, skipping integrity check"
-                );
+                return Err(AedbError::Validation(format!(
+                    "manifest wal segment sha256 mismatch: {}",
+                    segment.filename
+                )));
             }
         }
         let replay_limit_path = path.clone();
@@ -368,18 +362,18 @@ fn sha256_prefix_hex(path: &Path, bytes_to_hash: u64) -> Result<String, AedbErro
 #[cfg(test)]
 mod tests {
     use super::recover_with_config;
-    use crate::catalog::{Catalog, DdlOperation};
     use crate::catalog::schema::ColumnDef;
     use crate::catalog::types::{ColumnType, Row, Value};
+    use crate::catalog::{Catalog, DdlOperation};
     use crate::checkpoint::writer::CheckpointMeta;
-    use crate::commit::tx::WalCommitPayload;
     use crate::checkpoint::writer::write_checkpoint;
     use crate::commit::executor::CommitExecutor;
+    use crate::commit::tx::WalCommitPayload;
     use crate::commit::validation::Mutation;
-    use crate::recovery::replay::replay_segments;
-    use crate::storage::keyspace::Keyspace;
     use crate::manifest::atomic::write_manifest_atomic;
     use crate::manifest::schema::{Manifest, SegmentMeta};
+    use crate::recovery::replay::replay_segments;
+    use crate::storage::keyspace::Keyspace;
     use crate::wal::frame::append_frame_bytes;
     use crate::wal::segment::SegmentHeader;
     use std::collections::HashMap;

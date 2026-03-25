@@ -442,17 +442,20 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                                 continue;
                             }
                         };
-                        let index_key =
-                            match extract_index_key_encoded(row, schema, &index_def.columns) {
-                                Ok(key) => key,
-                                Err(err) => {
-                                    violations.push(format!(
+                        let index_key = match extract_index_key_encoded(
+                            row,
+                            schema,
+                            &index_def.columns,
+                        ) {
+                            Ok(key) => key,
+                            Err(err) => {
+                                violations.push(format!(
                                         "index key extraction failed for namespace={:?} table={table_name} index={index_name}: {err}",
                                         ns_id
                                     ));
-                                    continue;
-                                }
-                            };
+                                continue;
+                            }
+                        };
                         match &mut expected {
                             SecondaryIndexStore::BTree(entries) => {
                                 let mut pks = entries.get(&index_key).cloned().unwrap_or_default();
@@ -607,7 +610,9 @@ mod tests {
     use crate::catalog::types::{ColumnType, Row, Value};
     use crate::recovery::RecoveredState;
     use crate::storage::encoded_key::EncodedKey;
-    use crate::storage::keyspace::{Keyspace, Namespace, NamespaceId, SecondaryIndex, SecondaryIndexStore, TableData};
+    use crate::storage::keyspace::{
+        Keyspace, Namespace, NamespaceId, SecondaryIndex, SecondaryIndexStore, TableData,
+    };
     use im::{HashMap as ImHashMap, OrdMap};
     use std::collections::HashMap;
 
@@ -696,9 +701,11 @@ mod tests {
         });
 
         assert!(!report.ok);
-        assert!(report
-            .violations
-            .iter()
-            .any(|violation| violation.contains("secondary index mismatch")));
+        assert!(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.contains("secondary index mismatch"))
+        );
     }
 }

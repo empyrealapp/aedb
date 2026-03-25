@@ -2020,7 +2020,11 @@ async fn read_policy_like_patterns_substitute_caller_id() {
     }))
     .await
     .expect("table");
-    for (id, owner) in [(1_i64, "reader-alpha"), (2, "reader-beta"), (3, "other-alpha")] {
+    for (id, owner) in [
+        (1_i64, "reader-alpha"),
+        (2, "reader-beta"),
+        (3, "other-alpha"),
+    ] {
         db.commit(Mutation::Upsert {
             project_id: "p".into(),
             scope_id: "app".into(),
@@ -2632,8 +2636,7 @@ async fn secure_profile_rejects_short_hmac_key() {
 fn arcana_profile_rejects_short_hmac_key() {
     let weak = AedbConfig::default().with_hmac_key(vec![9u8; 16]);
     let err = crate::lib_helpers::validate_arcana_config(&weak)
-        .err()
-        .expect("short hmac key must be rejected");
+        .expect_err("short hmac key must be rejected");
     assert!(matches!(err, AedbError::InvalidConfig { .. }));
 }
 
@@ -2650,14 +2653,18 @@ fn low_latency_profile_uses_batch_durability_with_strict_recovery() {
 
 #[test]
 fn checkpoint_compression_level_is_validated() {
-    let mut cfg = AedbConfig::default();
-    cfg.checkpoint_compression_level = 23;
+    let cfg = AedbConfig {
+        checkpoint_compression_level: 23,
+        ..AedbConfig::default()
+    };
     let err = crate::lib_helpers::validate_config(&cfg)
-        .err()
-        .expect("out-of-range compression level must be rejected");
+        .expect_err("out-of-range compression level must be rejected");
     assert!(matches!(err, AedbError::InvalidConfig { .. }));
 
-    cfg.checkpoint_compression_level = 1;
+    let cfg = AedbConfig {
+        checkpoint_compression_level: 1,
+        ..AedbConfig::default()
+    };
     crate::lib_helpers::validate_config(&cfg).expect("valid compression level");
 }
 
@@ -5093,7 +5100,9 @@ fn wal_segment_gc_reclaims_checkpoint_covered_segments() {
     };
     crate::manifest::atomic::write_manifest_atomic_signed(&manifest, dir.path(), None)
         .expect("write manifest");
-    let snapshot_manager = Arc::new(parking_lot::Mutex::new(crate::snapshot::gc::SnapshotManager::default()));
+    let snapshot_manager = Arc::new(parking_lot::Mutex::new(
+        crate::snapshot::gc::SnapshotManager::default(),
+    ));
 
     let reclaimed =
         super::reclaim_eligible_wal_segments(dir.path(), &snapshot_manager, None).expect("gc");
@@ -5868,6 +5877,7 @@ async fn secure_multi_agent_user_perspective_invariants_hold() {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn req(
         instrument: &str,
         owner: &str,
@@ -8237,7 +8247,7 @@ async fn benchmark_durability_knob_sweep() {
         Profile {
             name: "baseline_10ms_1mb_no_coalesce",
             batch_interval_ms: 10,
-            batch_max_bytes: 1 * 1024 * 1024,
+            batch_max_bytes: 1024 * 1024,
             coalesce_enabled: false,
             coalesce_window_us: 0,
         },
@@ -8584,8 +8594,14 @@ async fn checkpoint_now_completes_under_hot_load() {
 
     let writes_after = writes.load(Ordering::Relaxed);
     let reads_after = reads.load(Ordering::Relaxed);
-    assert!(writes_after > writes_before, "writes stalled during checkpoint");
-    assert!(reads_after > reads_before, "reads stalled during checkpoint");
+    assert!(
+        writes_after > writes_before,
+        "writes stalled during checkpoint"
+    );
+    assert!(
+        reads_after > reads_before,
+        "reads stalled during checkpoint"
+    );
 
     stop.store(true, Ordering::Relaxed);
     tokio::time::timeout(Duration::from_secs(5), writer)
@@ -9537,18 +9553,24 @@ async fn strict_restore_rejects_older_backup_version() {
     )
     .await
     .expect("create scope");
-    db.backup_full(backup_dir.path()).await.expect("backup full");
+    db.backup_full(backup_dir.path())
+        .await
+        .expect("backup full");
 
-    let mut manifest =
-        crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key()).expect("manifest");
+    let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
+        .expect("manifest");
     manifest.aedb_version = "0.1.0".into();
     crate::backup::write_backup_manifest(backup_dir.path(), &manifest, config.hmac_key())
         .expect("rewrite manifest");
 
     let restore_dir = tempdir().expect("restore dir");
-    let err =
-        AedbInstance::restore_from_backup_chain(&[backup_dir.path().to_path_buf()], restore_dir.path(), &config, None)
-            .expect_err("strict restore must reject older backup version");
+    let err = AedbInstance::restore_from_backup_chain(
+        &[backup_dir.path().to_path_buf()],
+        restore_dir.path(),
+        &config,
+        None,
+    )
+    .expect_err("strict restore must reject older backup version");
     assert!(format!("{err}").contains("matching AEDB patch version"));
 }
 
@@ -9592,17 +9614,19 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
     )
     .await
     .expect("write kv");
-    db.backup_full(backup_dir.path()).await.expect("backup full");
+    db.backup_full(backup_dir.path())
+        .await
+        .expect("backup full");
 
-    let manifest =
-        crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key()).expect("manifest");
+    let manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
+        .expect("manifest");
     let wal_name = manifest.wal_segments.first().expect("wal segment");
     let wal_path = backup_dir.path().join("wal_tail").join(wal_name);
     let mut wal_bytes = fs::read(&wal_path).expect("read wal");
     wal_bytes[0] ^= 0xFF;
     fs::write(&wal_path, wal_bytes).expect("corrupt wal");
-    let mut manifest =
-        crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key()).expect("manifest");
+    let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
+        .expect("manifest");
     manifest.file_sha256.insert(
         format!("wal_tail/{wal_name}"),
         crate::backup::sha256_file_hex(&wal_path).expect("rehash corrupted wal"),
@@ -10717,8 +10741,10 @@ async fn strict_open_rejects_tampered_trust_mode_marker() {
 #[tokio::test]
 async fn list_with_total_respects_scan_bounds_for_count_queries() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_scan_rows = 3;
+    let config = AedbConfig {
+        max_scan_rows: 3,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
@@ -10749,7 +10775,10 @@ async fn list_with_total_respects_scan_bounds_for_count_queries() {
             scope_id: "app".into(),
             table_name: "items".into(),
             primary_key: vec![Value::Integer(id)],
-            row: Row::from_values(vec![Value::Integer(id), Value::Text(format!("item-{id}").into())]),
+            row: Row::from_values(vec![
+                Value::Integer(id),
+                Value::Text(format!("item-{id}").into()),
+            ]),
         })
         .await
         .expect("insert item");
@@ -10864,14 +10893,19 @@ async fn insert_batch_rejects_duplicate_primary_keys_within_same_batch() {
         )
         .await
         .expect("query users");
-    assert!(rows.rows.is_empty(), "failed batch must not partially apply");
+    assert!(
+        rows.rows.is_empty(),
+        "failed batch must not partially apply"
+    );
 }
 
 #[tokio::test]
 async fn delete_where_respects_scan_budget() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_scan_rows = 3;
+    let config = AedbConfig {
+        max_scan_rows: 3,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
@@ -10911,7 +10945,9 @@ async fn delete_where_respects_scan_budget() {
         })
         .await
         .expect_err("delete_where should honor scan budget");
-    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("mutation scan bound exceeded")));
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("mutation scan bound exceeded"))
+    );
 
     for id in 1_i64..=5_i64 {
         let row = db
@@ -10933,8 +10969,10 @@ async fn delete_where_respects_scan_budget() {
 #[tokio::test]
 async fn count_compare_assertions_respect_scan_budget() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_scan_rows = 3;
+    let config = AedbConfig {
+        max_scan_rows: 3,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
@@ -10990,14 +11028,18 @@ async fn count_compare_assertions_respect_scan_budget() {
         })
         .await
         .expect_err("assertion scan should be bounded");
-    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("assertion scan bound exceeded")));
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("assertion scan bound exceeded"))
+    );
 }
 
 #[tokio::test]
 async fn preflight_uses_instance_config_limits() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_kv_value_bytes = 4;
+    let config = AedbConfig {
+        max_kv_value_bytes: 4,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
@@ -11009,7 +11051,9 @@ async fn preflight_uses_instance_config_limits() {
             value: b"too-large".to_vec(),
         })
         .await;
-    assert!(matches!(result, crate::preflight::PreflightResult::Err { reason } if reason.contains("value too large")));
+    assert!(
+        matches!(result, crate::preflight::PreflightResult::Err { reason } if reason.contains("value too large"))
+    );
 }
 
 #[tokio::test]
@@ -11051,7 +11095,9 @@ async fn queries_reject_oversized_in_lists_and_like_patterns() {
         )
         .await
         .expect_err("oversized IN list should be rejected");
-    assert!(matches!(oversized_in, QueryError::InvalidQuery { reason } if reason.contains("IN list")));
+    assert!(
+        matches!(oversized_in, QueryError::InvalidQuery { reason } if reason.contains("IN list"))
+    );
 
     let oversized_like = db
         .query_with_options(
@@ -11064,7 +11110,9 @@ async fn queries_reject_oversized_in_lists_and_like_patterns() {
         )
         .await
         .expect_err("oversized LIKE should be rejected");
-    assert!(matches!(oversized_like, QueryError::InvalidQuery { reason } if reason.contains("LIKE pattern")));
+    assert!(
+        matches!(oversized_like, QueryError::InvalidQuery { reason } if reason.contains("LIKE pattern"))
+    );
 }
 
 #[tokio::test]
@@ -11283,16 +11331,24 @@ async fn idempotency_keys_are_scoped_to_caller() {
         .await
         .expect("bob commit");
 
-    assert!(matches!(alice.idempotency, crate::commit::executor::IdempotencyOutcome::Applied));
-    assert!(matches!(bob.idempotency, crate::commit::executor::IdempotencyOutcome::Applied));
+    assert!(matches!(
+        alice.idempotency,
+        crate::commit::executor::IdempotencyOutcome::Applied
+    ));
+    assert!(matches!(
+        bob.idempotency,
+        crate::commit::executor::IdempotencyOutcome::Applied
+    ));
     assert_ne!(alice.commit_seq, bob.commit_seq);
 }
 
 #[tokio::test]
 async fn batch_mutations_respect_max_batch_rows() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_batch_rows = 3;
+    let config = AedbConfig {
+        max_batch_rows: 3,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
@@ -11339,8 +11395,10 @@ async fn batch_mutations_respect_max_batch_rows() {
 #[tokio::test]
 async fn emit_event_respects_max_event_payload_bytes() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_event_payload_bytes = 16;
+    let config = AedbConfig {
+        max_event_payload_bytes: 16,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
@@ -11355,7 +11413,9 @@ async fn emit_event_respects_max_event_payload_bytes() {
         )
         .await
         .expect_err("event payload should be bounded");
-    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("max_event_payload_bytes")));
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("max_event_payload_bytes"))
+    );
 }
 
 #[tokio::test]
@@ -11547,14 +11607,18 @@ async fn cascade_delete_respects_max_depth() {
         })
         .await
         .expect_err("cascade depth should be bounded");
-    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("cascade delete depth exceeded")));
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("cascade delete depth exceeded"))
+    );
 }
 
 #[tokio::test]
 async fn memory_limit_is_enforced_before_wal_commit() {
     let dir = tempdir().expect("temp");
-    let mut config = AedbConfig::default();
-    config.max_memory_estimate_bytes = 500;
+    let config = AedbConfig {
+        max_memory_estimate_bytes: 500,
+        ..AedbConfig::default()
+    };
     let db = AedbInstance::open(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
@@ -11582,7 +11646,9 @@ async fn memory_limit_is_enforced_before_wal_commit() {
         })
         .await
         .expect_err("memory limit should reject commit");
-    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("memory estimate exceeded before WAL commit")));
+    assert!(
+        matches!(err, AedbError::Validation(ref msg) if msg.contains("memory estimate exceeded before WAL commit"))
+    );
 
     let rows = db
         .query_with_options(
@@ -11593,5 +11659,8 @@ async fn memory_limit_is_enforced_before_wal_commit() {
         )
         .await
         .expect("query rows");
-    assert!(rows.rows.is_empty(), "rejected commit must leave no row behind");
+    assert!(
+        rows.rows.is_empty(),
+        "rejected commit must leave no row behind"
+    );
 }

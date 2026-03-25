@@ -136,43 +136,41 @@ pub(crate) fn explain_access_path_for_query(
             });
         }
 
-        if let Some(table) = table {
-            if let Some(indexed) = indexed_pks_for_predicate_with_trace(
+        if let Some(table) = table
+            && let Some(indexed) = indexed_pks_for_predicate_with_trace(
                 catalog,
                 project_id,
                 scope_id,
                 &query.table,
                 table,
                 predicate,
-            )? {
-                if !indexed.selected_indexes.is_empty() {
-                    selected_indexes.extend(indexed.selected_indexes.clone());
-                    predicate_evaluation_path =
-                        crate::PredicateEvaluationPath::SecondaryIndexLookup;
-                } else {
-                    predicate_evaluation_path = crate::PredicateEvaluationPath::FullScanFilter;
-                }
-                trace.extend(indexed.plan_trace);
-                if matches!(
-                    predicate_evaluation_path,
-                    crate::PredicateEvaluationPath::FullScanFilter
-                ) {
-                    trace.push(
-                        "no matching secondary index; evaluating predicate during table scan"
-                            .to_string(),
-                    );
-                } else {
-                    trace.push(
-                        "residual predicate is evaluated on rows returned by index lookup"
-                            .to_string(),
-                    );
-                }
-                return Ok(AccessPathDiagnostics {
-                    selected_indexes,
-                    predicate_evaluation_path,
-                    plan_trace: trace,
-                });
+            )?
+        {
+            if !indexed.selected_indexes.is_empty() {
+                selected_indexes.extend(indexed.selected_indexes.clone());
+                predicate_evaluation_path = crate::PredicateEvaluationPath::SecondaryIndexLookup;
+            } else {
+                predicate_evaluation_path = crate::PredicateEvaluationPath::FullScanFilter;
             }
+            trace.extend(indexed.plan_trace);
+            if matches!(
+                predicate_evaluation_path,
+                crate::PredicateEvaluationPath::FullScanFilter
+            ) {
+                trace.push(
+                    "no matching secondary index; evaluating predicate during table scan"
+                        .to_string(),
+                );
+            } else {
+                trace.push(
+                    "residual predicate is evaluated on rows returned by index lookup".to_string(),
+                );
+            }
+            return Ok(AccessPathDiagnostics {
+                selected_indexes,
+                predicate_evaluation_path,
+                plan_trace: trace,
+            });
         }
 
         trace.push("predicate not indexable for current schema/index set".to_string());

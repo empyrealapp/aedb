@@ -194,12 +194,7 @@ fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
             project_id,
             scope_id,
             key,
-        } => Some(
-            MUTATION_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + key.len(),
-        ),
+        } => Some(MUTATION_OVERHEAD_UPPER_BOUND + project_id.len() + scope_id.len() + key.len()),
         Mutation::KvIncU256 {
             project_id,
             scope_id,
@@ -223,13 +218,9 @@ fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
             scope_id,
             key,
             ..
-        } => Some(
-            MUTATION_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + key.len()
-                + 48,
-        ),
+        } => {
+            Some(MUTATION_OVERHEAD_UPPER_BOUND + project_id.len() + scope_id.len() + key.len() + 48)
+        }
         Mutation::KvAddU64Ex {
             project_id,
             scope_id,
@@ -253,13 +244,9 @@ fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
             scope_id,
             key,
             ..
-        } => Some(
-            MUTATION_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + key.len()
-                + 24,
-        ),
+        } => {
+            Some(MUTATION_OVERHEAD_UPPER_BOUND + project_id.len() + scope_id.len() + key.len() + 24)
+        }
         Mutation::Upsert {
             project_id,
             scope_id,
@@ -298,8 +285,7 @@ fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
 }
 
 fn estimate_single_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
-    estimate_mutation_size_upper_bound(mutation)?
-        .checked_add(ENVELOPE_OVERHEAD_UPPER_BOUND)
+    estimate_mutation_size_upper_bound(mutation)?.checked_add(ENVELOPE_OVERHEAD_UPPER_BOUND)
 }
 
 fn estimate_transaction_envelope_size_upper_bound(envelope: &TransactionEnvelope) -> Option<usize> {
@@ -414,7 +400,7 @@ fn should_log_commit_phase(total_elapsed_ms: u64) -> bool {
         return false;
     }
     let n = COMMIT_PHASE_LOG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    n % settings.sample_every == 0
+    n.is_multiple_of(settings.sample_every)
 }
 
 #[derive(Clone)]
@@ -574,8 +560,7 @@ impl CommitExecutor {
         let initial_epoch_min_commits = adaptive_epoch.current_min_commits();
         let initial_epoch_max_wait_us = adaptive_epoch.current_max_wait_us();
         let global_unique_index = GlobalUniqueIndexState::from_snapshot(&catalog, &keyspace)?;
-        let initial_post_apply_refresh_needed =
-            Self::catalog_requires_post_apply_refresh(&catalog);
+        let initial_post_apply_refresh_needed = Self::catalog_requires_post_apply_refresh(&catalog);
         let mut version_store = VersionStore::new(
             config.max_versions,
             config.version_store_full_snapshot_interval_deltas,
@@ -1004,18 +989,16 @@ impl CommitExecutor {
                                 &catalog,
                                 &req.envelope.write_intent.mutations,
                             )
-                        } else {
-                            if let [mutation] = req.envelope.write_intent.mutations.as_slice() {
-                                if let Some(token) = single_write_partition_token(mutation) {
-                                    let mut out = HashSet::with_capacity(1);
-                                    out.insert(token);
-                                    out
-                                } else {
-                                    derive_write_partitions(&req.envelope.write_intent.mutations)
-                                }
+                        } else if let [mutation] = req.envelope.write_intent.mutations.as_slice() {
+                            if let Some(token) = single_write_partition_token(mutation) {
+                                let mut out = HashSet::with_capacity(1);
+                                out.insert(token);
+                                out
                             } else {
                                 derive_write_partitions(&req.envelope.write_intent.mutations)
                             }
+                        } else {
+                            derive_write_partitions(&req.envelope.write_intent.mutations)
                         };
                         (write_partitions, derive_read_partitions(&req.envelope))
                     } else {
@@ -1219,19 +1202,24 @@ impl CommitExecutor {
             .is_none()
             .then(|| estimate_single_mutation_size_upper_bound(&mutation))
             .flatten();
-        self.submit_envelope_with_mode_size_hint(TransactionEnvelope {
-            caller,
-            idempotency_key: None,
-            write_class: WriteClass::Standard,
-            assertions: Vec::new(),
-            read_set: Default::default(),
-            write_intent: WriteIntent {
-                mutations: vec![mutation],
+        self.submit_envelope_with_mode_size_hint(
+            TransactionEnvelope {
+                caller,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![mutation],
+                },
+                // No read set/assertions in single-mutation submit path.
+                // A fixed base_seq avoids an extra state lock on the hot write path.
+                base_seq: 0,
             },
-            // No read set/assertions in single-mutation submit path.
-            // A fixed base_seq avoids an extra state lock on the hot write path.
-            base_seq: 0,
-        }, false, false, fast_size_hint)
+            false,
+            false,
+            fast_size_hint,
+        )
         .await
     }
 

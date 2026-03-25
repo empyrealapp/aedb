@@ -715,7 +715,13 @@ pub fn preflight_plan(
     mutation: &Mutation,
     base_seq: u64,
 ) -> PreflightPlan {
-    preflight_plan_with_config(snapshot, catalog, mutation, base_seq, &AedbConfig::default())
+    preflight_plan_with_config(
+        snapshot,
+        catalog,
+        mutation,
+        base_seq,
+        &AedbConfig::default(),
+    )
 }
 
 pub fn preflight_plan_with_config(

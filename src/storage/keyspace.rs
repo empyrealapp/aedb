@@ -735,6 +735,7 @@ impl Keyspace {
         namespace.accumulators.remove(accumulator_name);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn append_accumulator_delta(
         &mut self,
         project_id: &str,
@@ -1213,6 +1214,7 @@ impl Keyspace {
         Ok(next)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_add_u256_ex(
         &mut self,
         project_id: &str,
@@ -1244,6 +1246,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_sub_u256_ex(
         &mut self,
         project_id: &str,
@@ -1359,6 +1362,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_add_u64_ex(
         &mut self,
         project_id: &str,
@@ -1420,6 +1424,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_sub_u64_ex(
         &mut self,
         project_id: &str,
@@ -1451,6 +1456,7 @@ impl Keyspace {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_sub_int_ex(
         &mut self,
         project_id: &str,
@@ -1495,6 +1501,7 @@ impl Keyspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn counter_add_sharded(
         &mut self,
         project_id: &str,

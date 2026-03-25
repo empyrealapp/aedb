@@ -146,10 +146,9 @@ fn verify_trust_mode_marker_hmac(dir: &Path, key: &[u8], bytes: &[u8]) -> Result
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AedbError> {
     use std::io::Write as _;
 
-    let dir = path.parent().ok_or_else(|| AedbError::Validation(format!(
-        "path has no parent: {}",
-        path.display()
-    )))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| AedbError::Validation(format!("path has no parent: {}", path.display())))?;
     let mut tmp = NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
     tmp.flush()?;
@@ -378,7 +377,7 @@ fn should_log_read_phase(total_micros: u64) -> bool {
         return false;
     }
     let n = READ_PHASE_LOG_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    n % settings.sample_every == 0
+    n.is_multiple_of(settings.sample_every)
 }
 
 fn system_now_micros() -> u64 {
@@ -1964,14 +1963,7 @@ impl AedbInstance {
         let mut result = result?;
         self.sign_query_result_cursor(&mut result)?;
         let result = Ok(result);
-        self.emit_query_telemetry(
-            started,
-            project_id,
-            scope_id,
-            &table,
-            view.seq,
-            &result,
-        );
+        self.emit_query_telemetry(started, project_id, scope_id, &table, view.seq, &result);
         result
     }
 
@@ -3547,6 +3539,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn counter_add_sharded_as(
         &self,
         caller: CallerContext,
@@ -3791,6 +3784,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accumulate_with_release(
         &self,
         project_id: &str,
@@ -3813,6 +3807,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accumulate_as(
         &self,
         caller: CallerContext,
@@ -3836,6 +3831,7 @@ impl AedbInstance {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn accumulate_with_release_as(
         &self,
         caller: CallerContext,
@@ -4720,7 +4716,7 @@ impl AedbInstance {
             "ack_reactive_processor_checkpoint_as",
             envelope,
         )
-            .await
+        .await
     }
 
     pub async fn ack_reactive_processor_checkpoint_batched(
@@ -4847,7 +4843,11 @@ impl AedbInstance {
             scope_id: SYSTEM_SCOPE_ID.to_string(),
             table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
         };
-        if !lease.view.catalog.has_permission(&caller.caller_id, &required) {
+        if !lease
+            .view
+            .catalog
+            .has_permission(&caller.caller_id, &required)
+        {
             return Err(AedbError::PermissionDenied("permission denied".into()));
         }
         Ok(())
@@ -5805,7 +5805,7 @@ impl AedbInstance {
             && bytes < options.max_bytes_per_run
             && Instant::now() < deadline
         {
-            let limit = (options.max_events_per_run - events.len()).min(128).max(1);
+            let limit = (options.max_events_per_run - events.len()).clamp(1, 128);
             let page = if let Some(caller) = caller {
                 db.read_event_stream_as(
                     caller,
@@ -9417,7 +9417,7 @@ impl AedbInstance {
             let prefix = b"__migrations/";
             let start = Bound::Included(prefix.to_vec());
             let end = next_prefix_bytes(prefix).map_or(Bound::Unbounded, Bound::Excluded);
-            if let Some((key, value)) = namespace.kv.entries.range((start, end)).rev().next() {
+            if let Some((key, value)) = namespace.kv.entries.range((start, end)).next_back() {
                 if let Some(version) = parse_migration_version_from_key(key) {
                     return Ok(version);
                 }
@@ -9832,12 +9832,7 @@ impl ReadTx<'_> {
             use_index: query.use_index.clone(),
         };
         let count_result = self
-            .query_with_options(
-                project_id,
-                scope_id,
-                count_query,
-                QueryOptions::default(),
-            )
+            .query_with_options(project_id, scope_id, count_query, QueryOptions::default())
             .await?;
         let total_count = count_result
             .rows
@@ -9860,12 +9855,7 @@ impl ReadTx<'_> {
             let mut full_query = query.clone();
             full_query.limit = Some(requested_rows);
             let full = self
-                .query_with_options(
-                    project_id,
-                    scope_id,
-                    full_query,
-                    QueryOptions::default(),
-                )
+                .query_with_options(project_id, scope_id, full_query, QueryOptions::default())
                 .await?;
             let rows = full
                 .rows
@@ -9934,7 +9924,7 @@ impl ReadTx<'_> {
             }),
             ..hydrate_query
         };
-        let page_size = self.db._config.max_scan_rows.min(100).max(1);
+        let page_size = self.db._config.max_scan_rows.clamp(1, 100);
         let mut hydrate_query = ensure_stable_order_from_catalog(
             project_id,
             scope_id,

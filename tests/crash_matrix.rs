@@ -1,4 +1,5 @@
 use aedb::AedbInstance;
+use aedb::backup::sha256_file_hex;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
@@ -7,7 +8,8 @@ use aedb::commit::tx::{IdempotencyKey, ReadSet, TransactionEnvelope, WriteClass,
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use aedb::error::AedbError;
-use aedb::manifest::atomic::load_manifest_signed;
+use aedb::manifest::atomic::{load_manifest_signed, write_manifest_atomic_signed};
+use aedb::manifest::schema::{Manifest, SegmentMeta};
 use aedb::query::plan::{ConsistencyMode, Expr, Query};
 use aedb::recovery::recover_with_config;
 use std::collections::HashMap;
@@ -623,26 +625,80 @@ async fn crash_matrix_corrupt_manifest_hmac_fails_closed() {
 async fn crash_matrix_segment_deletion_breaks_hash_chain() {
     let dir = tempdir().expect("temp dir");
     let mut config = production_config();
-    config.max_segment_bytes = 512;
+    config.max_segment_bytes = 256;
     let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
+    let mut durable_seq = 0u64;
     for i in 0..200u64 {
-        db.commit(Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: format!("seg:{i}").into_bytes(),
-            value: vec![u8::try_from(i % 251).unwrap_or(0); 64],
-        })
-        .await
-        .expect("write");
+        durable_seq = db
+            .commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("seg:{i}").into_bytes(),
+                value: vec![u8::try_from(i % 251).unwrap_or(0); 128],
+            })
+            .await
+            .expect("write")
+            .commit_seq;
     }
-    db.checkpoint_now().await.expect("checkpoint");
     drop(db);
 
     let segments = segment_paths(dir.path());
     assert!(segments.len() >= 3, "need >=3 segments for deletion test");
-    let middle = segments[segments.len() / 2].clone();
-    fs::remove_file(middle).expect("delete middle segment");
+    let active_segment_seq = segments
+        .last()
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| {
+                    name.trim_start_matches("segment_")
+                        .trim_end_matches(".aedbwal")
+                        .parse::<u64>()
+                        .ok()
+                })
+        })
+        .expect("active segment seq");
+    let mut manifest = Manifest {
+        durable_seq,
+        visible_seq: durable_seq,
+        active_segment_seq,
+        checkpoints: vec![],
+        segments: segments
+            .iter()
+            .map(|path| SegmentMeta {
+                filename: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("segment filename")
+                    .to_string(),
+                segment_seq: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.trim_start_matches("segment_")
+                            .trim_end_matches(".aedbwal")
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .expect("segment seq"),
+                sha256_hex: sha256_file_hex(path).expect("segment sha"),
+                size_bytes: fs::metadata(path).expect("segment metadata").len(),
+            })
+            .collect(),
+    };
+    write_manifest_atomic_signed(&manifest, dir.path(), config.hmac_key()).expect("manifest");
+
+    let deleted_filename = segments[segments.len() / 2]
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("deleted filename")
+        .to_string();
+    fs::remove_file(dir.path().join(&deleted_filename)).expect("delete middle segment");
+    manifest
+        .segments
+        .retain(|segment| segment.filename != deleted_filename);
+    write_manifest_atomic_signed(&manifest, dir.path(), config.hmac_key())
+        .expect("updated manifest");
 
     let reopen = AedbInstance::open(config, dir.path());
     assert!(reopen.is_err());

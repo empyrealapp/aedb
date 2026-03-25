@@ -365,15 +365,24 @@ async fn backup_incremental_is_hot_and_completes_without_stalling() {
     let writes_before = write_count.load(Ordering::Relaxed);
     let reads_before = read_count.load(Ordering::Relaxed);
 
-    timeout(Duration::from_secs(10), db.backup_incremental(inc_dir.path(), full_dir.path()))
-        .await
-        .expect("incremental backup timed out")
-        .expect("incremental backup");
+    timeout(
+        Duration::from_secs(10),
+        db.backup_incremental(inc_dir.path(), full_dir.path()),
+    )
+    .await
+    .expect("incremental backup timed out")
+    .expect("incremental backup");
 
     let writes_after = write_count.load(Ordering::Relaxed);
     let reads_after = read_count.load(Ordering::Relaxed);
-    assert!(writes_after > writes_before, "writes stalled during incremental backup");
-    assert!(reads_after > reads_before, "reads stalled during incremental backup");
+    assert!(
+        writes_after > writes_before,
+        "writes stalled during incremental backup"
+    );
+    assert!(
+        reads_after > reads_before,
+        "reads stalled during incremental backup"
+    );
 
     stop.store(true, Ordering::Relaxed);
     timeout(Duration::from_secs(5), writer)

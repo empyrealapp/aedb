@@ -306,7 +306,11 @@ mod tests {
     #[test]
     fn publish_delta_reuses_shared_arc_instance() {
         let mut store = VersionStore::new(8, 4, 0);
-        store.bootstrap(0, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
+        store.bootstrap(
+            0,
+            Keyspace::default().snapshot(),
+            crate::catalog::Catalog::default(),
+        );
         let delta = Arc::new(CommitDelta {
             seq: 7,
             mutations: vec![Mutation::KvSet {
@@ -327,7 +331,11 @@ mod tests {
     #[test]
     fn publish_delta_requests_full_snapshot_after_interval() {
         let mut store = VersionStore::new(8, 2, 0);
-        store.bootstrap(0, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
+        store.bootstrap(
+            0,
+            Keyspace::default().snapshot(),
+            crate::catalog::Catalog::default(),
+        );
 
         let first = Arc::new(CommitDelta {
             seq: 1,
@@ -341,7 +349,11 @@ mod tests {
         assert!(!store.publish_delta(1, first));
         assert!(store.publish_delta(2, second));
 
-        store.publish_full(2, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
+        store.publish_full(
+            2,
+            Keyspace::default().snapshot(),
+            crate::catalog::Catalog::default(),
+        );
 
         let third = Arc::new(CommitDelta {
             seq: 3,

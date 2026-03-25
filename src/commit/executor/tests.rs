@@ -13,10 +13,10 @@ use crate::commit::tx::{
 use crate::commit::validation::{ConflictAction, ConflictTarget, Mutation, UpdateExpr};
 use crate::config::AedbConfig;
 use crate::error::AedbError;
-use crate::query::plan::Expr;
 use crate::order_book::{
     ExecInstruction, OrderRequest, OrderSide, OrderType, SelfTradePrevention, TimeInForce,
 };
+use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
 use crate::wal::frame::FrameReader;
@@ -167,7 +167,9 @@ fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
 
     assert!(read_partitions.is_empty());
     assert!(
-        write_partitions.iter().any(|token| token.starts_with("tr:p::app:users:")),
+        write_partitions
+            .iter()
+            .any(|token| token.starts_with("tr:p::app:users:")),
         "expected staged table row partition token, got {write_partitions:?}"
     );
 }
@@ -878,7 +880,7 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
     let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
     assert_eq!(epoch.outcomes.len(), 2);
     assert!(
-        epoch.outcomes.iter().all(|o| matches!(o.result, Ok(_))),
+        epoch.outcomes.iter().all(|o| o.result.is_ok()),
         "all disjoint same-namespace writes should succeed"
     );
 
@@ -968,7 +970,7 @@ async fn same_table_different_rows_can_merge_after_parallel_apply() {
     let mut state = exec.state.lock().await;
     let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
     assert_eq!(epoch.outcomes.len(), 2);
-    assert!(epoch.outcomes.iter().all(|o| matches!(o.result, Ok(_))));
+    assert!(epoch.outcomes.iter().all(|o| o.result.is_ok()));
     assert_eq!(
         state
             .keyspace

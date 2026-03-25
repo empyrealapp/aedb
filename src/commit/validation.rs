@@ -1213,7 +1213,7 @@ fn validate_table_u256_field_update(
     primary_key: &[Value],
     column: &str,
 ) -> Result<(), AedbError> {
-            ensure_not_managed_table(project_id, table_name)?;
+    ensure_not_managed_table(project_id, table_name)?;
     let schema = table_schema(catalog, project_id, scope_id, table_name)?;
     if primary_key.len() != schema.primary_key.len() {
         return Err(AedbError::Validation("primary key length mismatch".into()));
