@@ -1,9 +1,39 @@
 use crate::catalog::schema::TableSchema;
 use crate::catalog::types::Value;
 use crate::query::error::QueryError;
-use crate::query::plan::Query;
+use crate::query::plan::{
+    MAX_AGGREGATES, MAX_EXPR_IN_LIST_VALUES, MAX_GROUP_BY_COLUMNS, MAX_LIKE_PATTERN_BYTES,
+    MAX_ORDER_BY_COLUMNS, Query,
+};
 
 pub(super) fn validate_query(schema: &TableSchema, query: &Query) -> Result<(), QueryError> {
+    if query.order_by.len() > MAX_ORDER_BY_COLUMNS {
+        return Err(QueryError::InvalidQuery {
+            reason: format!(
+                "ORDER BY has {} columns, exceeds maximum of {}",
+                query.order_by.len(),
+                MAX_ORDER_BY_COLUMNS
+            ),
+        });
+    }
+    if query.group_by.len() > MAX_GROUP_BY_COLUMNS {
+        return Err(QueryError::InvalidQuery {
+            reason: format!(
+                "GROUP BY has {} columns, exceeds maximum of {}",
+                query.group_by.len(),
+                MAX_GROUP_BY_COLUMNS
+            ),
+        });
+    }
+    if query.aggregates.len() > MAX_AGGREGATES {
+        return Err(QueryError::InvalidQuery {
+            reason: format!(
+                "query has {} aggregates, exceeds maximum of {}",
+                query.aggregates.len(),
+                MAX_AGGREGATES
+            ),
+        });
+    }
     for (col, _) in &query.order_by {
         if !schema.columns.iter().any(|c| c.name == *col) {
             return Err(QueryError::ColumnNotFound {
@@ -110,6 +140,15 @@ pub(super) fn validate_expr_types(
         }
         Expr::In(c, values) => {
             let t = find_col_type(c)?;
+            if values.len() > MAX_EXPR_IN_LIST_VALUES {
+                return Err(QueryError::InvalidQuery {
+                    reason: format!(
+                        "IN list has {} values, exceeds maximum of {}",
+                        values.len(),
+                        MAX_EXPR_IN_LIST_VALUES
+                    ),
+                });
+            }
             if !values.iter().all(|v| value_compatible(&t, v)) {
                 return Err(QueryError::TypeMismatch {
                     column: c.clone(),
@@ -128,13 +167,22 @@ pub(super) fn validate_expr_types(
                 });
             }
         }
-        Expr::Like(c, _) => {
+        Expr::Like(c, pattern) => {
             let t = find_col_type(c)?;
             if !matches!(t, ColumnType::Text) {
                 return Err(QueryError::TypeMismatch {
                     column: c.clone(),
                     expected: "Text".to_string(),
                     got: format!("{t:?}"),
+                });
+            }
+            if pattern.len() > MAX_LIKE_PATTERN_BYTES {
+                return Err(QueryError::InvalidQuery {
+                    reason: format!(
+                        "LIKE pattern is {} bytes, exceeds maximum of {}",
+                        pattern.len(),
+                        MAX_LIKE_PATTERN_BYTES
+                    ),
                 });
             }
         }

@@ -7,7 +7,7 @@ use crate::commit::tx::{
     IdempotencyKey, IdempotencyRecord, ReadBound, ReadKey, ReadRange, TransactionEnvelope,
     WriteClass, WriteIntent,
 };
-use crate::commit::validation::{Mutation, validate_mutation, validate_permissions};
+use crate::commit::validation::{Mutation, validate_permissions};
 use crate::config::{AedbConfig, DurabilityMode};
 use crate::error::AedbError;
 use crate::permission::CallerContext;
@@ -576,7 +576,11 @@ impl CommitExecutor {
         let global_unique_index = GlobalUniqueIndexState::from_snapshot(&catalog, &keyspace)?;
         let initial_post_apply_refresh_needed =
             Self::catalog_requires_post_apply_refresh(&catalog);
-        let mut version_store = VersionStore::new(config.max_versions, config.min_version_age_ms);
+        let mut version_store = VersionStore::new(
+            config.max_versions,
+            config.version_store_full_snapshot_interval_deltas,
+            config.min_version_age_ms,
+        );
         version_store.bootstrap(current_seq, keyspace.snapshot(), catalog.snapshot());
         let initial_latest_snapshot_view = version_store.acquire_latest()?.into_view();
         let mut wal = SegmentManager::new(
@@ -983,6 +987,7 @@ impl CommitExecutor {
             let pre_apply_tx = apply_tx.clone();
             let pre_queue_counter = Arc::clone(&queued_bytes);
             let pre_telemetry = Arc::clone(&telemetry);
+            let pre_config = Arc::clone(&config);
             let handle = tokio::spawn(async move {
                 while let Some(mut req) = ingress_rx.recv().await {
                     let mut prevalidate_elapsed_us = None;
@@ -1015,7 +1020,11 @@ impl CommitExecutor {
                         (write_partitions, derive_read_partitions(&req.envelope))
                     } else {
                         let prevalidate_started = Instant::now();
-                        let result = pre_stage_validate(&pre_validation_catalog, &req.envelope);
+                        let result = pre_stage_validate(
+                            &pre_validation_catalog,
+                            &req.envelope,
+                            pre_config.as_ref(),
+                        );
                         prevalidate_elapsed_us =
                             Some(prevalidate_started.elapsed().as_micros() as u64);
                         match result {

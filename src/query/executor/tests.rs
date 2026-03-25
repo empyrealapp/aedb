@@ -1,7 +1,7 @@
 use super::execute_query_with_options;
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
-use crate::catalog::schema::{ColumnDef, IndexType};
+use crate::catalog::schema::{ColumnDef, IndexType, TableSchema};
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::query::error::QueryError;
 use crate::query::plan::{Aggregate, Expr, Order, Query, QueryOptions, col, lit};
@@ -151,6 +151,25 @@ fn setup() -> (Keyspace, Catalog) {
     }
     table.indexes.insert("by_name".into(), by_name);
     (keyspace, catalog)
+}
+
+fn validation_schema_with_columns(count: usize) -> TableSchema {
+    TableSchema {
+        project_id: "A".into(),
+        scope_id: "app".into(),
+        table_name: "wide".into(),
+        owner_id: None,
+        columns: (0..count)
+            .map(|idx| ColumnDef {
+                name: format!("c{idx}"),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            })
+            .collect(),
+        primary_key: vec!["c0".into()],
+        constraints: Vec::new(),
+        foreign_keys: Vec::new(),
+    }
 }
 
 #[test]
@@ -1183,6 +1202,36 @@ fn uppercase_hex_cursor_is_accepted() {
     )
     .expect("uppercase cursor should decode");
     assert_eq!(second.rows.len(), 10);
+}
+
+#[test]
+fn validate_query_rejects_too_many_order_by_columns() {
+    let schema = validation_schema_with_columns(33);
+    let mut query = Query::select(&["*"]).from("wide");
+    query.order_by = (0..33).map(|idx| (format!("c{idx}"), Order::Asc)).collect();
+
+    let err = super::validate::validate_query(&schema, &query).expect_err("too many order by");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+}
+
+#[test]
+fn validate_query_rejects_too_many_group_by_columns() {
+    let schema = validation_schema_with_columns(33);
+    let mut query = Query::select(&["c0"]).from("wide");
+    query.group_by = (0..33).map(|idx| format!("c{idx}")).collect();
+
+    let err = super::validate::validate_query(&schema, &query).expect_err("too many group by");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+}
+
+#[test]
+fn validate_query_rejects_too_many_aggregates() {
+    let schema = validation_schema_with_columns(1);
+    let mut query = Query::select(&["count_star"]).from("wide");
+    query.aggregates = (0..33).map(|_| Aggregate::Count).collect();
+
+    let err = super::validate::validate_query(&schema, &query).expect_err("too many aggregates");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
 }
 
 #[test]

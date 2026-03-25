@@ -4,10 +4,10 @@ use aes_gcm::{Aes256Gcm, Nonce};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
 pub const BACKUP_MANIFEST_FILE: &str = "backup_manifest.json";
@@ -17,6 +17,8 @@ const BACKUP_ARCHIVE_MAGIC: &[u8; 8] = b"AEDBARC1";
 const BACKUP_ARCHIVE_FLAG_ENCRYPTED: u8 = 0x01;
 const BACKUP_ARCHIVE_ENTRY_FILE: u8 = 0x01;
 const BACKUP_ARCHIVE_ENTRY_END: u8 = 0xFF;
+const MAX_BACKUP_ARCHIVE_PATH_BYTES: u32 = 4_096;
+const MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupManifest {
@@ -32,7 +34,7 @@ pub struct BackupManifest {
     pub wal_head_seq: u64,
     pub checkpoint_file: String,
     pub wal_segments: Vec<String>,
-    pub file_sha256: HashMap<String, String>,
+    pub file_sha256: BTreeMap<String, String>,
 }
 
 pub fn write_backup_manifest(
@@ -128,6 +130,16 @@ pub fn write_backup_archive(
         } else {
             compressed
         };
+        if rel.len() > MAX_BACKUP_ARCHIVE_PATH_BYTES as usize {
+            return Err(AedbError::Validation(
+                "backup archive path exceeds max length".into(),
+            ));
+        }
+        if payload.len() as u64 > MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES {
+            return Err(AedbError::Validation(
+                "backup archive payload exceeds max size".into(),
+            ));
+        }
 
         write_u8(&mut writer, BACKUP_ARCHIVE_ENTRY_FILE)?;
         write_u32(&mut writer, rel.len() as u32)?;
@@ -182,12 +194,19 @@ pub fn extract_backup_archive(
             return Err(AedbError::Validation("invalid backup archive entry".into()));
         }
 
-        let path_len = read_u32(&mut reader)? as usize;
-        if path_len == 0 {
+        let path_len_u32 = read_u32(&mut reader)?;
+        if path_len_u32 == 0 {
             return Err(AedbError::Validation(
                 "backup archive path must not be empty".into(),
             ));
         }
+        if path_len_u32 > MAX_BACKUP_ARCHIVE_PATH_BYTES {
+            return Err(AedbError::Validation(
+                "backup archive path exceeds max length".into(),
+            ));
+        }
+        let path_len = usize::try_from(path_len_u32)
+            .map_err(|_| AedbError::Validation("backup archive path exceeds platform limits".into()))?;
         let mut path_bytes = vec![0u8; path_len];
         reader.read_exact(&mut path_bytes)?;
         let rel = String::from_utf8(path_bytes)
@@ -195,7 +214,14 @@ pub fn extract_backup_archive(
 
         validate_safe_relative_path(&rel, "backup archive path")?;
 
-        let payload_len = read_u64(&mut reader)? as usize;
+        let payload_len_u64 = read_u64(&mut reader)?;
+        if payload_len_u64 > MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES {
+            return Err(AedbError::Validation(
+                "backup archive payload exceeds max size".into(),
+            ));
+        }
+        let payload_len = usize::try_from(payload_len_u64)
+            .map_err(|_| AedbError::Validation("backup archive payload exceeds platform limits".into()))?;
         let mut payload = vec![0u8; payload_len];
         reader.read_exact(&mut payload)?;
 
@@ -386,9 +412,17 @@ fn resolve_backup_output_path(dir: &Path, rel: &str) -> Result<std::path::PathBu
     validate_safe_relative_path(rel, "backup archive path")?;
     let base = fs::canonicalize(dir)?;
     let out = dir.join(rel);
+    if !out.starts_with(dir) {
+        return Err(AedbError::Validation(
+            "backup path escapes backup directory".into(),
+        ));
+    }
     let parent = out.parent().ok_or_else(|| {
         AedbError::Validation("backup archive output path must have parent".into())
     })?;
+    ensure_no_symlink_components(dir, parent.strip_prefix(dir).map_err(|_| {
+        AedbError::Validation("backup path escapes backup directory".into())
+    })?)?;
     fs::create_dir_all(parent)?;
     let canonical_parent = fs::canonicalize(parent)?;
     if !canonical_parent.starts_with(&base) {
@@ -397,6 +431,26 @@ fn resolve_backup_output_path(dir: &Path, rel: &str) -> Result<std::path::PathBu
         ));
     }
     Ok(out)
+}
+
+fn ensure_no_symlink_components(base: &Path, rel_parent: &Path) -> Result<(), AedbError> {
+    let mut current = PathBuf::from(base);
+    for component in rel_parent.components() {
+        let Component::Normal(part) = component else {
+            return Err(AedbError::Validation(
+                "backup archive path contains disallowed path component".into(),
+            ));
+        };
+        current.push(part);
+        if let Ok(metadata) = fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(AedbError::Validation(
+                "backup archive output path traverses symlink".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn derive_archive_nonce(salt: &[u8; 16], index: u64, rel: &str) -> [u8; 12] {
@@ -506,7 +560,7 @@ mod tests {
             wal_head_seq: 2,
             checkpoint_file: "checkpoint_1.aedbcp".into(),
             wal_segments: vec!["segment_2.aedbwal".into()],
-            file_sha256: HashMap::from([
+            file_sha256: BTreeMap::from([
                 ("checkpoint_1.aedbcp".into(), "a".repeat(64)),
                 ("wal_tail/segment_2.aedbwal".into(), "b".repeat(64)),
             ]),
@@ -579,6 +633,38 @@ mod tests {
         assert!(format!("{err}").contains("decryption failed"));
     }
 
+    #[test]
+    fn backup_archive_rejects_oversized_path_and_payload_lengths() {
+        let archive_path = tempfile::NamedTempFile::new().expect("archive");
+        let out_dir = tempfile::tempdir().expect("out");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BACKUP_ARCHIVE_MAGIC);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.push(BACKUP_ARCHIVE_ENTRY_FILE);
+        bytes.extend_from_slice(&(MAX_BACKUP_ARCHIVE_PATH_BYTES + 1).to_le_bytes());
+        std::fs::write(archive_path.path(), &bytes).expect("write malformed archive");
+        let err = extract_backup_archive(archive_path.path(), out_dir.path(), None)
+            .expect_err("oversized path must be rejected");
+        assert!(format!("{err}").contains("path exceeds max length"));
+
+        let archive_path = tempfile::NamedTempFile::new().expect("archive");
+        let out_dir = tempfile::tempdir().expect("out");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(BACKUP_ARCHIVE_MAGIC);
+        bytes.push(0);
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes.push(BACKUP_ARCHIVE_ENTRY_FILE);
+        bytes.extend_from_slice(&(8u32).to_le_bytes());
+        bytes.extend_from_slice(b"file.bin");
+        bytes.extend_from_slice(&(MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES + 1).to_le_bytes());
+        std::fs::write(archive_path.path(), &bytes).expect("write malformed archive");
+        let err = extract_backup_archive(archive_path.path(), out_dir.path(), None)
+            .expect_err("oversized payload must be rejected");
+        assert!(format!("{err}").contains("payload exceeds max size"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn backup_manifest_rejects_symlink_escape() {
@@ -600,6 +686,18 @@ mod tests {
             sha256_file_hex(&dir.path().join("wal_tail/segment_2.aedbwal")).expect("hash wal"),
         );
         let err = verify_backup_files(dir.path(), &manifest).expect_err("must reject escape");
+        assert!(matches!(err, AedbError::Validation(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_output_path_rejects_symlinked_parent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("wal_tail"))
+            .expect("symlink parent");
+        let err = resolve_backup_output_path(dir.path(), "wal_tail/segment_1.aedbwal")
+            .expect_err("must reject symlinked output parent");
         assert!(matches!(err, AedbError::Validation(_)));
     }
 }

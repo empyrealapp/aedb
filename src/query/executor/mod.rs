@@ -222,7 +222,13 @@ pub fn execute_query_with_options(
             })?;
     }
 
-    if !options.allow_full_scan && query.limit.is_none() && query.predicate.is_none() {
+    if !options.allow_full_scan
+        && query.limit.is_none()
+        && query.predicate.is_none()
+        && query.group_by.is_empty()
+        && query.aggregates.is_empty()
+        && query.having.is_none()
+    {
         return Err(QueryError::InvalidQuery {
             reason: "full scan requires limit/cursor or allow_full_scan".into(),
         });

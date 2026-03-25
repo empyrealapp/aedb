@@ -23,6 +23,8 @@ struct Version {
 pub struct VersionStore {
     versions: VecDeque<Version>,
     max_versions: usize,
+    full_snapshot_interval_deltas: usize,
+    deltas_since_full_snapshot: usize,
     min_version_age_ms: u64,
 }
 
@@ -55,16 +57,23 @@ impl ReadViewGuard {
 }
 
 impl VersionStore {
-    pub fn new(max_versions: usize, min_version_age_ms: u64) -> Self {
+    pub fn new(
+        max_versions: usize,
+        full_snapshot_interval_deltas: usize,
+        min_version_age_ms: u64,
+    ) -> Self {
         Self {
             versions: VecDeque::new(),
             max_versions,
+            full_snapshot_interval_deltas,
+            deltas_since_full_snapshot: 0,
             min_version_age_ms,
         }
     }
 
     pub fn bootstrap(&mut self, seq: u64, keyspace: KeyspaceSnapshot, catalog: Catalog) {
         self.versions.clear();
+        self.deltas_since_full_snapshot = 0;
         self.versions.push_back(Version {
             seq,
             keyspace: Some(Arc::new(keyspace)),
@@ -75,7 +84,7 @@ impl VersionStore {
         });
     }
 
-    pub fn publish_delta(&mut self, seq: u64, delta: Arc<CommitDelta>) {
+    pub fn publish_delta(&mut self, seq: u64, delta: Arc<CommitDelta>) -> bool {
         self.versions.push_back(Version {
             seq,
             keyspace: None,
@@ -84,13 +93,16 @@ impl VersionStore {
             created_at: Instant::now(),
             ref_count: Arc::new(AtomicU64::new(0)),
         });
+        self.deltas_since_full_snapshot = self.deltas_since_full_snapshot.saturating_add(1);
         self.prune();
+        self.deltas_since_full_snapshot >= self.full_snapshot_interval_deltas
     }
 
     pub fn publish_full(&mut self, seq: u64, keyspace: KeyspaceSnapshot, catalog: Catalog) {
         if let Some(existing) = self.versions.iter_mut().find(|v| v.seq == seq) {
             existing.keyspace = Some(Arc::new(keyspace));
             existing.catalog = Some(Arc::new(catalog));
+            self.deltas_since_full_snapshot = 0;
             return;
         }
         self.versions.push_back(Version {
@@ -101,6 +113,7 @@ impl VersionStore {
             created_at: Instant::now(),
             ref_count: Arc::new(AtomicU64::new(0)),
         });
+        self.deltas_since_full_snapshot = 0;
         self.prune();
     }
 
@@ -231,7 +244,14 @@ impl VersionStore {
                 .ok_or_else(|| AedbError::Validation("delta version missing".into()))?;
             if let Some(delta) = &version.delta {
                 for mutation in &delta.mutations {
-                    apply_mutation(&mut catalog, &mut keyspace, mutation.clone(), delta.seq)?;
+                    apply_mutation(
+                        &mut catalog,
+                        &mut keyspace,
+                        mutation.clone(),
+                        delta.seq,
+                        None,
+                        None,
+                    )?;
                 }
             } else if let (Some(ks), Some(cat)) = (&version.keyspace, &version.catalog) {
                 keyspace = snapshot_to_keyspace(ks);
@@ -285,7 +305,7 @@ mod tests {
 
     #[test]
     fn publish_delta_reuses_shared_arc_instance() {
-        let mut store = VersionStore::new(8, 0);
+        let mut store = VersionStore::new(8, 4, 0);
         store.bootstrap(0, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
         let delta = Arc::new(CommitDelta {
             seq: 7,
@@ -297,10 +317,36 @@ mod tests {
             }],
         });
 
-        store.publish_delta(7, Arc::clone(&delta));
+        assert!(!store.publish_delta(7, Arc::clone(&delta)));
         let deltas = store.deltas_since(0, 7).expect("delta range");
 
         assert_eq!(deltas.len(), 1);
         assert!(Arc::ptr_eq(&delta, &deltas[0]));
+    }
+
+    #[test]
+    fn publish_delta_requests_full_snapshot_after_interval() {
+        let mut store = VersionStore::new(8, 2, 0);
+        store.bootstrap(0, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
+
+        let first = Arc::new(CommitDelta {
+            seq: 1,
+            mutations: Vec::new(),
+        });
+        let second = Arc::new(CommitDelta {
+            seq: 2,
+            mutations: Vec::new(),
+        });
+
+        assert!(!store.publish_delta(1, first));
+        assert!(store.publish_delta(2, second));
+
+        store.publish_full(2, Keyspace::default().snapshot(), crate::catalog::Catalog::default());
+
+        let third = Arc::new(CommitDelta {
+            seq: 3,
+            mutations: Vec::new(),
+        });
+        assert!(!store.publish_delta(3, third));
     }
 }

@@ -1,6 +1,8 @@
 use crate::catalog::schema::TableSchema;
 use crate::catalog::types::{ColumnType, Row, Value};
-use crate::catalog::{Catalog, DdlOperation, KV_INDEX_TABLE, ResourceType, namespace_key};
+use crate::catalog::{
+    Catalog, DdlOperation, KV_INDEX_TABLE, ResourceType, SYSTEM_PROJECT_ID, namespace_key,
+};
 use crate::config::AedbConfig;
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
@@ -9,11 +11,13 @@ use crate::order_book::{
     TimeInForce,
 };
 use crate::permission::{CallerContext, Permission};
-use crate::query::plan::Expr;
+use crate::query::plan::{Expr, MAX_EXPR_IN_LIST_VALUES, MAX_LIKE_PATTERN_BYTES};
+use crate::storage::encoded_key::EncodedKey;
 use primitive_types::U256;
 
 const ORDER_BOOK_ID_MAX_LEN: usize = 1024;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ConflictTarget {
@@ -504,6 +508,20 @@ pub fn validate_mutation(catalog: &Catalog, mutation: &Mutation) -> Result<(), A
     validate_mutation_with_config(catalog, mutation, &AedbConfig::default())
 }
 
+fn validate_batch_row_count(
+    batch_kind: &str,
+    row_count: usize,
+    config: &AedbConfig,
+) -> Result<(), AedbError> {
+    if row_count > config.max_batch_rows {
+        return Err(AedbError::Validation(format!(
+            "{batch_kind} exceeds max_batch_rows: rows={row_count}, max_batch_rows={}",
+            config.max_batch_rows
+        )));
+    }
+    Ok(())
+}
+
 pub fn validate_mutation_with_config(
     catalog: &Catalog,
     mutation: &Mutation,
@@ -524,26 +542,52 @@ pub fn validate_mutation_with_config(
             primary_key,
             row,
         } => {
-            ensure_not_managed_table(table_name)?;
-            validate_upsert_row(catalog, project_id, scope_id, table_name, primary_key, row)
+            ensure_not_managed_table(project_id, table_name)?;
+            validate_upsert_row(
+                catalog,
+                config,
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                row,
+            )
         }
         Mutation::InsertBatch {
             project_id,
             scope_id,
             table_name,
             rows,
+        } => {
+            ensure_not_managed_table(project_id, table_name)?;
+            validate_batch_row_count("insert batch", rows.len(), config)?;
+            let schema = table_schema(catalog, project_id, scope_id, table_name)?;
+            let mut seen_primary_keys = HashSet::with_capacity(rows.len());
+            for row in rows {
+                let primary_key = extract_primary_key(schema, row)?;
+                let encoded_pk = EncodedKey::from_values(&primary_key);
+                if !seen_primary_keys.insert(encoded_pk) {
+                    return Err(AedbError::DuplicatePK {
+                        table: table_name.clone(),
+                        key: format!("{primary_key:?}"),
+                    });
+                }
+                validate_row_against_schema(schema, &primary_key, row, config)?;
+            }
+            Ok(())
         }
-        | Mutation::UpsertBatch {
+        Mutation::UpsertBatch {
             project_id,
             scope_id,
             table_name,
             rows,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
+            validate_batch_row_count("upsert batch", rows.len(), config)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
             for row in rows {
                 let primary_key = extract_primary_key(schema, row)?;
-                validate_row_against_schema(schema, &primary_key, row)?;
+                validate_row_against_schema(schema, &primary_key, row, config)?;
             }
             Ok(())
         }
@@ -555,10 +599,10 @@ pub fn validate_mutation_with_config(
             conflict_target,
             conflict_action,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
             let primary_key = extract_primary_key(schema, row)?;
-            validate_row_against_schema(schema, &primary_key, row)?;
+            validate_row_against_schema(schema, &primary_key, row, config)?;
             validate_conflict_target(
                 catalog,
                 schema,
@@ -578,11 +622,12 @@ pub fn validate_mutation_with_config(
             conflict_target,
             conflict_action,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
+            validate_batch_row_count("upsert-on-conflict batch", rows.len(), config)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
             for row in rows {
                 let primary_key = extract_primary_key(schema, row)?;
-                validate_row_against_schema(schema, &primary_key, row)?;
+                validate_row_against_schema(schema, &primary_key, row, config)?;
             }
             validate_conflict_target(
                 catalog,
@@ -601,7 +646,7 @@ pub fn validate_mutation_with_config(
             table_name,
             primary_key,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
             if primary_key.len() != schema.primary_key.len() {
                 return Err(AedbError::Validation("primary key length mismatch".into()));
@@ -615,8 +660,9 @@ pub fn validate_mutation_with_config(
             predicate,
             limit,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
+            predicate.validate_depth()?;
             validate_expr_columns(schema, predicate)?;
             if let Some(limit) = limit
                 && *limit == 0
@@ -633,8 +679,9 @@ pub fn validate_mutation_with_config(
             updates,
             limit,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
+            predicate.validate_depth()?;
             validate_expr_columns(schema, predicate)?;
             if updates.is_empty() {
                 return Err(AedbError::Validation("updates cannot be empty".into()));
@@ -681,8 +728,9 @@ pub fn validate_mutation_with_config(
             updates,
             limit,
         } => {
-            ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
+            predicate.validate_depth()?;
             validate_expr_columns(schema, predicate)?;
             if updates.is_empty() {
                 return Err(AedbError::Validation("updates cannot be empty".into()));
@@ -959,6 +1007,13 @@ pub fn validate_mutation_with_config(
             if payload_json.trim().is_empty() {
                 return Err(AedbError::Validation("payload_json cannot be empty".into()));
             }
+            if payload_json.len() > config.max_event_payload_bytes {
+                return Err(AedbError::Validation(format!(
+                    "payload_json exceeds max_event_payload_bytes: bytes={}, max_event_payload_bytes={}",
+                    payload_json.len(),
+                    config.max_event_payload_bytes
+                )));
+            }
             let _v: serde_json::Value = serde_json::from_str(payload_json).map_err(|e| {
                 AedbError::Validation(format!("payload_json must be valid JSON: {e}"))
             })?;
@@ -1158,7 +1213,7 @@ fn validate_table_u256_field_update(
     primary_key: &[Value],
     column: &str,
 ) -> Result<(), AedbError> {
-    ensure_not_managed_table(table_name)?;
+            ensure_not_managed_table(project_id, table_name)?;
     let schema = table_schema(catalog, project_id, scope_id, table_name)?;
     if primary_key.len() != schema.primary_key.len() {
         return Err(AedbError::Validation("primary key length mismatch".into()));
@@ -1267,10 +1322,24 @@ fn validate_table_update_expr(
     Ok(())
 }
 
-fn ensure_not_managed_table(table_name: &str) -> Result<(), AedbError> {
-    if table_name == KV_INDEX_TABLE {
+fn is_system_managed_table(project_id: &str, table_name: &str) -> bool {
+    project_id == SYSTEM_PROJECT_ID
+        && matches!(
+            table_name,
+            "authz_audit"
+                | "assertion_audit"
+                | "lifecycle_outbox"
+                | "event_outbox"
+                | "reactive_processor_checkpoints"
+                | "reactive_processor_registry"
+                | "reactive_processor_dead_letters"
+        )
+}
+
+fn ensure_not_managed_table(project_id: &str, table_name: &str) -> Result<(), AedbError> {
+    if table_name == KV_INDEX_TABLE || is_system_managed_table(project_id, table_name) {
         return Err(AedbError::Validation(format!(
-            "table {KV_INDEX_TABLE} is managed and read-only"
+            "table {table_name} is managed and read-only"
         )));
     }
     Ok(())
@@ -1280,7 +1349,11 @@ fn validate_ddl_for_managed_tables(ddl: &DdlOperation) -> Result<(), AedbError> 
     match ddl {
         DdlOperation::CreateTable { table_name, .. }
         | DdlOperation::AlterTable { table_name, .. }
-        | DdlOperation::DropTable { table_name, .. } => ensure_not_managed_table(table_name),
+        | DdlOperation::DropTable { table_name, .. }
+            if table_name == KV_INDEX_TABLE =>
+        {
+            ensure_not_managed_table("", table_name)
+        }
         _ => Ok(()),
     }
 }
@@ -1326,10 +1399,7 @@ pub fn validate_permissions(
         if catalog.has_kv_write_permission(&caller.caller_id, project_id, scope_id, key) {
             return Ok(());
         }
-        return Err(AedbError::PermissionDenied(format!(
-            "caller={} missing kv write permission for key prefix",
-            caller.caller_id
-        )));
+        return Err(AedbError::PermissionDenied("permission denied".into()));
     }
     if let Mutation::Ddl(ddl) = mutation {
         match ddl {
@@ -1338,10 +1408,7 @@ pub fn validate_permissions(
                 if can_administer_permission(catalog, &caller.caller_id, permission) {
                     return Ok(());
                 }
-                return Err(AedbError::PermissionDenied(format!(
-                    "caller={} missing admin rights for permission {:?}",
-                    caller.caller_id, permission
-                )));
+                return Err(AedbError::PermissionDenied("permission denied".into()));
             }
             DdlOperation::TransferOwnership {
                 resource_type,
@@ -1374,10 +1441,7 @@ pub fn validate_permissions(
                 if allowed {
                     return Ok(());
                 }
-                return Err(AedbError::PermissionDenied(format!(
-                    "caller={} missing ownership transfer authority",
-                    caller.caller_id
-                )));
+                return Err(AedbError::PermissionDenied("permission denied".into()));
             }
             _ => {}
         }
@@ -1386,10 +1450,7 @@ pub fn validate_permissions(
     if catalog.has_permission(&caller.caller_id, &required) {
         return Ok(());
     }
-    Err(AedbError::PermissionDenied(format!(
-        "caller={} missing permission {:?}",
-        caller.caller_id, required
-    )))
+    Err(AedbError::PermissionDenied("permission denied".into()))
 }
 
 fn kv_write_target(mutation: &Mutation) -> Option<(&str, &str, &[u8])> {
@@ -2033,6 +2094,7 @@ fn validate_identifier_like(value: &str, label: &str) -> Result<(), AedbError> {
 
 fn validate_upsert_row(
     catalog: &Catalog,
+    config: &AedbConfig,
     project_id: &str,
     scope_id: &str,
     table_name: &str,
@@ -2040,7 +2102,7 @@ fn validate_upsert_row(
     row: &Row,
 ) -> Result<(), AedbError> {
     let schema = table_schema(catalog, project_id, scope_id, table_name)?;
-    validate_row_against_schema(schema, primary_key, row)
+    validate_row_against_schema(schema, primary_key, row, config)
 }
 
 fn validate_conflict_target(
@@ -2270,6 +2332,7 @@ fn validate_row_against_schema(
     schema: &TableSchema,
     primary_key: &[Value],
     row: &Row,
+    config: &AedbConfig,
 ) -> Result<(), AedbError> {
     if row.values.len() != schema.columns.len() {
         return Err(AedbError::Validation("row column count mismatch".into()));
@@ -2293,6 +2356,33 @@ fn validate_row_against_schema(
                 expected: format!("{:?}", col.col_type),
                 actual: value_type_name(value).to_string(),
             });
+        }
+        match value {
+            Value::Float(v) if v.is_nan() || v.is_infinite() => {
+                return Err(AedbError::Validation(format!(
+                    "non-finite float value rejected for {}.{}",
+                    schema.table_name, col.name
+                )));
+            }
+            Value::Text(v) | Value::Json(v) if v.len() > config.max_table_value_bytes => {
+                return Err(AedbError::Validation(format!(
+                    "table value exceeds max_table_value_bytes: table={}, column={}, bytes={}, max_table_value_bytes={}",
+                    schema.table_name,
+                    col.name,
+                    v.len(),
+                    config.max_table_value_bytes
+                )));
+            }
+            Value::Blob(v) if v.len() > config.max_table_value_bytes => {
+                return Err(AedbError::Validation(format!(
+                    "table value exceeds max_table_value_bytes: table={}, column={}, bytes={}, max_table_value_bytes={}",
+                    schema.table_name,
+                    col.name,
+                    v.len(),
+                    config.max_table_value_bytes
+                )));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -2346,7 +2436,23 @@ fn validate_expr_columns(schema: &TableSchema, expr: &Expr) -> Result<(), AedbEr
         | Expr::IsNotNull(col)
         | Expr::Like(col, _) => {
             if schema.columns.iter().any(|c| c.name == *col) {
-                Ok(())
+                match expr {
+                    Expr::In(_, values) if values.len() > MAX_EXPR_IN_LIST_VALUES => {
+                        Err(AedbError::Validation(format!(
+                            "IN list has {} values, exceeds maximum of {}",
+                            values.len(),
+                            MAX_EXPR_IN_LIST_VALUES
+                        )))
+                    }
+                    Expr::Like(_, pattern) if pattern.len() > MAX_LIKE_PATTERN_BYTES => {
+                        Err(AedbError::Validation(format!(
+                            "LIKE pattern is {} bytes, exceeds maximum of {}",
+                            pattern.len(),
+                            MAX_LIKE_PATTERN_BYTES
+                        )))
+                    }
+                    _ => Ok(()),
+                }
             } else {
                 Err(AedbError::Validation(format!("column not found: {col}")))
             }

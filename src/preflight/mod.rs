@@ -8,8 +8,9 @@ use crate::commit::validation::{
     KvIntegerAmount, KvIntegerMissingPolicy, KvIntegerUnderflowPolicy, KvU64MissingPolicy,
     KvU64MutatorOp, KvU64OverflowPolicy, KvU64UnderflowPolicy, KvU256MissingPolicy,
     KvU256MutatorOp, KvU256OverflowPolicy, KvU256UnderflowPolicy, Mutation, counter_shard_index,
-    counter_shard_storage_key, validate_mutation,
+    counter_shard_storage_key, validate_mutation_with_config,
 };
+use crate::config::AedbConfig;
 use crate::error::AedbError;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
@@ -27,7 +28,16 @@ pub fn preflight(
     catalog: &Catalog,
     mutation: &Mutation,
 ) -> PreflightResult {
-    if let Err(e) = validate_mutation(catalog, mutation) {
+    preflight_with_config(snapshot, catalog, mutation, &AedbConfig::default())
+}
+
+pub fn preflight_with_config(
+    snapshot: &KeyspaceSnapshot,
+    catalog: &Catalog,
+    mutation: &Mutation,
+    config: &AedbConfig,
+) -> PreflightResult {
+    if let Err(e) = validate_mutation_with_config(catalog, mutation, config) {
         return PreflightResult::Err {
             reason: e.to_string(),
         };
@@ -705,8 +715,18 @@ pub fn preflight_plan(
     mutation: &Mutation,
     base_seq: u64,
 ) -> PreflightPlan {
+    preflight_plan_with_config(snapshot, catalog, mutation, base_seq, &AedbConfig::default())
+}
+
+pub fn preflight_plan_with_config(
+    snapshot: &KeyspaceSnapshot,
+    catalog: &Catalog,
+    mutation: &Mutation,
+    base_seq: u64,
+    config: &AedbConfig,
+) -> PreflightPlan {
     let mut errors = Vec::new();
-    if let Err(e) = validate_mutation(catalog, mutation) {
+    if let Err(e) = validate_mutation_with_config(catalog, mutation, config) {
         errors.push(e.to_string());
     }
     let estimated_affected_rows = match mutation {

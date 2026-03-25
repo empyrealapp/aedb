@@ -14,6 +14,9 @@ use crate::commit::validation::{ConflictAction, ConflictTarget, Mutation, Update
 use crate::config::AedbConfig;
 use crate::error::AedbError;
 use crate::query::plan::Expr;
+use crate::order_book::{
+    ExecInstruction, OrderRequest, OrderSide, OrderType, SelfTradePrevention, TimeInForce,
+};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
 use crate::wal::frame::FrameReader;
@@ -159,7 +162,8 @@ fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
     };
 
     let (write_partitions, read_partitions) =
-        super::pre_stage_validate(&validation_catalog, &envelope).expect("prestage validate");
+        super::pre_stage_validate(&validation_catalog, &envelope, &AedbConfig::default())
+            .expect("prestage validate");
 
     assert!(read_partitions.is_empty());
     assert!(
@@ -1391,6 +1395,42 @@ fn parallel_single_partition_candidate_allows_multi_key_same_namespace() {
         &request.envelope.write_intent.mutations,
         &Catalog::default(),
     ));
+}
+
+#[test]
+fn order_book_mutations_are_not_parallel_apply_candidates() {
+    let request = request_with_mutations(vec![Mutation::OrderBookNew {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        request: OrderRequest {
+            instrument: "BTC-USD".into(),
+            client_order_id: "cid-1".into(),
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
+            price_ticks: 100,
+            qty_be: {
+                let mut out = [0u8; 32];
+                out[31] = 1;
+                out
+            },
+            owner: "alice".into(),
+            account: None,
+            nonce: 1,
+            price_limit_ticks: None,
+        },
+    }]);
+
+    assert!(
+        !super::is_parallel_single_partition_apply_candidate(
+            &request,
+            &request.envelope.write_intent.mutations,
+            &Catalog::default(),
+        ),
+        "order-book mutations should serialize until explicit barrier ordering exists"
+    );
 }
 
 #[tokio::test]

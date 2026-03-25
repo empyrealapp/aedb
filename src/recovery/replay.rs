@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
+use tracing::warn;
 
 #[allow(clippy::too_many_arguments)]
 pub fn replay_segments(
@@ -61,7 +62,7 @@ pub fn replay_segments(
                             "non-monotonic wal commit_seq during replay".into(),
                         ));
                     }
-                    apply_payload(
+                    let applied = apply_payload(
                         frame.payload_type,
                         &frame.payload,
                         frame.commit_seq,
@@ -69,16 +70,37 @@ pub fn replay_segments(
                         keyspace,
                         catalog,
                         idempotency,
-                    )?;
-                    last_applied_seq = frame.commit_seq;
-                    max_seq = max_seq.max(frame.commit_seq);
+                    );
+                    match applied {
+                        Ok(()) => {
+                            last_applied_seq = frame.commit_seq;
+                            max_seq = max_seq.max(frame.commit_seq);
+                        }
+                        Err(err) if strict_recovery => return Err(err),
+                        Err(err) => {
+                            warn!(
+                                segment = %segment.display(),
+                                commit_seq = frame.commit_seq,
+                                error = ?err,
+                                "recovery: skipping invalid wal frame in permissive mode"
+                            );
+                            continue;
+                        }
+                    }
                 }
                 Ok(None) => break,
                 Err(FrameError::Truncation) => break,
                 Err(FrameError::Corruption) => {
-                    return Err(AedbError::Validation(
-                        "wal frame corruption detected during replay".into(),
-                    ));
+                    if strict_recovery {
+                        return Err(AedbError::Validation(
+                            "wal frame corruption detected during replay".into(),
+                        ));
+                    }
+                    warn!(
+                        segment = %segment.display(),
+                        "recovery: encountered wal frame corruption; skipping remainder of segment in permissive mode"
+                    );
+                    break;
                 }
                 Err(FrameError::Io(e)) => return Err(AedbError::Io(std::io::Error::other(e))),
             }
@@ -100,7 +122,7 @@ fn apply_payload(
         0x01 | 0x02 | 0x04 => {
             let wal_payload = decode_wal_payload(payload)?;
             for mutation in wal_payload.mutations {
-                apply_mutation(catalog, keyspace, mutation, commit_seq)?;
+                apply_mutation(catalog, keyspace, mutation, commit_seq, None, None)?;
             }
             if let Some(key) = wal_payload.idempotency_key {
                 idempotency.insert(

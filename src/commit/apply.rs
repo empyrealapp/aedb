@@ -8,12 +8,15 @@ use crate::commit::validation::{
 };
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
+use crate::lib_helpers::bind_policy_expr;
 use crate::order_book::{
     apply_order_book_cancel, apply_order_book_cancel_replace, apply_order_book_define_table,
     apply_order_book_drop_table, apply_order_book_mass_cancel, apply_order_book_match,
     apply_order_book_new, apply_order_book_reduce, apply_set_instrument_config,
     apply_set_instrument_halted, u256_from_be,
 };
+use crate::permission::{CallerContext, Permission};
+use crate::query::plan::Expr;
 use crate::query::operators::{compile_expr, eval_compiled_expr_public};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::index::extract_index_key_encoded;
@@ -23,11 +26,15 @@ use crate::storage::keyspace::{
 use primitive_types::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const MAX_CASCADE_DELETE_DEPTH: usize = 8;
+
 pub fn apply_mutation(
     catalog: &mut Catalog,
     keyspace: &mut Keyspace,
     mutation: Mutation,
     commit_seq: u64,
+    scan_budget: Option<usize>,
+    caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
     match mutation {
         Mutation::Insert {
@@ -209,6 +216,8 @@ pub fn apply_mutation(
                 &predicate,
                 limit,
                 commit_seq,
+                scan_budget,
+                caller,
             )?;
         }
         Mutation::UpdateWhere {
@@ -229,6 +238,8 @@ pub fn apply_mutation(
                 &updates,
                 limit,
                 commit_seq,
+                scan_budget,
+                caller,
             )?;
         }
         Mutation::UpdateWhereExpr {
@@ -249,6 +260,8 @@ pub fn apply_mutation(
                 &updates,
                 limit,
                 commit_seq,
+                scan_budget,
+                caller,
             )?;
         }
         Mutation::Ddl(op) => {
@@ -2648,7 +2661,14 @@ fn apply_delete_internal_with_schema(
     };
 
     handle_referencing_foreign_keys(
-        catalog, keyspace, project_id, scope_id, table_name, &old_row, commit_seq,
+        catalog,
+        keyspace,
+        project_id,
+        scope_id,
+        table_name,
+        &old_row,
+        commit_seq,
+        0,
     )?;
 
     let removed = keyspace.delete_row(project_id, scope_id, table_name, primary_key, commit_seq);
@@ -2676,6 +2696,8 @@ fn apply_delete_where_internal(
     predicate: &crate::query::plan::Expr,
     limit: Option<usize>,
     commit_seq: u64,
+    scan_budget: Option<usize>,
+    caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
@@ -2686,12 +2708,13 @@ fn apply_delete_where_internal(
             resource_id: format!("{project_id}.{scope_id}.{table_name}"),
         })?
         .clone();
-    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    let compiled = compile_expr(predicate, &columns, table_name)
-        .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
+    let compiled = compile_table_predicate(
+        catalog, &schema, project_id, scope_id, table_name, predicate, caller,
+    )?;
     let mut to_delete: Vec<EncodedKey> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (encoded_pk, row) in &table.rows {
+        for (scanned_rows, (encoded_pk, row)) in table.rows.iter().enumerate() {
+            ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
@@ -2711,6 +2734,7 @@ fn apply_delete_where_internal(
             table_name,
             &encoded_pk,
             commit_seq,
+            0,
         )?;
     }
     Ok(())
@@ -2727,6 +2751,8 @@ fn apply_update_where_internal(
     updates: &[(String, Value)],
     limit: Option<usize>,
     commit_seq: u64,
+    scan_budget: Option<usize>,
+    caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
@@ -2738,9 +2764,9 @@ fn apply_update_where_internal(
         })?
         .clone();
     let primary_key_indices = primary_key_column_indices(&schema)?;
-    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    let compiled = compile_expr(predicate, &columns, table_name)
-        .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
+    let compiled = compile_table_predicate(
+        catalog, &schema, project_id, scope_id, table_name, predicate, caller,
+    )?;
     let mut update_indices = Vec::with_capacity(updates.len());
     for (column, value) in updates {
         let Some(column_index) = schema.columns.iter().position(|c| c.name == *column) else {
@@ -2753,7 +2779,8 @@ fn apply_update_where_internal(
     }
     let mut staged: Vec<Row> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for row in table.rows.values() {
+        for (scanned_rows, row) in table.rows.values().enumerate() {
+            ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
@@ -2799,6 +2826,8 @@ fn apply_update_where_expr_internal(
     updates: &[(String, TableUpdateExpr)],
     limit: Option<usize>,
     commit_seq: u64,
+    scan_budget: Option<usize>,
+    caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
@@ -2810,9 +2839,9 @@ fn apply_update_where_expr_internal(
         })?
         .clone();
     let primary_key_indices = primary_key_column_indices(&schema)?;
-    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    let compiled = compile_expr(predicate, &columns, table_name)
-        .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))?;
+    let compiled = compile_table_predicate(
+        catalog, &schema, project_id, scope_id, table_name, predicate, caller,
+    )?;
     let mut update_indices = Vec::with_capacity(updates.len());
     for (column, expr) in updates {
         let Some(column_index) = schema.columns.iter().position(|c| c.name == *column) else {
@@ -2841,7 +2870,8 @@ fn apply_update_where_expr_internal(
     }
     let mut staged: Vec<Row> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for row in table.rows.values() {
+        for (scanned_rows, row) in table.rows.values().enumerate() {
+            ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
@@ -2875,6 +2905,77 @@ fn apply_update_where_expr_internal(
         )?;
     }
     Ok(())
+}
+
+fn ensure_mutation_scan_budget(
+    scanned_rows: usize,
+    scan_budget: Option<usize>,
+) -> Result<(), AedbError> {
+    if let Some(max_scan_rows) = scan_budget
+        && scanned_rows > max_scan_rows
+    {
+        return Err(AedbError::Validation(format!(
+            "mutation scan bound exceeded: scanned_rows={}, max_scan_rows={}",
+            scanned_rows, max_scan_rows
+        )));
+    }
+    Ok(())
+}
+
+fn compile_table_predicate(
+    catalog: &Catalog,
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    predicate: &Expr,
+    caller: Option<&CallerContext>,
+) -> Result<crate::query::operators::CompiledExpr, AedbError> {
+    let effective_predicate =
+        apply_row_policy_to_predicate(catalog, project_id, scope_id, table_name, predicate, caller);
+    effective_predicate.validate_depth()?;
+    let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    compile_expr(&effective_predicate, &columns, table_name)
+        .map_err(|e| AedbError::Validation(format!("invalid predicate: {e:?}")))
+}
+
+fn apply_row_policy_to_predicate(
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    predicate: &Expr,
+    caller: Option<&CallerContext>,
+) -> Expr {
+    let Some(caller) = caller else {
+        return predicate.clone();
+    };
+    if caller.is_internal_system() {
+        return predicate.clone();
+    }
+    let bypass = catalog.has_permission(
+        &caller.caller_id,
+        &Permission::PolicyBypass {
+            project_id: project_id.to_string(),
+            table_name: Some(table_name.to_string()),
+        },
+    ) || catalog.has_permission(
+        &caller.caller_id,
+        &Permission::PolicyBypass {
+            project_id: project_id.to_string(),
+            table_name: None,
+        },
+    );
+    if bypass {
+        return predicate.clone();
+    }
+    let Some(policy) = catalog.read_policy_for_table(project_id, scope_id, table_name) else {
+        return predicate.clone();
+    };
+    Expr::And(
+        Box::new(predicate.clone()),
+        Box::new(bind_policy_expr(&policy, &caller.caller_id)),
+    )
 }
 
 enum ResolvedTableUpdateExpr {
@@ -2929,7 +3030,9 @@ fn handle_referencing_foreign_keys(
     ref_table_name: &str,
     ref_row: &Row,
     commit_seq: u64,
+    cascade_depth: usize,
 ) -> Result<(), AedbError> {
+    ensure_cascade_delete_depth(cascade_depth)?;
     let target_ns = namespace_key(ref_project_id, ref_scope_id);
     for ((dep_ns, dep_table_name), dep_schema) in &catalog.tables {
         for fk in &dep_schema.foreign_keys {
@@ -3000,6 +3103,7 @@ fn handle_referencing_foreign_keys(
                             dep_table_name,
                             &pk_encoded,
                             commit_seq,
+                            cascade_depth.saturating_add(1),
                         )?;
                     }
                 }
@@ -3086,7 +3190,9 @@ fn apply_delete_internal_encoded(
     table_name: &str,
     primary_key: &EncodedKey,
     commit_seq: u64,
+    cascade_depth: usize,
 ) -> Result<(), AedbError> {
+    ensure_cascade_delete_depth(cascade_depth)?;
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
         .tables
@@ -3102,6 +3208,7 @@ fn apply_delete_internal_encoded(
         table_name,
         primary_key,
         commit_seq,
+        cascade_depth,
     )
 }
 
@@ -3115,7 +3222,9 @@ fn apply_delete_internal_encoded_with_schema(
     table_name: &str,
     primary_key: &EncodedKey,
     commit_seq: u64,
+    cascade_depth: usize,
 ) -> Result<(), AedbError> {
+    ensure_cascade_delete_depth(cascade_depth)?;
     let Some(old_row) = keyspace
         .get_row_by_encoded(project_id, scope_id, table_name, primary_key)
         .cloned()
@@ -3124,7 +3233,14 @@ fn apply_delete_internal_encoded_with_schema(
     };
     let primary_values = extract_primary_key_from_row(schema, &old_row)?;
     handle_referencing_foreign_keys(
-        catalog, keyspace, project_id, scope_id, table_name, &old_row, commit_seq,
+        catalog,
+        keyspace,
+        project_id,
+        scope_id,
+        table_name,
+        &old_row,
+        commit_seq,
+        cascade_depth,
     )?;
     let removed =
         keyspace.delete_row_by_encoded(project_id, scope_id, table_name, primary_key, commit_seq);
@@ -3139,6 +3255,16 @@ fn apply_delete_internal_encoded_with_schema(
         removed.as_ref(),
         None,
     )?;
+    Ok(())
+}
+
+fn ensure_cascade_delete_depth(cascade_depth: usize) -> Result<(), AedbError> {
+    if cascade_depth > MAX_CASCADE_DELETE_DEPTH {
+        return Err(AedbError::Validation(format!(
+            "cascade delete depth exceeded: depth={}, max_depth={}",
+            cascade_depth, MAX_CASCADE_DELETE_DEPTH
+        )));
+    }
     Ok(())
 }
 

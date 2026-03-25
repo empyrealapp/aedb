@@ -436,6 +436,7 @@ pub(super) fn write_partitions_after_lifecycle(
 pub(super) fn pre_stage_validate(
     validation_catalog: &Arc<RwLock<Catalog>>,
     envelope: &TransactionEnvelope,
+    config: &AedbConfig,
 ) -> Result<(HashSet<String>, HashSet<String>), AedbError> {
     let catalog = validation_catalog.read();
     if !envelope.assertions.is_empty() {
@@ -448,7 +449,7 @@ pub(super) fn pre_stage_validate(
         if caller.is_some() {
             validate_permissions(active_catalog, caller, mutation)?;
         }
-        validate_mutation(active_catalog, mutation)?;
+        crate::commit::validation::validate_mutation_with_config(active_catalog, mutation, config)?;
         if let Mutation::Ddl(ddl) = mutation {
             if staged_catalog.is_none() {
                 staged_catalog = Some(catalog.clone());
@@ -1203,8 +1204,13 @@ pub(super) fn process_commit_epoch(
             continue;
         }
 
+        let effective_idempotency_key = request
+            .envelope
+            .idempotency_key
+            .as_ref()
+            .map(|key| scoped_idempotency_key(request.envelope.caller.as_ref(), key));
         let mut request_fingerprint = None;
-        if let Some(key) = request.envelope.idempotency_key.clone() {
+        if let Some(key) = effective_idempotency_key.clone() {
             let fingerprint = match request.envelope.request_fingerprint() {
                 Ok(fingerprint) => fingerprint,
                 Err(err) => {
@@ -1264,6 +1270,7 @@ pub(super) fn process_commit_epoch(
                 &working_catalog,
                 &working_keyspace,
                 &request.envelope.assertions,
+                state.config.max_scan_rows,
             )
         {
             if let Some(internal) = build_assertion_audit_commit(
@@ -1371,6 +1378,7 @@ pub(super) fn process_commit_epoch(
                         lock_manager: &state.coordinator_locks,
                         global_unique_index_enabled: state.config.global_unique_index_enabled,
                         partition_lock_timeout_ms: state.config.partition_lock_timeout_ms,
+                        max_scan_rows: state.config.max_scan_rows,
                     },
                 );
                 result.map(|()| {
@@ -1392,7 +1400,9 @@ pub(super) fn process_commit_epoch(
                         lock_manager: &state.coordinator_locks,
                         global_unique_index_enabled: state.config.global_unique_index_enabled,
                         partition_lock_timeout_ms: state.config.partition_lock_timeout_ms,
+                        max_scan_rows: state.config.max_scan_rows,
                     },
+                    request.envelope.caller.as_ref(),
                 );
                 result.map(|()| {
                     working_keyspace = trial_keyspace;
@@ -1444,6 +1454,8 @@ pub(super) fn process_commit_epoch(
                             &mut trial_keyspace,
                             mutation.clone(),
                             commit_seq,
+                            Some(state.config.max_scan_rows),
+                            request.envelope.caller.as_ref(),
                         ) {
                             apply_error = Some(err);
                             break;
@@ -1468,7 +1480,7 @@ pub(super) fn process_commit_epoch(
         let payload = match encode_wal_payload_from_parts(
             &mutations,
             &request.envelope.assertions,
-            request.envelope.idempotency_key.as_ref(),
+            effective_idempotency_key.as_ref(),
             request_fingerprint.as_ref(),
             Some(request.encoded_len),
         ) {
@@ -1485,7 +1497,7 @@ pub(super) fn process_commit_epoch(
         };
         let commit_ts_micros = now_micros();
 
-        if let Some(key) = request.envelope.idempotency_key.clone() {
+        if let Some(key) = effective_idempotency_key {
             working_idempotency
                 .get_or_insert_with(|| state.idempotency.clone())
                 .insert(
@@ -1548,6 +1560,7 @@ pub(super) fn process_commit_epoch(
             &sequenced,
             &deferred_parallel_commits,
             state.config.epoch_apply_timeout_ms,
+            state.config.max_scan_rows,
         );
         parallel_apply_micros = parallel_apply_micros
             .saturating_add(parallel_apply_started.elapsed().as_micros() as u64);
@@ -1635,6 +1648,43 @@ pub(super) fn process_commit_epoch(
         });
     }
     let pre_wal_micros = process_started.elapsed().as_micros() as u64;
+    let pre_wal_memory_estimate = working_keyspace.estimate_memory_bytes();
+    if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
+        let err_message = format!(
+            "memory estimate exceeded before WAL commit: memory_estimate_bytes={}, max_memory_estimate_bytes={}",
+            pre_wal_memory_estimate, state.config.max_memory_estimate_bytes
+        );
+        let err = AedbError::Validation(err_message.clone());
+        overwrite_assertion_failures_with_wal_error(
+            &mut outcomes,
+            &err,
+            "epoch aborted before WAL commit",
+        );
+        for failed in sequenced {
+            outcomes.push(EpochOutcome {
+                request: failed.request,
+                result: Err(AedbError::Validation(err_message.clone())),
+                post_apply_delta: None,
+            });
+        }
+        return EpochProcessResult {
+            outcomes,
+            coordinator_apply_attempts,
+            coordinator_apply_micros,
+            parallel_apply_micros,
+            pre_wal_micros,
+            finalize_micros: 0,
+            read_set_conflicts,
+            wal_append_ops,
+            wal_append_bytes,
+            wal_append_micros,
+            wal_sync_ops,
+            wal_sync_micros,
+            sync_executed,
+            catalog_changed,
+            ..EpochProcessResult::default()
+        };
+    }
     let append_started = Instant::now();
     if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
         let err = AedbError::Io(std::io::Error::other(err.to_string()));
@@ -1772,19 +1822,20 @@ pub(super) fn process_commit_epoch(
     );
     prune_idempotency(state);
 
+    let mut forced_full_snapshot = false;
     for commit in &sequenced {
-        state
+        forced_full_snapshot |= state
             .version_store
             .publish_delta(commit.seq, Arc::clone(&commit.delta));
     }
     for commit in &internal_sequenced {
-        state
+        forced_full_snapshot |= state
             .version_store
             .publish_delta(commit.seq, Arc::clone(&commit.delta));
     }
     let snapshot_due = now_micros().saturating_sub(state.last_full_snapshot_micros)
         >= state.config.max_snapshot_age_ms.saturating_mul(1000);
-    if snapshot_due {
+    if snapshot_due || forced_full_snapshot {
         state.version_store.publish_full(
             state.visible_head_seq,
             state.keyspace.snapshot(),
@@ -1990,7 +2041,14 @@ fn build_assertion_audit_commit(
     }];
 
     for mutation in &mutations {
-        if let Err(apply_err) = apply_mutation(catalog, keyspace, mutation.to_owned(), commit_seq) {
+        if let Err(apply_err) = apply_mutation(
+            catalog,
+            keyspace,
+            mutation.to_owned(),
+            commit_seq,
+            None,
+            None,
+        ) {
             warn!(error = ?apply_err, "failed to apply assertion audit mutation");
             *next_seq = next_seq.saturating_sub(1);
             return None;
@@ -2068,11 +2126,13 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
     sequenced: &[SequencedCommit],
     deferred_indexes: &[usize],
     epoch_apply_timeout_ms: u64,
+    max_scan_rows: usize,
 ) -> Result<(), AedbError> {
     let started = Instant::now();
     let mut receivers = Vec::with_capacity(deferred_indexes.len());
     let mut cancellations = Vec::with_capacity(deferred_indexes.len());
     let backend = keyspace.primary_index_backend;
+    let shared_catalog = Arc::new(catalog.clone());
     for deferred_index in deferred_indexes {
         let commit = sequenced
             .get(*deferred_index)
@@ -2108,7 +2168,9 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
             mutations,
             commit_seq: seq,
             backend,
-            catalog: catalog.clone(),
+            catalog: Arc::clone(&shared_catalog),
+            max_scan_rows,
+            caller: commit.request.envelope.caller.clone(),
             cancel: Arc::clone(&cancel),
             response_tx: tx,
         })?;
@@ -2571,14 +2633,7 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         | Mutation::Accumulate { .. }
         | Mutation::ExposeAccumulator { .. }
         | Mutation::ExposeAccumulatorBatch { .. }
-        | Mutation::OrderBookNew { .. }
-        | Mutation::OrderBookCancel { .. }
-        | Mutation::OrderBookCancelReplace { .. }
-        | Mutation::OrderBookMassCancel { .. }
-        | Mutation::OrderBookReduce { .. }
-        | Mutation::OrderBookMatch { .. }
-        | Mutation::OrderBookDefineTable { .. }
-        | Mutation::OrderBookDropTable { .. } => true,
+        => true,
         Mutation::Insert {
             project_id,
             scope_id,
@@ -3040,6 +3095,7 @@ pub(super) struct CoordinatorApplyOptions<'a> {
     pub lock_manager: &'a Arc<CoordinatorLockManager>,
     pub global_unique_index_enabled: bool,
     pub partition_lock_timeout_ms: u64,
+    pub max_scan_rows: usize,
 }
 
 pub(super) fn apply_via_coordinator(
@@ -3050,6 +3106,7 @@ pub(super) fn apply_via_coordinator(
     commit_seq: u64,
     ordered_partitions: &[String],
     options: CoordinatorApplyOptions<'_>,
+    caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
     let started = Instant::now();
     let _lock_guard = if options.coordinator_locking_enabled {
@@ -3076,7 +3133,14 @@ pub(super) fn apply_via_coordinator(
         if let Some(result) = apply_accumulator_hot_mutation(keyspace, mutation, commit_seq) {
             result?;
         } else {
-            apply_mutation(catalog, keyspace, mutation.clone(), commit_seq)?;
+            apply_mutation(
+                catalog,
+                keyspace,
+                mutation.clone(),
+                commit_seq,
+                Some(options.max_scan_rows),
+                caller,
+            )?;
         }
         if matches!(mutation, Mutation::Ddl(_)) {
             *global_unique_index = GlobalUniqueIndexState::from_snapshot(catalog, keyspace)?;
@@ -3329,6 +3393,8 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
                 ..
             } => {
                 let ns = namespace_key(project_id, scope_id);
+                // Predicate-based writes do not expose touched primary keys at scheduling time,
+                // so they conservatively serialize through the table partition.
                 out.insert(table_partition_token(&ns, table_name));
                 touched_tables.insert((ns, table_name.clone()));
             }
@@ -4037,12 +4103,21 @@ fn augment_mutations_with_caller(mutations: &mut [Mutation], caller: Option<&Cal
 
 pub(super) fn prune_idempotency(state: &mut ExecutorState) {
     let window_commits = state.config.idempotency_window_commits;
-    if window_commits == 0 {
+    let window_micros = state
+        .config
+        .idempotency_window_seconds
+        .saturating_mul(1_000_000);
+    if window_commits == 0 && window_micros == 0 {
         state.idempotency.clear();
         return;
     }
     let min_seq = state.current_seq.saturating_sub(window_commits);
-    state.idempotency.retain(|_, rec| rec.commit_seq > min_seq);
+    let min_recorded_at = now_micros().saturating_sub(window_micros);
+    state.idempotency.retain(|_, rec| {
+        let within_commit_window = window_commits == 0 || rec.commit_seq > min_seq;
+        let within_time_window = window_micros == 0 || rec.recorded_at_micros >= min_recorded_at;
+        within_commit_window && within_time_window
+    });
 }
 
 pub(super) fn now_micros() -> u64 {
@@ -4050,6 +4125,28 @@ pub(super) fn now_micros() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64
+}
+
+fn scoped_idempotency_key(
+    caller: Option<&CallerContext>,
+    key: &IdempotencyKey,
+) -> IdempotencyKey {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aedb:idempotency:v1");
+    match caller {
+        Some(caller) => {
+            hasher.update(&[1]);
+            hasher.update(caller.caller_id.as_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+    hasher.update(&key.0);
+    let hash = hasher.finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hash.as_bytes()[..16]);
+    IdempotencyKey(out)
 }
 
 pub(super) fn refresh_async_indexes(

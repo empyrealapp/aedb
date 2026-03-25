@@ -1843,7 +1843,15 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, crate::error::AedbError> {
 }
 
 fn estimate_row_bytes(row: &Row) -> usize {
-    row.values.iter().map(estimate_value_bytes).sum::<usize>() + 16
+    const ROW_BASE_OVERHEAD_BYTES: usize = 48;
+    const VALUE_SLOT_OVERHEAD_BYTES: usize = 16;
+
+    row.values
+        .iter()
+        .map(estimate_value_bytes)
+        .sum::<usize>()
+        .saturating_add(ROW_BASE_OVERHEAD_BYTES)
+        .saturating_add(row.values.len().saturating_mul(VALUE_SLOT_OVERHEAD_BYTES))
 }
 
 fn estimate_value_bytes(v: &Value) -> usize {

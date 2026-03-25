@@ -201,4 +201,45 @@ mod tests {
         assert_eq!(seq, 7);
         assert_eq!(ks, keyspace);
     }
+
+    #[test]
+    fn encrypted_checkpoints_use_distinct_random_nonces() {
+        let dir = tempdir().expect("temp");
+        let keyspace = Keyspace::default();
+        let catalog = Catalog::default();
+        let key = [7u8; 32];
+
+        let first = write_checkpoint_with_key(
+            &keyspace.snapshot(),
+            &catalog,
+            42,
+            dir.path(),
+            Some(&key),
+            Some("k1".into()),
+            std::collections::HashMap::new(),
+            3,
+        )
+        .expect("write first");
+        let first_bytes = std::fs::read(dir.path().join(&first.filename)).expect("read first");
+        let second = write_checkpoint_with_key(
+            &keyspace.snapshot(),
+            &catalog,
+            42,
+            dir.path(),
+            Some(&key),
+            Some("k1".into()),
+            std::collections::HashMap::new(),
+            3,
+        )
+        .expect("write second");
+        let second_bytes = std::fs::read(dir.path().join(second.filename)).expect("read second");
+
+        assert!(first_bytes.starts_with(b"AEDBENC1"));
+        assert!(second_bytes.starts_with(b"AEDBENC1"));
+        assert_ne!(
+            &first_bytes[8..20],
+            &second_bytes[8..20],
+            "encrypted checkpoints must not reuse nonces"
+        );
+    }
 }

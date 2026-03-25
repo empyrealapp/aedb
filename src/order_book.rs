@@ -429,9 +429,9 @@ pub fn key_execution_report_last(instrument: &str) -> Vec<u8> {
 }
 
 pub fn key_owner_nonce(instrument: &str, owner: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(10 + instrument.len() + owner.len());
+    let mut k = Vec::with_capacity(18 + instrument.len() + owner.len());
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":nonce:");
     k.extend_from_slice(owner.as_bytes());
     k
@@ -443,9 +443,9 @@ fn append_segment_len_prefixed(out: &mut Vec<u8>, segment: &str) {
 }
 
 pub fn key_client_id(instrument: &str, owner: &str, client_order_id: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(25 + instrument.len() + owner.len() + client_order_id.len());
+    let mut k = Vec::with_capacity(33 + instrument.len() + owner.len() + client_order_id.len());
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":cid:");
     append_segment_len_prefixed(&mut k, owner);
     append_segment_len_prefixed(&mut k, client_order_id);
@@ -453,18 +453,18 @@ pub fn key_client_id(instrument: &str, owner: &str, client_order_id: &str) -> Ve
 }
 
 pub fn key_order(instrument: &str, order_id: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(7 + instrument.len() + 8);
+    let mut k = Vec::with_capacity(15 + instrument.len() + 8);
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":ord:");
     k.extend_from_slice(&encode_order_id(order_id));
     k
 }
 
 pub fn key_plqty(instrument: &str, side: OrderSide, price_ticks: i64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(12 + instrument.len() + 8);
+    let mut k = Vec::with_capacity(20 + instrument.len() + 8);
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":plqty:");
     k.push(b'0' + side.as_u8());
     k.push(b':');
@@ -479,9 +479,9 @@ pub fn key_fifo(
     placed_seq: u64,
     order_id: u64,
 ) -> Vec<u8> {
-    let mut k = Vec::with_capacity(11 + instrument.len() + 8 + 1 + 8 + 1 + 8);
+    let mut k = Vec::with_capacity(19 + instrument.len() + 8 + 1 + 8 + 1 + 8);
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":fifo:");
     k.push(b'0' + side.as_u8());
     k.push(b':');
@@ -494,9 +494,9 @@ pub fn key_fifo(
 }
 
 pub fn key_open_order(instrument: &str, owner: &str, order_id: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(20 + instrument.len() + owner.len() + 8);
+    let mut k = Vec::with_capacity(28 + instrument.len() + owner.len() + 8);
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":open:");
     append_segment_len_prefixed(&mut k, owner);
     k.push(b':');
@@ -505,26 +505,26 @@ pub fn key_open_order(instrument: &str, owner: &str, order_id: u64) -> Vec<u8> {
 }
 
 pub fn key_trade(instrument: &str, fill_id: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(9 + instrument.len() + 8);
+    let mut k = Vec::with_capacity(17 + instrument.len() + 8);
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":trade:");
     k.extend_from_slice(&fill_id.to_be_bytes());
     k
 }
 
 pub fn trade_prefix(instrument: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(9 + instrument.len());
+    let mut k = Vec::with_capacity(17 + instrument.len());
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":trade:");
     k
 }
 
 pub fn fifo_prefix(instrument: &str, side: OrderSide, price_ticks: i64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(11 + instrument.len() + 8 + 1);
+    let mut k = Vec::with_capacity(19 + instrument.len() + 8 + 1);
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":fifo:");
     k.push(b'0' + side.as_u8());
     k.push(b':');
@@ -534,9 +534,9 @@ pub fn fifo_prefix(instrument: &str, side: OrderSide, price_ticks: i64) -> Vec<u
 }
 
 pub fn plqty_prefix(instrument: &str, side: OrderSide) -> Vec<u8> {
-    let mut k = Vec::with_capacity(11 + instrument.len());
+    let mut k = Vec::with_capacity(19 + instrument.len());
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":plqty:");
     k.push(b'0' + side.as_u8());
     k.push(b':');
@@ -544,9 +544,9 @@ pub fn plqty_prefix(instrument: &str, side: OrderSide) -> Vec<u8> {
 }
 
 pub fn open_orders_prefix(instrument: &str, owner: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(19 + instrument.len() + owner.len());
+    let mut k = Vec::with_capacity(27 + instrument.len() + owner.len());
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":open:");
     append_segment_len_prefixed(&mut k, owner);
     k.push(b':');
@@ -554,9 +554,9 @@ pub fn open_orders_prefix(instrument: &str, owner: &str) -> Vec<u8> {
 }
 
 pub fn all_orders_prefix(instrument: &str) -> Vec<u8> {
-    let mut k = Vec::with_capacity(9 + instrument.len());
+    let mut k = Vec::with_capacity(17 + instrument.len());
     k.extend_from_slice(b"ob:");
-    k.extend_from_slice(instrument.as_bytes());
+    append_segment_len_prefixed(&mut k, instrument);
     k.extend_from_slice(b":ord:");
     k
 }
@@ -2326,6 +2326,13 @@ mod tests {
         let k1 = key_client_id("BTC-USD", "alice:desk", "order-1");
         let k2 = key_client_id("BTC-USD", "alice", "desk:order-1");
         assert_ne!(k1, k2, "length-prefixed encoding must be unambiguous");
+    }
+
+    #[test]
+    fn key_owner_nonce_is_collision_resistant_for_instrument_alias_inputs() {
+        let k1 = key_owner_nonce("X:nonce:alice", "bob");
+        let k2 = key_owner_nonce("X", "alice:nonce:bob");
+        assert_ne!(k1, k2, "instrument encoding must not alias nonce owners");
     }
 
     #[test]

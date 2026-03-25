@@ -3,6 +3,7 @@ use crate::commit::apply::apply_mutation;
 use crate::commit::validation::Mutation;
 use crate::config::PrimaryIndexBackend;
 use crate::error::AedbError;
+use crate::permission::CallerContext;
 use crate::storage::keyspace::{Keyspace, Namespace, NamespaceId};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,7 +22,9 @@ pub(super) struct ParallelTask {
     pub(super) mutations: Vec<Mutation>,
     pub(super) commit_seq: u64,
     pub(super) backend: PrimaryIndexBackend,
-    pub(super) catalog: Catalog,
+    pub(super) catalog: Arc<Catalog>,
+    pub(super) max_scan_rows: usize,
+    pub(super) caller: Option<CallerContext>,
     pub(super) cancel: Arc<AtomicBool>,
     pub(super) response_tx: Sender<Result<(NamespaceId, Namespace), AedbError>>,
 }
@@ -80,7 +83,7 @@ fn execute_task(task: ParallelTask) -> Result<(), AedbError> {
             .send(Err(AedbError::ParallelApplyCancelled));
         return Ok(());
     }
-    let mut local_catalog = task.catalog;
+    let mut local_catalog = (*task.catalog).clone();
     let mut local_keyspace = Keyspace::with_backend(task.backend);
     local_keyspace.insert_namespace(task.namespace_id.clone(), task.base_namespace);
     for mutation in &task.mutations {
@@ -96,6 +99,8 @@ fn execute_task(task: ParallelTask) -> Result<(), AedbError> {
             &mut local_keyspace,
             mutation.clone(),
             task.commit_seq,
+            Some(task.max_scan_rows),
+            task.caller.as_ref(),
         ) {
             let _ = task.response_tx.send(Err(e));
             return Ok(());
