@@ -279,7 +279,7 @@ impl SegmentManager {
     pub fn close_active(&mut self) -> Result<ClosedSegment, SegmentError> {
         let mut active = self.active.take().ok_or(SegmentError::NotOpen)?;
         active.file.flush()?;
-        let hash = *active.hasher.finalize().as_bytes();
+        let hash = active.hasher.finalize().into();
         let size_bytes = active.file.metadata()?.len();
 
         Ok(ClosedSegment {

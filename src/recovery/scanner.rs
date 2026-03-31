@@ -39,7 +39,7 @@ pub fn verify_hash_chain(paths: &[PathBuf]) -> Result<(), AedbError> {
             }
             hasher.update(&buffer[..n]);
         }
-        prev_hash = *hasher.finalize().as_bytes();
+        prev_hash = hasher.finalize().into();
     }
     Ok(())
 }
@@ -141,7 +141,7 @@ pub fn validated_hash_chain_prefix_len(
                 }
             }
         }
-        prev_hash = *hasher.finalize().as_bytes();
+        prev_hash = hasher.finalize().into();
         valid_segment_count += 1;
     }
 
