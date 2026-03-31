@@ -279,7 +279,7 @@ impl SegmentManager {
     pub fn close_active(&mut self) -> Result<ClosedSegment, SegmentError> {
         let mut active = self.active.take().ok_or(SegmentError::NotOpen)?;
         active.file.flush()?;
-        let hash = active.hasher.finalize().into();
+        let hash = *blake3::Hasher::finalize(&active.hasher).as_bytes();
         let size_bytes = active.file.metadata()?.len();
 
         Ok(ClosedSegment {
@@ -404,6 +404,28 @@ mod tests {
                 assert_eq!(parsed.prev_segment_hash, prev.hash);
             }
         }
+    }
+
+    #[test]
+    fn close_active_hash_matches_segment_bytes() {
+        let dir = tempdir().expect("temp dir");
+        let mut manager = SegmentManager::new(
+            dir.path(),
+            SegmentConfig {
+                max_segment_bytes: 10_000,
+                max_segment_age: Duration::from_secs(3600),
+            },
+            11,
+        );
+        manager.open_active(1).expect("open");
+        manager
+            .append_frame(1, 1, 0x01, b"segment-payload")
+            .expect("append");
+
+        let closed = manager.close_active().expect("close");
+        let bytes = fs::read(&closed.path).expect("read segment");
+
+        assert_eq!(closed.hash, *blake3::hash(&bytes).as_bytes());
     }
 
     #[test]

@@ -39,7 +39,7 @@ pub fn verify_hash_chain(paths: &[PathBuf]) -> Result<(), AedbError> {
             }
             hasher.update(&buffer[..n]);
         }
-        prev_hash = hasher.finalize().into();
+        prev_hash = *blake3::Hasher::finalize(&hasher).as_bytes();
     }
     Ok(())
 }
@@ -141,7 +141,7 @@ pub fn validated_hash_chain_prefix_len(
                 }
             }
         }
-        prev_hash = hasher.finalize().into();
+        prev_hash = *blake3::Hasher::finalize(&hasher).as_bytes();
         valid_segment_count += 1;
     }
 
@@ -210,5 +210,21 @@ mod tests {
             validated_hash_chain_prefix_len(&paths, true, true).expect("strict valid"),
             2
         );
+    }
+
+    #[test]
+    fn verify_hash_chain_accepts_valid_segment_sequence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seg1 = dir.path().join("segment_0000000000000001.aedbwal");
+        let seg2 = dir.path().join("segment_0000000000000002.aedbwal");
+
+        let h1 = SegmentHeader::new(7, 1, [0u8; 32]);
+        write_segment(&seg1, h1, b"frame-a");
+        let hash1 = segment_hash(&seg1);
+
+        let h2 = SegmentHeader::new(7, 2, hash1);
+        write_segment(&seg2, h2, b"frame-b");
+
+        verify_hash_chain(&[seg1, seg2]).expect("valid hash chain");
     }
 }

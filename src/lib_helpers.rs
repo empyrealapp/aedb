@@ -1718,7 +1718,7 @@ pub(crate) fn verify_hash_chain_batch(
             }
             hasher.update(&buffer[..n]);
         }
-        let hash = hasher.finalize().into();
+        let hash = *blake3::Hasher::finalize(&hasher).as_bytes();
         expected_prev_hash = Some(hash);
         last = Some((parsed.segment_seq, hash));
     }
