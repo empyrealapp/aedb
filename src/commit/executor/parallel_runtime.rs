@@ -5,6 +5,7 @@ use crate::config::PrimaryIndexBackend;
 use crate::error::AedbError;
 use crate::permission::CallerContext;
 use crate::storage::keyspace::{Keyspace, Namespace, NamespaceId};
+use crate::storage::value_store::PersistentValueStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self as std_mpsc, Receiver, Sender};
@@ -22,6 +23,8 @@ pub(super) struct ParallelTask {
     pub(super) mutations: Vec<Mutation>,
     pub(super) commit_seq: u64,
     pub(super) backend: PrimaryIndexBackend,
+    pub(super) value_store: Option<Arc<PersistentValueStore>>,
+    pub(super) persistent_value_inline_threshold_bytes: usize,
     pub(super) catalog: Arc<Catalog>,
     pub(super) max_scan_rows: usize,
     pub(super) caller: Option<CallerContext>,
@@ -85,6 +88,10 @@ fn execute_task(task: ParallelTask) -> Result<(), AedbError> {
     }
     let mut local_catalog = (*task.catalog).clone();
     let mut local_keyspace = Keyspace::with_backend(task.backend);
+    if let Some(store) = task.value_store {
+        local_keyspace
+            .set_persistent_value_store(store, task.persistent_value_inline_threshold_bytes);
+    }
     local_keyspace.insert_namespace_unchecked(task.namespace_id.clone(), task.base_namespace);
     for mutation in &task.mutations {
         if task.cancel.load(Ordering::Relaxed) {

@@ -15,8 +15,6 @@ Because of that, **field add/remove does not require a migration entry**.
 - Create or drop state
 - Create or drop event
 - Create or drop processor
-- Create or drop accumulator
-- Alter accumulator runtime config
 - Add or drop index
 - Field type changes that require transform logic
 - Field renames (tag/name alias mapping)

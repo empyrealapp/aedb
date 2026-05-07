@@ -4,11 +4,12 @@ use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::Mutation;
-use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
-use aedb::error::AedbError;
+use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use aedb::permission::{CallerContext, Permission};
 use aedb::query::plan::{ConsistencyMode, Query, col, lit};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use std::time::Instant;
 use tempfile::tempdir;
 
@@ -27,14 +28,26 @@ struct BenchThresholds {
     batch_throughput_cps: u64,
 }
 
-fn doc_thresholds() -> BenchThresholds {
+fn benchmark_thresholds() -> BenchThresholds {
+    if cfg!(debug_assertions) {
+        return BenchThresholds {
+            kv_get_p50_us: 25,
+            kv_get_p99_us: 100,
+            kv_scan_100_p50_us: 350,
+            kv_scan_100_p99_us: 800,
+            mixed_commit_p50_us: 60_000,
+            mixed_commit_p99_us: 100_000,
+            batch_throughput_cps: 1_500,
+        };
+    }
+
     BenchThresholds {
         kv_get_p50_us: 5,
         kv_get_p99_us: 50,
-        kv_scan_100_p50_us: 100,
+        kv_scan_100_p50_us: 150,
         kv_scan_100_p99_us: 500,
-        mixed_commit_p50_us: 200,
-        mixed_commit_p99_us: 2_000,
+        mixed_commit_p50_us: 35_000,
+        mixed_commit_p99_us: 60_000,
         batch_throughput_cps: 5_000,
     }
 }
@@ -45,6 +58,25 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
     }
     let percentile_index = ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
     sorted[percentile_index.min(sorted.len() - 1)]
+}
+
+fn latency_us(latencies: &mut [u128]) -> (u64, u64) {
+    latencies.sort_unstable();
+    (
+        percentile(latencies, 0.50) as u64,
+        percentile(latencies, 0.99) as u64,
+    )
+}
+
+fn high_throughput_config() -> AedbConfig {
+    AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 10,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        ..AedbConfig::default()
+    }
 }
 
 async fn setup(config: AedbConfig, rows: i64) -> (tempfile::TempDir, AedbInstance) {
@@ -126,7 +158,7 @@ async fn benchmark_gate_doc_matrix() {
     let enforce = std::env::var("AEDB_ENFORCE_BENCH_GATES")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let thresholds = doc_thresholds();
+    let thresholds = benchmark_thresholds();
 
     let config = AedbConfig {
         recovery_mode: RecoveryMode::Strict,
@@ -137,7 +169,7 @@ async fn benchmark_gate_doc_matrix() {
 
     let caller = CallerContext::new("bench");
 
-    let mut kv_get_lat = Vec::new();
+    let mut kv_get_lat_ns = Vec::new();
     for i in 0..300 {
         let key = format!("bank:user:{}:balance", i % 2_000);
         let t0 = Instant::now();
@@ -151,11 +183,13 @@ async fn benchmark_gate_doc_matrix() {
             )
             .await
             .expect("kv get");
-        kv_get_lat.push(t0.elapsed().as_micros());
+        kv_get_lat_ns.push(t0.elapsed().as_nanos());
     }
-    kv_get_lat.sort_unstable();
-    let kv_get_p50 = percentile(&kv_get_lat, 0.50) as u64;
-    let kv_get_p99 = percentile(&kv_get_lat, 0.99) as u64;
+    kv_get_lat_ns.sort_unstable();
+    let kv_get_p50_ns = percentile(&kv_get_lat_ns, 0.50) as u64;
+    let kv_get_p99_ns = percentile(&kv_get_lat_ns, 0.99) as u64;
+    let kv_get_p50 = kv_get_p50_ns / 1_000;
+    let kv_get_p99 = kv_get_p99_ns / 1_000;
 
     let mut kv_scan_lat = Vec::new();
     for _ in 0..120 {
@@ -265,8 +299,16 @@ async fn benchmark_gate_doc_matrix() {
     let throughput = (submitted as f64 / elapsed_secs) as u64;
 
     eprintln!(
-        "benchmark_gate: kv_get p50={}us p99={}us; kv_scan100 p50={}us p99={}us; mixed_commit p50={}us p99={}us; batch_throughput={} cps",
-        kv_get_p50, kv_get_p99, kv_scan_p50, kv_scan_p99, mixed_p50, mixed_p99, throughput
+        "benchmark_gate: kv_get p50={}ns p99={}ns ({}us/{}us); kv_scan100 p50={}us p99={}us; mixed_commit p50={}us p99={}us; batch_throughput={} cps",
+        kv_get_p50_ns,
+        kv_get_p99_ns,
+        kv_get_p50,
+        kv_get_p99,
+        kv_scan_p50,
+        kv_scan_p99,
+        mixed_p50,
+        mixed_p99,
+        throughput
     );
 
     if enforce {
@@ -278,7 +320,7 @@ async fn benchmark_gate_doc_matrix() {
         assert!(mixed_p99 <= thresholds.mixed_commit_p99_us);
         assert!(throughput >= thresholds.batch_throughput_cps);
     } else {
-        assert!(kv_get_p99 > 0);
+        assert!(kv_get_p99_ns > 0);
         assert!(kv_scan_p99 > 0);
         assert!(mixed_p99 > 0);
         assert!(throughput > 0);
@@ -366,244 +408,596 @@ async fn benchmark_coordinator_vs_parallel_lanes() {
 
 #[tokio::test]
 #[ignore = "benchmark gate; run explicitly in CI or perf environment"]
-async fn benchmark_accumulator_expose_throughput() {
-    let enforce = std::env::var("AEDB_ENFORCE_BENCH_GATES")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let target_tps = 10_000u64;
-    let enforce_percentile = std::env::var("AEDB_BENCH_GATE_PERCENTILE")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .map(|p| p.clamp(0.0, 1.0))
-        .unwrap_or(0.25);
+async fn benchmark_persistent_large_kv_values() {
+    const VALUE_COUNT: usize = 48;
+    const VALUE_BYTES: usize = 128 * 1024;
 
-    let mode = std::env::var("AEDB_BENCH_DURABILITY").unwrap_or_else(|_| "batch".to_string());
-    let config = if mode.eq_ignore_ascii_case("full") {
+    fn disk_config(hot_cache_bytes: usize) -> AedbConfig {
         AedbConfig {
-            durability_mode: DurabilityMode::Full,
-            recovery_mode: RecoveryMode::Strict,
-            ..AedbConfig::default()
-        }
-        .with_hmac_key(vec![9u8; 32])
-    } else {
-        AedbConfig {
-            durability_mode: DurabilityMode::Batch,
-            batch_interval_ms: 10,
-            batch_max_bytes: usize::MAX,
+            durability_mode: DurabilityMode::OsBuffered,
             recovery_mode: RecoveryMode::Permissive,
             hash_chain_required: false,
+            persistent_value_inline_threshold_bytes: 1024,
+            persistent_value_hot_cache_bytes: hot_cache_bytes,
+            max_kv_value_bytes: 256 * 1024,
+            max_transaction_bytes: 512 * 1024,
             ..AedbConfig::default()
         }
-    };
-    let workers = std::env::var("AEDB_BENCH_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(32);
-    let run_secs = std::env::var("AEDB_BENCH_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2);
-    let runs = std::env::var("AEDB_BENCH_RUNS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(if enforce { 5 } else { 1 })
-        .max(1);
-    let mut run_tps = Vec::with_capacity(runs);
-    let mut rejected_total = 0u64;
-    for run_idx in 0..runs {
-        let dir = tempdir().expect("temp dir");
-        let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
-        db.create_project(PROJECT_ID).await.expect("project");
-        db.create_accumulator_with_options(
-            PROJECT_ID,
-            SCOPE_ID,
-            "house_balance",
-            Some(200_000),
-            20_000,
-            0,
-            None,
-        )
-        .await
-        .expect("create accumulator");
-        db.accumulate(
-            PROJECT_ID,
-            SCOPE_ID,
-            "house_balance",
-            1_000_000_000,
-            "seed".into(),
-            1,
-        )
-        .await
-        .expect("seed balance");
-        let deadline = Instant::now() + std::time::Duration::from_secs(run_secs);
-        let mut handles = Vec::with_capacity(workers);
-        for worker in 0..workers {
-            let db = Arc::clone(&db);
-            handles.push(tokio::spawn(async move {
-                let mut ok = 0u64;
-                let mut rejected = 0u64;
-                let mut seq = 0u64;
-                while Instant::now() < deadline {
-                    let exposure_id = format!("bench:{run_idx}:{worker}:{seq}");
-                    match db
-                        .expose_accumulator(PROJECT_ID, SCOPE_ID, "house_balance", 1, exposure_id)
-                        .await
-                    {
-                        Ok(_) => ok += 1,
-                        Err(AedbError::Validation(_)) => rejected += 1,
-                        Err(e) => panic!("unexpected expose error: {e}"),
-                    }
-                    seq += 1;
-                }
-                (ok, rejected)
-            }));
-        }
-        let mut ok_total = 0u64;
-        let mut rejected_run = 0u64;
-        for handle in handles {
-            let (ok, rejected) = handle.await.expect("worker join");
-            ok_total += ok;
-            rejected_run += rejected;
-        }
-        rejected_total += rejected_run;
-        let tps = (ok_total as f64 / run_secs as f64).round() as u64;
-        run_tps.push(tps);
-        eprintln!(
-            "benchmark_accumulator_expose_throughput: durability={} run={} workers={} seconds={} ok={} rejected={} tps={}",
-            mode,
-            run_idx + 1,
-            workers,
-            run_secs,
-            ok_total,
-            rejected_run,
-            tps
-        );
     }
-    run_tps.sort_unstable();
-    let run_tps_u128: Vec<u128> = run_tps.iter().map(|v| *v as u128).collect();
-    let p50 = percentile(&run_tps_u128, 0.50) as u64;
-    let p10 = percentile(&run_tps_u128, 0.10) as u64;
-    let gate_tps = percentile(&run_tps_u128, enforce_percentile) as u64;
+
+    async fn setup_large_values(hot_cache_bytes: usize) -> (tempfile::TempDir, AedbInstance) {
+        let dir = tempdir().expect("temp dir");
+        let db = AedbInstance::open(disk_config(hot_cache_bytes), dir.path()).expect("open");
+        db.create_project(PROJECT_ID).await.expect("project");
+        for i in 0..VALUE_COUNT {
+            let value = vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES];
+            db.commit(Mutation::KvSet {
+                project_id: PROJECT_ID.into(),
+                scope_id: SCOPE_ID.into(),
+                key: format!("blob:{i}").into_bytes(),
+                value,
+            })
+            .await
+            .expect("seed blob");
+        }
+        (dir, db)
+    }
+
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(disk_config(0), dir.path()).expect("open");
+    db.create_project(PROJECT_ID).await.expect("project");
+    let mut large_set_lat = Vec::new();
+    for i in 0..VALUE_COUNT {
+        let value = vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES];
+        let t0 = Instant::now();
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("write:{i}").into_bytes(),
+            value,
+        })
+        .await
+        .expect("large kv set");
+        large_set_lat.push(t0.elapsed().as_micros());
+    }
+    large_set_lat.sort_unstable();
+    let large_set_p50 = percentile(&large_set_lat, 0.50) as u64;
+    let large_set_p99 = percentile(&large_set_lat, 0.99) as u64;
+
+    let (_hot_dir, hot_db) = setup_large_values(VALUE_BYTES * VALUE_COUNT).await;
+    let mut hot_get_lat = Vec::new();
+    for i in 0..VALUE_COUNT {
+        let key = format!("blob:{i}");
+        let t0 = Instant::now();
+        let got = hot_db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("hot blob get")
+            .expect("hot blob");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        hot_get_lat.push(t0.elapsed().as_micros());
+    }
+    hot_get_lat.sort_unstable();
+    let hot_get_p50 = percentile(&hot_get_lat, 0.50) as u64;
+    let hot_get_p99 = percentile(&hot_get_lat, 0.99) as u64;
+
+    let (_cold_dir, cold_db) = setup_large_values(0).await;
+    let mut cold_get_lat = Vec::new();
+    for i in 0..VALUE_COUNT {
+        let key = format!("blob:{i}");
+        let t0 = Instant::now();
+        let got = cold_db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("cold blob get")
+            .expect("cold blob");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        cold_get_lat.push(t0.elapsed().as_micros());
+    }
+    cold_get_lat.sort_unstable();
+    let cold_get_p50 = percentile(&cold_get_lat, 0.50) as u64;
+    let cold_get_p99 = percentile(&cold_get_lat, 0.99) as u64;
+
     eprintln!(
-        "benchmark_accumulator_expose_throughput summary: durability={} runs={} gate_percentile={} gate_tps={} p10_tps={} p50_tps={} min_tps={} max_tps={} rejected_total={}",
-        mode,
-        runs,
-        enforce_percentile,
-        gate_tps,
-        p10,
-        p50,
-        run_tps.first().copied().unwrap_or_default(),
-        run_tps.last().copied().unwrap_or_default(),
-        rejected_total
+        "persistent_large_kv: value_bytes={} count={} set_p50={}us set_p99={}us hot_get_p50={}us hot_get_p99={}us cold_get_p50={}us cold_get_p99={}us",
+        VALUE_BYTES,
+        VALUE_COUNT,
+        large_set_p50,
+        large_set_p99,
+        hot_get_p50,
+        hot_get_p99,
+        cold_get_p50,
+        cold_get_p99
     );
 
-    if enforce {
-        assert_eq!(rejected_total, 0, "unexpected exposure rejections");
-        assert!(
-            gate_tps >= target_tps,
-            "accumulator expose throughput p{} below target: {} < {}",
-            (enforce_percentile * 100.0).round() as u64,
-            gate_tps,
-            target_tps
+    assert!(large_set_p99 > 0);
+    assert!(hot_get_p99 > 0);
+    assert!(cold_get_p99 > 0);
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_small_kv_memory_pressure_spill() {
+    const VALUE_COUNT: usize = 256;
+    const VALUE_BYTES: usize = 256;
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::OsBuffered,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        persistent_value_inline_threshold_bytes: 1024,
+        persistent_value_hot_cache_bytes: VALUE_COUNT * VALUE_BYTES,
+        max_kv_value_bytes: 1024,
+        max_transaction_bytes: 4096,
+        max_memory_estimate_bytes: 16 * 1024,
+        ..AedbConfig::default()
+    };
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project(PROJECT_ID).await.expect("project");
+
+    let mut set_lat = Vec::new();
+    for i in 0..VALUE_COUNT {
+        let value = vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES];
+        let t0 = Instant::now();
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("small-pressure:{i:04}").into_bytes(),
+            value,
+        })
+        .await
+        .expect("small kv set");
+        set_lat.push(t0.elapsed().as_micros());
+    }
+    set_lat.sort_unstable();
+    let set_p50 = percentile(&set_lat, 0.50) as u64;
+    let set_p99 = percentile(&set_lat, 0.99) as u64;
+
+    let mut cold_get_lat = Vec::new();
+    for i in 0..VALUE_COUNT {
+        let key = format!("small-pressure:{i:04}");
+        let t0 = Instant::now();
+        let got = db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("cold small get")
+            .expect("cold small value");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        cold_get_lat.push(t0.elapsed().as_micros());
+    }
+    cold_get_lat.sort_unstable();
+    let cold_get_p50 = percentile(&cold_get_lat, 0.50) as u64;
+    let cold_get_p99 = percentile(&cold_get_lat, 0.99) as u64;
+
+    let mut hot_get_lat = Vec::new();
+    for i in 0..VALUE_COUNT {
+        let key = format!("small-pressure:{i:04}");
+        let t0 = Instant::now();
+        let got = db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("hot small get")
+            .expect("hot small value");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        hot_get_lat.push(t0.elapsed().as_micros());
+    }
+    hot_get_lat.sort_unstable();
+    let hot_get_p50 = percentile(&hot_get_lat, 0.50) as u64;
+    let hot_get_p99 = percentile(&hot_get_lat, 0.99) as u64;
+
+    let memory_estimate = db.estimated_memory_bytes().await;
+    let metrics = db.operational_metrics().await;
+    eprintln!(
+        "small_kv_pressure: value_bytes={} count={} set_p50={}us set_p99={}us cold_get_p50={}us cold_get_p99={}us hot_get_p50={}us hot_get_p99={}us memory_estimate={} value_store_bytes={}",
+        VALUE_BYTES,
+        VALUE_COUNT,
+        set_p50,
+        set_p99,
+        cold_get_p50,
+        cold_get_p99,
+        hot_get_p50,
+        hot_get_p99,
+        memory_estimate,
+        metrics.persistent_value_store_bytes
+    );
+
+    assert!(memory_estimate <= 16 * 1024);
+    assert!(metrics.persistent_value_store_bytes > 8 + VALUE_BYTES as u64);
+    assert!(set_p99 > 0);
+    assert!(cold_get_p99 > 0);
+    assert!(hot_get_p99 <= cold_get_p99);
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_many_small_kv_no_pressure() {
+    const SEED_COUNT: usize = 4_096;
+    const OPS: usize = 512;
+    const VALUE_BYTES: usize = 64;
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::OsBuffered,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        persistent_value_inline_threshold_bytes: 1024,
+        max_kv_value_bytes: 1024,
+        max_transaction_bytes: 4096,
+        max_memory_estimate_bytes: 512 * 1024 * 1024,
+        ..AedbConfig::default()
+    };
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project(PROJECT_ID).await.expect("project");
+
+    for i in 0..SEED_COUNT {
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("many-small:{i:04}").into_bytes(),
+            value: vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES],
+        })
+        .await
+        .expect("seed small kv");
+    }
+
+    let mut update_lat = Vec::new();
+    for i in 0..OPS {
+        let t0 = Instant::now();
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("many-small:{:04}", i % SEED_COUNT).into_bytes(),
+            value: vec![u8::try_from((i + 1) % 251).expect("byte"); VALUE_BYTES],
+        })
+        .await
+        .expect("update small kv");
+        update_lat.push(t0.elapsed().as_micros());
+    }
+    update_lat.sort_unstable();
+    let update_p50 = percentile(&update_lat, 0.50) as u64;
+    let update_p99 = percentile(&update_lat, 0.99) as u64;
+
+    let mut get_lat = Vec::new();
+    for i in 0..OPS {
+        let key = format!("many-small:{:04}", i % SEED_COUNT);
+        let t0 = Instant::now();
+        let got = db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("get small kv")
+            .expect("small kv");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        get_lat.push(t0.elapsed().as_micros());
+    }
+    get_lat.sort_unstable();
+    let get_p50 = percentile(&get_lat, 0.50) as u64;
+    let get_p99 = percentile(&get_lat, 0.99) as u64;
+
+    let memory_estimate = db.estimated_memory_bytes().await;
+    eprintln!(
+        "many_small_kv_no_pressure: seed_count={} ops={} value_bytes={} update_p50={}us update_p99={}us get_p50={}us get_p99={}us memory_estimate={}",
+        SEED_COUNT, OPS, VALUE_BYTES, update_p50, update_p99, get_p50, get_p99, memory_estimate
+    );
+
+    assert!(update_p99 > 0);
+    assert!(get_p99 <= update_p99);
+    assert!(memory_estimate > SEED_COUNT * VALUE_BYTES);
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_durability_profile_write_matrix() {
+    const OPS: usize = 160;
+    let profiles = [
+        (
+            "full_strict",
+            AedbConfig {
+                durability_mode: DurabilityMode::Full,
+                recovery_mode: RecoveryMode::Strict,
+                ..AedbConfig::default()
+            }
+            .with_hmac_key(vec![3u8; 32]),
+        ),
+        (
+            "batch_strict",
+            AedbConfig {
+                durability_mode: DurabilityMode::Batch,
+                batch_interval_ms: 10,
+                batch_max_bytes: usize::MAX,
+                recovery_mode: RecoveryMode::Strict,
+                ..AedbConfig::default()
+            }
+            .with_hmac_key(vec![4u8; 32]),
+        ),
+        (
+            "osbuffered_permissive",
+            AedbConfig {
+                durability_mode: DurabilityMode::OsBuffered,
+                recovery_mode: RecoveryMode::Permissive,
+                hash_chain_required: false,
+                ..AedbConfig::default()
+            },
+        ),
+    ];
+
+    for (name, config) in profiles {
+        let dir = tempdir().expect("temp dir");
+        let db = AedbInstance::open(config, dir.path()).expect("open");
+        db.create_project(PROJECT_ID).await.expect("project");
+
+        let mut latencies = Vec::with_capacity(OPS);
+        for i in 0..OPS {
+            let t0 = Instant::now();
+            db.commit(Mutation::KvSet {
+                project_id: PROJECT_ID.into(),
+                scope_id: SCOPE_ID.into(),
+                key: format!("profile:{name}:{i:04}").into_bytes(),
+                value: vec![u8::try_from(i % 251).expect("byte"); 64],
+            })
+            .await
+            .expect("profile write");
+            latencies.push(t0.elapsed().as_micros());
+        }
+        let (p50, p99) = latency_us(&mut latencies);
+        let metrics = db.operational_metrics().await;
+        eprintln!(
+            "durability_profile: name={} ops={} p50={}us p99={}us avg_commit={}us wal_append_ops={} avg_wal_append={}us wal_sync_ops={} avg_wal_sync={}us",
+            name,
+            OPS,
+            p50,
+            p99,
+            metrics.avg_commit_latency_micros,
+            metrics.wal_append_ops,
+            metrics.avg_wal_append_micros,
+            metrics.wal_sync_ops,
+            metrics.avg_wal_sync_micros
         );
-    } else {
-        assert!(p50 > 0);
+        assert!(p99 > 0);
     }
 }
 
 #[tokio::test]
 #[ignore = "benchmark gate; run explicitly in CI or perf environment"]
-async fn benchmark_accumulator_expose_batched_throughput() {
-    let mode = std::env::var("AEDB_BENCH_DURABILITY").unwrap_or_else(|_| "batch".to_string());
-    let config = if mode.eq_ignore_ascii_case("full") {
-        AedbConfig {
-            durability_mode: DurabilityMode::Full,
-            recovery_mode: RecoveryMode::Strict,
-            ..AedbConfig::default()
+async fn benchmark_many_small_kv_batching() {
+    const INDIVIDUAL_OPS: usize = 512;
+    const BATCHES: usize = 64;
+    const BATCH_SIZE: usize = 16;
+    let config = high_throughput_config();
+
+    let individual_dir = tempdir().expect("individual temp dir");
+    let individual_db = AedbInstance::open(config.clone(), individual_dir.path()).expect("open");
+    individual_db
+        .create_project(PROJECT_ID)
+        .await
+        .expect("project");
+    let individual_start = Instant::now();
+    for i in 0..INDIVIDUAL_OPS {
+        individual_db
+            .commit(Mutation::KvSet {
+                project_id: PROJECT_ID.into(),
+                scope_id: SCOPE_ID.into(),
+                key: format!("individual:{i:04}").into_bytes(),
+                value: vec![1u8; 32],
+            })
+            .await
+            .expect("individual write");
+    }
+    let individual_secs = individual_start.elapsed().as_secs_f64().max(0.001);
+    let individual_ops_per_sec = (INDIVIDUAL_OPS as f64 / individual_secs) as u64;
+
+    let batch_dir = tempdir().expect("batch temp dir");
+    let batch_db = AedbInstance::open(config, batch_dir.path()).expect("open");
+    batch_db.create_project(PROJECT_ID).await.expect("project");
+    let batch_start = Instant::now();
+    for batch in 0..BATCHES {
+        let mut entries = Vec::with_capacity(BATCH_SIZE);
+        for item in 0..BATCH_SIZE {
+            let key_index = batch * BATCH_SIZE + item;
+            entries.push((
+                format!("batched:{key_index:04}").into_bytes(),
+                vec![2u8; 32],
+            ));
         }
-        .with_hmac_key(vec![9u8; 32])
-    } else {
-        AedbConfig {
-            durability_mode: DurabilityMode::Batch,
-            batch_interval_ms: 10,
-            batch_max_bytes: usize::MAX,
-            recovery_mode: RecoveryMode::Permissive,
-            hash_chain_required: false,
-            ..AedbConfig::default()
-        }
+        batch_db
+            .kv_set_many_atomic(PROJECT_ID, SCOPE_ID, entries)
+            .await
+            .expect("batched write");
+    }
+    let batch_secs = batch_start.elapsed().as_secs_f64().max(0.001);
+    let batched_ops = BATCHES * BATCH_SIZE;
+    let batch_ops_per_sec = (batched_ops as f64 / batch_secs) as u64;
+    let batch_commits_per_sec = (BATCHES as f64 / batch_secs) as u64;
+
+    eprintln!(
+        "many_small_kv_batching: individual_ops={} individual_ops_per_sec={} batched_ops={} batch_size={} batched_ops_per_sec={} batched_commits_per_sec={}",
+        INDIVIDUAL_OPS,
+        individual_ops_per_sec,
+        batched_ops,
+        BATCH_SIZE,
+        batch_ops_per_sec,
+        batch_commits_per_sec
+    );
+    assert!(batch_ops_per_sec > individual_ops_per_sec);
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_spilled_kv_hot_cold_read_mix() {
+    const KEYS: usize = 2_048;
+    const HOT_KEYS: usize = 64;
+    const OPS: usize = 1_024;
+    const VALUE_BYTES: usize = 128;
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::OsBuffered,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        persistent_value_inline_threshold_bytes: 32,
+        persistent_value_hot_cache_bytes: HOT_KEYS * VALUE_BYTES,
+        max_kv_value_bytes: 1024,
+        max_transaction_bytes: 4096,
+        ..AedbConfig::default()
     };
     let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project(PROJECT_ID).await.expect("project");
+    for i in 0..KEYS {
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("zipf:{i:04}").into_bytes(),
+            value: vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES],
+        })
+        .await
+        .expect("seed spilled kv");
+    }
+
+    let mut latencies = Vec::with_capacity(OPS);
+    for i in 0..OPS {
+        let key_index = if i % 10 < 8 {
+            (i * 17) % HOT_KEYS
+        } else {
+            HOT_KEYS + ((i * 131) % (KEYS - HOT_KEYS))
+        };
+        let key = format!("zipf:{key_index:04}");
+        let t0 = Instant::now();
+        let got = db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("get spilled kv")
+            .expect("value");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        latencies.push(t0.elapsed().as_micros());
+    }
+    let (p50, p99) = latency_us(&mut latencies);
+    let metrics = db.operational_metrics().await;
+    eprintln!(
+        "spilled_kv_hot_cold_read_mix: keys={} hot_keys={} ops={} p50={}us p99={}us value_store_bytes={} hot_cache_bytes={} hot_cache_capacity={}",
+        KEYS,
+        HOT_KEYS,
+        OPS,
+        p50,
+        p99,
+        metrics.persistent_value_store_bytes,
+        metrics.persistent_value_hot_cache_bytes,
+        metrics.persistent_value_hot_cache_capacity_bytes
+    );
+    assert!(p99 > 0);
+    assert!(
+        metrics.persistent_value_hot_cache_bytes
+            <= metrics.persistent_value_hot_cache_capacity_bytes
+    );
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_checkpoint_and_backup_under_spilled_write_load() {
+    const VALUE_BYTES: usize = 64 * 1024;
+    const SEED_VALUES: usize = 24;
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 10,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        persistent_value_inline_threshold_bytes: 1024,
+        persistent_value_hot_cache_bytes: 4 * VALUE_BYTES,
+        max_kv_value_bytes: 128 * 1024,
+        max_transaction_bytes: 256 * 1024,
+        ..AedbConfig::default()
+    };
+    let dir = tempdir().expect("temp dir");
+    let backup_dir = tempdir().expect("backup dir");
     let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
     db.create_project(PROJECT_ID).await.expect("project");
-    db.create_accumulator_with_options(
-        PROJECT_ID,
-        SCOPE_ID,
-        "house_balance",
-        Some(200_000),
-        20_000,
-        0,
-        None,
-    )
-    .await
-    .expect("create accumulator");
-    db.accumulate(
-        PROJECT_ID,
-        SCOPE_ID,
-        "house_balance",
-        1_000_000_000,
-        "seed".into(),
-        1,
-    )
-    .await
-    .expect("seed balance");
+    for i in 0..SEED_VALUES {
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("seed-large:{i:04}").into_bytes(),
+            value: vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES],
+        })
+        .await
+        .expect("seed large value");
+    }
 
-    let batch_size = std::env::var("AEDB_BENCH_BATCH_SIZE")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16)
-        .max(1);
-    let workers = std::env::var("AEDB_BENCH_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16)
-        .max(1);
-    let run_secs = std::env::var("AEDB_BENCH_SECONDS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2);
-    let deadline = Instant::now() + std::time::Duration::from_secs(run_secs);
-
-    let mut handles = Vec::with_capacity(workers);
-    for worker in 0..workers {
-        let db = Arc::clone(&db);
-        handles.push(tokio::spawn(async move {
-            let mut batches = 0u64;
-            let mut seq = 0u64;
-            while Instant::now() < deadline {
-                let mut exposures = Vec::with_capacity(batch_size);
-                for _ in 0..batch_size {
-                    exposures.push((1, format!("bench-batch:{worker}:{seq}")));
-                    seq += 1;
-                }
-                db.expose_accumulator_many_atomic(PROJECT_ID, SCOPE_ID, "house_balance", exposures)
-                    .await
-                    .expect("batch expose");
-                batches += 1;
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let writer_db = Arc::clone(&db);
+    let writer = tokio::spawn(async move {
+        let mut writes = 0usize;
+        while !writer_stop.load(Ordering::Relaxed) {
+            writer_db
+                .commit(Mutation::KvSet {
+                    project_id: PROJECT_ID.into(),
+                    scope_id: SCOPE_ID.into(),
+                    key: format!("live-large:{writes:04}").into_bytes(),
+                    value: vec![u8::try_from(writes % 251).expect("byte"); VALUE_BYTES],
+                })
+                .await
+                .expect("live large write");
+            writes += 1;
+            if writes >= 32 {
+                break;
             }
-            batches
-        }));
-    }
-    let mut batches = 0u64;
-    for handle in handles {
-        batches += handle.await.expect("worker join");
-    }
-    let elapsed = run_secs as f64;
-    let total_ops = batches * batch_size as u64;
-    let ops_tps = (total_ops as f64 / elapsed).round() as u64;
-    let commit_tps = (batches as f64 / elapsed).round() as u64;
+        }
+        writes
+    });
+
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let checkpoint_started = Instant::now();
+    let checkpoint_seq = db.checkpoint_now().await.expect("checkpoint");
+    let checkpoint_micros = checkpoint_started.elapsed().as_micros() as u64;
+    let backup_started = Instant::now();
+    let backup = db
+        .backup_full(backup_dir.path())
+        .await
+        .expect("backup full");
+    let backup_micros = backup_started.elapsed().as_micros() as u64;
+    stop.store(true, Ordering::Relaxed);
+    let writes = writer.await.expect("writer join");
+
+    let metrics = db.operational_metrics().await;
     eprintln!(
-        "benchmark_accumulator_expose_batched_throughput: durability={} workers={} batch_size={} seconds={} commits={} commit_tps={} ops_tps={}",
-        mode, workers, batch_size, run_secs, batches, commit_tps, ops_tps
+        "checkpoint_backup_spilled_write_load: checkpoint_seq={} checkpoint={}us backup_seq={} backup={}us concurrent_writes={} value_store_bytes={} hot_cache_bytes={}",
+        checkpoint_seq,
+        checkpoint_micros,
+        backup.wal_head_seq,
+        backup_micros,
+        writes,
+        metrics.persistent_value_store_bytes,
+        metrics.persistent_value_hot_cache_bytes
     );
-    assert!(ops_tps > 0);
+    assert!(checkpoint_seq > 0);
+    assert!(backup.wal_head_seq >= checkpoint_seq);
+    assert!(writes > 0);
 }

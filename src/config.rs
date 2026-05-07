@@ -14,6 +14,13 @@ pub enum RecoveryMode {
     Permissive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageMode {
+    InMemory,
+    #[default]
+    DiskBacked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PrimaryIndexBackend {
     #[default]
@@ -43,6 +50,9 @@ pub struct AedbConfig {
     pub max_batch_rows: usize,
     pub max_kv_key_bytes: usize,
     pub max_kv_value_bytes: usize,
+    pub storage_mode: StorageMode,
+    pub persistent_value_inline_threshold_bytes: usize,
+    pub persistent_value_hot_cache_bytes: usize,
     pub max_table_value_bytes: usize,
     pub max_event_payload_bytes: usize,
     pub max_memory_estimate_bytes: usize,
@@ -104,6 +114,9 @@ impl Default for AedbConfig {
             max_batch_rows: 10_000,
             max_kv_key_bytes: 1024,
             max_kv_value_bytes: 1024 * 1024,
+            storage_mode: StorageMode::DiskBacked,
+            persistent_value_inline_threshold_bytes: 64 * 1024,
+            persistent_value_hot_cache_bytes: 64 * 1024 * 1024,
             max_table_value_bytes: 1024 * 1024,
             max_event_payload_bytes: 64 * 1024,
             max_memory_estimate_bytes: 2 * 1024 * 1024 * 1024,

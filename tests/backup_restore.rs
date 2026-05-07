@@ -1,7 +1,7 @@
 use aedb::AedbInstance;
 use aedb::backup::{load_backup_manifest, sha256_file_hex, write_backup_manifest};
 use aedb::commit::validation::Mutation;
-use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
+use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use aedb::query::plan::ConsistencyMode;
 use aedb::recovery::recover_with_config;
 use aedb::wal::frame::{FrameError, FrameReader};
@@ -204,6 +204,66 @@ async fn backup_full_is_hot_and_restore_is_consistent_at_backup_head() {
             "key > backup head must not exist in restored state"
         );
     }
+}
+
+#[tokio::test]
+async fn full_backup_of_disk_backed_values_is_self_contained() {
+    let live_dir = tempdir().expect("live dir");
+    let backup_dir = tempdir().expect("backup dir");
+    let disk_restore_dir = tempdir().expect("disk restore dir");
+    let memory_restore_dir = tempdir().expect("memory restore dir");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 32,
+        max_kv_value_bytes: 256 * 1024,
+        max_transaction_bytes: 512 * 1024,
+        ..backup_test_config()
+    };
+    let value: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+
+    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"blob".to_vec(), value.clone())
+        .await
+        .expect("set large value");
+    let metrics = db.operational_metrics().await;
+    assert!(
+        metrics.persistent_value_store_bytes > value.len() as u64,
+        "test must spill value to persistent sidecar"
+    );
+
+    let backup = db.backup_full(backup_dir.path()).await.expect("backup");
+    assert_eq!(backup.wal_head_seq, backup.checkpoint_seq);
+    assert!(
+        !backup_dir.path().join("values.aedbdat").exists(),
+        "backup must be self-contained in checkpoint/WAL artifacts, not sidecar-dependent"
+    );
+
+    AedbInstance::restore_from_backup(backup_dir.path(), disk_restore_dir.path(), &config)
+        .expect("restore disk-backed");
+    let disk_restored =
+        AedbInstance::open(config.clone(), disk_restore_dir.path()).expect("open disk restored");
+    let disk_value = disk_restored
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect("disk get")
+        .expect("disk value");
+    assert_eq!(disk_value.value, value);
+
+    let memory_config = AedbConfig {
+        storage_mode: StorageMode::InMemory,
+        ..config.clone()
+    };
+    AedbInstance::restore_from_backup(backup_dir.path(), memory_restore_dir.path(), &memory_config)
+        .expect("restore in-memory");
+    let memory_restored =
+        AedbInstance::open(memory_config, memory_restore_dir.path()).expect("open memory restored");
+    let memory_value = memory_restored
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect("memory get")
+        .expect("memory value");
+    assert_eq!(memory_value.value, value);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

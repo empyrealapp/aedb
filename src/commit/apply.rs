@@ -527,7 +527,9 @@ pub fn apply_mutation(
             scope_id,
             key,
             value,
-        } => keyspace.kv_set(&project_id, &scope_id, key, value, commit_seq),
+        } => {
+            keyspace.kv_set(&project_id, &scope_id, key, value, commit_seq)?;
+        }
         Mutation::KvDel {
             project_id,
             scope_id,

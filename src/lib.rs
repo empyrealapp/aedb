@@ -44,7 +44,7 @@ use crate::commit::validation::{
     MAX_COUNTER_SHARDS, Mutation, TableUpdateExpr, validate_mutation_with_config,
     validate_permissions,
 };
-use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
+use crate::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
 use crate::lib_helpers::*;
@@ -72,6 +72,7 @@ use crate::snapshot::gc::{SnapshotHandle, SnapshotManager};
 use crate::snapshot::reader::SnapshotReadView;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, KvEntry, NamespaceId};
+use crate::storage::value_store::PersistentValueStore;
 use crate::wal::frame::{FrameError, FrameReader};
 use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 use hmac::{Hmac, Mac};
@@ -261,6 +262,25 @@ fn derive_cursor_signing_key(config: &AedbConfig, dir: &Path) -> [u8; 32] {
         material.extend_from_slice(dir.to_string_lossy().as_bytes());
     }
     blake3::derive_key("aedb-query-cursor-v1", &material)
+}
+
+fn attach_configured_value_store(
+    keyspace: &mut Keyspace,
+    config: &AedbConfig,
+    dir: &Path,
+) -> Result<(), AedbError> {
+    if matches!(config.storage_mode, StorageMode::DiskBacked) {
+        let store = Arc::new(PersistentValueStore::open_with_hot_cache_bytes(
+            dir,
+            config.persistent_value_hot_cache_bytes,
+        )?);
+        keyspace
+            .attach_persistent_value_store(store, config.persistent_value_inline_threshold_bytes)?;
+        keyspace.spill_kv_values_to_memory_target(config.max_memory_estimate_bytes)?;
+    } else {
+        keyspace.detach_persistent_value_store();
+    }
+    Ok(())
 }
 
 fn reclaim_eligible_wal_segments(
@@ -672,6 +692,9 @@ pub struct OperationalMetrics {
     pub snapshot_age_micros: u64,
     pub startup_recovery_micros: u64,
     pub startup_recovered_seq: u64,
+    pub persistent_value_store_bytes: u64,
+    pub persistent_value_hot_cache_bytes: usize,
+    pub persistent_value_hot_cache_capacity_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1218,6 +1241,9 @@ impl AedbInstance {
             recovery_mode = ?config.recovery_mode,
             hash_chain_required = config.hash_chain_required,
             primary_index_backend = ?config.primary_index_backend,
+            storage_mode = ?config.storage_mode,
+            persistent_value_inline_threshold_bytes = config.persistent_value_inline_threshold_bytes,
+            persistent_value_hot_cache_bytes = config.persistent_value_hot_cache_bytes,
             "aedb config"
         );
         create_private_dir_all(dir)?;
@@ -1230,6 +1256,7 @@ impl AedbInstance {
         let (executor, startup_recovered_seq) = if has_existing {
             let mut recovered = recover_with_config(dir, &config)?;
             recovered.keyspace.set_backend(config.primary_index_backend);
+            attach_configured_value_store(&mut recovered.keyspace, &config, dir)?;
             if require_authenticated_calls {
                 seed_system_global_admin(&mut recovered.catalog);
             }
@@ -1250,10 +1277,13 @@ impl AedbInstance {
             if require_authenticated_calls {
                 seed_system_global_admin(&mut catalog);
             }
+            let mut keyspace =
+                crate::storage::keyspace::Keyspace::with_backend(config.primary_index_backend);
+            attach_configured_value_store(&mut keyspace, &config, dir)?;
             (
                 CommitExecutor::with_state(
                     dir,
-                    crate::storage::keyspace::Keyspace::with_backend(config.primary_index_backend),
+                    keyspace,
                     catalog,
                     0,
                     1,
@@ -2772,7 +2802,9 @@ impl AedbInstance {
             });
         }
         let execute_started = Instant::now();
-        let result = snapshot.kv_get(project_id, scope_id, key).cloned();
+        let result = snapshot
+            .try_kv_get(project_id, scope_id, key)
+            .map_err(QueryError::from)?;
         let execute_micros = execute_started.elapsed().as_micros() as u64;
         self.maybe_log_read_phase(
             "kv_get",
@@ -2819,8 +2851,8 @@ impl AedbInstance {
         let result = lease
             .view
             .keyspace
-            .kv_get(project_id, scope_id, key)
-            .cloned();
+            .try_kv_get(project_id, scope_id, key)
+            .map_err(QueryError::from)?;
         let execute_micros = execute_started.elapsed().as_micros() as u64;
         self.maybe_log_read_phase(
             "kv_get",
@@ -2878,7 +2910,11 @@ impl AedbInstance {
         let execute_started = Instant::now();
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            out.push(snapshot.kv_get(project_id, scope_id, key).cloned());
+            out.push(
+                snapshot
+                    .try_kv_get(project_id, scope_id, key)
+                    .map_err(QueryError::from)?,
+            );
         }
         let execute_micros = execute_started.elapsed().as_micros() as u64;
         self.maybe_log_read_phase(
@@ -2917,7 +2953,12 @@ impl AedbInstance {
                 if !k.starts_with(prefix) {
                     break;
                 }
-                entries.push((k.clone(), v.clone()));
+                let entry = lease
+                    .view
+                    .keyspace
+                    .materialize_kv_entry(v)
+                    .map_err(QueryError::from)?;
+                entries.push((k.clone(), entry));
                 if entries.len() == page_size {
                     break;
                 }
@@ -3019,7 +3060,8 @@ impl AedbInstance {
                 {
                     continue;
                 }
-                entries.push((k.clone(), v.clone()));
+                let entry = snapshot.materialize_kv_entry(v).map_err(QueryError::from)?;
+                entries.push((k.clone(), entry));
                 if entries.len() > page_size {
                     break;
                 }
@@ -3141,7 +3183,8 @@ impl AedbInstance {
                 {
                     continue;
                 }
-                entries.push((k.clone(), v.clone()));
+                let entry = snapshot.materialize_kv_entry(v).map_err(QueryError::from)?;
+                entries.push((k.clone(), entry));
                 if entries.len() > page_size {
                     break;
                 }
@@ -3231,7 +3274,10 @@ impl AedbInstance {
                 out.push(ScopedKvEntry {
                     scope_id: scope.to_string(),
                     key: k.clone(),
-                    value: v.value.clone(),
+                    value: snapshot
+                        .materialize_kv_entry(v)
+                        .map_err(QueryError::from)?
+                        .value,
                     version: v.version,
                 });
                 if out.len() >= limit as usize {
@@ -3286,6 +3332,53 @@ impl AedbInstance {
             },
         )
         .await
+    }
+
+    pub async fn kv_set_many_atomic(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<CommitResult, AedbError> {
+        if entries.is_empty() {
+            return Err(AedbError::Validation(
+                "kv_set_many_atomic requires at least one entry".into(),
+            ));
+        }
+        let mutations = entries
+            .into_iter()
+            .map(|(key, value)| Mutation::KvSet {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                value,
+            })
+            .collect();
+        self.commit_many_atomic(mutations).await
+    }
+
+    pub async fn kv_set_many_atomic_as(
+        &self,
+        caller: CallerContext,
+        project_id: &str,
+        scope_id: &str,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<CommitResult, AedbError> {
+        if entries.is_empty() {
+            return Err(AedbError::Validation(
+                "kv_set_many_atomic_as requires at least one entry".into(),
+            ));
+        }
+        let mutations = entries
+            .into_iter()
+            .map(|(key, value)| Mutation::KvSet {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                key,
+                value,
+            })
+            .collect();
+        self.commit_many_atomic_as(caller, mutations).await
     }
 
     pub async fn kv_del(
@@ -6791,7 +6884,11 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let order_key = key_order(instrument, order_id);
-        let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
+        let Some(entry) = lease
+            .view
+            .keyspace
+            .try_kv_get(project_id, scope_id, &order_key)?
+        else {
             return Err(AedbError::Validation(format!(
                 "strict cancel target not found: order_id={order_id}"
             )));
@@ -6946,7 +7043,11 @@ impl AedbInstance {
     ) -> Result<CommitResult, AedbError> {
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let cid_key = key_client_id(instrument, owner, client_order_id);
-        let Some(cid_entry) = lease.view.keyspace.kv_get(project_id, scope_id, &cid_key) else {
+        let Some(cid_entry) = lease
+            .view
+            .keyspace
+            .try_kv_get(project_id, scope_id, &cid_key)?
+        else {
             return Err(AedbError::Validation(format!(
                 "strict cancel target not found: client_order_id={client_order_id}"
             )));
@@ -6960,7 +7061,11 @@ impl AedbInstance {
         id_bytes.copy_from_slice(&cid_entry.value);
         let order_id = u64::from_be_bytes(id_bytes);
         let order_key = key_order(instrument, order_id);
-        let Some(order_entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
+        let Some(order_entry) = lease
+            .view
+            .keyspace
+            .try_kv_get(project_id, scope_id, &order_key)?
+        else {
             return Err(AedbError::Validation(format!(
                 "strict cancel target not found: order_id={order_id}"
             )));
@@ -7251,7 +7356,11 @@ impl AedbInstance {
     ) -> Result<(Vec<u8>, u64, u64), AedbError> {
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let order_key = key_order(instrument, order_id);
-        let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &order_key) else {
+        let Some(entry) = lease
+            .view
+            .keyspace
+            .try_kv_get(project_id, scope_id, &order_key)?
+        else {
             return Err(AedbError::Validation(format!(
                 "strict target not found: order_id={order_id}"
             )));
@@ -9039,6 +9148,10 @@ impl AedbInstance {
         }
         let mut merged_keyspace = Keyspace {
             primary_index_backend: live.keyspace.primary_index_backend,
+            value_store: live.keyspace.value_store.clone(),
+            persistent_value_inline_threshold_bytes: live
+                .keyspace
+                .persistent_value_inline_threshold_bytes,
             namespaces: Arc::new(merged_namespaces.into()),
             async_indexes: Arc::new(merged_async_indexes.into()),
             mem_bytes: 0,
@@ -9208,6 +9321,10 @@ impl AedbInstance {
             snapshot_age_micros,
             startup_recovery_micros: self.startup_recovery_micros,
             startup_recovered_seq: self.startup_recovered_seq,
+            persistent_value_store_bytes: runtime.persistent_value_store_bytes,
+            persistent_value_hot_cache_bytes: runtime.persistent_value_hot_cache_bytes,
+            persistent_value_hot_cache_capacity_bytes: runtime
+                .persistent_value_hot_cache_capacity_bytes,
         }
     }
 
@@ -9302,7 +9419,7 @@ impl AedbInstance {
         for attempt in 0..=MAX_RETRIES_ON_CONFLICT {
             let (snapshot, _, base_seq) = self.executor.snapshot_state().await;
             if let Some(existing) =
-                snapshot.kv_get(&migration.project_id, &migration.scope_id, &key)
+                snapshot.try_kv_get(&migration.project_id, &migration.scope_id, &key)?
             {
                 let record = decode_record(&existing.value)?;
                 if record.checksum_hex != checksum {
@@ -9354,7 +9471,7 @@ impl AedbInstance {
                 Err(err) => {
                     let (snapshot, _, _) = self.executor.snapshot_state().await;
                     if let Some(existing) =
-                        snapshot.kv_get(&migration.project_id, &migration.scope_id, &key)
+                        snapshot.try_kv_get(&migration.project_id, &migration.scope_id, &key)?
                     {
                         let record = decode_record(&existing.value)?;
                         if record.checksum_hex != checksum {
@@ -9564,7 +9681,7 @@ impl AedbInstance {
             .ok_or_else(|| AedbError::Validation("table not found".into()))?;
         let rows: Vec<crate::catalog::types::Row> = table.rows.values().cloned().collect();
         let start_offset = snapshot
-            .kv_get(project_id, scope_id, progress_key)
+            .try_kv_get(project_id, scope_id, progress_key)?
             .and_then(|e| std::str::from_utf8(&e.value).ok()?.parse::<usize>().ok())
             .unwrap_or(0);
         let mut updated = 0u64;

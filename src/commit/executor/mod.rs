@@ -106,48 +106,7 @@ impl std::io::Write for CountingWriter {
 }
 
 fn estimate_prevalidated_single_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
-    const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 256;
     match mutation {
-        Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposure_id,
-            ..
-        } => Some(
-            ENVELOPE_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + accumulator_name.len()
-                + exposure_id.len(),
-        ),
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            dedupe_key,
-            release_exposure_id,
-            ..
-        } => Some(
-            ENVELOPE_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + accumulator_name.len()
-                + dedupe_key.len()
-                + release_exposure_id.as_ref().map(|id| id.len()).unwrap_or(0),
-        ),
-        Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-        } => Some(
-            ENVELOPE_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + accumulator_name.len()
-                + exposures.iter().map(|(_, id)| id.len() + 16).sum::<usize>(),
-        ),
         _ => None,
     }
 }
@@ -512,6 +471,9 @@ pub struct ExecutorRuntimeState {
     pub visible_head_seq: u64,
     pub durable_head_seq: u64,
     pub last_full_snapshot_micros: u64,
+    pub persistent_value_store_bytes: u64,
+    pub persistent_value_hot_cache_bytes: usize,
+    pub persistent_value_hot_cache_capacity_bytes: usize,
 }
 
 impl CommitExecutor {
@@ -1089,7 +1051,9 @@ impl CommitExecutor {
                 }
                 if s.pending_batch_bytes > 0 {
                     let sync_started = Instant::now();
-                    if s.wal.sync_active().is_ok() {
+                    if s.keyspace.sync_persistent_value_store().is_ok()
+                        && s.wal.sync_active().is_ok()
+                    {
                         let sync_us = sync_started.elapsed().as_micros() as u64;
                         s.durable_head_seq = s.pending_batch_max_seq.max(s.durable_head_seq);
                         s.pending_batch_bytes = 0;
@@ -1502,6 +1466,7 @@ impl CommitExecutor {
         }
         let durable_before = s.durable_head_seq;
         let sync_started = Instant::now();
+        s.keyspace.sync_persistent_value_store()?;
         s.wal
             .sync_active()
             .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
@@ -1677,11 +1642,30 @@ impl CommitExecutor {
     }
 
     pub async fn runtime_state_metrics(&self) -> ExecutorRuntimeState {
+        let (
+            persistent_value_store_bytes,
+            persistent_value_hot_cache_bytes,
+            persistent_value_hot_cache_capacity_bytes,
+        ) = {
+            let state = self.state.lock().await;
+            if let Some(store) = &state.keyspace.value_store {
+                (
+                    store.len_bytes(),
+                    store.hot_cache_resident_bytes(),
+                    store.hot_cache_capacity_bytes(),
+                )
+            } else {
+                (0, 0, 0)
+            }
+        };
         ExecutorRuntimeState {
             current_seq: self.current_seq.load(Ordering::Acquire),
             visible_head_seq: self.visible_head_seq.load(Ordering::Acquire),
             durable_head_seq: self.durable_head_seq.load(Ordering::Acquire),
             last_full_snapshot_micros: self.last_full_snapshot_micros.load(Ordering::Acquire),
+            persistent_value_store_bytes,
+            persistent_value_hot_cache_bytes,
+            persistent_value_hot_cache_capacity_bytes,
         }
     }
 }

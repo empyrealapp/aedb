@@ -9,9 +9,12 @@ use crate::commit::validation::{
 use crate::config::PrimaryIndexBackend;
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
+use crate::storage::value_store::{PersistentValueRef, PersistentValueStore};
 use im::{HashMap, OrdMap, OrdSet};
 use primitive_types::U256;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -73,6 +76,8 @@ pub struct KvEntry {
     pub value: Vec<u8>,
     pub version: u64,
     pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_ref: Option<PersistentValueRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -213,10 +218,14 @@ pub struct Namespace {
     pub accumulators: HashMap<String, AccumulatorData>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Keyspace {
     #[serde(default = "default_primary_index_backend")]
     pub primary_index_backend: PrimaryIndexBackend,
+    #[serde(skip)]
+    pub value_store: Option<Arc<PersistentValueStore>>,
+    #[serde(skip, default = "default_persistent_value_inline_threshold_bytes")]
+    pub persistent_value_inline_threshold_bytes: usize,
     #[serde(
         serialize_with = "serialize_arc_hashmap",
         deserialize_with = "deserialize_arc_hashmap"
@@ -238,6 +247,10 @@ pub struct Keyspace {
 pub struct KeyspaceSnapshot {
     #[serde(default = "default_primary_index_backend")]
     pub primary_index_backend: PrimaryIndexBackend,
+    #[serde(skip)]
+    pub value_store: Option<Arc<PersistentValueStore>>,
+    #[serde(skip, default = "default_persistent_value_inline_threshold_bytes")]
+    pub persistent_value_inline_threshold_bytes: usize,
     #[serde(
         serialize_with = "serialize_arc_hashmap",
         deserialize_with = "deserialize_arc_hashmap"
@@ -291,14 +304,188 @@ where
     HashMap::deserialize(deserializer).map(Arc::new)
 }
 
+fn materialize_kv_entry(
+    entry: &KvEntry,
+    value_store: Option<&PersistentValueStore>,
+) -> Result<KvEntry, crate::error::AedbError> {
+    if let Some(value_ref) = &entry.value_ref {
+        let store = value_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+            message: "persistent value store is not attached".into(),
+        })?;
+        let mut out = entry.clone();
+        out.value = store.read(value_ref)?;
+        out.value_ref = None;
+        Ok(out)
+    } else {
+        Ok(entry.clone())
+    }
+}
+
+fn maybe_spill_kv_entry(
+    value_store: Option<&Arc<PersistentValueStore>>,
+    inline_threshold_bytes: usize,
+    value: Vec<u8>,
+    version: u64,
+    created_at: u64,
+) -> Result<KvEntry, crate::error::AedbError> {
+    if let Some(store) = value_store
+        && value.len() > inline_threshold_bytes
+    {
+        let value_ref = store.append(&value)?;
+        return Ok(KvEntry {
+            value: Vec::new(),
+            version,
+            created_at,
+            value_ref: Some(value_ref),
+        });
+    }
+    Ok(KvEntry {
+        value,
+        version,
+        created_at,
+        value_ref: None,
+    })
+}
+
+impl Default for Keyspace {
+    fn default() -> Self {
+        Self::with_backend(default_primary_index_backend())
+    }
+}
+
 impl Keyspace {
     pub fn with_backend(primary_index_backend: PrimaryIndexBackend) -> Self {
         Self {
             primary_index_backend,
+            value_store: None,
+            persistent_value_inline_threshold_bytes: usize::MAX,
             namespaces: Arc::new(HashMap::new()),
             async_indexes: Arc::new(HashMap::new()),
             mem_bytes: 0,
         }
+    }
+
+    pub fn attach_persistent_value_store(
+        &mut self,
+        store: Arc<PersistentValueStore>,
+        inline_threshold_bytes: usize,
+    ) -> Result<(), crate::error::AedbError> {
+        self.set_persistent_value_store(store, inline_threshold_bytes);
+        self.refresh_mem_bytes();
+        self.spill_kv_values()?;
+        self.refresh_mem_bytes();
+        Ok(())
+    }
+
+    pub(crate) fn set_persistent_value_store(
+        &mut self,
+        store: Arc<PersistentValueStore>,
+        inline_threshold_bytes: usize,
+    ) {
+        self.value_store = Some(store);
+        self.persistent_value_inline_threshold_bytes = inline_threshold_bytes;
+    }
+
+    pub fn detach_persistent_value_store(&mut self) {
+        self.value_store = None;
+        self.persistent_value_inline_threshold_bytes = usize::MAX;
+    }
+
+    pub fn sync_persistent_value_store(&self) -> Result<(), crate::error::AedbError> {
+        if let Some(store) = &self.value_store {
+            store.sync_all()?;
+        }
+        Ok(())
+    }
+
+    pub fn spill_kv_values(&mut self) -> Result<(), crate::error::AedbError> {
+        let Some(store) = self.value_store.clone() else {
+            return Ok(());
+        };
+        let threshold = self.persistent_value_inline_threshold_bytes;
+        let namespace_ids: Vec<NamespaceId> = self.namespaces.keys().cloned().collect();
+        let mut spilled_payload_bytes = 0usize;
+        for namespace_id in namespace_ids {
+            let Some(namespace) = self.namespaces_mut().get_mut(&namespace_id) else {
+                continue;
+            };
+            let entries: Result<OrdMap<Vec<u8>, KvEntry>, crate::error::AedbError> = namespace
+                .kv
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    let mut entry = entry.clone();
+                    if entry.value_ref.is_none() && entry.value.len() > threshold {
+                        spilled_payload_bytes =
+                            spilled_payload_bytes.saturating_add(entry.value.len());
+                        let value_ref = store.append_cold(&entry.value)?;
+                        entry.value = Vec::new();
+                        entry.value_ref = Some(value_ref);
+                    }
+                    Ok((key.clone(), entry))
+                })
+                .collect();
+            namespace.kv.entries = entries?;
+        }
+        self.mem_bytes = self.mem_bytes.saturating_sub(spilled_payload_bytes);
+        Ok(())
+    }
+
+    pub fn spill_kv_values_to_memory_target(
+        &mut self,
+        target_bytes: usize,
+    ) -> Result<usize, crate::error::AedbError> {
+        let mut memory_estimate = self.estimate_memory_bytes();
+        if memory_estimate <= target_bytes {
+            return Ok(memory_estimate);
+        }
+
+        let Some(store) = self.value_store.clone() else {
+            return Ok(memory_estimate);
+        };
+
+        let mut candidates = Vec::new();
+        let mut oldest_first = BinaryHeap::new();
+        for (namespace_id, namespace) in self.namespaces.iter() {
+            for (key, entry) in namespace.kv.entries.iter() {
+                if entry.value_ref.is_none() && !entry.value.is_empty() {
+                    let candidate_index = candidates.len();
+                    let payload_bytes = entry.value.len();
+                    candidates.push((namespace_id.clone(), key.clone(), payload_bytes));
+                    oldest_first.push(Reverse((entry.version, payload_bytes, candidate_index)));
+                }
+            }
+        }
+
+        while memory_estimate > target_bytes {
+            let Some(Reverse((_, _, candidate_index))) = oldest_first.pop() else {
+                break;
+            };
+            let Some((namespace_id, key, payload_bytes)) = candidates.get(candidate_index) else {
+                continue;
+            };
+            let spilled = {
+                let Some(namespace) = self.namespaces_mut().get_mut(namespace_id) else {
+                    continue;
+                };
+                let Some(entry) = namespace.kv.entries.get_mut(key) else {
+                    continue;
+                };
+                if entry.value_ref.is_some() || entry.value.is_empty() {
+                    continue;
+                }
+                let value_ref = store.append_cold(&entry.value)?;
+                entry.value = Vec::new();
+                entry.value_ref = Some(value_ref);
+                true
+            };
+            if spilled {
+                memory_estimate = memory_estimate.saturating_sub(*payload_bytes);
+                self.mem_bytes = self.mem_bytes.saturating_sub(*payload_bytes);
+            }
+        }
+
+        Ok(memory_estimate)
     }
 
     /// Ensures the namespaces HashMap is uniquely owned, cloning if necessary (copy-on-write).
@@ -341,11 +528,13 @@ impl Keyspace {
         table_name: &str,
         index_name: &str,
     ) {
-        let key = (ns_id.clone(), table_name.to_string(), index_name.to_string());
+        let key = (
+            ns_id.clone(),
+            table_name.to_string(),
+            index_name.to_string(),
+        );
         if let Some(p) = Arc::make_mut(&mut self.async_indexes).remove(&key) {
-            self.mem_bytes = self
-                .mem_bytes
-                .saturating_sub(projection_data_mem_cost(&p));
+            self.mem_bytes = self.mem_bytes.saturating_sub(projection_data_mem_cost(&p));
         }
     }
 
@@ -355,12 +544,14 @@ impl Keyspace {
         table_name: &str,
         index_name: &str,
     ) -> Option<AsyncProjectionData> {
-        let key = (ns_id.clone(), table_name.to_string(), index_name.to_string());
+        let key = (
+            ns_id.clone(),
+            table_name.to_string(),
+            index_name.to_string(),
+        );
         let removed = Arc::make_mut(&mut self.async_indexes).remove(&key);
         if let Some(p) = &removed {
-            self.mem_bytes = self
-                .mem_bytes
-                .saturating_sub(projection_data_mem_cost(p));
+            self.mem_bytes = self.mem_bytes.saturating_sub(projection_data_mem_cost(p));
         }
         removed
     }
@@ -469,7 +660,9 @@ impl Keyspace {
         commit_seq: u64,
     ) {
         let encoded_pk = EncodedKey::from_values(&pk);
-        self.upsert_row_by_encoded_pk(project_id, scope_id, table_name, encoded_pk, row, commit_seq);
+        self.upsert_row_by_encoded_pk(
+            project_id, scope_id, table_name, encoded_pk, row, commit_seq,
+        );
     }
 
     pub fn upsert_row_by_encoded_pk(
@@ -587,6 +780,8 @@ impl Keyspace {
     pub fn snapshot(&self) -> KeyspaceSnapshot {
         KeyspaceSnapshot {
             primary_index_backend: self.primary_index_backend,
+            value_store: self.value_store.clone(),
+            persistent_value_inline_threshold_bytes: self.persistent_value_inline_threshold_bytes,
             namespaces: Arc::clone(&self.namespaces),
             async_indexes: Arc::clone(&self.async_indexes),
             mem_bytes: self.mem_bytes,
@@ -1061,9 +1256,21 @@ impl Keyspace {
         effective_accumulator_value(accumulator).map(Some)
     }
 
-    pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<&KvEntry> {
+    pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
+        self.try_kv_get(project_id, scope_id, key)
+            .expect("persistent value store read failed")
+    }
+
+    pub fn try_kv_get(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: &[u8],
+    ) -> Result<Option<KvEntry>, crate::error::AedbError> {
         self.namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.kv.entries.get(key))
+            .map(|entry| materialize_kv_entry(entry, self.value_store.as_deref()))
+            .transpose()
     }
 
     pub fn counter_read_sharded(
@@ -1076,7 +1283,7 @@ impl Keyspace {
         let mut total = 0u64;
         for shard in 0..shard_count {
             let shard_key = counter_shard_storage_key(key, shard);
-            if let Some(entry) = self.kv_get(project_id, scope_id, &shard_key) {
+            if let Some(entry) = self.try_kv_get(project_id, scope_id, &shard_key)? {
                 let value = decode_u64(&entry.value)?;
                 total = total
                     .checked_add(value)
@@ -1093,31 +1300,34 @@ impl Keyspace {
         key: Vec<u8>,
         value: Vec<u8>,
         commit_seq: u64,
-    ) {
-        let new_cost = kv_entry_cost(key.len(), value.len());
-        let old_cost = {
-            let kv = self.kv_data_mut(project_id, scope_id);
-            let (created_at, old_cost) = match kv.entries.get(&key) {
-                Some(entry) => (entry.created_at, kv_entry_cost(key.len(), entry.value.len())),
-                None => {
-                    kv.structural_version = commit_seq;
-                    (commit_seq, 0)
-                }
-            };
-            kv.entries.insert(
-                key,
-                KvEntry {
-                    value,
-                    version: commit_seq,
-                    created_at,
-                },
-            );
-            old_cost
+    ) -> Result<(), crate::error::AedbError> {
+        let value_store = self.value_store.clone();
+        let inline_threshold_bytes = self.persistent_value_inline_threshold_bytes;
+        let kv = self.kv_data_mut(project_id, scope_id);
+        let (created_at, old_cost) = match kv.entries.get(&key) {
+            Some(entry) => (
+                entry.created_at,
+                kv_entry_cost(key.len(), entry.value.len()),
+            ),
+            None => {
+                kv.structural_version = commit_seq;
+                (commit_seq, 0)
+            }
         };
+        let entry = maybe_spill_kv_entry(
+            value_store.as_ref(),
+            inline_threshold_bytes,
+            value,
+            commit_seq,
+            created_at,
+        )?;
+        let new_cost = kv_entry_cost(key.len(), entry.value.len());
+        kv.entries.insert(key, entry);
         self.mem_bytes = self
             .mem_bytes
             .saturating_add(new_cost)
             .saturating_sub(old_cost);
+        Ok(())
     }
 
     pub fn kv_del(
@@ -1155,29 +1365,36 @@ impl Keyspace {
         prefix: &[u8],
         limit: usize,
     ) -> Vec<(Vec<u8>, KvEntry)> {
+        self.try_kv_scan_prefix(project_id, scope_id, prefix, limit)
+            .expect("persistent value store read failed")
+    }
+
+    pub fn try_kv_scan_prefix(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, KvEntry)>, crate::error::AedbError> {
         let Some(kv) = self
             .namespace(&NamespaceId::project_scope(project_id, scope_id))
             .map(|ns| &ns.kv)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        if prefix.is_empty() {
-            return kv
-                .entries
-                .iter()
-                .take(limit)
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-        }
-        let start = Bound::Included(prefix.to_vec());
-        let end = prefix_range_end(prefix)
-            .map(Bound::Excluded)
-            .unwrap_or(Bound::Unbounded);
-        kv.entries
-            .range((start, end))
-            .take(limit)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KvEntry)> + '_> = if prefix.is_empty() {
+            Box::new(kv.entries.iter().take(limit))
+        } else {
+            let start = Bound::Included(prefix.to_vec());
+            let end = prefix_range_end(prefix)
+                .map(Bound::Excluded)
+                .unwrap_or(Bound::Unbounded);
+            Box::new(kv.entries.range((start, end)).take(limit))
+        };
+        iter.map(|(k, v)| {
+            materialize_kv_entry(v, self.value_store.as_deref()).map(|entry| (k.clone(), entry))
+        })
+        .collect()
     }
 
     pub fn kv_scan_prefix_ref<'a>(
@@ -1255,16 +1472,30 @@ impl Keyspace {
         end: Bound<Vec<u8>>,
         limit: usize,
     ) -> Vec<(Vec<u8>, KvEntry)> {
+        self.try_kv_scan_range(project_id, scope_id, start, end, limit)
+            .expect("persistent value store read failed")
+    }
+
+    pub fn try_kv_scan_range(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, KvEntry)>, crate::error::AedbError> {
         let Some(kv) = self
             .namespace(&NamespaceId::project_scope(project_id, scope_id))
             .map(|ns| &ns.kv)
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         kv.entries
             .range((start, end))
             .take(limit)
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| {
+                materialize_kv_entry(v, self.value_store.as_deref()).map(|entry| (k.clone(), entry))
+            })
             .collect()
     }
 
@@ -1277,14 +1508,14 @@ impl Keyspace {
         commit_seq: u64,
     ) -> Result<U256, crate::error::AedbError> {
         let current = self
-            .kv_get(project_id, scope_id, &key)
+            .try_kv_get(project_id, scope_id, &key)?
             .map(|e| decode_u256(&e.value))
             .transpose()?
             .unwrap_or(U256::zero());
         let next = current
             .checked_add(amount)
             .ok_or(crate::error::AedbError::Overflow)?;
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(next)
     }
 
@@ -1297,7 +1528,7 @@ impl Keyspace {
         commit_seq: u64,
     ) -> Result<U256, crate::error::AedbError> {
         let current = self
-            .kv_get(project_id, scope_id, &key)
+            .try_kv_get(project_id, scope_id, &key)?
             .map(|e| decode_u256(&e.value))
             .transpose()?
             .unwrap_or(U256::zero());
@@ -1305,7 +1536,7 @@ impl Keyspace {
             return Err(crate::error::AedbError::Underflow);
         }
         let next = current - amount;
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(next)
     }
 
@@ -1320,7 +1551,7 @@ impl Keyspace {
         on_overflow: &KvU256OverflowPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u256(&entry.value)?,
             (None, KvU256MissingPolicy::TreatAsZero) => U256::zero(),
@@ -1337,7 +1568,7 @@ impl Keyspace {
                 KvU256OverflowPolicy::Saturate => U256::MAX,
             },
         };
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(())
     }
 
@@ -1352,7 +1583,7 @@ impl Keyspace {
         on_underflow: &KvU256UnderflowPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u256(&entry.value)?,
             (None, KvU256MissingPolicy::TreatAsZero) => U256::zero(),
@@ -1369,7 +1600,7 @@ impl Keyspace {
             };
         }
         let next = current_value - amount;
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(())
     }
 
@@ -1382,7 +1613,8 @@ impl Keyspace {
         on_missing: &KvU256MissingPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
+        let current_exists = current.is_some();
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u256(&entry.value)?,
             (None, KvU256MissingPolicy::TreatAsZero) => U256::zero(),
@@ -1393,10 +1625,10 @@ impl Keyspace {
             }
         };
         let next = current_value.max(candidate);
-        if current.is_some() && next == current_value {
+        if current_exists && next == current_value {
             return Ok(());
         }
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(())
     }
 
@@ -1409,7 +1641,8 @@ impl Keyspace {
         on_missing: &KvU256MissingPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
+        let current_exists = current.is_some();
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u256(&entry.value)?,
             (None, KvU256MissingPolicy::TreatAsZero) => U256::zero(),
@@ -1420,10 +1653,10 @@ impl Keyspace {
             }
         };
         let next = current_value.min(candidate);
-        if current.is_some() && next == current_value {
+        if current_exists && next == current_value {
             return Ok(());
         }
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(())
     }
 
@@ -1437,7 +1670,7 @@ impl Keyspace {
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
         let current = self
-            .kv_get(project_id, scope_id, &key)
+            .try_kv_get(project_id, scope_id, &key)?
             .map(|e| decode_u256(&e.value))
             .transpose()?
             .unwrap_or(U256::zero());
@@ -1453,7 +1686,7 @@ impl Keyspace {
                 current - operand
             }
         };
-        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u256(next), commit_seq)?;
         Ok(())
     }
 
@@ -1468,7 +1701,7 @@ impl Keyspace {
         on_overflow: &KvU64OverflowPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u64(&entry.value)?,
             (None, KvU64MissingPolicy::TreatAsZero) => 0u64,
@@ -1485,7 +1718,7 @@ impl Keyspace {
                 KvU64OverflowPolicy::Saturate => u64::MAX,
             },
         };
-        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq)?;
         Ok(())
     }
 
@@ -1499,7 +1732,7 @@ impl Keyspace {
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
         let current = self
-            .kv_get(project_id, scope_id, &key)
+            .try_kv_get(project_id, scope_id, &key)?
             .map(|e| decode_u64(&e.value))
             .transpose()?
             .unwrap_or(0u64);
@@ -1515,7 +1748,7 @@ impl Keyspace {
                 current - operand
             }
         };
-        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq)?;
         Ok(())
     }
 
@@ -1530,7 +1763,7 @@ impl Keyspace {
         on_underflow: &KvU64UnderflowPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u64(&entry.value)?,
             (None, KvU64MissingPolicy::TreatAsZero) => 0u64,
@@ -1547,7 +1780,7 @@ impl Keyspace {
             };
         }
         let next = current_value - amount;
-        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq)?;
         Ok(())
     }
 
@@ -1629,7 +1862,8 @@ impl Keyspace {
         on_missing: &KvU64MissingPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
+        let current_exists = current.is_some();
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u64(&entry.value)?,
             (None, KvU64MissingPolicy::TreatAsZero) => 0u64,
@@ -1640,10 +1874,10 @@ impl Keyspace {
             }
         };
         let next = current_value.max(candidate);
-        if current.is_some() && next == current_value {
+        if current_exists && next == current_value {
             return Ok(());
         }
-        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq)?;
         Ok(())
     }
 
@@ -1656,7 +1890,8 @@ impl Keyspace {
         on_missing: &KvU64MissingPolicy,
         commit_seq: u64,
     ) -> Result<(), crate::error::AedbError> {
-        let current = self.kv_get(project_id, scope_id, &key);
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
+        let current_exists = current.is_some();
         let current_value = match (current, on_missing) {
             (Some(entry), _) => decode_u64(&entry.value)?,
             (None, KvU64MissingPolicy::TreatAsZero) => 0u64,
@@ -1667,16 +1902,17 @@ impl Keyspace {
             }
         };
         let next = current_value.min(candidate);
-        if current.is_some() && next == current_value {
+        if current_exists && next == current_value {
             return Ok(());
         }
-        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq);
+        self.kv_set(project_id, scope_id, key, encode_u64(next), commit_seq)?;
         Ok(())
     }
 
     pub fn kv_version(&self, project_id: &str, scope_id: &str, key: &[u8]) -> u64 {
-        self.kv_get(project_id, scope_id, key)
-            .map(|e| e.version)
+        self.namespace(&NamespaceId::project_scope(project_id, scope_id))
+            .and_then(|ns| ns.kv.entries.get(key))
+            .map(|entry| entry.version)
             .unwrap_or(0)
     }
 
@@ -1715,8 +1951,11 @@ impl Keyspace {
     /// merges) to seed `mem_bytes`, and as the parity oracle in tests.
     pub fn recompute_memory_bytes_full(&self) -> usize {
         let ns_bytes: usize = self.namespaces.values().map(namespace_mem_cost).sum();
-        let projection_bytes: usize =
-            self.async_indexes.values().map(projection_data_mem_cost).sum();
+        let projection_bytes: usize = self
+            .async_indexes
+            .values()
+            .map(projection_data_mem_cost)
+            .sum();
         ns_bytes.saturating_add(projection_bytes)
     }
 
@@ -1734,8 +1973,11 @@ impl KeyspaceSnapshot {
 
     pub fn recompute_memory_bytes_full(&self) -> usize {
         let ns_bytes: usize = self.namespaces.values().map(namespace_mem_cost).sum();
-        let projection_bytes: usize =
-            self.async_indexes.values().map(projection_data_mem_cost).sum();
+        let projection_bytes: usize = self
+            .async_indexes
+            .values()
+            .map(projection_data_mem_cost)
+            .sum();
         ns_bytes.saturating_add(projection_bytes)
     }
 
@@ -1751,10 +1993,117 @@ impl KeyspaceSnapshot {
             .and_then(|ns| ns.tables.get(table_name))
     }
 
-    pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<&KvEntry> {
+    pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
+        self.try_kv_get(project_id, scope_id, key)
+            .expect("persistent value store read failed")
+    }
+
+    pub fn try_kv_get(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: &[u8],
+    ) -> Result<Option<KvEntry>, crate::error::AedbError> {
         self.namespaces
             .get(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.kv.entries.get(key))
+            .map(|entry| materialize_kv_entry(entry, self.value_store.as_deref()))
+            .transpose()
+    }
+
+    pub(crate) fn materialize_kv_entry(
+        &self,
+        entry: &KvEntry,
+    ) -> Result<KvEntry, crate::error::AedbError> {
+        materialize_kv_entry(entry, self.value_store.as_deref())
+    }
+
+    pub fn kv_scan_prefix(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Vec<(Vec<u8>, KvEntry)> {
+        self.try_kv_scan_prefix(project_id, scope_id, prefix, limit)
+            .expect("persistent value store read failed")
+    }
+
+    pub fn try_kv_scan_prefix(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, KvEntry)>, crate::error::AedbError> {
+        let Some(kv) = self
+            .namespaces
+            .get(&NamespaceId::project_scope(project_id, scope_id))
+            .map(|ns| &ns.kv)
+        else {
+            return Ok(Vec::new());
+        };
+        let iter: Box<dyn Iterator<Item = (&Vec<u8>, &KvEntry)> + '_> = if prefix.is_empty() {
+            Box::new(kv.entries.iter().take(limit))
+        } else {
+            let start = Bound::Included(prefix.to_vec());
+            let end = prefix_range_end(prefix)
+                .map(Bound::Excluded)
+                .unwrap_or(Bound::Unbounded);
+            Box::new(kv.entries.range((start, end)).take(limit))
+        };
+        iter.map(|(k, v)| {
+            materialize_kv_entry(v, self.value_store.as_deref()).map(|entry| (k.clone(), entry))
+        })
+        .collect()
+    }
+
+    pub fn try_kv_scan_range(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, KvEntry)>, crate::error::AedbError> {
+        let Some(kv) = self
+            .namespaces
+            .get(&NamespaceId::project_scope(project_id, scope_id))
+            .map(|ns| &ns.kv)
+        else {
+            return Ok(Vec::new());
+        };
+        kv.entries
+            .range((start, end))
+            .take(limit)
+            .map(|(k, v)| {
+                materialize_kv_entry(v, self.value_store.as_deref()).map(|entry| (k.clone(), entry))
+            })
+            .collect()
+    }
+
+    pub fn materialized_for_checkpoint(&self) -> Result<Self, crate::error::AedbError> {
+        let mut out = self.clone();
+        let store = self.value_store.as_deref();
+        let namespace_ids: Vec<NamespaceId> = out.namespaces.keys().cloned().collect();
+        for namespace_id in namespace_ids {
+            let Some(namespace) = Arc::make_mut(&mut out.namespaces).get_mut(&namespace_id) else {
+                continue;
+            };
+            let entries: Result<OrdMap<Vec<u8>, KvEntry>, crate::error::AedbError> = namespace
+                .kv
+                .entries
+                .iter()
+                .map(|(key, entry)| {
+                    materialize_kv_entry(entry, store).map(|entry| (key.clone(), entry))
+                })
+                .collect();
+            namespace.kv.entries = entries?;
+        }
+        out.value_store = None;
+        out.persistent_value_inline_threshold_bytes = usize::MAX;
+        out.mem_bytes = out.recompute_memory_bytes_full();
+        Ok(out)
     }
 
     pub fn counter_read_sharded(
@@ -1767,7 +2116,7 @@ impl KeyspaceSnapshot {
         let mut total = 0u64;
         for shard in 0..shard_count {
             let shard_key = counter_shard_storage_key(key, shard);
-            if let Some(entry) = self.kv_get(project_id, scope_id, &shard_key) {
+            if let Some(entry) = self.try_kv_get(project_id, scope_id, &shard_key)? {
                 let value = decode_u64(&entry.value)?;
                 total = total
                     .checked_add(value)
@@ -1830,6 +2179,10 @@ impl KeyspaceSnapshot {
 
 fn default_primary_index_backend() -> PrimaryIndexBackend {
     PrimaryIndexBackend::OrdMap
+}
+
+fn default_persistent_value_inline_threshold_bytes() -> usize {
+    usize::MAX
 }
 
 fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -1946,7 +2299,12 @@ pub(crate) fn namespace_mem_cost(ns: &Namespace) -> usize {
         .map(table_data_mem_cost)
         .sum::<usize>()
         .saturating_add(kv_data_mem_cost(&ns.kv))
-        .saturating_add(ns.accumulators.values().map(accumulator_data_mem_cost).sum())
+        .saturating_add(
+            ns.accumulators
+                .values()
+                .map(accumulator_data_mem_cost)
+                .sum(),
+        )
 }
 
 fn estimate_value_bytes(v: &Value) -> usize {
@@ -2056,7 +2414,8 @@ mod tests {
             row(vec![Value::Text("abc".into()), Value::U256([1u8; 32])]),
             1,
         );
-        ks.kv_set("p", "app", b"k".to_vec(), b"v".to_vec(), 2);
+        ks.kv_set("p", "app", b"k".to_vec(), b"v".to_vec(), 2)
+            .expect("set kv");
         assert!(ks.estimate_memory_bytes() > 0);
     }
 
@@ -2124,10 +2483,14 @@ mod tests {
     #[test]
     fn kv_prefix_scans_are_lexicographically_bounded() {
         let mut ks = Keyspace::default();
-        ks.kv_set("p", "app", b"ob:a:1".to_vec(), b"v1".to_vec(), 1);
-        ks.kv_set("p", "app", b"ob:a:2".to_vec(), b"v2".to_vec(), 2);
-        ks.kv_set("p", "app", b"ob:b:1".to_vec(), b"v3".to_vec(), 3);
-        ks.kv_set("p", "app", b"zz".to_vec(), b"v4".to_vec(), 4);
+        ks.kv_set("p", "app", b"ob:a:1".to_vec(), b"v1".to_vec(), 1)
+            .expect("set a1");
+        ks.kv_set("p", "app", b"ob:a:2".to_vec(), b"v2".to_vec(), 2)
+            .expect("set a2");
+        ks.kv_set("p", "app", b"ob:b:1".to_vec(), b"v3".to_vec(), 3)
+            .expect("set b1");
+        ks.kv_set("p", "app", b"zz".to_vec(), b"v4".to_vec(), 4)
+            .expect("set zz");
 
         let rows = ks.kv_scan_prefix("p", "app", b"ob:a:", 10);
         assert_eq!(rows.len(), 2);
@@ -2202,10 +2565,7 @@ mod tests {
                 "users",
                 vec![Value::Integer(i)],
                 Row {
-                    values: vec![
-                        Value::Integer(i),
-                        Value::Text(format!("name_{i}").into()),
-                    ],
+                    values: vec![Value::Integer(i), Value::Text(format!("name_{i}").into())],
                 },
                 i as u64 + 1,
             );
@@ -2242,12 +2602,14 @@ mod tests {
                 format!("key:{i}").into_bytes(),
                 vec![0xAB; 64],
                 i + 1,
-            );
+            )
+            .expect("set kv");
         }
         assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
 
         // KV update (replaces).
-        ks.kv_set("p", "app", b"key:0".to_vec(), vec![0xCD; 256], 50);
+        ks.kv_set("p", "app", b"key:0".to_vec(), vec![0xCD; 256], 50)
+            .expect("update kv");
         assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
 
         // KV delete.

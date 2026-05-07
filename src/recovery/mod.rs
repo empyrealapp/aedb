@@ -5,17 +5,19 @@ use crate::backup::sha256_file_hex;
 use crate::catalog::Catalog;
 use crate::checkpoint::loader::load_checkpoint_with_key;
 use crate::commit::tx::{IdempotencyKey, IdempotencyRecord};
-use crate::config::AedbConfig;
+use crate::config::{AedbConfig, StorageMode};
 use crate::error::AedbError;
 use crate::manifest::atomic::load_manifest_signed_mode;
 use crate::manifest::schema::Manifest;
 use crate::recovery::replay::replay_segments;
 use crate::recovery::scanner::scan_segments;
 use crate::storage::keyspace::Keyspace;
+use crate::storage::value_store::PersistentValueStore;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +82,7 @@ pub fn recover_with_config(
         &mut catalog,
         &mut idempotency,
     )?;
+    attach_configured_value_store(&mut keyspace, config, data_dir)?;
     Ok(RecoveredState {
         keyspace,
         catalog,
@@ -133,12 +136,32 @@ pub fn recover_at_seq_with_config(
         &mut catalog,
         &mut idempotency,
     )?;
+    attach_configured_value_store(&mut keyspace, config, data_dir)?;
     Ok(RecoveredState {
         keyspace,
         catalog,
         current_seq: replayed,
         idempotency,
     })
+}
+
+fn attach_configured_value_store(
+    keyspace: &mut Keyspace,
+    config: &AedbConfig,
+    data_dir: &Path,
+) -> Result<(), AedbError> {
+    if matches!(config.storage_mode, StorageMode::DiskBacked) {
+        let store = Arc::new(PersistentValueStore::open_with_hot_cache_bytes(
+            data_dir,
+            config.persistent_value_hot_cache_bytes,
+        )?);
+        keyspace
+            .attach_persistent_value_store(store, config.persistent_value_inline_threshold_bytes)?;
+        keyspace.spill_kv_values_to_memory_target(config.max_memory_estimate_bytes)?;
+    } else {
+        keyspace.detach_persistent_value_store();
+    }
+    Ok(())
 }
 
 fn has_explicit_manifest(data_dir: &Path) -> bool {

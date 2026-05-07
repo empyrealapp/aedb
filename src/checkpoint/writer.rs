@@ -53,9 +53,10 @@ pub fn write_checkpoint_with_key(
     compression_level: i32,
 ) -> Result<CheckpointMeta, AedbError> {
     fs::create_dir_all(dir)?;
+    let snapshot = snapshot.materialized_for_checkpoint()?;
     let checkpoint = CheckpointData {
         seq,
-        keyspace: snapshot.clone(),
+        keyspace: snapshot,
         catalog: catalog.clone(),
         idempotency,
     };

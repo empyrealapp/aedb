@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 pub const BACKUP_MANIFEST_FILE: &str = "backup_manifest.json";
@@ -45,12 +46,13 @@ pub fn write_backup_manifest(
     fs::create_dir_all(dir)?;
     let bytes =
         serde_json::to_vec_pretty(manifest).map_err(|e| AedbError::Encode(e.to_string()))?;
-    fs::write(dir.join(BACKUP_MANIFEST_FILE), &bytes)?;
+    write_file_atomic_synced(dir, BACKUP_MANIFEST_FILE, &bytes)?;
     if let Some(key) = signing_key {
         let sig = hmac_hex(key, &bytes)?;
-        fs::write(dir.join(BACKUP_MANIFEST_HMAC_FILE), sig)?;
+        write_file_atomic_synced(dir, BACKUP_MANIFEST_HMAC_FILE, sig.as_bytes())?;
     } else {
         let _ = fs::remove_file(dir.join(BACKUP_MANIFEST_HMAC_FILE));
+        sync_dir(dir)?;
     }
     Ok(())
 }
@@ -113,7 +115,8 @@ pub fn write_backup_archive(
     };
     let salt = *Uuid::new_v4().as_bytes();
 
-    let mut writer = BufWriter::new(fs::File::create(archive_path)?);
+    let archive_file = fs::File::create(archive_path)?;
+    let mut writer = BufWriter::new(archive_file);
     writer.write_all(BACKUP_ARCHIVE_MAGIC)?;
     writer.write_all(&[archive_flags])?;
     writer.write_all(&salt)?;
@@ -150,6 +153,10 @@ pub fn write_backup_archive(
 
     write_u8(&mut writer, BACKUP_ARCHIVE_ENTRY_END)?;
     writer.flush()?;
+    writer.get_ref().sync_all()?;
+    if let Some(parent) = archive_path.parent() {
+        sync_dir(parent)?;
+    }
     Ok(())
 }
 
@@ -243,9 +250,10 @@ pub fn extract_backup_archive(
             .map_err(|e| AedbError::Decode(e.to_string()))?;
 
         let out = resolve_backup_output_path(dir, &rel)?;
-        fs::write(out, bytes)?;
+        write_output_file_synced(&out, &bytes)?;
         entry_index = entry_index.saturating_add(1);
     }
+    sync_dir(dir)?;
     Ok(())
 }
 
@@ -270,6 +278,35 @@ fn hmac_hex(key: &[u8], bytes: &[u8]) -> Result<String, AedbError> {
         .map_err(|e| AedbError::Validation(format!("invalid hmac key: {e}")))?;
     mac.update(bytes);
     Ok(hex_string(&mac.finalize().into_bytes()))
+}
+
+fn write_file_atomic_synced(dir: &Path, filename: &str, bytes: &[u8]) -> Result<(), AedbError> {
+    let final_path = dir.join(filename);
+    let mut tmp = NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&final_path)
+        .map_err(|e| AedbError::Io(e.error))?;
+    fs::File::open(&final_path)?.sync_all()?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+fn write_output_file_synced(path: &Path, bytes: &[u8]) -> Result<(), AedbError> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<(), AedbError> {
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn verify_hmac_hex(key: &[u8], bytes: &[u8], expected_hex: &str) -> Result<(), AedbError> {

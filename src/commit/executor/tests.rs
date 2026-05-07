@@ -10,7 +10,9 @@ use crate::commit::tx::{
     ReadAssertion, ReadBound, ReadKey, ReadRange, ReadRangeEntry, ReadSet, ReadSetEntry,
     TransactionEnvelope, WriteClass, WriteIntent,
 };
-use crate::commit::validation::{ConflictAction, ConflictTarget, Mutation, UpdateExpr};
+use crate::commit::validation::{
+    ConflictAction, ConflictTarget, KvU64MissingPolicy, KvU64OverflowPolicy, Mutation, UpdateExpr,
+};
 use crate::config::AedbConfig;
 use crate::error::AedbError;
 use crate::order_book::{
@@ -818,7 +820,7 @@ async fn parallel_worker_panic_rejects_entire_epoch_without_state_publish() {
 }
 
 #[tokio::test]
-async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_updates() {
+async fn same_namespace_disjoint_parallel_apply_merges_kv_integer_updates() {
     let dir = tempdir().expect("temp");
     let exec = CommitExecutor::with_state(
         dir.path(),
@@ -838,20 +840,6 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
     }))
     .await
     .expect("project");
-    exec.submit(Mutation::Ddl(DdlOperation::CreateAccumulator {
-        project_id: "p".into(),
-        scope_id: "app".into(),
-        accumulator_name: "house_balance".into(),
-        if_not_exists: false,
-        value_type: crate::catalog::schema::AccumulatorValueType::BigInt,
-        dedupe_retain_commits: Some(10_000),
-        snapshot_every: 1_000,
-        exposure_margin_bps: 1_000,
-        exposure_ttl_commits: Some(10_000),
-    }))
-    .await
-    .expect("accumulator");
-
     let req_a = request_with_mutations(vec![
         Mutation::KvSet {
             project_id: "p".into(),
@@ -859,14 +847,13 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
             key: b"user:u1".to_vec(),
             value: b"v1".to_vec(),
         },
-        Mutation::Accumulate {
+        Mutation::KvAddU64Ex {
             project_id: "p".into(),
             scope_id: "app".into(),
-            accumulator_name: "house_balance".into(),
-            delta: 5,
-            dedupe_key: "tx-a".into(),
-            order_key: 1,
-            release_exposure_id: None,
+            key: b"house_balance".to_vec(),
+            amount_be: 5u64.to_be_bytes(),
+            on_missing: KvU64MissingPolicy::TreatAsZero,
+            on_overflow: KvU64OverflowPolicy::Reject,
         },
     ]);
     let req_b = request_with_mutations(vec![Mutation::KvSet {
@@ -888,23 +875,22 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
         state
             .keyspace
             .kv_get("p", "app", b"user:u1")
-            .map(|entry| entry.value.as_slice()),
-        Some(&b"v1"[..])
+            .map(|entry| entry.value),
+        Some(b"v1".to_vec())
     );
     assert_eq!(
         state
             .keyspace
             .kv_get("p", "app", b"user:u2")
-            .map(|entry| entry.value.as_slice()),
-        Some(&b"v2"[..])
+            .map(|entry| entry.value),
+        Some(b"v2".to_vec())
     );
     assert_eq!(
         state
             .keyspace
-            .accumulator_effective_value("p", "app", "house_balance")
-            .expect("effective value")
-            .expect("accumulator"),
-        5
+            .kv_get("p", "app", b"house_balance")
+            .map(|entry| entry.value),
+        Some(5u64.to_be_bytes().to_vec())
     );
 }
 
@@ -1235,79 +1221,6 @@ fn assertion_read_dependency_non_conflicting_key_can_coexist_in_epoch_selection(
         candidate_index,
         Some(0),
         "assertion-derived token on one key should not block unrelated-key writes"
-    );
-}
-
-#[test]
-fn accumulator_assertion_dependency_conflicts_with_same_accumulator_write_token() {
-    let candidate = request_with_assertions_and_mutations(
-        vec![ReadAssertion::AccumulatorAvailableAtLeast {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            accumulator_name: "house_balance".into(),
-            min_amount: 100,
-        }],
-        vec![Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: b"marker".to_vec(),
-            value: b"v".to_vec(),
-        }],
-    );
-
-    let mut pending = VecDeque::new();
-    pending.push_back(candidate);
-    let mut epoch_writes = HashSet::new();
-    epoch_writes.insert(format!(
-        "acc:{}:{}",
-        namespace_key("p", "app"),
-        "house_balance"
-    ));
-    let candidate_index = super::find_compatible_candidate_index(
-        &pending,
-        &epoch_writes,
-        &HashSet::new(),
-        false,
-        false,
-    );
-    assert!(
-        candidate_index.is_none(),
-        "accumulator assertion token must conflict with same-accumulator write token"
-    );
-}
-
-#[test]
-fn accumulator_assertion_dependency_allows_different_accumulator_parallel_selection() {
-    let candidate = request_with_assertions_and_mutations(
-        vec![ReadAssertion::AccumulatorExposureWithinMargin {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            accumulator_name: "house_balance".into(),
-            additional_exposure: 50,
-        }],
-        vec![Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: b"marker".to_vec(),
-            value: b"v".to_vec(),
-        }],
-    );
-
-    let mut pending = VecDeque::new();
-    pending.push_back(candidate);
-    let mut epoch_writes = HashSet::new();
-    epoch_writes.insert(format!("acc:{}:{}", namespace_key("p", "app"), "vip_pool"));
-    let candidate_index = super::find_compatible_candidate_index(
-        &pending,
-        &epoch_writes,
-        &HashSet::new(),
-        false,
-        false,
-    );
-    assert_eq!(
-        candidate_index,
-        Some(0),
-        "accumulator assertion token should allow unrelated accumulator writes"
     );
 }
 

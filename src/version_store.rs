@@ -291,6 +291,8 @@ fn acquire(version: &Version) -> ReadViewGuard {
 fn snapshot_to_keyspace(snapshot: &KeyspaceSnapshot) -> Keyspace {
     Keyspace {
         primary_index_backend: snapshot.primary_index_backend,
+        value_store: snapshot.value_store.clone(),
+        persistent_value_inline_threshold_bytes: snapshot.persistent_value_inline_threshold_bytes,
         namespaces: snapshot.namespaces.clone(),
         async_indexes: snapshot.async_indexes.clone(),
         mem_bytes: snapshot.mem_bytes,

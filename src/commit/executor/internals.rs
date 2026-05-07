@@ -109,10 +109,7 @@ fn apply_keyspace_only_mutation(
             scope_id,
             key,
             value,
-        } => Some({
-            keyspace.kv_set(project_id, scope_id, key.clone(), value.clone(), commit_seq);
-            Ok(())
-        }),
+        } => Some(keyspace.kv_set(project_id, scope_id, key.clone(), value.clone(), commit_seq)),
         Mutation::KvDel {
             project_id,
             scope_id,
@@ -1422,22 +1419,18 @@ pub(super) fn process_commit_epoch(
             let mut trial_catalog = working_catalog.clone();
             let mut apply_error = None;
             for mutation in &mutations {
-                let applied =
-                    apply_accumulator_hot_mutation(&mut trial_keyspace, mutation, commit_seq)
-                        .or_else(|| {
-                            if request.prevalidated {
-                                apply_mutation_trusted_if_eligible(
-                                    &mut trial_catalog,
-                                    &mut trial_keyspace,
-                                    mutation.clone(),
-                                    commit_seq,
-                                    request.envelope.base_seq,
-                                    snapshot_seq_before_commit,
-                                )
-                            } else {
-                                None
-                            }
-                        });
+                let applied = if request.prevalidated {
+                    apply_mutation_trusted_if_eligible(
+                        &mut trial_catalog,
+                        &mut trial_keyspace,
+                        mutation.clone(),
+                        commit_seq,
+                        request.envelope.base_seq,
+                        snapshot_seq_before_commit,
+                    )
+                } else {
+                    None
+                };
                 match applied {
                     Some(Ok(())) => {}
                     Some(Err(err)) => {
@@ -1642,7 +1635,46 @@ pub(super) fn process_commit_epoch(
         });
     }
     let pre_wal_micros = process_started.elapsed().as_micros() as u64;
-    let pre_wal_memory_estimate = working_keyspace.estimate_memory_bytes();
+    let mut pre_wal_memory_estimate = working_keyspace.estimate_memory_bytes();
+    if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
+        pre_wal_memory_estimate = match working_keyspace
+            .spill_kv_values_to_memory_target(state.config.max_memory_estimate_bytes)
+        {
+            Ok(memory_estimate) => memory_estimate,
+            Err(err) => {
+                overwrite_assertion_failures_with_wal_error(
+                    &mut outcomes,
+                    &err,
+                    "epoch aborted during persistent value spill",
+                );
+                for failed in sequenced {
+                    outcomes.push(EpochOutcome {
+                        request: failed.request,
+                        result: Err(AedbError::Validation(format!(
+                            "epoch aborted during persistent value spill: {err}"
+                        ))),
+                        post_apply_delta: None,
+                    });
+                }
+                return EpochProcessResult {
+                    outcomes,
+                    coordinator_apply_attempts,
+                    coordinator_apply_micros,
+                    parallel_apply_micros,
+                    pre_wal_micros,
+                    finalize_micros: 0,
+                    read_set_conflicts,
+                    wal_append_ops,
+                    wal_append_bytes,
+                    wal_append_micros,
+                    wal_sync_ops,
+                    wal_sync_micros,
+                    sync_executed,
+                    catalog_changed,
+                };
+            }
+        };
+    }
     if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
         let err_message = format!(
             "memory estimate exceeded before WAL commit: memory_estimate_bytes={}, max_memory_estimate_bytes={}",
@@ -1720,6 +1752,38 @@ pub(super) fn process_commit_epoch(
     }
     if requires_sync {
         let sync_started = Instant::now();
+        if let Err(err) = working_keyspace.sync_persistent_value_store() {
+            overwrite_assertion_failures_with_wal_error(
+                &mut outcomes,
+                &err,
+                "epoch aborted during persistent value sync",
+            );
+            for failed in sequenced {
+                outcomes.push(EpochOutcome {
+                    request: failed.request,
+                    result: Err(AedbError::Validation(format!(
+                        "epoch aborted during persistent value sync: {err}"
+                    ))),
+                    post_apply_delta: None,
+                });
+            }
+            return EpochProcessResult {
+                outcomes,
+                coordinator_apply_attempts,
+                coordinator_apply_micros,
+                parallel_apply_micros,
+                pre_wal_micros,
+                finalize_micros: 0,
+                read_set_conflicts,
+                wal_append_ops,
+                wal_append_bytes,
+                wal_append_micros,
+                wal_sync_ops,
+                wal_sync_micros,
+                sync_executed,
+                catalog_changed,
+            };
+        }
         if let Err(err) = state.wal.sync_active() {
             let err = AedbError::Io(std::io::Error::other(err.to_string()));
             overwrite_assertion_failures_with_wal_error(
@@ -1794,7 +1858,9 @@ pub(super) fn process_commit_epoch(
                 state.pending_batch_max_seq = last_seq;
                 if state.pending_batch_bytes >= state.config.batch_max_bytes {
                     let sync_started = Instant::now();
-                    if state.wal.sync_active().is_ok() {
+                    if state.keyspace.sync_persistent_value_store().is_ok()
+                        && state.wal.sync_active().is_ok()
+                    {
                         wal_sync_ops = wal_sync_ops.saturating_add(1);
                         wal_sync_micros = wal_sync_micros
                             .saturating_add(sync_started.elapsed().as_micros() as u64);
@@ -2159,6 +2225,9 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
             mutations,
             commit_seq: seq,
             backend,
+            value_store: keyspace.value_store.clone(),
+            persistent_value_inline_threshold_bytes: keyspace
+                .persistent_value_inline_threshold_bytes,
             catalog: Arc::clone(&shared_catalog),
             max_scan_rows,
             caller: commit.request.envelope.caller.clone(),
@@ -2350,7 +2419,11 @@ fn merge_parallel_namespace_result(
     let mut table_names: Vec<_> = targets.tables.iter().cloned().collect();
     table_names.sort();
     for table_name in table_names {
-        let prev_cost = dest.tables.get(&table_name).map(table_data_mem_cost).unwrap_or(0);
+        let prev_cost = dest
+            .tables
+            .get(&table_name)
+            .map(table_data_mem_cost)
+            .unwrap_or(0);
         match namespace.tables.get(&table_name) {
             Some(table) => {
                 added = added.saturating_add(table_data_mem_cost(table));
@@ -2451,7 +2524,10 @@ fn merge_parallel_namespace_result(
         }
         removed = removed.saturating_add(prev_acc_cost);
     }
-    keyspace.mem_bytes = keyspace.mem_bytes.saturating_add(added).saturating_sub(removed);
+    keyspace.mem_bytes = keyspace
+        .mem_bytes
+        .saturating_add(added)
+        .saturating_sub(removed);
 }
 
 pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<NamespaceId> {
@@ -3148,18 +3224,14 @@ pub(super) fn apply_via_coordinator(
         } else {
             enforce_global_unique_scope_invariants(catalog, keyspace, mutation)?;
         }
-        if let Some(result) = apply_accumulator_hot_mutation(keyspace, mutation, commit_seq) {
-            result?;
-        } else {
-            apply_mutation(
-                catalog,
-                keyspace,
-                mutation.clone(),
-                commit_seq,
-                Some(options.max_scan_rows),
-                caller,
-            )?;
-        }
+        apply_mutation(
+            catalog,
+            keyspace,
+            mutation.clone(),
+            commit_seq,
+            Some(options.max_scan_rows),
+            caller,
+        )?;
         if matches!(mutation, Mutation::Ddl(_)) {
             *global_unique_index = GlobalUniqueIndexState::from_snapshot(catalog, keyspace)?;
         }
@@ -3528,29 +3600,20 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
                 scope_id,
                 accumulator_name,
                 ..
-            } => {
-                let ns = namespace_key(project_id, scope_id);
-                out.insert(format!("acc:{ns}:{accumulator_name}"));
             }
-            Mutation::ExposeAccumulator {
+            | Mutation::ExposeAccumulator {
                 project_id,
                 scope_id,
                 accumulator_name,
                 ..
-            } => {
-                let ns = namespace_key(project_id, scope_id);
-                out.insert(format!("acc:{ns}:{accumulator_name}"));
             }
-            Mutation::ExposeAccumulatorBatch {
+            | Mutation::ExposeAccumulatorBatch {
                 project_id,
                 scope_id,
                 accumulator_name,
                 ..
-            } => {
-                let ns = namespace_key(project_id, scope_id);
-                out.insert(format!("acc:{ns}:{accumulator_name}"));
             }
-            Mutation::ReleaseAccumulatorExposure {
+            | Mutation::ReleaseAccumulatorExposure {
                 project_id,
                 scope_id,
                 accumulator_name,
@@ -4588,12 +4651,9 @@ fn rebuild_kv_projection_rows(
     table_name: &str,
     materialized_seq: u64,
 ) -> Result<(), AedbError> {
-    let keys: Vec<Vec<u8>> = state
+    let entries = state
         .keyspace
-        .kv_scan_prefix(project_id, scope_id, &[], usize::MAX)
-        .into_iter()
-        .map(|(k, _)| k)
-        .collect();
+        .try_kv_scan_prefix(project_id, scope_id, &[], usize::MAX)?;
     let ns = namespace_key(project_id, scope_id);
     if let Some(table) = state.keyspace.table_by_namespace_key_mut(&ns, table_name) {
         table.rows.clear();
@@ -4608,21 +4668,19 @@ fn rebuild_kv_projection_rows(
             .table_mut(project_id, scope_id, table_name)
             .structural_version = materialized_seq;
     }
-    for key in keys {
-        if let Some(entry) = state.keyspace.kv_get(project_id, scope_id, &key).cloned() {
-            upsert_kv_projection_row(
-                state,
-                project_id,
-                scope_id,
-                table_name,
-                KvProjectionRow {
-                    key,
-                    value: entry.value,
-                    commit_seq: entry.version,
-                    updated_at: materialized_seq,
-                },
-            )?;
-        }
+    for (key, entry) in entries {
+        upsert_kv_projection_row(
+            state,
+            project_id,
+            scope_id,
+            table_name,
+            KvProjectionRow {
+                key,
+                value: entry.value,
+                commit_seq: entry.version,
+                updated_at: materialized_seq,
+            },
+        )?;
     }
     Ok(())
 }
@@ -4727,7 +4785,7 @@ fn apply_kv_projection_delta(
             key,
             ..
         } if namespace_key(p, s) == namespace => {
-            if let Some(entry) = state.keyspace.kv_get(project_id, scope_id, key).cloned() {
+            if let Some(entry) = state.keyspace.kv_get(project_id, scope_id, key) {
                 upsert_kv_projection_row(
                     state,
                     project_id,

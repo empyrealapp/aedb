@@ -14,9 +14,10 @@ use crate::commit::tx::{
 };
 use crate::commit::validation::{
     KvIntegerAmount, KvIntegerMissingPolicy, KvIntegerUnderflowPolicy, KvU64MissingPolicy,
-    KvU64UnderflowPolicy, KvU256MissingPolicy, KvU256UnderflowPolicy, MAX_COUNTER_SHARDS, Mutation,
+    KvU64OverflowPolicy, KvU64UnderflowPolicy, KvU256MissingPolicy, KvU256UnderflowPolicy,
+    MAX_COUNTER_SHARDS, Mutation,
 };
-use crate::config::{AedbConfig, DurabilityMode, RecoveryMode};
+use crate::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use crate::error::{AedbError, AedbErrorCode, ResourceType as ErrorResourceType};
 use crate::permission::{CallerContext, Permission};
 use crate::query::error::QueryError;
@@ -911,6 +912,60 @@ async fn kv_write_helpers_respect_scope_boundaries() {
         .expect("private read")
         .expect("private key");
     assert_eq!(private_value.value, b"7".to_vec());
+}
+
+#[tokio::test]
+async fn kv_set_many_atomic_writes_all_entries_in_one_commit() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let result = db
+        .kv_set_many_atomic(
+            "p",
+            "app",
+            vec![
+                (b"batch:a".to_vec(), b"1".to_vec()),
+                (b"batch:b".to_vec(), b"2".to_vec()),
+                (b"batch:c".to_vec(), b"3".to_vec()),
+            ],
+        )
+        .await
+        .expect("batch kv set");
+
+    let caller = CallerContext::new("reader");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        actor_id: None,
+        delegable: false,
+        caller_id: caller.caller_id.clone(),
+        permission: Permission::KvRead {
+            project_id: "p".into(),
+            scope_id: Some("app".into()),
+            prefix: Some(b"batch:".to_vec()),
+        },
+    }))
+    .await
+    .expect("grant read");
+
+    for (key, value) in [
+        (b"batch:a".as_slice(), b"1".to_vec()),
+        (b"batch:b".as_slice(), b"2".to_vec()),
+        (b"batch:c".as_slice(), b"3".to_vec()),
+    ] {
+        let entry = db
+            .kv_get("p", "app", key, ConsistencyMode::AtLatest, &caller)
+            .await
+            .expect("read batch key")
+            .expect("batch key exists");
+        assert_eq!(entry.value, value);
+        assert_eq!(entry.version, result.commit_seq);
+    }
+
+    let err = db
+        .kv_set_many_atomic("p", "app", Vec::new())
+        .await
+        .expect_err("empty batch rejected");
+    assert!(matches!(err, AedbError::Validation(_)));
 }
 
 #[tokio::test]
@@ -2666,6 +2721,222 @@ fn checkpoint_compression_level_is_validated() {
         ..AedbConfig::default()
     };
     crate::lib_helpers::validate_config(&cfg).expect("valid compression level");
+}
+
+#[tokio::test]
+async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 32,
+        max_kv_value_bytes: 256 * 1024,
+        max_transaction_bytes: 512 * 1024,
+        max_memory_estimate_bytes: 8 * 1024,
+        ..AedbConfig::default()
+    };
+    let value: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
+
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"blob".to_vec(), value.clone())
+        .await
+        .expect("set large value");
+
+    let memory_estimate = db.estimated_memory_bytes().await;
+    assert!(
+        memory_estimate < value.len() / 4,
+        "large value should not remain inline in keyspace memory estimate: {memory_estimate}"
+    );
+    let metrics = db.operational_metrics().await;
+    assert!(
+        metrics.persistent_value_store_bytes > value.len() as u64,
+        "value store metrics should include spilled payload bytes"
+    );
+    assert_eq!(
+        metrics.persistent_value_hot_cache_capacity_bytes,
+        config.persistent_value_hot_cache_bytes
+    );
+    assert!(
+        metrics.persistent_value_hot_cache_bytes
+            <= metrics.persistent_value_hot_cache_capacity_bytes
+    );
+    let value_file = dir.path().join("values.aedbdat");
+    assert!(
+        fs::metadata(&value_file)
+            .expect("value store metadata")
+            .len()
+            > value.len() as u64,
+        "value store should contain spilled payload bytes"
+    );
+
+    let got = db
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect("get")
+        .expect("value");
+    assert_eq!(got.value, value);
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let recovered = reopened
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect("recovered get")
+        .expect("recovered value");
+    assert_eq!(recovered.value, value);
+    reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn disk_backed_small_kv_values_spill_under_memory_pressure() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 1024,
+        persistent_value_hot_cache_bytes: 0,
+        max_kv_value_bytes: 1024,
+        max_transaction_bytes: 4096,
+        max_memory_estimate_bytes: 2048,
+        ..AedbConfig::default()
+    };
+
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    for i in 0..32u8 {
+        db.kv_set(
+            "p",
+            "app",
+            format!("small:{i:02}").into_bytes(),
+            vec![i; 256],
+        )
+        .await
+        .expect("set small value");
+    }
+
+    let memory_estimate = db.estimated_memory_bytes().await;
+    assert!(
+        memory_estimate <= config.max_memory_estimate_bytes,
+        "small KV payloads should spill before memory guard rejects: {memory_estimate}"
+    );
+    let metrics = db.operational_metrics().await;
+    assert!(
+        metrics.persistent_value_store_bytes > 8 + 16 * 256,
+        "persistent value store should contain pressure-spilled small payloads"
+    );
+    for i in 0..32u8 {
+        let key = format!("small:{i:02}");
+        let got = db
+            .kv_get_no_auth("p", "app", key.as_bytes(), ConsistencyMode::AtLatest)
+            .await
+            .expect("get")
+            .expect("value");
+        assert_eq!(got.value, vec![i; 256]);
+    }
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    let reopened = AedbInstance::open(config.clone(), dir.path()).expect("reopen");
+    let recovered_memory_estimate = reopened.estimated_memory_bytes().await;
+    assert!(
+        recovered_memory_estimate <= config.max_memory_estimate_bytes,
+        "recovery should re-spill small KV payloads under memory target: {recovered_memory_estimate}"
+    );
+    for i in 0..32u8 {
+        let key = format!("small:{i:02}");
+        let got = reopened
+            .kv_get_no_auth("p", "app", key.as_bytes(), ConsistencyMode::AtLatest)
+            .await
+            .expect("recovered get")
+            .expect("recovered value");
+        assert_eq!(got.value, vec![i; 256]);
+    }
+    reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn disk_backed_kv_spilled_versions_remain_snapshot_consistent() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 16,
+        persistent_value_hot_cache_bytes: 0,
+        max_kv_value_bytes: 256 * 1024,
+        max_transaction_bytes: 512 * 1024,
+        ..AedbConfig::default()
+    };
+    let first_value: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+    let second_value: Vec<u8> = (0..96 * 1024).map(|i| 255 - (i % 251) as u8).collect();
+
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    let first = db
+        .kv_set("p", "app", b"blob".to_vec(), first_value.clone())
+        .await
+        .expect("first set");
+    let second = db
+        .kv_set("p", "app", b"blob".to_vec(), second_value.clone())
+        .await
+        .expect("second set");
+
+    let at_first = db
+        .kv_get_no_auth(
+            "p",
+            "app",
+            b"blob",
+            ConsistencyMode::AtSeq(first.commit_seq),
+        )
+        .await
+        .expect("get first snapshot")
+        .expect("first snapshot value");
+    assert_eq!(at_first.value, first_value);
+
+    let at_second = db
+        .kv_get_no_auth(
+            "p",
+            "app",
+            b"blob",
+            ConsistencyMode::AtSeq(second.commit_seq),
+        )
+        .await
+        .expect("get second snapshot")
+        .expect("second snapshot value");
+    assert_eq!(at_second.value, second_value);
+    db.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn disk_backed_checkpoint_is_self_contained_when_value_file_is_missing() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 16,
+        persistent_value_hot_cache_bytes: 0,
+        max_kv_value_bytes: 256 * 1024,
+        max_transaction_bytes: 512 * 1024,
+        ..AedbConfig::default()
+    };
+    let value: Vec<u8> = (0..128 * 1024).map(|i| (i % 199) as u8).collect();
+
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"blob".to_vec(), value.clone())
+        .await
+        .expect("set large value");
+    db.checkpoint_now().await.expect("checkpoint");
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    fs::remove_file(dir.path().join("values.aedbdat")).expect("remove value store");
+
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen from checkpoint");
+    let recovered = reopened
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect("recovered get")
+        .expect("recovered value");
+    assert_eq!(recovered.value, value);
+    reopened.shutdown().await.expect("shutdown reopened");
 }
 
 #[tokio::test]
@@ -7472,7 +7743,7 @@ async fn multi_update_transaction_envelope_updates_table_and_kv() {
 }
 
 #[tokio::test]
-async fn transaction_envelope_can_commit_table_kv_and_accumulator_atomically() {
+async fn transaction_envelope_can_commit_table_kv_and_integer_atomically() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
@@ -7503,10 +7774,6 @@ async fn transaction_envelope_can_commit_table_kv_and_accumulator_atomically() {
     }))
     .await
     .expect("ledger table");
-    db.create_accumulator("p", "app", "house_balance", Some(86_400), 10_000)
-        .await
-        .expect("create accumulator");
-
     let envelope = TransactionEnvelope {
         caller: None,
         idempotency_key: Some(IdempotencyKey([11u8; 16])),
@@ -7532,14 +7799,13 @@ async fn transaction_envelope_can_commit_table_kv_and_accumulator_atomically() {
                     key: b"ledger:last".to_vec(),
                     value: b"1".to_vec(),
                 },
-                Mutation::Accumulate {
+                Mutation::KvAddU64Ex {
                     project_id: "p".into(),
                     scope_id: "app".into(),
-                    accumulator_name: "house_balance".into(),
-                    delta: 75,
-                    dedupe_key: "txn-acc-1".into(),
-                    order_key: 1,
-                    release_exposure_id: None,
+                    key: b"house_balance".to_vec(),
+                    amount_be: 75u64.to_be_bytes(),
+                    on_missing: KvU64MissingPolicy::TreatAsZero,
+                    on_overflow: KvU64OverflowPolicy::Reject,
                 },
             ],
         },
@@ -7579,19 +7845,17 @@ async fn transaction_envelope_can_commit_table_kv_and_accumulator_atomically() {
         Some(b"1".as_slice())
     );
 
-    let projected = db
-        .accumulator_value("p", "app", "house_balance", ConsistencyMode::AtLatest)
+    let balance = db
+        .kv_get_no_auth("p", "app", b"house_balance", ConsistencyMode::AtLatest)
         .await
-        .expect("projected accumulator value");
-    let strong = db
-        .accumulator_value_strong("p", "app", "house_balance", ConsistencyMode::AtLatest)
-        .await
-        .expect("strong accumulator value");
-    assert_eq!(strong, 75);
-    assert!(
-        projected <= strong,
-        "projected value must not exceed strong value"
-    );
+        .expect("read integer balance")
+        .expect("integer balance exists");
+    let balance_bytes: [u8; 8] = balance
+        .value
+        .as_slice()
+        .try_into()
+        .expect("u64 balance bytes");
+    assert_eq!(u64::from_be_bytes(balance_bytes), 75);
 
     let replay = db
         .commit_envelope(envelope)
@@ -7624,11 +7888,17 @@ async fn transaction_envelope_can_commit_table_kv_and_accumulator_atomically() {
         stable_marker.as_ref().map(|entry| entry.value.as_slice()),
         Some(b"1".as_slice())
     );
-    let stable_strong = db
-        .accumulator_value_strong("p", "app", "house_balance", ConsistencyMode::AtLatest)
+    let stable_balance = db
+        .kv_get_no_auth("p", "app", b"house_balance", ConsistencyMode::AtLatest)
         .await
-        .expect("stable strong accumulator value");
-    assert_eq!(stable_strong, 75);
+        .expect("read stable integer balance")
+        .expect("stable integer balance exists");
+    let stable_balance_bytes: [u8; 8] = stable_balance
+        .value
+        .as_slice()
+        .try_into()
+        .expect("stable u64 balance bytes");
+    assert_eq!(u64::from_be_bytes(stable_balance_bytes), 75);
 }
 
 #[tokio::test]
@@ -8832,184 +9102,6 @@ async fn concurrent_apply_migration_converges_idempotently() {
             .await
             .expect("users table exists")
     );
-}
-
-#[tokio::test]
-async fn effect_batch_require_available_rejects_via_commit_assertion() {
-    let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
-    db.create_project("p").await.expect("project");
-    db.create_accumulator_with_options("p", "app", "house_balance", Some(86_400), 10_000, 0, None)
-        .await
-        .expect("create accumulator");
-
-    let result = db
-        .commit_effect_batch(
-            "p",
-            "app",
-            crate::engine_interface::EffectBatch {
-                preconditions: vec![
-                    crate::engine_interface::EffectPrecondition::RequireAvailable {
-                        accumulator: "house_balance".into(),
-                        min_amount: 1,
-                    },
-                ],
-                effects: vec![crate::engine_interface::EffectOperation::Accumulate {
-                    accumulator: "house_balance".into(),
-                    delta: 0,
-                    dedupe_id: "noop-1".into(),
-                    order_key: 1,
-                }],
-                events: Vec::new(),
-            },
-        )
-        .await
-        .expect("commit effect batch");
-
-    match result {
-        crate::engine_interface::EffectBatchCommitResult::Rejected(rejected) => {
-            assert_eq!(rejected.error_code, "available_below_min");
-            assert_eq!(
-                rejected.failed_precondition,
-                "RequireAvailable(house_balance, min=1)"
-            );
-            assert_eq!(rejected.actual_value, 0);
-        }
-        crate::engine_interface::EffectBatchCommitResult::Applied(_) => {
-            panic!("expected rejected result")
-        }
-    }
-}
-
-#[tokio::test]
-async fn effect_batch_require_exposure_ok_rejects_via_commit_assertion() {
-    let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
-    db.create_project("p").await.expect("project");
-    db.create_accumulator_with_options(
-        "p",
-        "app",
-        "house_balance",
-        Some(86_400),
-        10_000,
-        1_000,
-        None,
-    )
-    .await
-    .expect("create accumulator");
-    db.accumulate("p", "app", "house_balance", 100, "fund".into(), 1)
-        .await
-        .expect("seed balance");
-
-    let result = db
-        .commit_effect_batch(
-            "p",
-            "app",
-            crate::engine_interface::EffectBatch {
-                preconditions: vec![
-                    crate::engine_interface::EffectPrecondition::RequireExposureOk {
-                        accumulator: "house_balance".into(),
-                        amount: 100,
-                    },
-                ],
-                effects: vec![crate::engine_interface::EffectOperation::Accumulate {
-                    accumulator: "house_balance".into(),
-                    delta: 0,
-                    dedupe_id: "noop-2".into(),
-                    order_key: 2,
-                }],
-                events: Vec::new(),
-            },
-        )
-        .await
-        .expect("commit effect batch");
-
-    match result {
-        crate::engine_interface::EffectBatchCommitResult::Rejected(rejected) => {
-            assert_eq!(rejected.error_code, "exposure_margin_exceeded");
-            assert_eq!(
-                rejected.failed_precondition,
-                "RequireExposureOk(house_balance, amount=100)"
-            );
-            assert_eq!(rejected.actual_value, 0);
-        }
-        crate::engine_interface::EffectBatchCommitResult::Applied(_) => {
-            panic!("expected rejected result")
-        }
-    }
-}
-
-#[tokio::test]
-async fn effect_batch_require_available_is_race_safe_under_concurrency() {
-    let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
-    db.create_project("p").await.expect("project");
-    db.create_accumulator_with_options("p", "app", "house_balance", Some(86_400), 10_000, 0, None)
-        .await
-        .expect("create accumulator");
-    db.accumulate("p", "app", "house_balance", 100, "fund".into(), 1)
-        .await
-        .expect("seed balance");
-
-    let contenders = 16usize;
-    let barrier = Arc::new(tokio::sync::Barrier::new(contenders));
-    let mut tasks = Vec::with_capacity(contenders);
-    for i in 0..contenders {
-        let db = Arc::clone(&db);
-        let barrier = Arc::clone(&barrier);
-        tasks.push(tokio::spawn(async move {
-            barrier.wait().await;
-            db.commit_effect_batch(
-                "p",
-                "app",
-                crate::engine_interface::EffectBatch {
-                    preconditions: vec![
-                        crate::engine_interface::EffectPrecondition::RequireAvailable {
-                            accumulator: "house_balance".into(),
-                            min_amount: 100,
-                        },
-                    ],
-                    effects: vec![crate::engine_interface::EffectOperation::Expose {
-                        accumulator: "house_balance".into(),
-                        amount: 100,
-                        dedupe_id: format!("reserve-{i}"),
-                    }],
-                    events: Vec::new(),
-                },
-            )
-            .await
-        }));
-    }
-
-    let mut applied = 0usize;
-    let mut rejected = 0usize;
-    for task in tasks {
-        match task.await.expect("join").expect("commit effect batch") {
-            crate::engine_interface::EffectBatchCommitResult::Applied(_) => applied += 1,
-            crate::engine_interface::EffectBatchCommitResult::Rejected(err) => {
-                assert_eq!(err.error_code, "available_below_min");
-                rejected += 1;
-            }
-        }
-    }
-
-    assert_eq!(applied, 1, "exactly one withdrawal should apply");
-    assert_eq!(
-        rejected,
-        contenders - 1,
-        "all other withdrawals must be rejected"
-    );
-
-    let available = db
-        .accumulator_available("p", "app", "house_balance", ConsistencyMode::AtLatest)
-        .await
-        .expect("available");
-    assert_eq!(available, 0, "winner consumed full available capacity");
-    let exposure = db
-        .accumulator_exposure("p", "app", "house_balance", ConsistencyMode::AtLatest)
-        .await
-        .expect("exposure");
-    assert_eq!(exposure, 100, "winner reserved full amount");
 }
 
 struct RecordingTelemetryHook {
