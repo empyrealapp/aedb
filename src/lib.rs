@@ -9037,11 +9037,13 @@ impl AedbInstance {
                 merged_async_indexes.insert(key.clone(), value.clone());
             }
         }
-        let merged_keyspace = Keyspace {
+        let mut merged_keyspace = Keyspace {
             primary_index_backend: live.keyspace.primary_index_backend,
             namespaces: Arc::new(merged_namespaces.into()),
             async_indexes: Arc::new(merged_async_indexes.into()),
+            mem_bytes: 0,
         };
+        merged_keyspace.refresh_mem_bytes();
 
         let mut merged_catalog = live.catalog.clone();
         if let Some(project) = restored.catalog.projects.get(project_id) {

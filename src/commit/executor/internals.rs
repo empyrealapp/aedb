@@ -2341,18 +2341,26 @@ fn merge_parallel_namespace_result(
     namespace: &Namespace,
     targets: &ParallelMergeTargets,
 ) {
+    use crate::storage::keyspace::{
+        accumulator_data_mem_cost, kv_entry_cost, row_mem_cost, table_data_mem_cost,
+    };
+    let mut added: usize = 0;
+    let mut removed: usize = 0;
     let dest = keyspace.namespace_mut(ns_id.clone());
     let mut table_names: Vec<_> = targets.tables.iter().cloned().collect();
     table_names.sort();
     for table_name in table_names {
+        let prev_cost = dest.tables.get(&table_name).map(table_data_mem_cost).unwrap_or(0);
         match namespace.tables.get(&table_name) {
             Some(table) => {
+                added = added.saturating_add(table_data_mem_cost(table));
                 dest.tables.insert(table_name, table.clone());
             }
             None => {
                 dest.tables.remove(&table_name);
             }
         }
+        removed = removed.saturating_add(prev_cost);
     }
     let mut row_tables: Vec<_> = targets.table_rows.keys().cloned().collect();
     row_tables.sort();
@@ -2363,8 +2371,10 @@ fn merge_parallel_namespace_result(
         let dest_table = dest.tables.entry(table_name.clone()).or_default();
         let source_table = namespace.tables.get(&table_name);
         for row_key in row_keys {
+            let prev_row_cost = dest_table.rows.get(row_key).map(row_mem_cost).unwrap_or(0);
             match source_table.and_then(|table| table.rows.get(row_key)) {
                 Some(row) => {
+                    added = added.saturating_add(row_mem_cost(row));
                     dest_table.rows.insert(row_key.clone(), row.clone());
                     dest_table.row_cache.insert(row_key.clone(), row.clone());
                     dest_table.pk_hash.insert(row_key.clone(), ());
@@ -2375,6 +2385,7 @@ fn merge_parallel_namespace_result(
                     dest_table.pk_hash.remove(row_key);
                 }
             }
+            removed = removed.saturating_add(prev_row_cost);
             match source_table.and_then(|table| table.row_versions.get(row_key)) {
                 Some(version) => {
                     dest_table.row_versions.insert(row_key.clone(), *version);
@@ -2397,14 +2408,22 @@ fn merge_parallel_namespace_result(
     let mut kv_keys: Vec<_> = targets.kv_keys.iter().cloned().collect();
     kv_keys.sort();
     for key in kv_keys {
+        let prev_kv_cost = dest
+            .kv
+            .entries
+            .get(&key)
+            .map(|e| kv_entry_cost(key.len(), e.value.len()))
+            .unwrap_or(0);
         match namespace.kv.entries.get(&key) {
             Some(entry) => {
+                added = added.saturating_add(kv_entry_cost(key.len(), entry.value.len()));
                 dest.kv.entries.insert(key, entry.clone());
             }
             None => {
                 dest.kv.entries.remove(&key);
             }
         }
+        removed = removed.saturating_add(prev_kv_cost);
     }
     if !targets.kv_keys.is_empty() {
         dest.kv.structural_version = dest
@@ -2415,8 +2434,14 @@ fn merge_parallel_namespace_result(
     let mut accumulator_names: Vec<_> = targets.accumulators.iter().cloned().collect();
     accumulator_names.sort();
     for accumulator_name in accumulator_names {
+        let prev_acc_cost = dest
+            .accumulators
+            .get(&accumulator_name)
+            .map(accumulator_data_mem_cost)
+            .unwrap_or(0);
         match namespace.accumulators.get(&accumulator_name) {
             Some(accumulator) => {
+                added = added.saturating_add(accumulator_data_mem_cost(accumulator));
                 dest.accumulators
                     .insert(accumulator_name, accumulator.clone());
             }
@@ -2424,7 +2449,9 @@ fn merge_parallel_namespace_result(
                 dest.accumulators.remove(&accumulator_name);
             }
         }
+        removed = removed.saturating_add(prev_acc_cost);
     }
+    keyspace.mem_bytes = keyspace.mem_bytes.saturating_add(added).saturating_sub(removed);
 }
 
 pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<NamespaceId> {

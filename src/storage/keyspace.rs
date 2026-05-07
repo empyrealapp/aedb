@@ -227,6 +227,11 @@ pub struct Keyspace {
         deserialize_with = "deserialize_arc_async_indexes"
     )]
     pub async_indexes: Arc<HashMap<(NamespaceId, String, String), AsyncProjectionData>>,
+    /// Running sum used by `estimate_memory_bytes()`. Maintained incrementally by
+    /// every mutation helper. Use `recompute_memory_bytes_full()` to rebuild
+    /// after constructing from external data (checkpoint load, partial merges).
+    #[serde(default)]
+    pub mem_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +248,8 @@ pub struct KeyspaceSnapshot {
         deserialize_with = "deserialize_arc_async_indexes"
     )]
     pub async_indexes: Arc<HashMap<(NamespaceId, String, String), AsyncProjectionData>>,
+    #[serde(default)]
+    pub mem_bytes: usize,
 }
 
 // Custom serde for Arc<HashMap>
@@ -290,6 +297,7 @@ impl Keyspace {
             primary_index_backend,
             namespaces: Arc::new(HashMap::new()),
             async_indexes: Arc::new(HashMap::new()),
+            mem_bytes: 0,
         }
     }
 
@@ -315,7 +323,15 @@ impl Keyspace {
         index_name: String,
         data: AsyncProjectionData,
     ) {
-        Arc::make_mut(&mut self.async_indexes).insert((ns_id, table_name, index_name), data);
+        let new_cost = projection_data_mem_cost(&data);
+        let key = (ns_id, table_name, index_name);
+        let map = Arc::make_mut(&mut self.async_indexes);
+        let old_cost = map.get(&key).map(projection_data_mem_cost).unwrap_or(0);
+        map.insert(key, data);
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost)
+            .saturating_sub(old_cost);
     }
 
     /// Removes an async projection from the keyspace (copy-on-write).
@@ -325,11 +341,12 @@ impl Keyspace {
         table_name: &str,
         index_name: &str,
     ) {
-        Arc::make_mut(&mut self.async_indexes).remove(&(
-            ns_id.clone(),
-            table_name.to_string(),
-            index_name.to_string(),
-        ));
+        let key = (ns_id.clone(), table_name.to_string(), index_name.to_string());
+        if let Some(p) = Arc::make_mut(&mut self.async_indexes).remove(&key) {
+            self.mem_bytes = self
+                .mem_bytes
+                .saturating_sub(projection_data_mem_cost(&p));
+        }
     }
 
     pub fn take_async_projection(
@@ -338,15 +355,32 @@ impl Keyspace {
         table_name: &str,
         index_name: &str,
     ) -> Option<AsyncProjectionData> {
-        Arc::make_mut(&mut self.async_indexes).remove(&(
-            ns_id.clone(),
-            table_name.to_string(),
-            index_name.to_string(),
-        ))
+        let key = (ns_id.clone(), table_name.to_string(), index_name.to_string());
+        let removed = Arc::make_mut(&mut self.async_indexes).remove(&key);
+        if let Some(p) = &removed {
+            self.mem_bytes = self
+                .mem_bytes
+                .saturating_sub(projection_data_mem_cost(p));
+        }
+        removed
     }
 
     /// Inserts a namespace into the keyspace (copy-on-write).
     pub fn insert_namespace(&mut self, ns_id: NamespaceId, namespace: Namespace) {
+        let new_cost = namespace_mem_cost(&namespace);
+        let map = Arc::make_mut(&mut self.namespaces);
+        let old_cost = map.get(&ns_id).map(namespace_mem_cost).unwrap_or(0);
+        map.insert(ns_id, namespace);
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost)
+            .saturating_sub(old_cost);
+    }
+
+    /// Inserts without updating `mem_bytes`. Use for throwaway keyspaces
+    /// (e.g. per-task local keyspaces in the parallel apply runtime) where
+    /// the running counter is never read. Avoids the O(N) walk.
+    pub fn insert_namespace_unchecked(&mut self, ns_id: NamespaceId, namespace: Namespace) {
         Arc::make_mut(&mut self.namespaces).insert(ns_id, namespace);
     }
 
@@ -434,23 +468,8 @@ impl Keyspace {
         row: Row,
         commit_seq: u64,
     ) {
-        let use_cache = self.primary_index_backend == PrimaryIndexBackend::ArtExperimental;
-        let table = self.table_mut(project_id, scope_id, table_name);
         let encoded_pk = EncodedKey::from_values(&pk);
-        if !table.rows.contains_key(&encoded_pk) {
-            table.structural_version = commit_seq;
-        }
-        if use_cache {
-            table.rows.insert(encoded_pk.clone(), row.clone());
-            table.row_cache.insert(encoded_pk.clone(), row);
-        } else {
-            table.rows.insert(encoded_pk.clone(), row);
-        }
-        table.row_versions.insert(encoded_pk.clone(), commit_seq);
-        table.pk_hash.insert(encoded_pk.clone(), ());
-        if use_cache {
-            table.row_versions_cache.insert(encoded_pk, commit_seq);
-        }
+        self.upsert_row_by_encoded_pk(project_id, scope_id, table_name, encoded_pk, row, commit_seq);
     }
 
     pub fn upsert_row_by_encoded_pk(
@@ -463,21 +482,30 @@ impl Keyspace {
         commit_seq: u64,
     ) {
         let use_cache = self.primary_index_backend == PrimaryIndexBackend::ArtExperimental;
-        let table = self.table_mut(project_id, scope_id, table_name);
-        if !table.rows.contains_key(&encoded_pk) {
-            table.structural_version = commit_seq;
-        }
-        if use_cache {
-            table.rows.insert(encoded_pk.clone(), row.clone());
-            table.row_cache.insert(encoded_pk.clone(), row);
-        } else {
-            table.rows.insert(encoded_pk.clone(), row);
-        }
-        table.row_versions.insert(encoded_pk.clone(), commit_seq);
-        table.pk_hash.insert(encoded_pk.clone(), ());
-        if use_cache {
-            table.row_versions_cache.insert(encoded_pk, commit_seq);
-        }
+        let new_cost = row_mem_cost(&row);
+        let old_cost = {
+            let table = self.table_mut(project_id, scope_id, table_name);
+            let old_cost = table.rows.get(&encoded_pk).map(row_mem_cost).unwrap_or(0);
+            if old_cost == 0 {
+                table.structural_version = commit_seq;
+            }
+            if use_cache {
+                table.rows.insert(encoded_pk.clone(), row.clone());
+                table.row_cache.insert(encoded_pk.clone(), row);
+            } else {
+                table.rows.insert(encoded_pk.clone(), row);
+            }
+            table.row_versions.insert(encoded_pk.clone(), commit_seq);
+            table.pk_hash.insert(encoded_pk.clone(), ());
+            if use_cache {
+                table.row_versions_cache.insert(encoded_pk, commit_seq);
+            }
+            old_cost
+        };
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost)
+            .saturating_sub(old_cost);
     }
 
     pub fn get_row(
@@ -531,17 +559,23 @@ impl Keyspace {
         encoded_pk: &EncodedKey,
         commit_seq: u64,
     ) -> Option<Row> {
-        let table = self
-            .namespace_mut(NamespaceId::project_scope(project_id, scope_id))
-            .tables
-            .get_mut(table_name)?;
-        table.row_versions.remove(encoded_pk);
-        table.pk_hash.remove(encoded_pk);
-        table.row_cache.remove(encoded_pk);
-        table.row_versions_cache.remove(encoded_pk);
-        let removed = table.rows.remove(encoded_pk);
-        if removed.is_some() {
-            table.structural_version = commit_seq;
+        let removed = {
+            let table = self
+                .namespace_mut(NamespaceId::project_scope(project_id, scope_id))
+                .tables
+                .get_mut(table_name)?;
+            table.row_versions.remove(encoded_pk);
+            table.pk_hash.remove(encoded_pk);
+            table.row_cache.remove(encoded_pk);
+            table.row_versions_cache.remove(encoded_pk);
+            let removed = table.rows.remove(encoded_pk);
+            if removed.is_some() {
+                table.structural_version = commit_seq;
+            }
+            removed
+        };
+        if let Some(row) = &removed {
+            self.mem_bytes = self.mem_bytes.saturating_sub(row_mem_cost(row));
         }
         removed
     }
@@ -555,13 +589,17 @@ impl Keyspace {
             primary_index_backend: self.primary_index_backend,
             namespaces: Arc::clone(&self.namespaces),
             async_indexes: Arc::clone(&self.async_indexes),
+            mem_bytes: self.mem_bytes,
         }
     }
 
     pub fn drop_table(&mut self, project_id: &str, scope_id: &str, table_name: &str) {
         let ns = NamespaceId::project_scope(project_id, scope_id);
+        let mut freed: usize = 0;
         if let Some(namespace) = self.namespaces_mut().get_mut(&ns) {
-            namespace.tables.remove(table_name);
+            if let Some(t) = namespace.tables.remove(table_name) {
+                freed = freed.saturating_add(table_data_mem_cost(&t));
+            }
         }
         let async_keys: Vec<(NamespaceId, String, String)> = self
             .async_indexes
@@ -570,8 +608,11 @@ impl Keyspace {
             .cloned()
             .collect();
         for key in async_keys {
-            self.async_indexes_mut().remove(&key);
+            if let Some(p) = self.async_indexes_mut().remove(&key) {
+                freed = freed.saturating_add(projection_data_mem_cost(&p));
+            }
         }
+        self.mem_bytes = self.mem_bytes.saturating_sub(freed);
     }
 
     pub fn drop_project(&mut self, project_id: &str) {
@@ -586,8 +627,11 @@ impl Keyspace {
             })
             .cloned()
             .collect();
+        let mut freed: usize = 0;
         for key in ns_keys {
-            self.namespaces_mut().remove(&key);
+            if let Some(ns) = self.namespaces_mut().remove(&key) {
+                freed = freed.saturating_add(namespace_mem_cost(&ns));
+            }
         }
         let async_keys: Vec<(NamespaceId, String, String)> = self
             .async_indexes
@@ -600,13 +644,19 @@ impl Keyspace {
             .cloned()
             .collect();
         for key in async_keys {
-            self.async_indexes_mut().remove(&key);
+            if let Some(p) = self.async_indexes_mut().remove(&key) {
+                freed = freed.saturating_add(projection_data_mem_cost(&p));
+            }
         }
+        self.mem_bytes = self.mem_bytes.saturating_sub(freed);
     }
 
     pub fn drop_scope(&mut self, project_id: &str, scope_id: &str) {
         let ns = NamespaceId::project_scope(project_id, scope_id);
-        self.namespaces_mut().remove(&ns);
+        let mut freed: usize = 0;
+        if let Some(removed_ns) = self.namespaces_mut().remove(&ns) {
+            freed = freed.saturating_add(namespace_mem_cost(&removed_ns));
+        }
         let async_keys: Vec<(NamespaceId, String, String)> = self
             .async_indexes
             .keys()
@@ -614,8 +664,11 @@ impl Keyspace {
             .cloned()
             .collect();
         for key in async_keys {
-            self.async_indexes_mut().remove(&key);
+            if let Some(p) = self.async_indexes_mut().remove(&key) {
+                freed = freed.saturating_add(projection_data_mem_cost(&p));
+            }
         }
+        self.mem_bytes = self.mem_bytes.saturating_sub(freed);
     }
 
     pub fn get_row_version(
@@ -731,8 +784,16 @@ impl Keyspace {
     }
 
     pub fn drop_accumulator(&mut self, project_id: &str, scope_id: &str, accumulator_name: &str) {
-        let namespace = self.namespace_mut(NamespaceId::project_scope(project_id, scope_id));
-        namespace.accumulators.remove(accumulator_name);
+        let freed = {
+            let namespace = self.namespace_mut(NamespaceId::project_scope(project_id, scope_id));
+            namespace
+                .accumulators
+                .remove(accumulator_name)
+                .as_ref()
+                .map(accumulator_data_mem_cost)
+                .unwrap_or(0)
+        };
+        self.mem_bytes = self.mem_bytes.saturating_sub(freed);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -802,6 +863,10 @@ impl Keyspace {
                 commit_seq,
             },
         );
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(ACCUMULATOR_DELTA_COST)
+            .saturating_add(accumulator_dedupe_cost(dedupe_key.len()));
         Ok(AccumulatorAppendResult::Applied)
     }
 
@@ -855,6 +920,9 @@ impl Keyspace {
                 opened_at_seq: commit_seq,
             },
         );
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(accumulator_exposure_cost(exposure_id.len()));
         Ok(())
     }
 
@@ -928,9 +996,12 @@ impl Keyspace {
 
         accumulator.total_exposure = running_total;
         accumulator.exposure_rebuild_required = false;
+        let mut added: usize = 0;
         for (exposure_id, record) in pending_inserts {
+            added = added.saturating_add(accumulator_exposure_cost(exposure_id.len()));
             accumulator.open_exposures.insert(exposure_id, record);
         }
+        self.mem_bytes = self.mem_bytes.saturating_add(added);
         Ok(())
     }
 
@@ -954,6 +1025,9 @@ impl Keyspace {
         accumulator.open_exposures.remove(exposure_id);
         accumulator.total_exposure -= record_amount;
         accumulator.exposure_rebuild_required = false;
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_sub(accumulator_exposure_cost(exposure_id.len()));
         Ok(())
     }
 
@@ -1020,22 +1094,30 @@ impl Keyspace {
         value: Vec<u8>,
         commit_seq: u64,
     ) {
-        let kv = self.kv_data_mut(project_id, scope_id);
-        let created_at = match kv.entries.get(&key) {
-            Some(entry) => entry.created_at,
-            None => {
-                kv.structural_version = commit_seq;
-                commit_seq
-            }
+        let new_cost = kv_entry_cost(key.len(), value.len());
+        let old_cost = {
+            let kv = self.kv_data_mut(project_id, scope_id);
+            let (created_at, old_cost) = match kv.entries.get(&key) {
+                Some(entry) => (entry.created_at, kv_entry_cost(key.len(), entry.value.len())),
+                None => {
+                    kv.structural_version = commit_seq;
+                    (commit_seq, 0)
+                }
+            };
+            kv.entries.insert(
+                key,
+                KvEntry {
+                    value,
+                    version: commit_seq,
+                    created_at,
+                },
+            );
+            old_cost
         };
-        kv.entries.insert(
-            key,
-            KvEntry {
-                value,
-                version: commit_seq,
-                created_at,
-            },
-        );
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost)
+            .saturating_sub(old_cost);
     }
 
     pub fn kv_del(
@@ -1045,12 +1127,25 @@ impl Keyspace {
         key: &[u8],
         commit_seq: u64,
     ) -> bool {
-        let kv = self.kv_data_mut(project_id, scope_id);
-        let removed = kv.entries.remove(key).is_some();
-        if removed {
-            kv.structural_version = commit_seq;
+        let cost_freed = {
+            let kv = self.kv_data_mut(project_id, scope_id);
+            let cost = kv
+                .entries
+                .get(key)
+                .map(|e| kv_entry_cost(key.len(), e.value.len()))
+                .unwrap_or(0);
+            let removed = kv.entries.remove(key).is_some();
+            if removed {
+                kv.structural_version = commit_seq;
+            }
+            if removed { cost } else { 0 }
+        };
+        if cost_freed > 0 {
+            self.mem_bytes = self.mem_bytes.saturating_sub(cost_freed);
+            true
+        } else {
+            false
         }
-        removed
     }
 
     pub fn kv_scan_prefix(
@@ -1612,105 +1707,36 @@ impl Keyspace {
     }
 
     pub fn estimate_memory_bytes(&self) -> usize {
-        let row_bytes = self
-            .namespaces
-            .values()
-            .map(|ns| {
-                ns.tables
-                    .values()
-                    .map(|t| {
-                        t.rows.values().map(estimate_row_bytes).sum::<usize>() + t.rows.len() * 32
-                    })
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let kv_bytes = self
-            .namespaces
-            .values()
-            .map(|ns| {
-                ns.kv
-                    .entries
-                    .iter()
-                    .map(|(key, value)| key.len() + value.value.len() + 24)
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let projection_bytes = self
-            .async_indexes
-            .values()
-            .map(|p| p.rows.values().map(estimate_row_bytes).sum::<usize>())
-            .sum::<usize>();
-        let accumulator_bytes = self
-            .namespaces
-            .values()
-            .map(|ns| {
-                ns.accumulators
-                    .values()
-                    .map(|acc| {
-                        acc.dedupe.iter().map(|(k, _)| k.len() + 32).sum::<usize>()
-                            + acc.deltas.len() * 80
-                            + acc
-                                .open_exposures
-                                .iter()
-                                .map(|(k, _)| k.len() + 24)
-                                .sum::<usize>()
-                    })
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        row_bytes + kv_bytes + projection_bytes + accumulator_bytes
+        self.mem_bytes
+    }
+
+    /// Walks the entire keyspace to compute the memory estimate from scratch.
+    /// Used after constructing a `Keyspace` from external data (checkpoint load,
+    /// merges) to seed `mem_bytes`, and as the parity oracle in tests.
+    pub fn recompute_memory_bytes_full(&self) -> usize {
+        let ns_bytes: usize = self.namespaces.values().map(namespace_mem_cost).sum();
+        let projection_bytes: usize =
+            self.async_indexes.values().map(projection_data_mem_cost).sum();
+        ns_bytes.saturating_add(projection_bytes)
+    }
+
+    /// Reseeds `mem_bytes` from a full walk. Call after building a `Keyspace`
+    /// from external sources where the running counter cannot be tracked.
+    pub fn refresh_mem_bytes(&mut self) {
+        self.mem_bytes = self.recompute_memory_bytes_full();
     }
 }
 
 impl KeyspaceSnapshot {
     pub fn estimate_memory_bytes(&self) -> usize {
-        let row_bytes = self
-            .namespaces
-            .values()
-            .map(|ns| {
-                ns.tables
-                    .values()
-                    .map(|t| {
-                        t.rows.values().map(estimate_row_bytes).sum::<usize>() + t.rows.len() * 32
-                    })
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let kv_bytes = self
-            .namespaces
-            .values()
-            .map(|ns| {
-                ns.kv
-                    .entries
-                    .iter()
-                    .map(|(key, value)| key.len() + value.value.len() + 24)
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        let projection_bytes = self
-            .async_indexes
-            .values()
-            .map(|p| p.rows.values().map(estimate_row_bytes).sum::<usize>())
-            .sum::<usize>();
-        let accumulator_bytes = self
-            .namespaces
-            .values()
-            .map(|ns| {
-                ns.accumulators
-                    .values()
-                    .map(|acc| {
-                        acc.dedupe.iter().map(|(k, _)| k.len() + 32).sum::<usize>()
-                            + acc.deltas.len() * 80
-                            + acc
-                                .open_exposures
-                                .iter()
-                                .map(|(k, _)| k.len() + 24)
-                                .sum::<usize>()
-                    })
-                    .sum::<usize>()
-            })
-            .sum::<usize>();
-        row_bytes + kv_bytes + projection_bytes + accumulator_bytes
+        self.mem_bytes
+    }
+
+    pub fn recompute_memory_bytes_full(&self) -> usize {
+        let ns_bytes: usize = self.namespaces.values().map(namespace_mem_cost).sum();
+        let projection_bytes: usize =
+            self.async_indexes.values().map(projection_data_mem_cost).sum();
+        ns_bytes.saturating_add(projection_bytes)
     }
 
     pub fn table(&self, project_id: &str, scope_id: &str, table_name: &str) -> Option<&TableData> {
@@ -1859,6 +1885,68 @@ fn estimate_row_bytes(row: &Row) -> usize {
         .sum::<usize>()
         .saturating_add(ROW_BASE_OVERHEAD_BYTES)
         .saturating_add(row.values.len().saturating_mul(VALUE_SLOT_OVERHEAD_BYTES))
+}
+
+/// Cost contribution of one table row in `estimate_memory_bytes` accounting.
+/// Matches the original O(N) walk: row bytes + 32 per-row overhead.
+pub(crate) fn row_mem_cost(row: &Row) -> usize {
+    estimate_row_bytes(row).saturating_add(32)
+}
+
+pub(crate) fn projection_row_mem_cost(row: &Row) -> usize {
+    estimate_row_bytes(row)
+}
+
+pub(crate) fn kv_entry_cost(key_len: usize, value_len: usize) -> usize {
+    key_len.saturating_add(value_len).saturating_add(24)
+}
+
+pub(crate) fn accumulator_dedupe_cost(key_len: usize) -> usize {
+    key_len.saturating_add(32)
+}
+
+pub(crate) const ACCUMULATOR_DELTA_COST: usize = 80;
+
+pub(crate) fn accumulator_exposure_cost(key_len: usize) -> usize {
+    key_len.saturating_add(24)
+}
+
+pub(crate) fn table_data_mem_cost(t: &TableData) -> usize {
+    t.rows.values().map(row_mem_cost).sum::<usize>()
+}
+
+pub(crate) fn kv_data_mem_cost(kv: &KvData) -> usize {
+    kv.entries
+        .iter()
+        .map(|(k, v)| kv_entry_cost(k.len(), v.value.len()))
+        .sum()
+}
+
+pub(crate) fn projection_data_mem_cost(p: &AsyncProjectionData) -> usize {
+    p.rows.values().map(projection_row_mem_cost).sum()
+}
+
+pub(crate) fn accumulator_data_mem_cost(acc: &AccumulatorData) -> usize {
+    acc.dedupe
+        .iter()
+        .map(|(k, _)| accumulator_dedupe_cost(k.len()))
+        .sum::<usize>()
+        .saturating_add(acc.deltas.len().saturating_mul(ACCUMULATOR_DELTA_COST))
+        .saturating_add(
+            acc.open_exposures
+                .iter()
+                .map(|(k, _)| accumulator_exposure_cost(k.len()))
+                .sum::<usize>(),
+        )
+}
+
+pub(crate) fn namespace_mem_cost(ns: &Namespace) -> usize {
+    ns.tables
+        .values()
+        .map(table_data_mem_cost)
+        .sum::<usize>()
+        .saturating_add(kv_data_mem_cost(&ns.kv))
+        .saturating_add(ns.accumulators.values().map(accumulator_data_mem_cost).sum())
 }
 
 fn estimate_value_bytes(v: &Value) -> usize {
@@ -2096,5 +2184,143 @@ mod tests {
         assert_eq!(acc.pending_delta_sum, i128::MAX);
         assert!(acc.deltas.is_empty());
         assert!(acc.dedupe.is_empty());
+    }
+
+    #[test]
+    fn mem_bytes_running_counter_matches_full_walk() {
+        // Exercise every tracked mutation site and assert the running counter
+        // stays in sync with a fresh O(N) recompute.
+        let mut ks = Keyspace::default();
+        assert_eq!(ks.mem_bytes, 0);
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Table inserts.
+        for i in 0..50_i64 {
+            ks.upsert_row(
+                "p",
+                "app",
+                "users",
+                vec![Value::Integer(i)],
+                Row {
+                    values: vec![
+                        Value::Integer(i),
+                        Value::Text(format!("name_{i}").into()),
+                    ],
+                },
+                i as u64 + 1,
+            );
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Update existing row (replaces, delta = new - old).
+        ks.upsert_row(
+            "p",
+            "app",
+            "users",
+            vec![Value::Integer(0)],
+            Row {
+                values: vec![
+                    Value::Integer(0),
+                    Value::Text("a-much-longer-name-than-original".into()),
+                ],
+            },
+            100,
+        );
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Delete some rows.
+        for i in 0..10_i64 {
+            ks.delete_row("p", "app", "users", &[Value::Integer(i)], 200);
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // KV mutations.
+        for i in 0..30_u64 {
+            ks.kv_set(
+                "p",
+                "app",
+                format!("key:{i}").into_bytes(),
+                vec![0xAB; 64],
+                i + 1,
+            );
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // KV update (replaces).
+        ks.kv_set("p", "app", b"key:0".to_vec(), vec![0xCD; 256], 50);
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // KV delete.
+        for i in 0..5_u64 {
+            ks.kv_del("p", "app", format!("key:{i}").as_bytes(), 60);
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Accumulator: deltas + dedupe.
+        ks.create_accumulator("p", "app", "house", 1_000);
+        for i in 0..20_u64 {
+            ks.append_accumulator_delta(
+                "p",
+                "app",
+                "house",
+                10,
+                &format!("dedupe-{i}"),
+                i + 1,
+                i + 1,
+            )
+            .expect("append");
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Exposures.
+        for i in 0..5_u64 {
+            ks.expose_accumulator("p", "app", "house", 5, &format!("hand-{i}"), 100 + i)
+                .expect("expose");
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Release some.
+        for i in 0..3_u64 {
+            ks.release_accumulator_exposure("p", "app", "house", &format!("hand-{i}"))
+                .expect("release");
+        }
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        // Drops.
+        ks.drop_accumulator("p", "app", "house");
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        ks.drop_table("p", "app", "users");
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        ks.drop_scope("p", "app");
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        ks.drop_project("p");
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+        assert_eq!(ks.mem_bytes, 0);
+    }
+
+    #[test]
+    fn refresh_mem_bytes_recovers_from_external_construction() {
+        // Simulates the checkpoint-load path: a Keyspace built from external
+        // data with `mem_bytes` defaulting to 0 must be reseedable.
+        let mut ks = Keyspace::default();
+        for i in 0..10_i64 {
+            ks.upsert_row(
+                "p",
+                "app",
+                "t",
+                vec![Value::Integer(i)],
+                Row {
+                    values: vec![Value::Integer(i)],
+                },
+                i as u64 + 1,
+            );
+        }
+        let expected = ks.mem_bytes;
+        ks.mem_bytes = 0;
+        ks.refresh_mem_bytes();
+        assert_eq!(ks.mem_bytes, expected);
     }
 }
