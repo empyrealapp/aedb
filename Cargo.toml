@@ -56,7 +56,13 @@ tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["test-util", "macros"] }
 rand = "0.8"
+dhat = "0.3"
+pprof = { version = "0.13", features = ["flamegraph"] }
 
 [[bench]]
 name = "perf"
+harness = false
+
+[[bench]]
+name = "scale"
 harness = false
