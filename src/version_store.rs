@@ -293,6 +293,7 @@ fn snapshot_to_keyspace(snapshot: &KeyspaceSnapshot) -> Keyspace {
         primary_index_backend: snapshot.primary_index_backend,
         namespaces: snapshot.namespaces.clone(),
         async_indexes: snapshot.async_indexes.clone(),
+        mem_bytes: snapshot.mem_bytes,
     }
 }
 

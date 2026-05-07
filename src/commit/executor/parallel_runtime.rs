@@ -85,7 +85,7 @@ fn execute_task(task: ParallelTask) -> Result<(), AedbError> {
     }
     let mut local_catalog = (*task.catalog).clone();
     let mut local_keyspace = Keyspace::with_backend(task.backend);
-    local_keyspace.insert_namespace(task.namespace_id.clone(), task.base_namespace);
+    local_keyspace.insert_namespace_unchecked(task.namespace_id.clone(), task.base_namespace);
     for mutation in &task.mutations {
         if task.cancel.load(Ordering::Relaxed) {
             let _ = task

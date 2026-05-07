@@ -56,16 +56,14 @@ pub fn load_checkpoint_with_key(
         .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
     let data: CheckpointData =
         rmp_serde::from_slice(&decompressed).map_err(|e| AedbError::Decode(e.to_string()))?;
-    Ok((
-        Keyspace {
-            primary_index_backend: data.keyspace.primary_index_backend,
-            namespaces: data.keyspace.namespaces,
-            async_indexes: data.keyspace.async_indexes,
-        },
-        data.catalog,
-        data.seq,
-        data.idempotency,
-    ))
+    let mut keyspace = Keyspace {
+        primary_index_backend: data.keyspace.primary_index_backend,
+        namespaces: data.keyspace.namespaces,
+        async_indexes: data.keyspace.async_indexes,
+        mem_bytes: 0,
+    };
+    keyspace.refresh_mem_bytes();
+    Ok((keyspace, data.catalog, data.seq, data.idempotency))
 }
 
 fn decrypt_checkpoint_payload(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, AedbError> {

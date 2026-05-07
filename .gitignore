@@ -30,6 +30,9 @@
 profraw/
 *.profraw
 *.profdata
+/profiles/
+dhat-heap.json
+flamegraph.svg
 
 # Logs and temp files
 *.log
