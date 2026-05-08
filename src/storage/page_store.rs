@@ -105,6 +105,58 @@ impl PagedStore {
     }
 
     pub fn append_page(&self, payload: &[u8]) -> Result<PageRef, AedbError> {
+        self.append_pages(&[payload]).map(|mut refs| refs.remove(0))
+    }
+
+    pub fn append_pages(&self, payloads: &[&[u8]]) -> Result<Vec<PageRef>, AedbError> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+        for payload in payloads {
+            self.validate_payload(payload)?;
+        }
+
+        let mut refs = Vec::with_capacity(payloads.len());
+        {
+            let mut file = self.file.lock();
+            let mut next_page_id = self.page_count.load(Ordering::Acquire);
+            let mut frame = vec![0u8; PAGE_FRAME_HEADER_BYTES + self.page_size];
+            file.seek(SeekFrom::End(0))?;
+            for payload in payloads {
+                frame.fill(0);
+                let page_id = PageId(next_page_id);
+                let page_len = page_len_u32(payload)?;
+                let blake3_hash = page_hash(page_id, payload);
+                frame[0..8].copy_from_slice(&page_id.0.to_le_bytes());
+                frame[8..12].copy_from_slice(&page_len.to_le_bytes());
+                frame[16..48].copy_from_slice(&blake3_hash);
+                frame[PAGE_FRAME_HEADER_BYTES..PAGE_FRAME_HEADER_BYTES + payload.len()]
+                    .copy_from_slice(payload);
+                file.write_all(&frame)?;
+                refs.push(PageRef {
+                    page_id,
+                    len: page_len,
+                    blake3_hash,
+                });
+                next_page_id =
+                    next_page_id
+                        .checked_add(1)
+                        .ok_or_else(|| AedbError::IntegrityError {
+                            message: "page store page id overflow".into(),
+                        })?;
+            }
+            file.flush()?;
+            self.page_count.store(next_page_id, Ordering::Release);
+        }
+        self.dirty.store(true, Ordering::Release);
+        let mut cache = self.cache.lock();
+        for (page_ref, payload) in refs.iter().zip(payloads.iter()) {
+            cache.insert(page_ref.page_id, *payload);
+        }
+        Ok(refs)
+    }
+
+    fn validate_payload(&self, payload: &[u8]) -> Result<(), AedbError> {
         if payload.len() > self.page_size {
             return Err(AedbError::Validation(format!(
                 "page payload exceeds page_size: payload_bytes={}, page_size={}",
@@ -112,40 +164,8 @@ impl PagedStore {
                 self.page_size
             )));
         }
-        let page_len = u32::try_from(payload.len())
-            .map_err(|_| AedbError::Validation("page payload length does not fit u32".into()))?;
-        let page_ref = {
-            let mut file = self.file.lock();
-            let page_id = PageId(self.page_count.load(Ordering::Acquire));
-            let blake3_hash = page_hash(page_id, payload);
-
-            let mut frame = vec![0u8; PAGE_FRAME_HEADER_BYTES + self.page_size];
-            frame[0..8].copy_from_slice(&page_id.0.to_le_bytes());
-            frame[8..12].copy_from_slice(&page_len.to_le_bytes());
-            frame[16..48].copy_from_slice(&blake3_hash);
-            frame[PAGE_FRAME_HEADER_BYTES..PAGE_FRAME_HEADER_BYTES + payload.len()]
-                .copy_from_slice(payload);
-
-            file.seek(SeekFrom::End(0))?;
-            file.write_all(&frame)?;
-            file.flush()?;
-            let next_page_count =
-                page_id
-                    .0
-                    .checked_add(1)
-                    .ok_or_else(|| AedbError::IntegrityError {
-                        message: "page store page id overflow".into(),
-                    })?;
-            self.page_count.store(next_page_count, Ordering::Release);
-            PageRef {
-                page_id,
-                len: page_len,
-                blake3_hash,
-            }
-        };
-        self.dirty.store(true, Ordering::Release);
-        self.cache.lock().insert(page_ref.page_id, payload);
-        Ok(page_ref)
+        let _ = page_len_u32(payload)?;
+        Ok(())
     }
 
     pub fn read_page(&self, page_ref: &PageRef) -> Result<Vec<u8>, AedbError> {
@@ -257,6 +277,11 @@ fn frame_offset(page_id: PageId, page_stride: u64) -> Result<u64, AedbError> {
         .ok_or_else(|| AedbError::IntegrityError {
             message: "page frame offset overflow".into(),
         })
+}
+
+fn page_len_u32(payload: &[u8]) -> Result<u32, AedbError> {
+    u32::try_from(payload.len())
+        .map_err(|_| AedbError::Validation("page payload length does not fit u32".into()))
 }
 
 fn page_hash(page_id: PageId, payload: &[u8]) -> [u8; 32] {
@@ -383,6 +408,27 @@ mod tests {
             store.read_page(page_ref).expect("read");
             assert!(store.cache_resident_pages() <= 2);
         }
+    }
+
+    #[test]
+    fn append_pages_batches_contiguous_page_ids() {
+        let dir = tempdir().expect("temp");
+        let store = PagedStore::open(dir.path(), "rows.aedbpg", 512, 4).expect("open");
+        let payloads = [
+            b"batch-alpha".as_slice(),
+            b"batch-beta".as_slice(),
+            b"batch-gamma".as_slice(),
+        ];
+        let refs = store.append_pages(&payloads).expect("append batch");
+        assert_eq!(refs.len(), payloads.len());
+        for (expected_page_id, page_ref) in refs.iter().enumerate() {
+            assert_eq!(page_ref.page_id.0, expected_page_id as u64);
+            assert_eq!(
+                store.read_page(page_ref).expect("read batch page"),
+                payloads[expected_page_id]
+            );
+        }
+        assert_eq!(store.page_count(), payloads.len() as u64);
     }
 
     #[test]

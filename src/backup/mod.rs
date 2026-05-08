@@ -647,8 +647,11 @@ mod tests {
         let archive_plain = src.path().join("backup_plain.aedbarc");
         let archive_enc = src.path().join("backup_enc.aedbarc");
         std::fs::create_dir_all(src.path().join("wal_tail")).expect("wal dir");
+        std::fs::create_dir_all(src.path().join("pages")).expect("pages dir");
         std::fs::write(src.path().join("backup_manifest.json"), b"{\"x\":1}").expect("manifest");
         std::fs::write(src.path().join("wal_tail/segment_1.aedbwal"), b"segment").expect("wal");
+        std::fs::write(src.path().join("pages/rows.aedbpg"), b"page-data")
+            .expect("page store file");
 
         write_backup_archive(src.path(), &archive_plain, None).expect("write plain");
         extract_backup_archive(&archive_plain, dst_plain.path(), None).expect("extract plain");
@@ -663,6 +666,10 @@ mod tests {
         assert_eq!(
             std::fs::read(dst_enc.path().join("wal_tail/segment_1.aedbwal")).expect("read wal"),
             b"segment".to_vec()
+        );
+        assert_eq!(
+            std::fs::read(dst_enc.path().join("pages/rows.aedbpg")).expect("read page store file"),
+            b"page-data".to_vec()
         );
 
         let wrong = [7u8; 32];

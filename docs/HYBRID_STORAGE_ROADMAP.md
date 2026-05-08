@@ -17,10 +17,16 @@ This PR adds two concrete pieces:
 
 - fixed-size page frames
 - deterministic page IDs
+- batched page appends with a single file lock and flush
 - per-page BLAKE3 integrity checks
 - partial-frame rejection on open
 - bounded in-memory page caching
 - durable `sync_all`
+
+The existing single-file backup archive path already includes all regular files
+written under the backup directory, including future page files. The remaining
+manifest work is to record page roots and page-file membership explicitly when
+rows, KV keys, and indexes move onto `PagedStore`.
 
 ## What Is Still Memory-Resident
 
@@ -45,7 +51,7 @@ exceeds that ceiling after KV payload spill, AEDB rejects it before WAL append.
    memory.
 4. Make snapshots reference immutable page roots instead of cloning whole maps.
 5. Extend checkpoint/backup/restore manifests to include page roots and page
-   files.
+   file membership.
 6. Add page-cache metrics and workload benchmarks for hot/cold mixes.
 
 ## Non-Goals For This PR

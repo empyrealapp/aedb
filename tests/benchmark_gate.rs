@@ -7,6 +7,7 @@ use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use aedb::permission::{CallerContext, Permission};
 use aedb::query::plan::{ConsistencyMode, Query, col, lit};
+use aedb::storage::page_store::PagedStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -523,6 +524,78 @@ async fn benchmark_persistent_large_kv_values() {
     assert!(large_set_p99 > 0);
     assert!(hot_get_p99 > 0);
     assert!(cold_get_p99 > 0);
+}
+
+#[test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+fn benchmark_page_store_batch_append_and_hot_cache() {
+    const PAGE_SIZE: usize = 4096;
+    const CACHE_PAGES: usize = 128;
+    const PAGE_COUNT: usize = 1024;
+    const PAYLOAD_BYTES: usize = 2048;
+
+    let payloads = (0..PAGE_COUNT)
+        .map(|i| vec![u8::try_from(i % 251).expect("byte"); PAYLOAD_BYTES])
+        .collect::<Vec<_>>();
+
+    let individual_dir = tempdir().expect("individual dir");
+    let individual_store =
+        PagedStore::open(individual_dir.path(), "rows.aedbpg", PAGE_SIZE, CACHE_PAGES)
+            .expect("open individual page store");
+    let individual_start = Instant::now();
+    for payload in &payloads {
+        individual_store
+            .append_page(payload)
+            .expect("append individual page");
+    }
+    let individual_append_ns = individual_start.elapsed().as_nanos();
+
+    let batch_dir = tempdir().expect("batch dir");
+    let batch_store = PagedStore::open(batch_dir.path(), "rows.aedbpg", PAGE_SIZE, CACHE_PAGES)
+        .expect("open batch page store");
+    let slices = payloads.iter().map(Vec::as_slice).collect::<Vec<&[u8]>>();
+    let batch_start = Instant::now();
+    let refs = batch_store.append_pages(&slices).expect("append batch");
+    let batch_append_ns = batch_start.elapsed().as_nanos();
+
+    assert_eq!(refs.len(), PAGE_COUNT);
+    assert_eq!(batch_store.page_count(), PAGE_COUNT as u64);
+    assert!(batch_store.cache_resident_pages() <= CACHE_PAGES);
+    for (expected_page_id, page_ref) in refs.iter().enumerate() {
+        assert_eq!(page_ref.page_id.0, expected_page_id as u64);
+    }
+
+    let mut hot_read_lat_ns = Vec::new();
+    for page_ref in refs.iter().rev().take(CACHE_PAGES) {
+        let t0 = Instant::now();
+        let page = batch_store.read_page(page_ref).expect("hot page read");
+        assert_eq!(page.len(), PAYLOAD_BYTES);
+        hot_read_lat_ns.push(t0.elapsed().as_nanos());
+    }
+    hot_read_lat_ns.sort_unstable();
+    let hot_p50_ns = percentile(&hot_read_lat_ns, 0.50) as u64;
+    let hot_p99_ns = percentile(&hot_read_lat_ns, 0.99) as u64;
+    let batch_per_page_ns = batch_append_ns / PAGE_COUNT as u128;
+    let individual_per_page_ns = individual_append_ns / PAGE_COUNT as u128;
+
+    eprintln!(
+        "page_store_batch: pages={} payload_bytes={} individual_append={}ns batch_append={}ns individual_per_page={}ns batch_per_page={}ns hot_read_p50={}ns hot_read_p99={}ns",
+        PAGE_COUNT,
+        PAYLOAD_BYTES,
+        individual_append_ns,
+        batch_append_ns,
+        individual_per_page_ns,
+        batch_per_page_ns,
+        hot_p50_ns,
+        hot_p99_ns
+    );
+
+    assert!(batch_append_ns > 0);
+    assert!(hot_p99_ns > 0);
+    assert!(
+        batch_append_ns < individual_append_ns,
+        "batched append should avoid per-page lock and flush overhead"
+    );
 }
 
 #[tokio::test]
