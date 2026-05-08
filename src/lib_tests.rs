@@ -2676,6 +2676,29 @@ async fn production_profile_rejects_batch_durability() {
 }
 
 #[tokio::test]
+async fn production_profile_requires_disk_backed_kv_payloads() {
+    let dir = tempdir().expect("temp");
+    let mut weak = AedbConfig::production([7u8; 32]);
+    weak.storage_mode = StorageMode::InMemory;
+    let err = AedbInstance::open_production(weak, dir.path())
+        .err()
+        .expect("production profile must reject in-memory storage");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+
+    let dir = tempdir().expect("temp");
+    let mut weak = AedbConfig::production([8u8; 32]);
+    weak.persistent_value_inline_threshold_bytes = 1;
+    let err = AedbInstance::open_production(weak, dir.path())
+        .err()
+        .expect("production profile must reject inline KV payloads");
+    assert!(matches!(err, AedbError::InvalidConfig { .. }));
+
+    let cfg = AedbConfig::production([9u8; 32]);
+    assert_eq!(cfg.storage_mode, StorageMode::DiskBacked);
+    assert_eq!(cfg.persistent_value_inline_threshold_bytes, 0);
+}
+
+#[tokio::test]
 async fn secure_profile_rejects_short_hmac_key() {
     let dir = tempdir().expect("temp");
     let weak = AedbConfig::default()
@@ -2704,6 +2727,8 @@ fn low_latency_profile_uses_batch_durability_with_strict_recovery() {
     assert!(cfg.batch_interval_ms > 0);
     assert!(cfg.batch_max_bytes > 0);
     assert!(cfg.manifest_hmac_key.is_some());
+    assert_eq!(cfg.storage_mode, StorageMode::DiskBacked);
+    assert_eq!(cfg.persistent_value_inline_threshold_bytes, 0);
 }
 
 #[test]
@@ -2785,6 +2810,40 @@ async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
         .expect("recovered get")
         .expect("recovered value");
     assert_eq!(recovered.value, value);
+    reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn production_profile_spills_all_kv_payloads_by_default() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig::production([7u8; 32]);
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"tiny".to_vec(), b"x".to_vec())
+        .await
+        .expect("set tiny value");
+
+    let metrics = db.operational_metrics().await;
+    assert!(
+        metrics.persistent_value_store_bytes > 8,
+        "production config should spill even tiny KV payloads to values.aedbdat"
+    );
+    let got = db
+        .kv_get_no_auth("p", "app", b"tiny", ConsistencyMode::AtLatest)
+        .await
+        .expect("get")
+        .expect("value");
+    assert_eq!(got.value, b"x");
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let recovered = reopened
+        .kv_get_no_auth("p", "app", b"tiny", ConsistencyMode::AtLatest)
+        .await
+        .expect("recovered get")
+        .expect("recovered value");
+    assert_eq!(recovered.value, b"x");
     reopened.shutdown().await.expect("shutdown reopened");
 }
 

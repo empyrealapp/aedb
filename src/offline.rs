@@ -6,7 +6,7 @@ use crate::manifest::atomic::write_manifest_atomic_signed;
 use crate::manifest::schema::Manifest;
 use crate::recovery::{RecoveredState, recover_with_config};
 use crate::storage::index::extract_index_key_encoded;
-use crate::storage::keyspace::{NamespaceId, SecondaryIndexStore};
+use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ pub fn export_snapshot_dump(
     let recovered = recover_with_config(data_dir, config)?;
     let state = SnapshotDumpState {
         current_seq: recovered.current_seq,
-        keyspace: recovered.keyspace,
+        keyspace: materialized_dump_keyspace(&recovered.keyspace)?,
         catalog: recovered.catalog,
         idempotency: recovered.idempotency,
     };
@@ -149,7 +149,7 @@ pub fn parity_report_against_data_dir(
     let recovered = recover_with_config(data_dir, config)?;
     let actual_state = SnapshotDumpState {
         current_seq: recovered.current_seq,
-        keyspace: recovered.keyspace,
+        keyspace: materialized_dump_keyspace(&recovered.keyspace)?,
         catalog: recovered.catalog,
         idempotency: recovered.idempotency,
     };
@@ -177,6 +177,19 @@ fn summarize_state(state: &SnapshotDumpState, parity_checksum_hex: String) -> Sn
         table_rows,
         kv_entries,
     }
+}
+
+fn materialized_dump_keyspace(keyspace: &Keyspace) -> Result<Keyspace, AedbError> {
+    let materialized = keyspace.snapshot().materialized_for_checkpoint()?;
+    Ok(Keyspace {
+        primary_index_backend: materialized.primary_index_backend,
+        value_store: None,
+        persistent_value_inline_threshold_bytes: materialized
+            .persistent_value_inline_threshold_bytes,
+        namespaces: materialized.namespaces,
+        async_indexes: materialized.async_indexes,
+        mem_bytes: materialized.mem_bytes,
+    })
 }
 
 fn load_dump(path: &Path) -> Result<SnapshotDumpEnvelope, AedbError> {

@@ -396,13 +396,21 @@ let db = aedb::AedbInstance::open(config, dir.path())?;
 
 `AedbConfig::default()` uses `StorageMode::DiskBacked`. KV values larger than
 `persistent_value_inline_threshold_bytes` are written to the append-only
-`values.aedbdat` file and read back through the snapshot APIs. Smaller values can
-remain inline for compact metadata and counters, but when the keyspace approaches
+`values.aedbdat` file and read back through the snapshot APIs. Production and
+secure profiles set that threshold to `0`, so every non-empty KV payload is
+disk-backed by default. Smaller values can remain inline in non-production
+profiles for compact metadata and counters, but when the keyspace approaches
 `max_memory_estimate_bytes`, AEDB spills least-recently-updated inline KV payloads
 to the same value store before rejecting writes for memory pressure. Recently
 accessed spilled values are also kept in a bounded hot cache controlled by
 `persistent_value_hot_cache_bytes`, so the active working set stays in memory
 without requiring cold values to live there.
+
+This mode supports KV payload sets larger than memory. It is not yet a
+general-purpose larger-than-memory table/index engine: KV keys, entry metadata,
+table rows, secondary indexes, async projections, accumulators, snapshots, and
+version metadata remain memory-resident and are protected by
+`max_memory_estimate_bytes`.
 `operational_metrics()` reports `persistent_value_store_bytes`,
 `persistent_value_hot_cache_bytes`, and
 `persistent_value_hot_cache_capacity_bytes` so operators can watch disk growth and
@@ -413,7 +421,7 @@ use aedb::config::{AedbConfig, StorageMode};
 
 let config = AedbConfig {
     storage_mode: StorageMode::DiskBacked,
-    persistent_value_inline_threshold_bytes: 64 * 1024,
+    persistent_value_inline_threshold_bytes: 0,
     persistent_value_hot_cache_bytes: 64 * 1024 * 1024,
     ..AedbConfig::default()
 };

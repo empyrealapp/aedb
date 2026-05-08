@@ -17,6 +17,11 @@ pub enum RecoveryMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StorageMode {
     InMemory,
+    /// Durable WAL/checkpoint state plus append-only disk storage for KV payloads.
+    ///
+    /// This mode keeps table rows, indexes, KV keys, versions, and metadata in
+    /// memory. Set `persistent_value_inline_threshold_bytes` to `0` when KV
+    /// payloads must not remain inline in memory.
     #[default]
     DiskBacked,
 }
@@ -160,6 +165,8 @@ impl AedbConfig {
             recovery_mode: RecoveryMode::Strict,
             durability_mode: DurabilityMode::Full,
             hash_chain_required: true,
+            storage_mode: StorageMode::DiskBacked,
+            persistent_value_inline_threshold_bytes: 0,
             ..Self::default()
         }
     }
@@ -194,6 +201,8 @@ impl AedbConfig {
             durable_ack_coalesce_window_us: 500,
             epoch_max_wait_us: 50,
             adaptive_epoch_target_latency_us: 1_000,
+            storage_mode: StorageMode::DiskBacked,
+            persistent_value_inline_threshold_bytes: 0,
             ..Self::default()
         }
     }

@@ -531,6 +531,18 @@ pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbErro
             message: "secure mode requires hash_chain_required=true".into(),
         });
     }
+    if !matches!(config.storage_mode, StorageMode::DiskBacked) {
+        return Err(AedbError::InvalidConfig {
+            message: "secure mode requires StorageMode::DiskBacked".into(),
+        });
+    }
+    if config.persistent_value_inline_threshold_bytes != 0 {
+        return Err(AedbError::InvalidConfig {
+            message:
+                "secure mode requires persistent_value_inline_threshold_bytes=0 so KV payloads are disk-backed"
+                    .into(),
+        });
+    }
     Ok(())
 }
 
@@ -562,6 +574,18 @@ pub fn validate_arcana_config(config: &AedbConfig) -> Result<(), AedbError> {
     if !config.hash_chain_required {
         return Err(AedbError::InvalidConfig {
             message: "Arcana production profile requires hash_chain_required=true".into(),
+        });
+    }
+    if !matches!(config.storage_mode, StorageMode::DiskBacked) {
+        return Err(AedbError::InvalidConfig {
+            message: "Arcana production profile requires StorageMode::DiskBacked".into(),
+        });
+    }
+    if config.persistent_value_inline_threshold_bytes != 0 {
+        return Err(AedbError::InvalidConfig {
+            message:
+                "Arcana production profile requires persistent_value_inline_threshold_bytes=0 so KV payloads are disk-backed"
+                    .into(),
         });
     }
     Ok(())
