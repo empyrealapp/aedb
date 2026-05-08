@@ -403,31 +403,20 @@ impl Keyspace {
             return Ok(());
         };
         let threshold = self.persistent_value_inline_threshold_bytes;
-        let namespace_ids: Vec<NamespaceId> = self.namespaces.keys().cloned().collect();
-        let mut spilled_payload_bytes = 0usize;
-        for namespace_id in namespace_ids {
-            let Some(namespace) = self.namespaces_mut().get_mut(&namespace_id) else {
-                continue;
-            };
-            let entries: Result<OrdMap<Vec<u8>, KvEntry>, crate::error::AedbError> = namespace
-                .kv
-                .entries
-                .iter()
-                .map(|(key, entry)| {
-                    let mut entry = entry.clone();
+        let mut plans = Vec::new();
+        let value_refs = {
+            let mut values = Vec::new();
+            for (namespace_id, namespace) in self.namespaces.iter() {
+                for (key, entry) in namespace.kv.entries.iter() {
                     if entry.value_ref.is_none() && entry.value.len() > threshold {
-                        spilled_payload_bytes =
-                            spilled_payload_bytes.saturating_add(entry.value.len());
-                        let value_ref = store.append_cold(&entry.value)?;
-                        entry.value = Vec::new();
-                        entry.value_ref = Some(value_ref);
+                        plans.push((namespace_id.clone(), key.clone(), entry.value.len()));
+                        values.push(entry.value.as_slice());
                     }
-                    Ok((key.clone(), entry))
-                })
-                .collect();
-            namespace.kv.entries = entries?;
-        }
-        self.mem_bytes = self.mem_bytes.saturating_sub(spilled_payload_bytes);
+                }
+            }
+            store.append_many_cold_slices(&values)?
+        };
+        self.apply_spill_plans(plans, value_refs);
         Ok(())
     }
 
@@ -457,35 +446,58 @@ impl Keyspace {
             }
         }
 
-        while memory_estimate > target_bytes {
-            let Some(Reverse((_, _, candidate_index))) = oldest_first.pop() else {
-                break;
-            };
-            let Some((namespace_id, key, payload_bytes)) = candidates.get(candidate_index) else {
-                continue;
-            };
-            let spilled = {
-                let Some(namespace) = self.namespaces_mut().get_mut(namespace_id) else {
+        let mut plans = Vec::new();
+        let value_refs = {
+            let mut values = Vec::new();
+            while memory_estimate > target_bytes {
+                let Some(Reverse((_, _, candidate_index))) = oldest_first.pop() else {
+                    break;
+                };
+                let Some((namespace_id, key, payload_bytes)) = candidates.get(candidate_index)
+                else {
                     continue;
                 };
-                let Some(entry) = namespace.kv.entries.get_mut(key) else {
+                let Some(entry) = self
+                    .namespaces
+                    .get(namespace_id)
+                    .and_then(|namespace| namespace.kv.entries.get(key))
+                else {
                     continue;
                 };
                 if entry.value_ref.is_some() || entry.value.is_empty() {
                     continue;
                 }
-                let value_ref = store.append_cold(&entry.value)?;
-                entry.value = Vec::new();
-                entry.value_ref = Some(value_ref);
-                true
-            };
-            if spilled {
+                plans.push((namespace_id.clone(), key.clone(), *payload_bytes));
+                values.push(entry.value.as_slice());
                 memory_estimate = memory_estimate.saturating_sub(*payload_bytes);
-                self.mem_bytes = self.mem_bytes.saturating_sub(*payload_bytes);
             }
-        }
+
+            store.append_many_cold_slices(&values)?
+        };
+        self.apply_spill_plans(plans, value_refs);
 
         Ok(memory_estimate)
+    }
+
+    fn apply_spill_plans(
+        &mut self,
+        plans: Vec<(NamespaceId, Vec<u8>, usize)>,
+        value_refs: Vec<PersistentValueRef>,
+    ) {
+        for ((namespace_id, key, payload_bytes), value_ref) in plans.into_iter().zip(value_refs) {
+            let Some(namespace) = self.namespaces_mut().get_mut(&namespace_id) else {
+                continue;
+            };
+            let Some(entry) = namespace.kv.entries.get_mut(&key) else {
+                continue;
+            };
+            if entry.value_ref.is_some() || entry.value.is_empty() {
+                continue;
+            }
+            entry.value = Vec::new();
+            entry.value_ref = Some(value_ref);
+            self.mem_bytes = self.mem_bytes.saturating_sub(payload_bytes);
+        }
     }
 
     /// Ensures the namespaces HashMap is uniquely owned, cloning if necessary (copy-on-write).
@@ -2085,20 +2097,44 @@ impl KeyspaceSnapshot {
     pub fn materialized_for_checkpoint(&self) -> Result<Self, crate::error::AedbError> {
         let mut out = self.clone();
         let store = self.value_store.as_deref();
-        let namespace_ids: Vec<NamespaceId> = out.namespaces.keys().cloned().collect();
+        let namespace_ids: Vec<NamespaceId> = self
+            .namespaces
+            .iter()
+            .filter(|(_, namespace)| {
+                namespace
+                    .kv
+                    .entries
+                    .values()
+                    .any(|entry| entry.value_ref.is_some())
+            })
+            .map(|(namespace_id, _)| namespace_id.clone())
+            .collect();
         for namespace_id in namespace_ids {
+            let keys_to_materialize: Vec<Vec<u8>> = self
+                .namespaces
+                .get(&namespace_id)
+                .map(|namespace| {
+                    namespace
+                        .kv
+                        .entries
+                        .iter()
+                        .filter(|(_, entry)| entry.value_ref.is_some())
+                        .map(|(key, _)| key.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if keys_to_materialize.is_empty() {
+                continue;
+            }
             let Some(namespace) = Arc::make_mut(&mut out.namespaces).get_mut(&namespace_id) else {
                 continue;
             };
-            let entries: Result<OrdMap<Vec<u8>, KvEntry>, crate::error::AedbError> = namespace
-                .kv
-                .entries
-                .iter()
-                .map(|(key, entry)| {
-                    materialize_kv_entry(entry, store).map(|entry| (key.clone(), entry))
-                })
-                .collect();
-            namespace.kv.entries = entries?;
+            for key in keys_to_materialize {
+                let Some(entry) = namespace.kv.entries.get_mut(&key) else {
+                    continue;
+                };
+                *entry = materialize_kv_entry(entry, store)?;
+            }
         }
         out.value_store = None;
         out.persistent_value_inline_threshold_bytes = usize::MAX;
@@ -2327,6 +2363,9 @@ mod tests {
     use crate::config::PrimaryIndexBackend;
     use crate::error::AedbError;
     use crate::storage::encoded_key::EncodedKey;
+    use crate::storage::value_store::PersistentValueStore;
+    use std::sync::Arc;
+    use tempfile::tempdir;
 
     fn row(values: Vec<Value>) -> Row {
         Row::from_values(values)
@@ -2500,6 +2539,64 @@ mod tests {
         let refs = ks.kv_scan_prefix_ref("p", "app", b"ob:", 10);
         assert_eq!(refs.len(), 3);
         assert!(refs.iter().all(|(k, _)| k.starts_with(b"ob:")));
+    }
+
+    #[test]
+    fn materialized_checkpoint_hydrates_spilled_kv_without_mutating_source() {
+        let dir = tempdir().expect("temp");
+        let store = Arc::new(
+            PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 0).expect("open store"),
+        );
+        let mut ks = Keyspace::default();
+        ks.attach_persistent_value_store(store, 4)
+            .expect("attach value store");
+        ks.kv_set("p", "app", b"big".to_vec(), b"large-value".to_vec(), 1)
+            .expect("set spilled value");
+        ks.kv_set("p", "app", b"tiny".to_vec(), b"tiny".to_vec(), 2)
+            .expect("set inline value");
+
+        let snapshot = ks.snapshot();
+        let source_big = snapshot
+            .namespaces
+            .get(&NamespaceId::project_scope("p", "app"))
+            .expect("namespace")
+            .kv
+            .entries
+            .get(&b"big".to_vec())
+            .expect("source big entry");
+        assert!(source_big.value_ref.is_some());
+        assert!(source_big.value.is_empty());
+
+        let materialized = snapshot
+            .materialized_for_checkpoint()
+            .expect("materialize checkpoint");
+        let materialized_namespace = materialized
+            .namespaces
+            .get(&NamespaceId::project_scope("p", "app"))
+            .expect("materialized namespace");
+        let materialized_big = materialized_namespace
+            .kv
+            .entries
+            .get(&b"big".to_vec())
+            .expect("materialized big entry");
+        assert_eq!(materialized_big.value, b"large-value");
+        assert!(materialized_big.value_ref.is_none());
+        assert!(materialized.value_store.is_none());
+        assert_eq!(
+            materialized.mem_bytes,
+            materialized.recompute_memory_bytes_full()
+        );
+
+        let source_big_after = snapshot
+            .namespaces
+            .get(&NamespaceId::project_scope("p", "app"))
+            .expect("source namespace")
+            .kv
+            .entries
+            .get(&b"big".to_vec())
+            .expect("source big entry after materialize");
+        assert!(source_big_after.value_ref.is_some());
+        assert!(source_big_after.value.is_empty());
     }
 
     #[test]

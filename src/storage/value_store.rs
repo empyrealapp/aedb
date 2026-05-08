@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const VALUE_STORE_FILE: &str = "values.aedbdat";
@@ -89,21 +90,77 @@ impl PersistentValueStore {
         self.append_with_cache_policy(value, false)
     }
 
+    pub fn append_many_cold(
+        &self,
+        values: &[Vec<u8>],
+    ) -> Result<Vec<PersistentValueRef>, AedbError> {
+        let value_slices: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
+        self.append_many_cold_slices(&value_slices)
+    }
+
+    pub fn append_many_cold_slices(
+        &self,
+        values: &[&[u8]],
+    ) -> Result<Vec<PersistentValueRef>, AedbError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let value_metadata: Vec<([u8; 32], u64)> = values
+            .iter()
+            .map(|value| (*blake3::hash(value).as_bytes(), value.len() as u64))
+            .collect();
+        let append_start_offset = {
+            let mut file = self.file.lock();
+            let append_start_offset = file.seek(SeekFrom::End(0))?;
+            for value in values {
+                file.write_all(value)?;
+            }
+            file.flush()?;
+            append_start_offset
+        };
+
+        let mut value_offset = append_start_offset;
+        let mut refs = Vec::with_capacity(values.len());
+        for (blake3_hash, len) in value_metadata {
+            refs.push(PersistentValueRef {
+                offset: value_offset,
+                len,
+                blake3_hash,
+            });
+            value_offset =
+                value_offset
+                    .checked_add(len)
+                    .ok_or_else(|| AedbError::IntegrityError {
+                        message: "persistent value store append offset overflows".into(),
+                    })?;
+        }
+        self.len.store(value_offset, Ordering::Release);
+        self.dirty.store(true, Ordering::Release);
+        Ok(refs)
+    }
+
     fn append_with_cache_policy(
         &self,
         value: &[u8],
         populate_hot_cache: bool,
     ) -> Result<PersistentValueRef, AedbError> {
-        let mut file = self.file.lock();
-        let append_start_offset = file.seek(SeekFrom::End(0))?;
-        file.write_all(value)?;
-        file.flush()?;
-        let next_file_len = append_start_offset.saturating_add(value.len() as u64);
+        let blake3_hash = *blake3::hash(value).as_bytes();
+        let (append_start_offset, next_file_len) = {
+            let mut file = self.file.lock();
+            let append_start_offset = file.seek(SeekFrom::End(0))?;
+            file.write_all(value)?;
+            file.flush()?;
+            (
+                append_start_offset,
+                append_start_offset.saturating_add(value.len() as u64),
+            )
+        };
         self.len.store(next_file_len, Ordering::Release);
         let value_ref = PersistentValueRef {
             offset: append_start_offset,
             len: value.len() as u64,
-            blake3_hash: *blake3::hash(value).as_bytes(),
+            blake3_hash,
         };
         if populate_hot_cache {
             self.hot_cache.lock().insert(value_ref.clone(), value);
@@ -113,8 +170,8 @@ impl PersistentValueStore {
     }
 
     pub fn read(&self, value_ref: &PersistentValueRef) -> Result<Vec<u8>, AedbError> {
-        if let Some(value) = self.hot_cache.lock().get(value_ref) {
-            return Ok(value);
+        if let Some(value) = { self.hot_cache.lock().get(value_ref) } {
+            return Ok(value.as_ref().to_vec());
         }
 
         let end = value_ref.offset.checked_add(value_ref.len).ok_or_else(|| {
@@ -130,29 +187,32 @@ impl PersistentValueStore {
             });
         }
 
-        let mut mmap = self.mmap.lock();
-        let start = usize::try_from(value_ref.offset).map_err(|_| AedbError::IntegrityError {
-            message: "persistent value offset does not fit usize".into(),
-        })?;
-        let end = usize::try_from(end).map_err(|_| AedbError::IntegrityError {
-            message: "persistent value end offset does not fit usize".into(),
-        })?;
-        if end > mmap.len() {
-            let file = self.file.lock();
-            *mmap = map_file(&file)?;
-        }
-        let Some(bytes) = mmap.get(start..end) else {
-            return Err(AedbError::IntegrityError {
-                message: "persistent value reference outside mapped value store".into(),
-            });
+        let value = {
+            let mut mmap = self.mmap.lock();
+            let start =
+                usize::try_from(value_ref.offset).map_err(|_| AedbError::IntegrityError {
+                    message: "persistent value offset does not fit usize".into(),
+                })?;
+            let end = usize::try_from(end).map_err(|_| AedbError::IntegrityError {
+                message: "persistent value end offset does not fit usize".into(),
+            })?;
+            if end > mmap.len() {
+                let file = self.file.lock();
+                *mmap = map_file(&file)?;
+            }
+            let Some(bytes) = mmap.get(start..end) else {
+                return Err(AedbError::IntegrityError {
+                    message: "persistent value reference outside mapped value store".into(),
+                });
+            };
+            bytes.to_vec()
         };
-        let actual = blake3::hash(bytes);
+        let actual = blake3::hash(&value);
         if actual.as_bytes() != &value_ref.blake3_hash {
             return Err(AedbError::IntegrityError {
                 message: "persistent value hash mismatch".into(),
             });
         }
-        let value = bytes.to_vec();
         self.hot_cache.lock().insert(value_ref.clone(), &value);
         Ok(value)
     }
@@ -200,7 +260,7 @@ struct HotValueCache {
 
 #[derive(Debug)]
 struct CachedHotValue {
-    value: Vec<u8>,
+    value: Arc<[u8]>,
     access_tick: u64,
 }
 
@@ -223,11 +283,11 @@ impl HotValueCache {
         self.resident_bytes
     }
 
-    fn get(&mut self, value_ref: &PersistentValueRef) -> Option<Vec<u8>> {
+    fn get(&mut self, value_ref: &PersistentValueRef) -> Option<Arc<[u8]>> {
         let access_tick = self.allocate_access_tick();
         let cached = self.values.get_mut(value_ref)?;
         self.access_order.remove(&cached.access_tick);
-        let value = cached.value.clone();
+        let value = Arc::clone(&cached.value);
         cached.access_tick = access_tick;
         self.access_order.insert(access_tick, value_ref.clone());
         Some(value)
@@ -246,7 +306,7 @@ impl HotValueCache {
         self.values.insert(
             value_ref,
             CachedHotValue {
-                value: value.to_vec(),
+                value: Arc::from(value),
                 access_tick,
             },
         );
@@ -315,6 +375,30 @@ mod tests {
         assert_eq!(store.hot_cache_resident_bytes(), 0);
         assert_eq!(store.read(&value_ref).expect("read"), b"cold-only");
         assert_eq!(store.hot_cache_resident_bytes(), 0);
+    }
+
+    #[test]
+    fn append_many_cold_writes_contiguous_values_without_hot_cache_population() {
+        let dir = tempdir().expect("temp");
+        let store =
+            PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 128).expect("open store");
+        let values = vec![
+            b"batch-one".to_vec(),
+            b"batch-two-longer".to_vec(),
+            b"batch-three".to_vec(),
+        ];
+
+        let refs = store.append_many_cold(&values).expect("append batch");
+
+        assert_eq!(refs.len(), values.len());
+        assert_eq!(refs[0].offset, super::VALUE_STORE_MAGIC.len() as u64);
+        for pair in refs.windows(2) {
+            assert_eq!(pair[0].offset + pair[0].len, pair[1].offset);
+        }
+        assert_eq!(store.hot_cache_resident_bytes(), 0);
+        for (value_ref, expected) in refs.iter().zip(values.iter()) {
+            assert_eq!(store.read(value_ref).expect("read batch value"), *expected);
+        }
     }
 
     #[test]
