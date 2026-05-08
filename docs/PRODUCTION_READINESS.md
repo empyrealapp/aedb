@@ -22,6 +22,8 @@ AEDB production profiles are disk-backed for WAL/checkpoint durability and KV pa
 
 AEDB is not yet a general larger-than-memory table/index engine. KV keys, entry metadata, table rows, secondary indexes, async projections, accumulators, snapshots, and version metadata are memory-resident. Production deployments must size `max_memory_estimate_bytes` for that metadata/row/index working set; commits that still exceed the ceiling after KV payload spill are rejected before WAL append.
 
+See [HYBRID_STORAGE_ROADMAP.md](HYBRID_STORAGE_ROADMAP.md) for the disk-authoritative storage roadmap. This PR introduces the paged storage primitive that future disk-backed row and index structures will use.
+
 ## Mandatory Repo Gates
 
 Run the full repo-local production gate:

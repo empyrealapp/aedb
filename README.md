@@ -410,7 +410,9 @@ This mode supports KV payload sets larger than memory. It is not yet a
 general-purpose larger-than-memory table/index engine: KV keys, entry metadata,
 table rows, secondary indexes, async projections, accumulators, snapshots, and
 version metadata remain memory-resident and are protected by
-`max_memory_estimate_bytes`.
+`max_memory_estimate_bytes`. The storage layer now also includes a checksummed
+`PagedStore` with a bounded page cache; that is the foundation for moving table
+rows, KV keys, and index pages onto disk in the hybrid storage roadmap.
 `operational_metrics()` reports `persistent_value_store_bytes`,
 `persistent_value_hot_cache_bytes`, and
 `persistent_value_hot_cache_capacity_bytes` so operators can watch disk growth and
