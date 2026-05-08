@@ -1,4 +1,5 @@
 use aedb::AedbInstance;
+use aedb::backup::{extract_backup_archive, sha256_file_hex, write_backup_archive};
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
@@ -596,6 +597,59 @@ fn benchmark_page_store_batch_append_and_hot_cache() {
         batch_append_ns < individual_append_ns,
         "batched append should avoid per-page lock and flush overhead"
     );
+}
+
+#[test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+fn benchmark_single_file_archive_large_page_file_streaming() {
+    const LARGE_PAGE_BYTES: usize = 32 * 1024 * 1024;
+
+    let src = tempdir().expect("src");
+    let dst = tempdir().expect("dst");
+    let archive = src.path().join("backup_large.aedbarc");
+    let page_dir = src.path().join("pages");
+    std::fs::create_dir_all(&page_dir).expect("page dir");
+    std::fs::write(src.path().join("backup_manifest.json"), b"{\"x\":1}").expect("manifest");
+
+    let page_file = page_dir.join("rows.aedbpg");
+    let mut page = Vec::with_capacity(LARGE_PAGE_BYTES);
+    for i in 0..LARGE_PAGE_BYTES {
+        page.push(((i.wrapping_mul(17) ^ (i >> 11)) & 0xff) as u8);
+    }
+    std::fs::write(&page_file, &page).expect("page file");
+
+    let key = [13u8; 32];
+    let write_start = Instant::now();
+    write_backup_archive(src.path(), &archive, Some(&key)).expect("write archive");
+    let write_ms = write_start.elapsed().as_millis();
+
+    let extract_start = Instant::now();
+    extract_backup_archive(&archive, dst.path(), Some(&key)).expect("extract archive");
+    let extract_ms = extract_start.elapsed().as_millis();
+
+    let source_hash = sha256_file_hex(&page_file).expect("source hash");
+    let restored_hash =
+        sha256_file_hex(&dst.path().join("pages/rows.aedbpg")).expect("restored hash");
+    assert_eq!(source_hash, restored_hash);
+
+    let archive_bytes = std::fs::metadata(&archive).expect("archive metadata").len();
+    let throughput_mib_s = |bytes: usize, millis: u128| -> u128 {
+        let millis = millis.max(1);
+        (bytes as u128 * 1000) / (millis * 1024 * 1024)
+    };
+    eprintln!(
+        "single_file_archive_large_page_streaming: source_bytes={} archive_bytes={} write={}ms ({}MiB/s) extract={}ms ({}MiB/s)",
+        LARGE_PAGE_BYTES,
+        archive_bytes,
+        write_ms,
+        throughput_mib_s(LARGE_PAGE_BYTES, write_ms),
+        extract_ms,
+        throughput_mib_s(LARGE_PAGE_BYTES, extract_ms)
+    );
+
+    assert!(archive_bytes > 0);
+    assert!(write_ms > 0);
+    assert!(extract_ms > 0);
 }
 
 #[tokio::test]
