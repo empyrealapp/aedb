@@ -1517,11 +1517,18 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
 
 pub(crate) fn copy_file_prefix(src: &Path, dst: &Path, size_bytes: u64) -> Result<(), AedbError> {
     let mut reader = File::open(src)?;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut writer = File::create(dst)?;
     std::io::copy(
         &mut std::io::Read::by_ref(&mut reader).take(size_bytes),
         &mut writer,
     )?;
+    writer.sync_all()?;
+    if let Some(parent) = dst.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

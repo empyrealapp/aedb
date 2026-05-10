@@ -35,7 +35,10 @@ use crate::catalog::{DdlOperation, ResourceType};
 use crate::checkpoint::loader::load_checkpoint_with_key;
 use crate::checkpoint::writer::write_checkpoint_with_key;
 use crate::commit::action::{ActionCommitOutcome, ActionCommitResult, ActionEnvelopeRequest};
-use crate::commit::executor::{CommitExecutor, CommitResult, ExecutorMetrics, IdempotencyOutcome};
+use crate::commit::executor::{
+    CommitExecutor, CommitResult, ENVELOPE_OVERHEAD_UPPER_BOUND, ExecutorMetrics,
+    IdempotencyOutcome, MUTATION_OVERHEAD_UPPER_BOUND,
+};
 use crate::commit::tx::{
     ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
 };
@@ -1556,6 +1559,14 @@ impl AedbInstance {
         &self,
         envelope: TransactionEnvelope,
     ) -> Result<CommitResult, AedbError> {
+        self.commit_envelope_with_size_hint(envelope, None).await
+    }
+
+    async fn commit_envelope_with_size_hint(
+        &self,
+        envelope: TransactionEnvelope,
+        encoded_size_hint: Option<usize>,
+    ) -> Result<CommitResult, AedbError> {
         let started = Instant::now();
         if self.require_authenticated_calls && envelope.caller.is_none() {
             return Err(AedbError::PermissionDenied(
@@ -1570,7 +1581,14 @@ impl AedbInstance {
             }
             ensure_external_caller_allowed(caller)?;
         }
-        let result = self.executor.submit_envelope(envelope).await;
+        let result = match encoded_size_hint {
+            Some(hint) => {
+                self.executor
+                    .submit_envelope_with_size_hint(envelope, Some(hint))
+                    .await
+            }
+            None => self.executor.submit_envelope(envelope).await,
+        };
         self.emit_commit_telemetry("commit_envelope", started, &result);
         let result = result?;
         self.dispatch_lifecycle_events_for_commit(result.commit_seq)
@@ -1977,6 +1995,7 @@ impl AedbInstance {
             caller,
             self._config.max_scan_rows,
         );
+        tokio::task::yield_now().await;
         let execute_micros = execute_started.elapsed().as_micros() as u64;
         let units = result
             .as_ref()
@@ -3345,16 +3364,40 @@ impl AedbInstance {
                 "kv_set_many_atomic requires at least one entry".into(),
             ));
         }
-        let mutations = entries
-            .into_iter()
-            .map(|(key, value)| Mutation::KvSet {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
+        let project_id_owned = project_id.to_string();
+        let scope_id_owned = scope_id.to_string();
+        let mut encoded_size_hint = Some(ENVELOPE_OVERHEAD_UPPER_BOUND);
+        let mut mutations = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            encoded_size_hint = encoded_size_hint.and_then(|size| {
+                size.checked_add(
+                    MUTATION_OVERHEAD_UPPER_BOUND
+                        .saturating_add(project_id.len())
+                        .saturating_add(scope_id.len())
+                        .saturating_add(key.len())
+                        .saturating_add(value.len()),
+                )
+            });
+            mutations.push(Mutation::KvSet {
+                project_id: project_id_owned.clone(),
+                scope_id: scope_id_owned.clone(),
                 key,
                 value,
-            })
-            .collect();
-        self.commit_many_atomic(mutations).await
+            });
+        }
+        self.commit_envelope_with_size_hint(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: ReadSet::default(),
+                write_intent: WriteIntent { mutations },
+                base_seq: 0,
+            },
+            encoded_size_hint,
+        )
+        .await
     }
 
     pub async fn kv_set_many_atomic_as(
@@ -3369,16 +3412,40 @@ impl AedbInstance {
                 "kv_set_many_atomic_as requires at least one entry".into(),
             ));
         }
-        let mutations = entries
-            .into_iter()
-            .map(|(key, value)| Mutation::KvSet {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
+        let project_id_owned = project_id.to_string();
+        let scope_id_owned = scope_id.to_string();
+        let mut encoded_size_hint = Some(ENVELOPE_OVERHEAD_UPPER_BOUND);
+        let mut mutations = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            encoded_size_hint = encoded_size_hint.and_then(|size| {
+                size.checked_add(
+                    MUTATION_OVERHEAD_UPPER_BOUND
+                        .saturating_add(project_id.len())
+                        .saturating_add(scope_id.len())
+                        .saturating_add(key.len())
+                        .saturating_add(value.len()),
+                )
+            });
+            mutations.push(Mutation::KvSet {
+                project_id: project_id_owned.clone(),
+                scope_id: scope_id_owned.clone(),
                 key,
                 value,
-            })
-            .collect();
-        self.commit_many_atomic_as(caller, mutations).await
+            });
+        }
+        self.commit_envelope_with_size_hint(
+            TransactionEnvelope {
+                caller: Some(caller),
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: ReadSet::default(),
+                write_intent: WriteIntent { mutations },
+                base_seq: 0,
+            },
+            encoded_size_hint,
+        )
+        .await
     }
 
     pub async fn kv_del(
@@ -9817,6 +9884,7 @@ impl ReadTx<'_> {
             self.caller.as_ref(),
             self.db._config.max_scan_rows,
         );
+        tokio::task::yield_now().await;
         let mut result = result?;
         self.db.sign_query_result_cursor(&mut result)?;
         let result = Ok(result);

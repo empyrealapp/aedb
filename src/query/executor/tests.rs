@@ -1,4 +1,5 @@
 use super::execute_query_with_options;
+use super::indexing::indexed_pks_for_predicate_limited;
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
 use crate::catalog::schema::{ColumnDef, IndexType, TableSchema};
@@ -357,6 +358,74 @@ fn index_backed_range_scan_reduces_examined_rows() {
     .expect("range");
     assert!(ranged.rows.len() < full.rows.len());
     assert!(ranged.rows_examined < full.rows_examined);
+}
+
+#[test]
+fn exact_index_predicate_limit_caps_candidate_materialization() {
+    let (mut keyspace, catalog) = setup();
+    let ns = namespace_key("A", "app");
+    let schema = catalog
+        .tables
+        .get(&(ns.clone(), "users".to_string()))
+        .expect("schema")
+        .clone();
+    let table = keyspace
+        .table_by_namespace_key_mut(&ns, "users")
+        .expect("table");
+    for i in 100..300 {
+        let pk = vec![Value::Integer(i)];
+        let row = Row {
+            values: vec![
+                Value::Integer(i),
+                Value::Text(format!("hot{i}").into()),
+                Value::Integer(42),
+                Value::Text(format!("hot{i}@example.com").into()),
+            ],
+        };
+        let encoded_pk = EncodedKey::from_values(&pk);
+        let age_key =
+            extract_index_key_encoded(&row, &schema, &["age".into()]).expect("age index key");
+        table
+            .indexes
+            .get_mut("by_age")
+            .expect("age index")
+            .insert(age_key, encoded_pk);
+        table.rows.insert(EncodedKey::from_values(&pk), row);
+    }
+    let snapshot = keyspace.snapshot();
+    let table = snapshot.table("A", "app", "users").expect("snapshot table");
+
+    let exact = indexed_pks_for_predicate_limited(
+        &catalog,
+        "A",
+        "app",
+        "users",
+        table,
+        &Expr::Eq("age".into(), Value::Integer(42)),
+        Some(7),
+    )
+    .expect("index lookup")
+    .expect("indexed");
+    assert!(exact.predicate_exact);
+    assert_eq!(exact.pks.len(), 7);
+
+    let residual = indexed_pks_for_predicate_limited(
+        &catalog,
+        "A",
+        "app",
+        "users",
+        table,
+        &Expr::Eq("age".into(), Value::Integer(42))
+            .and(Expr::Eq("email".into(), Value::Text("missing".into()))),
+        Some(7),
+    )
+    .expect("residual lookup")
+    .expect("indexed");
+    assert!(!residual.predicate_exact);
+    assert!(
+        residual.pks.len() > 7,
+        "residual predicates must not cap candidates before filtering"
+    );
 }
 
 #[test]

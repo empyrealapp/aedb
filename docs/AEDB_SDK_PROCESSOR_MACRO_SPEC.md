@@ -39,30 +39,32 @@ Reads and writes are typed by state/event type.
 - `first() -> Option<T>`
 - `rank(key) -> Option<usize>`
 
-### Numeric state API
-Numeric state is represented with normal KV values or typed table columns.
-Generated SDK helpers should emit AEDB's numeric KV mutations instead of a
-separate additive primitive:
-- `add_u64(key, amount)`
-- `sub_u64(key, amount)`
-- `max_u64(key, value)`
-- `min_u64(key, value)`
-- `mutate_u64(key, op)`
+### AccumulatorHandle API
+- `value()`
+- `value_strong()`
+- `available()`
+- `exposure()`
+- `lag()`
 
 ## Effect batch builder
 WASM game logic should return one `EffectBatch`:
+- `require_available(accumulator, min_amount)`
+- `require_exposure_ok(accumulator, amount)`
+- `accumulate(accumulator, delta).dedupe(id)`
+- `expose(accumulator, amount, dedupe_id)`
+- `release_exposure(accumulator, dedupe_id)`
 - `put<T: State>(&T)`
 - `delete<T: State>(key)`
 - `emit<E: Event>(&E)`
 
-## Numeric state boundary
+## Accumulator boundary
 AEDB should expose primitive building blocks only:
-- typed KV integer mutations
-- table column updates
-- transaction envelopes for atomic state + metadata commits
+- positive/negative `accumulate`
+- availability and exposure reads
+- preconditions that reject insufficient balance/capacity
 
 AEDB should **not** encode app withdrawal policy semantics (for example `withdraw_delay` or `request_withdraw` workflow).  
-Application logic (Arcana) should implement delayed withdrawals by scheduling a later effect batch or action envelope that applies the normal integer mutation.
+Application logic (Arcana) should implement delayed withdrawals by scheduling a later effect batch with `require_available + accumulate(negative_delta)`.
 
 ## Processor macro
 `#[processor(...)]` defines typed event consumers with generated registration + invocation wiring.
@@ -74,20 +76,23 @@ Expected options:
 - `batch_size` (optional, defaulted)
 - `owns` (writable state types)
 - `reads` (read-only state types)
+- `reads_accumulators` (read-only accumulator names)
 
 `ProcessorCtx<E>` should provide:
 - `events()`
 - `state<T>()` for owned types
 - `read_state<T>()` for read-only types
-- `numeric_kv()` for typed KV integer updates when generated SDK helpers need them
+- `accumulate(name, key, delta, dedupe_id)`
+- `accumulator_value(name, key)`
 - `commit()` (atomic writes + checkpoint advance)
 
 ## Error model
-- Invalid effect batches return structured typed errors.
+- Rejected effect batches return structured typed errors.
 - Processor panic/error does not advance checkpoint; events are retried.
 
 ## Startup flow
 At startup, register:
+- accumulators
 - state schemas
 - event schemas
 - processors

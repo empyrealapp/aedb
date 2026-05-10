@@ -434,17 +434,18 @@ impl Keyspace {
         };
 
         let mut candidates = Vec::new();
-        let mut oldest_first = BinaryHeap::new();
+        let mut heap_entries = Vec::new();
         for (namespace_id, namespace) in self.namespaces.iter() {
             for (key, entry) in namespace.kv.entries.iter() {
                 if entry.value_ref.is_none() && !entry.value.is_empty() {
                     let candidate_index = candidates.len();
                     let payload_bytes = entry.value.len();
                     candidates.push((namespace_id.clone(), key.clone(), payload_bytes));
-                    oldest_first.push(Reverse((entry.version, payload_bytes, candidate_index)));
+                    heap_entries.push(Reverse((entry.version, payload_bytes, candidate_index)));
                 }
             }
         }
+        let mut oldest_first = BinaryHeap::from(heap_entries);
 
         let mut plans = Vec::new();
         let value_refs = {
@@ -1326,13 +1327,22 @@ impl Keyspace {
                 (commit_seq, 0)
             }
         };
-        let entry = maybe_spill_kv_entry(
-            value_store.as_ref(),
-            inline_threshold_bytes,
-            value,
-            commit_seq,
-            created_at,
-        )?;
+        let entry = if value.len() <= inline_threshold_bytes {
+            KvEntry {
+                value,
+                version: commit_seq,
+                created_at,
+                value_ref: None,
+            }
+        } else {
+            maybe_spill_kv_entry(
+                value_store.as_ref(),
+                inline_threshold_bytes,
+                value,
+                commit_seq,
+                created_at,
+            )?
+        };
         let new_cost = kv_entry_cost(key.len(), entry.value.len());
         kv.entries.insert(key, entry);
         self.mem_bytes = self
@@ -1340,6 +1350,131 @@ impl Keyspace {
             .saturating_add(new_cost)
             .saturating_sub(old_cost);
         Ok(())
+    }
+
+    pub fn kv_set_many_same_namespace<'a, I>(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        entries: I,
+        commit_seq: u64,
+    ) -> Result<(), crate::error::AedbError>
+    where
+        I: IntoIterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+    {
+        let value_store = self.value_store.clone();
+        let inline_threshold_bytes = self.persistent_value_inline_threshold_bytes;
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        let spilled_value_refs = if let Some(store) = value_store.as_ref() {
+            let spilled_values = entries
+                .iter()
+                .filter_map(|(_key, value)| {
+                    (value.len() > inline_threshold_bytes).then_some(value.as_slice())
+                })
+                .collect::<Vec<_>>();
+            store.append_many_hot_slices(&spilled_values)?
+        } else {
+            Vec::new()
+        };
+        let mut spilled_value_refs = spilled_value_refs.into_iter();
+        let mut new_cost_total = 0usize;
+        let mut old_cost_total = 0usize;
+        {
+            let kv = self.kv_data_mut(project_id, scope_id);
+            for (key, value) in entries {
+                let (created_at, old_cost) = match kv.entries.get(key) {
+                    Some(entry) => (
+                        entry.created_at,
+                        kv_entry_cost(key.len(), entry.value.len()),
+                    ),
+                    None => {
+                        kv.structural_version = commit_seq;
+                        (commit_seq, 0)
+                    }
+                };
+                let entry = if value.len() <= inline_threshold_bytes {
+                    KvEntry {
+                        value: value.clone(),
+                        version: commit_seq,
+                        created_at,
+                        value_ref: None,
+                    }
+                } else if value_store.is_some() {
+                    KvEntry {
+                        value: Vec::new(),
+                        version: commit_seq,
+                        created_at,
+                        value_ref: Some(spilled_value_refs.next().ok_or_else(|| {
+                            crate::error::AedbError::IntegrityError {
+                                message: "missing persistent value ref for spilled KV batch".into(),
+                            }
+                        })?),
+                    }
+                } else {
+                    KvEntry {
+                        value: value.clone(),
+                        version: commit_seq,
+                        created_at,
+                        value_ref: None,
+                    }
+                };
+                new_cost_total =
+                    new_cost_total.saturating_add(kv_entry_cost(key.len(), entry.value.len()));
+                old_cost_total = old_cost_total.saturating_add(old_cost);
+                kv.entries.insert(key.clone(), entry);
+            }
+        }
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost_total)
+            .saturating_sub(old_cost_total);
+        debug_assert!(
+            spilled_value_refs.next().is_none(),
+            "all persistent value refs should be consumed"
+        );
+        Ok(())
+    }
+
+    pub fn kv_set_many_inline_same_namespace<'a, I>(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        entries: I,
+        commit_seq: u64,
+    ) where
+        I: IntoIterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
+    {
+        let mut new_cost_total = 0usize;
+        let mut old_cost_total = 0usize;
+        {
+            let kv = self.kv_data_mut(project_id, scope_id);
+            for (key, value) in entries {
+                let (created_at, old_cost) = match kv.entries.get(key) {
+                    Some(entry) => (
+                        entry.created_at,
+                        kv_entry_cost(key.len(), entry.value.len()),
+                    ),
+                    None => {
+                        kv.structural_version = commit_seq;
+                        (commit_seq, 0)
+                    }
+                };
+                let entry = KvEntry {
+                    value: value.clone(),
+                    version: commit_seq,
+                    created_at,
+                    value_ref: None,
+                };
+                new_cost_total =
+                    new_cost_total.saturating_add(kv_entry_cost(key.len(), entry.value.len()));
+                old_cost_total = old_cost_total.saturating_add(old_cost);
+                kv.entries.insert(key.clone(), entry);
+            }
+        }
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost_total)
+            .saturating_sub(old_cost_total);
     }
 
     pub fn kv_del(
@@ -2758,6 +2893,75 @@ mod tests {
         ks.drop_project("p");
         assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
         assert_eq!(ks.mem_bytes, 0);
+    }
+
+    #[test]
+    fn kv_set_many_same_namespace_updates_entries_and_memory() {
+        let mut ks = Keyspace::default();
+        let entries = [
+            (b"a".to_vec(), b"one".to_vec()),
+            (b"b".to_vec(), b"two".to_vec()),
+        ];
+        ks.kv_set_many_same_namespace("p", "app", entries.iter().map(|(k, v)| (k, v)), 7)
+            .expect("batch set");
+        assert_eq!(
+            ks.kv_get("p", "app", b"a").map(|entry| entry.value),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(
+            ks.kv_get("p", "app", b"b").map(|entry| entry.value),
+            Some(b"two".to_vec())
+        );
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+        let overwrite = [(b"a".to_vec(), b"three".to_vec())];
+        ks.kv_set_many_same_namespace("p", "app", overwrite.iter().map(|(k, v)| (k, v)), 8)
+            .expect("batch overwrite");
+        let overwritten = ks.kv_get("p", "app", b"a").expect("overwritten");
+        assert_eq!(overwritten.value, b"three".to_vec());
+        assert_eq!(overwritten.created_at, 7);
+        assert_eq!(overwritten.version, 8);
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+    }
+
+    #[test]
+    fn kv_set_many_same_namespace_spills_large_values_and_keeps_them_hot() {
+        let dir = tempdir().expect("temp");
+        let store = Arc::new(
+            PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 128).expect("open store"),
+        );
+        let mut ks = Keyspace::default();
+        ks.attach_persistent_value_store(Arc::clone(&store), 4)
+            .expect("attach");
+        let entries = [
+            (b"big-a".to_vec(), b"large-value-a".to_vec()),
+            (b"big-b".to_vec(), b"large-value-b".to_vec()),
+        ];
+
+        ks.kv_set_many_same_namespace("p", "app", entries.iter().map(|(k, v)| (k, v)), 11)
+            .expect("batch set");
+
+        let namespace = ks
+            .namespaces
+            .get(&NamespaceId::project_scope("p", "app"))
+            .expect("namespace");
+        for (key, value) in &entries {
+            let entry = namespace.kv.entries.get(key).expect("entry");
+            entry.value_ref.as_ref().expect("spilled value ref");
+            assert!(entry.value.is_empty());
+            assert_eq!(
+                ks.try_kv_get("p", "app", key)
+                    .expect("read")
+                    .expect("value")
+                    .value,
+                *value
+            );
+        }
+        assert!(
+            store.hot_cache_resident_bytes() > 0,
+            "spilled batch values should be hot immediately after write"
+        );
+        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
     }
 
     #[test]

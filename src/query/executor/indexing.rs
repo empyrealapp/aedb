@@ -21,20 +21,27 @@ pub(super) struct IndexLookupResult {
     pub pks: Vec<EncodedKey>,
     pub selected_indexes: Vec<String>,
     pub plan_trace: Vec<String>,
+    pub predicate_exact: bool,
 }
 
-pub(super) fn indexed_pks_for_predicate(
+pub(super) fn indexed_pks_for_predicate_limited(
     catalog: &Catalog,
     project_id: &str,
     scope_id: &str,
     table_name: &str,
     table: &crate::storage::keyspace::TableData,
     predicate: &crate::query::plan::Expr,
-) -> Result<Option<Vec<EncodedKey>>, QueryError> {
-    Ok(indexed_pks_for_predicate_with_trace(
-        catalog, project_id, scope_id, table_name, table, predicate,
-    )?
-    .map(|result| result.pks))
+    candidate_limit: Option<usize>,
+) -> Result<Option<IndexLookupResult>, QueryError> {
+    indexed_pks_for_predicate_with_trace_inner(
+        catalog,
+        project_id,
+        scope_id,
+        table_name,
+        table,
+        predicate,
+        candidate_limit,
+    )
 }
 
 pub(super) fn indexed_pks_for_predicate_with_trace(
@@ -45,15 +52,56 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
     table: &crate::storage::keyspace::TableData,
     predicate: &crate::query::plan::Expr,
 ) -> Result<Option<IndexLookupResult>, QueryError> {
+    indexed_pks_for_predicate_with_trace_inner(
+        catalog, project_id, scope_id, table_name, table, predicate, None,
+    )
+}
+
+fn indexed_pks_for_predicate_with_trace_inner(
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    table: &crate::storage::keyspace::TableData,
+    predicate: &crate::query::plan::Expr,
+    candidate_limit: Option<usize>,
+) -> Result<Option<IndexLookupResult>, QueryError> {
+    let mut result = indexed_pks_for_predicate_with_trace_uncapped(
+        catalog,
+        project_id,
+        scope_id,
+        table_name,
+        table,
+        predicate,
+        candidate_limit,
+    )?;
+    if let Some(result) = result.as_mut()
+        && result.predicate_exact
+        && let Some(limit) = candidate_limit
+    {
+        result.pks.truncate(limit);
+    }
+    Ok(result)
+}
+
+fn indexed_pks_for_predicate_with_trace_uncapped(
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    table: &crate::storage::keyspace::TableData,
+    predicate: &crate::query::plan::Expr,
+    candidate_limit: Option<usize>,
+) -> Result<Option<IndexLookupResult>, QueryError> {
     use crate::query::plan::Expr;
 
     match predicate {
         Expr::And(lhs, rhs) => {
-            let left = indexed_pks_for_predicate_with_trace(
-                catalog, project_id, scope_id, table_name, table, lhs,
+            let left = indexed_pks_for_predicate_with_trace_uncapped(
+                catalog, project_id, scope_id, table_name, table, lhs, None,
             )?;
-            let right = indexed_pks_for_predicate_with_trace(
-                catalog, project_id, scope_id, table_name, table, rhs,
+            let right = indexed_pks_for_predicate_with_trace_uncapped(
+                catalog, project_id, scope_id, table_name, table, rhs, None,
             )?;
             return Ok(match (left, right) {
                 (Some(left), Some(right)) => Some(IndexLookupResult {
@@ -62,6 +110,7 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
                         left.selected_indexes,
                         right.selected_indexes,
                     ),
+                    predicate_exact: left.predicate_exact && right.predicate_exact,
                     plan_trace: merge_trace(
                         "AND predicate combines indexed candidates with intersection",
                         left.plan_trace,
@@ -73,6 +122,7 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
                         "AND predicate uses indexed left side; right side will be residual filter",
                         left.plan_trace,
                     ),
+                    predicate_exact: false,
                     ..left
                 }),
                 (None, Some(right)) => Some(IndexLookupResult {
@@ -80,17 +130,18 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
                         "AND predicate uses indexed right side; left side will be residual filter",
                         right.plan_trace,
                     ),
+                    predicate_exact: false,
                     ..right
                 }),
                 (None, None) => None,
             });
         }
         Expr::Or(lhs, rhs) => {
-            let left = indexed_pks_for_predicate_with_trace(
-                catalog, project_id, scope_id, table_name, table, lhs,
+            let left = indexed_pks_for_predicate_with_trace_uncapped(
+                catalog, project_id, scope_id, table_name, table, lhs, None,
             )?;
-            let right = indexed_pks_for_predicate_with_trace(
-                catalog, project_id, scope_id, table_name, table, rhs,
+            let right = indexed_pks_for_predicate_with_trace_uncapped(
+                catalog, project_id, scope_id, table_name, table, rhs, None,
             )?;
             return Ok(match (left, right) {
                 (Some(left), Some(right)) => Some(IndexLookupResult {
@@ -99,6 +150,7 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
                         left.selected_indexes,
                         right.selected_indexes,
                     ),
+                    predicate_exact: left.predicate_exact && right.predicate_exact,
                     plan_trace: merge_trace(
                         "OR predicate combines indexed candidates with union",
                         left.plan_trace,
@@ -168,13 +220,17 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
             .collect::<Vec<_>>();
         let encoded = EncodedKey::from_values(&prefix_values);
         let pks = if prefix_cols == idx_def.columns.len() {
-            selected_index.scan_eq(&encoded)
+            selected_index.scan_eq_limit(&encoded, candidate_limit.unwrap_or(usize::MAX))
         } else {
-            selected_index.scan_prefix(&encoded)
+            match candidate_limit {
+                Some(limit) => selected_index.scan_prefix_window(Some(&encoded), 0, limit),
+                None => selected_index.scan_prefix(&encoded),
+            }
         };
         return Ok(Some(IndexLookupResult {
             pks,
             selected_indexes: vec![idx_name.clone()],
+            predicate_exact: true,
             plan_trace: vec![format!(
                 "selected composite index '{idx_name}' with leftmost prefix columns={prefix_cols}"
             )],
@@ -212,15 +268,26 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
     };
 
     let pks = match lookup.clone() {
-        IndexLookup::Range { bounds, .. } => index.scan_range(bounds.0, bounds.1),
-        IndexLookup::MultiEq { values, .. } => values
-            .into_iter()
-            .flat_map(|v| index.scan_eq(&EncodedKey::from_values(&[v])))
-            .collect(),
+        IndexLookup::Range { bounds, .. } => {
+            index.scan_range_limit(bounds.0, bounds.1, candidate_limit.unwrap_or(usize::MAX))
+        }
+        IndexLookup::MultiEq { values, .. } => {
+            let limit = candidate_limit.unwrap_or(usize::MAX);
+            let mut pks = Vec::new();
+            for value in values {
+                let remaining = limit.saturating_sub(pks.len());
+                if remaining == 0 {
+                    break;
+                }
+                pks.extend(index.scan_eq_limit(&EncodedKey::from_values(&[value]), remaining));
+            }
+            pks
+        }
     };
     Ok(Some(IndexLookupResult {
         pks,
         selected_indexes: vec![index_name.clone()],
+        predicate_exact: true,
         plan_trace: vec![format!(
             "selected single-column index '{index_name}' for predicate on '{column}'"
         )],
@@ -294,12 +361,9 @@ fn extract_indexable_predicate(predicate: &crate::query::plan::Expr) -> Option<I
     use crate::query::plan::Expr;
 
     match predicate {
-        Expr::Eq(c, v) => Some(IndexLookup::Range {
+        Expr::Eq(c, v) => Some(IndexLookup::MultiEq {
             column: c.clone(),
-            bounds: (
-                Bound::Included(EncodedKey::from_values(std::slice::from_ref(v))),
-                Bound::Included(EncodedKey::from_values(std::slice::from_ref(v))),
-            ),
+            values: vec![v.clone()],
         }),
         Expr::In(c, values) => Some(IndexLookup::MultiEq {
             column: c.clone(),

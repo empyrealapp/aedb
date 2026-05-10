@@ -408,6 +408,190 @@ async fn benchmark_coordinator_vs_parallel_lanes() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_saturated_state_machine_kv_writes() {
+    const WORKERS: usize = 32;
+    const RUN_MILLIS: u64 = 1_500;
+
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 10,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        max_inflight_commits: 512,
+        epoch_min_commits: 64,
+        epoch_max_commits: 512,
+        adaptive_epoch_enabled: true,
+        adaptive_epoch_min_commits_ceiling: 512,
+        adaptive_epoch_wait_us_ceiling: 5_000,
+        ..AedbConfig::default()
+    };
+    let (_dir, db) = setup(config, 16).await;
+    let db = Arc::new(db);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(RUN_MILLIS);
+    let mut tasks = Vec::new();
+
+    for worker_id in 0..WORKERS {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            let mut local_commits = 0u64;
+            let mut latencies = Vec::new();
+            while Instant::now() < deadline {
+                let key = format!("sm:{worker_id}:{local_commits}").into_bytes();
+                let t0 = Instant::now();
+                db.commit(Mutation::KvSet {
+                    project_id: PROJECT_ID.into(),
+                    scope_id: SCOPE_ID.into(),
+                    key,
+                    value: local_commits.to_be_bytes().to_vec(),
+                })
+                .await
+                .expect("state-machine kv write");
+                latencies.push(t0.elapsed().as_micros());
+                local_commits += 1;
+            }
+            (local_commits, latencies)
+        }));
+    }
+
+    let mut committed = 0u64;
+    let mut all_latencies = Vec::new();
+    for task in tasks {
+        let (local_commits, mut latencies) = task.await.expect("worker join");
+        committed += local_commits;
+        all_latencies.append(&mut latencies);
+    }
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let tps = (committed as f64 / elapsed) as u64;
+    let (p50_us, p99_us) = latency_us(&mut all_latencies);
+    let metrics = db.operational_metrics().await;
+    let avg_epoch_size = if metrics.epoch_process_ops == 0 {
+        0.0
+    } else {
+        metrics.commits_total as f64 / metrics.epoch_process_ops as f64
+    };
+
+    eprintln!(
+        "saturated_state_machine_kv: workers={} committed={} tps={} p50={}us p99={}us avg_commit={}us epochs={} avg_epoch_size={:.2} avg_epoch_process={}us wal_append_ops={} avg_wal_append={}us queue_depth={} conflicts={} errors={}",
+        WORKERS,
+        committed,
+        tps,
+        p50_us,
+        p99_us,
+        metrics.avg_commit_latency_micros,
+        metrics.epoch_process_ops,
+        avg_epoch_size,
+        metrics.avg_epoch_process_micros,
+        metrics.wal_append_ops,
+        metrics.avg_wal_append_micros,
+        metrics.queue_depth,
+        metrics.conflict_rejections,
+        metrics.commit_errors
+    );
+
+    assert!(committed > 0);
+    assert!(tps > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_saturated_batched_state_machine_kv_writes() {
+    const WORKERS: usize = 16;
+    const BATCH_SIZE: usize = 16;
+    const RUN_MILLIS: u64 = 1_500;
+
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 10,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        max_inflight_commits: 512,
+        epoch_min_commits: 16,
+        epoch_max_commits: 512,
+        adaptive_epoch_enabled: true,
+        adaptive_epoch_min_commits_ceiling: 512,
+        adaptive_epoch_wait_us_ceiling: 2_000,
+        ..AedbConfig::default()
+    };
+    let (_dir, db) = setup(config, 16).await;
+    let db = Arc::new(db);
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(RUN_MILLIS);
+    let mut tasks = Vec::new();
+
+    for worker_id in 0..WORKERS {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            let mut local_batches = 0u64;
+            let mut local_transitions = 0u64;
+            let mut latencies = Vec::new();
+            while Instant::now() < deadline {
+                let mut entries = Vec::with_capacity(BATCH_SIZE);
+                for item in 0..BATCH_SIZE {
+                    let key = format!("sm-batch:{worker_id}:{local_batches}:{item}").into_bytes();
+                    let value = local_transitions.to_be_bytes().to_vec();
+                    entries.push((key, value));
+                    local_transitions += 1;
+                }
+                let t0 = Instant::now();
+                db.kv_set_many_atomic(PROJECT_ID, SCOPE_ID, entries)
+                    .await
+                    .expect("batched state-machine kv write");
+                latencies.push(t0.elapsed().as_micros());
+                local_batches += 1;
+            }
+            (local_batches, local_transitions, latencies)
+        }));
+    }
+
+    let mut batches = 0u64;
+    let mut transitions = 0u64;
+    let mut all_latencies = Vec::new();
+    for task in tasks {
+        let (local_batches, local_transitions, mut latencies) = task.await.expect("worker join");
+        batches += local_batches;
+        transitions += local_transitions;
+        all_latencies.append(&mut latencies);
+    }
+    let elapsed = started.elapsed().as_secs_f64().max(0.001);
+    let batch_tps = (batches as f64 / elapsed) as u64;
+    let transition_tps = (transitions as f64 / elapsed) as u64;
+    let (p50_us, p99_us) = latency_us(&mut all_latencies);
+    let metrics = db.operational_metrics().await;
+    let avg_epoch_size = if metrics.epoch_process_ops == 0 {
+        0.0
+    } else {
+        metrics.commits_total as f64 / metrics.epoch_process_ops as f64
+    };
+
+    eprintln!(
+        "saturated_batched_state_machine_kv: workers={} batch_size={} batches={} transitions={} batch_tps={} transition_tps={} p50={}us p99={}us avg_commit={}us epochs={} avg_epoch_size={:.2} avg_epoch_process={}us wal_append_ops={} avg_wal_append={}us conflicts={} errors={}",
+        WORKERS,
+        BATCH_SIZE,
+        batches,
+        transitions,
+        batch_tps,
+        transition_tps,
+        p50_us,
+        p99_us,
+        metrics.avg_commit_latency_micros,
+        metrics.epoch_process_ops,
+        avg_epoch_size,
+        metrics.avg_epoch_process_micros,
+        metrics.wal_append_ops,
+        metrics.avg_wal_append_micros,
+        metrics.conflict_rejections,
+        metrics.commit_errors
+    );
+
+    assert!(transitions > 0);
+    assert!(transition_tps > 0);
+}
+
 #[tokio::test]
 #[ignore = "benchmark gate; run explicitly in CI or perf environment"]
 async fn benchmark_persistent_large_kv_values() {
@@ -576,11 +760,23 @@ fn benchmark_page_store_batch_append_and_hot_cache() {
     hot_read_lat_ns.sort_unstable();
     let hot_p50_ns = percentile(&hot_read_lat_ns, 0.50) as u64;
     let hot_p99_ns = percentile(&hot_read_lat_ns, 0.99) as u64;
+    let cold_store = PagedStore::open(batch_dir.path(), "rows.aedbpg", PAGE_SIZE, 0)
+        .expect("open cold page store");
+    let mut cold_read_lat_ns = Vec::new();
+    for page_ref in refs.iter().take(CACHE_PAGES) {
+        let t0 = Instant::now();
+        let page = cold_store.read_page(page_ref).expect("cold page read");
+        assert_eq!(page.len(), PAYLOAD_BYTES);
+        cold_read_lat_ns.push(t0.elapsed().as_nanos());
+    }
+    cold_read_lat_ns.sort_unstable();
+    let cold_p50_ns = percentile(&cold_read_lat_ns, 0.50) as u64;
+    let cold_p99_ns = percentile(&cold_read_lat_ns, 0.99) as u64;
     let batch_per_page_ns = batch_append_ns / PAGE_COUNT as u128;
     let individual_per_page_ns = individual_append_ns / PAGE_COUNT as u128;
 
     eprintln!(
-        "page_store_batch: pages={} payload_bytes={} individual_append={}ns batch_append={}ns individual_per_page={}ns batch_per_page={}ns hot_read_p50={}ns hot_read_p99={}ns",
+        "page_store_batch: pages={} payload_bytes={} individual_append={}ns batch_append={}ns individual_per_page={}ns batch_per_page={}ns hot_read_p50={}ns hot_read_p99={}ns cold_read_p50={}ns cold_read_p99={}ns",
         PAGE_COUNT,
         PAYLOAD_BYTES,
         individual_append_ns,
@@ -588,11 +784,14 @@ fn benchmark_page_store_batch_append_and_hot_cache() {
         individual_per_page_ns,
         batch_per_page_ns,
         hot_p50_ns,
-        hot_p99_ns
+        hot_p99_ns,
+        cold_p50_ns,
+        cold_p99_ns
     );
 
     assert!(batch_append_ns > 0);
     assert!(hot_p99_ns > 0);
+    assert!(cold_p99_ns > 0);
     assert!(
         batch_append_ns < individual_append_ns,
         "batched append should avoid per-page lock and flush overhead"

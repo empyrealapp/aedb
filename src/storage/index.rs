@@ -56,14 +56,21 @@ impl SecondaryIndex {
     }
 
     pub fn scan_eq(&self, key: &EncodedKey) -> Vec<EncodedKey> {
+        self.scan_eq_limit(key, usize::MAX)
+    }
+
+    pub fn scan_eq_limit(&self, key: &EncodedKey, limit: usize) -> Vec<EncodedKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
         match &self.store {
             SecondaryIndexStore::BTree(entries) => entries
                 .get(key)
-                .map(|pks| pks.iter().cloned().collect())
+                .map(|pks| pks.iter().take(limit).cloned().collect())
                 .unwrap_or_default(),
             SecondaryIndexStore::Hash(entries) => entries
                 .get(key)
-                .map(|pks| pks.iter().cloned().collect())
+                .map(|pks| pks.iter().take(limit).cloned().collect())
                 .unwrap_or_default(),
             SecondaryIndexStore::UniqueHash(entries) => entries
                 .get(key)
@@ -73,10 +80,23 @@ impl SecondaryIndex {
     }
 
     pub fn scan_range(&self, start: Bound<EncodedKey>, end: Bound<EncodedKey>) -> Vec<EncodedKey> {
+        self.scan_range_limit(start, end, usize::MAX)
+    }
+
+    pub fn scan_range_limit(
+        &self,
+        start: Bound<EncodedKey>,
+        end: Bound<EncodedKey>,
+        limit: usize,
+    ) -> Vec<EncodedKey> {
+        if limit == 0 {
+            return Vec::new();
+        }
         match &self.store {
             SecondaryIndexStore::BTree(entries) => entries
                 .range((start, end))
                 .flat_map(|(_, pks)| pks.iter().cloned())
+                .take(limit)
                 .collect(),
             SecondaryIndexStore::Hash(_) | SecondaryIndexStore::UniqueHash(_) => Vec::new(),
         }

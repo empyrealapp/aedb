@@ -116,89 +116,74 @@ Native U256 KV mutation variants are available for strict/soft decrement and bou
 - Namespace hierarchy: `project -> scope -> table`
 - Typed relational tables for structured data
 - KV APIs for point lookups, prefix/range scans, and counters
+- Native accumulators for high-ingest, exactly-once additive state
 
-KV integer example:
+Accumulator example:
 
 ```rust
-db.kv_add_u64_ex(
-    "casino",
-    "app",
-    b"house_balance".to_vec(),
-    75u64.to_be_bytes(),
-    KvU64MissingPolicy::TreatAsZero,
-    KvU64OverflowPolicy::Reject,
-)
-.await?;
-
-db.kv_sub_u64_ex(
-    "casino",
-    "app",
-    b"house_balance".to_vec(),
-    25u64.to_be_bytes(),
-    KvU64MissingPolicy::Reject,
-    KvU64UnderflowPolicy::Reject,
-)
-.await?;
-
-let entry = db
-    .kv_get_no_auth("casino", "app", b"house_balance", ConsistencyMode::AtLatest)
+db.create_accumulator("casino", "app", "house_balance", Some(86_400), 10_000)
     .await?;
-let balance = entry
-    .map(|entry| u64::from_be_bytes(entry.value.as_slice().try_into().expect("u64 bytes")))
-    .unwrap_or_default();
-assert_eq!(balance, 50);
-```
 
-Use KV numeric mutations for counters and simple balances. Use typed tables when the
-integer belongs to a structured row with relational constraints, indexes, or queryable
-history.
-
-For many small KV writes that must commit atomically, prefer batching them through
-`kv_set_many_atomic` instead of issuing one commit per key:
-
-```rust
-db.kv_set_many_atomic(
+db.accumulate(
     "casino",
     "app",
-    vec![
-        (b"balance:alice".to_vec(), 50u64.to_be_bytes().to_vec()),
-        (b"balance:bob".to_vec(), 75u64.to_be_bytes().to_vec()),
-    ],
+    "house_balance",
+    -125,               // delta
+    "settle_tx_123".into(), // dedupe key
+    42,                 // order key
 )
 .await?;
-```
 
-Mixed table plus KV integer commits can be wrapped in one transaction envelope:
+let projected = db
+    .accumulator_value("casino", "app", "house_balance", ConsistencyMode::AtLatest)
+    .await?;
+let strong = db
+    .accumulator_value_strong("casino", "app", "house_balance", ConsistencyMode::AtLatest)
+    .await?;
+let lag = db
+    .accumulator_lag("casino", "app", "house_balance", ConsistencyMode::AtLatest)
+    .await?;
 
-```rust
-let envelope = TransactionEnvelope {
-    caller: None,
-    idempotency_key: Some(idempotency_key),
-    write_class: WriteClass::Standard,
-    assertions: Vec::new(),
-    read_set: Default::default(),
-    write_intent: WriteIntent {
-        mutations: vec![
-            Mutation::Upsert {
-                project_id: "casino".into(),
-                scope_id: "app".into(),
-                table_name: "ledger".into(),
-                primary_key: vec![Value::Integer(1)],
-                row: ledger_row,
-            },
-            Mutation::KvAddU64Ex {
-                project_id: "casino".into(),
-                scope_id: "app".into(),
-                key: b"house_balance".to_vec(),
-                amount_be: 75u64.to_be_bytes(),
-                on_missing: KvU64MissingPolicy::TreatAsZero,
-                on_overflow: KvU64OverflowPolicy::Reject,
-            },
-        ],
-    },
-    base_seq: db.head_state().await.visible_head_seq,
-};
-db.commit_envelope(envelope).await?;
+// Safety model:
+// - accumulator_value(...) is the projected/materialized value and may lag.
+// - accumulator_value_strong(...), accumulator_available(...), exposure assertions,
+//   and expose_accumulator(...) evaluate against the effective value
+//   (materialized value + unapplied deltas in the same snapshot).
+// Use the strong/effective APIs for credit, reserve, and risk decisions.
+
+// Optional circuit-breaker controls (basis points + orphan TTL in commit units)
+db.create_accumulator_with_options(
+    "casino",
+    "app",
+    "house_balance_cb",
+    Some(86_400),
+    10_000,
+    1_000, // 10% exposure margin
+    Some(20_000),
+)
+.await?;
+
+db.expose_accumulator("casino", "app", "house_balance_cb", 500, "hand-42".into())
+    .await?;
+db.accumulate_with_release(
+    "casino",
+    "app",
+    "house_balance_cb",
+    -120,
+    "settle_hand_42".into(),
+    43,
+    Some("hand-42".into()),
+)
+.await?;
+let exposure = db
+    .accumulator_exposure("casino", "app", "house_balance_cb", ConsistencyMode::AtLatest)
+    .await?;
+let available = db
+    .accumulator_available("casino", "app", "house_balance_cb", ConsistencyMode::AtLatest)
+    .await?;
+let exposure_metrics = db
+    .accumulator_exposure_metrics("casino", "app", "house_balance_cb", ConsistencyMode::AtLatest)
+    .await?;
 
 // Tier-2 event stream + processor checkpoint primitives
 db.emit_event(
@@ -218,6 +203,42 @@ db.ack_reactive_processor_checkpoint("points_processor", page.next_commit_seq.un
 let processor_lag = db
     .reactive_processor_lag("points_processor", ConsistencyMode::AtLatest)
     .await?;
+```
+
+Recommended hand lifecycle (high-throughput):
+
+```rust
+// 1) Reserve max loss at deal time (fast circuit breaker)
+db.expose_accumulator("casino", "app", "house_balance_cb", max_payout, hand_id.clone())
+    .await?;
+
+// 2) Apply actual outcome and release full reservation at settle time
+db.accumulate_with_release(
+    "casino",
+    "app",
+    "house_balance_cb",
+    actual_result,
+    hand_id.clone(), // dedupe key
+    settle_seq,
+    Some(hand_id),   // release exposure id
+)
+.await?;
+```
+
+For bursty deal traffic, use atomic batch reserve:
+
+```rust
+db.expose_accumulator_many_atomic(
+    "casino",
+    "app",
+    "house_balance_cb",
+    vec![
+        (500, "hand-101".to_string()),
+        (750, "hand-102".to_string()),
+        (300, "hand-103".to_string()),
+    ],
+)
+.await?;
 ```
 
 For event processors, prefer watermark-batched checkpoint ACKs to reduce write load:
@@ -328,9 +349,11 @@ When handler retries are exhausted, AEDB writes failed events to the durable
 `_system.app.reactive_processor_dead_letters` table and advances checkpoint so
 poison batches do not stall ingestion.
 
-Secure mode/authenticated flows can use `kv_set_as`, `kv_mutate_u64_as`,
-`kv_compare_and_add_u64_as`, `kv_compare_and_sub_u64_as`, `kv_compare_and_set_u64_as`,
-and `ack_reactive_processor_checkpoint_batched_as`.
+Secure mode/authenticated flows can use `create_accumulator_as`, `accumulate_as`,
+`accumulator_value_as`, `accumulator_value_strong_as`, `accumulator_lag_as`,
+`expose_accumulator_as`, `accumulate_with_release_as`, `accumulator_exposure_as`,
+`accumulator_available_as`, `accumulator_exposure_metrics_as`,
+`expose_accumulator_many_atomic_as`, and `ack_reactive_processor_checkpoint_batched_as`.
 
 Arcana-oriented engine interface primitives (effect batches, keyed-state helpers,
 processor pull/commit/context) are also exposed under `aedb::engine_interface`
@@ -389,44 +412,6 @@ Low-latency profile example:
 use aedb::config::AedbConfig;
 
 let config = AedbConfig::low_latency([7u8; 32]);
-let db = aedb::AedbInstance::open(config, dir.path())?;
-```
-
-### Storage mode
-
-`AedbConfig::default()` uses `StorageMode::DiskBacked`. KV values larger than
-`persistent_value_inline_threshold_bytes` are written to the append-only
-`values.aedbdat` file and read back through the snapshot APIs. Production and
-secure profiles set that threshold to `0`, so every non-empty KV payload is
-disk-backed by default. Smaller values can remain inline in non-production
-profiles for compact metadata and counters, but when the keyspace approaches
-`max_memory_estimate_bytes`, AEDB spills least-recently-updated inline KV payloads
-to the same value store before rejecting writes for memory pressure. Recently
-accessed spilled values are also kept in a bounded hot cache controlled by
-`persistent_value_hot_cache_bytes`, so the active working set stays in memory
-without requiring cold values to live there.
-
-This mode supports KV payload sets larger than memory. It is not yet a
-general-purpose larger-than-memory table/index engine: KV keys, entry metadata,
-table rows, secondary indexes, async projections, accumulators, snapshots, and
-version metadata remain memory-resident and are protected by
-`max_memory_estimate_bytes`. The storage layer now also includes a checksummed
-`PagedStore` with a bounded page cache; that is the foundation for moving table
-rows, KV keys, and index pages onto disk in the hybrid storage roadmap.
-`operational_metrics()` reports `persistent_value_store_bytes`,
-`persistent_value_hot_cache_bytes`, and
-`persistent_value_hot_cache_capacity_bytes` so operators can watch disk growth and
-cache residency.
-
-```rust
-use aedb::config::{AedbConfig, StorageMode};
-
-let config = AedbConfig {
-    storage_mode: StorageMode::DiskBacked,
-    persistent_value_inline_threshold_bytes: 0,
-    persistent_value_hot_cache_bytes: 64 * 1024 * 1024,
-    ..AedbConfig::default()
-};
 let db = aedb::AedbInstance::open(config, dir.path())?;
 ```
 

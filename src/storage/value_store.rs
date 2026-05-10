@@ -1,6 +1,6 @@
 use crate::error::AedbError;
 use memmap2::{Mmap, MmapOptions};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const VALUE_STORE_FILE: &str = "values.aedbdat";
 const VALUE_STORE_MAGIC: &[u8; 8] = b"AEDBVAL1";
+const VALUE_STORE_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PersistentValueRef {
@@ -23,7 +24,8 @@ pub struct PersistentValueRef {
 pub struct PersistentValueStore {
     path: PathBuf,
     file: Mutex<File>,
-    mmap: Mutex<Mmap>,
+    mmap: RwLock<Mmap>,
+    hot_cache_capacity_bytes: usize,
     hot_cache: Mutex<HotValueCache>,
     len: AtomicU64,
     dirty: AtomicBool,
@@ -75,7 +77,8 @@ impl PersistentValueStore {
         Ok(Self {
             path,
             file: Mutex::new(file),
-            mmap: Mutex::new(mmap),
+            mmap: RwLock::new(mmap),
+            hot_cache_capacity_bytes,
             hot_cache: Mutex::new(HotValueCache::new(hot_cache_capacity_bytes)),
             len: AtomicU64::new(file_len),
             dirty: AtomicBool::new(false),
@@ -98,44 +101,66 @@ impl PersistentValueStore {
         self.append_many_cold_slices(&value_slices)
     }
 
+    pub fn append_many_hot_slices(
+        &self,
+        values: &[&[u8]],
+    ) -> Result<Vec<PersistentValueRef>, AedbError> {
+        self.append_many_slices_with_cache_policy(values, true)
+    }
+
     pub fn append_many_cold_slices(
         &self,
         values: &[&[u8]],
+    ) -> Result<Vec<PersistentValueRef>, AedbError> {
+        self.append_many_slices_with_cache_policy(values, false)
+    }
+
+    fn append_many_slices_with_cache_policy(
+        &self,
+        values: &[&[u8]],
+        populate_hot_cache: bool,
     ) -> Result<Vec<PersistentValueRef>, AedbError> {
         if values.is_empty() {
             return Ok(Vec::new());
         }
 
-        let value_metadata: Vec<([u8; 32], u64)> = values
-            .iter()
-            .map(|value| (*blake3::hash(value).as_bytes(), value.len() as u64))
-            .collect();
-        let append_start_offset = {
+        let (refs, next_file_len) = {
             let mut file = self.file.lock();
             let append_start_offset = file.seek(SeekFrom::End(0))?;
+            let write_buf_capacity = VALUE_STORE_WRITE_BUFFER_BYTES.min(
+                values
+                    .iter()
+                    .fold(0usize, |total, value| total.saturating_add(value.len())),
+            );
+            let mut write_buf = Vec::with_capacity(write_buf_capacity);
+            let mut refs = Vec::with_capacity(values.len());
+            let mut value_offset = append_start_offset;
             for value in values {
-                file.write_all(value)?;
+                let value_byte_count = value.len() as u64;
+                refs.push(PersistentValueRef {
+                    offset: value_offset,
+                    len: value_byte_count,
+                    blake3_hash: *blake3::hash(value).as_bytes(),
+                });
+                append_value_to_writer(&mut *file, &mut write_buf, value)?;
+                value_offset = value_offset.checked_add(value_byte_count).ok_or_else(|| {
+                    AedbError::IntegrityError {
+                        message: "persistent value store append offset overflows".into(),
+                    }
+                })?;
             }
+            flush_write_buffer(&mut *file, &mut write_buf)?;
             file.flush()?;
-            append_start_offset
+            (refs, value_offset)
         };
 
-        let mut value_offset = append_start_offset;
-        let mut refs = Vec::with_capacity(values.len());
-        for (blake3_hash, len) in value_metadata {
-            refs.push(PersistentValueRef {
-                offset: value_offset,
-                len,
-                blake3_hash,
-            });
-            value_offset =
-                value_offset
-                    .checked_add(len)
-                    .ok_or_else(|| AedbError::IntegrityError {
-                        message: "persistent value store append offset overflows".into(),
-                    })?;
+        self.len.store(next_file_len, Ordering::Release);
+        if populate_hot_cache && self.hot_cache_capacity_bytes > 0 {
+            let mut hot_cache = self.hot_cache.lock();
+            for (value_ref, value) in refs.iter().zip(values.iter()) {
+                hot_cache.insert(value_ref.clone(), value);
+            }
         }
-        self.len.store(value_offset, Ordering::Release);
         self.dirty.store(true, Ordering::Release);
         Ok(refs)
     }
@@ -162,7 +187,7 @@ impl PersistentValueStore {
             len: value.len() as u64,
             blake3_hash,
         };
-        if populate_hot_cache {
+        if populate_hot_cache && self.hot_cache_capacity_bytes > 0 {
             self.hot_cache.lock().insert(value_ref.clone(), value);
         }
         self.dirty.store(true, Ordering::Release);
@@ -170,8 +195,10 @@ impl PersistentValueStore {
     }
 
     pub fn read(&self, value_ref: &PersistentValueRef) -> Result<Vec<u8>, AedbError> {
-        if let Some(value) = { self.hot_cache.lock().get(value_ref) } {
-            return Ok(value.as_ref().to_vec());
+        if self.hot_cache_capacity_bytes > 0 {
+            if let Some(value) = { self.hot_cache.lock().get(value_ref) } {
+                return Ok(value.as_ref().to_vec());
+            }
         }
 
         let end = value_ref.offset.checked_add(value_ref.len).ok_or_else(|| {
@@ -187,17 +214,18 @@ impl PersistentValueStore {
             });
         }
 
-        let value = {
-            let mut mmap = self.mmap.lock();
-            let start =
-                usize::try_from(value_ref.offset).map_err(|_| AedbError::IntegrityError {
-                    message: "persistent value offset does not fit usize".into(),
-                })?;
-            let end = usize::try_from(end).map_err(|_| AedbError::IntegrityError {
-                message: "persistent value end offset does not fit usize".into(),
-            })?;
+        let start = usize::try_from(value_ref.offset).map_err(|_| AedbError::IntegrityError {
+            message: "persistent value offset does not fit usize".into(),
+        })?;
+        let end = usize::try_from(end).map_err(|_| AedbError::IntegrityError {
+            message: "persistent value end offset does not fit usize".into(),
+        })?;
+        let value = if let Some(value) = self.try_read_mapped_value(start, end)? {
+            value
+        } else {
+            let file = self.file.lock();
+            let mut mmap = self.mmap.write();
             if end > mmap.len() {
-                let file = self.file.lock();
                 *mmap = map_file(&file)?;
             }
             let Some(bytes) = mmap.get(start..end) else {
@@ -213,7 +241,9 @@ impl PersistentValueStore {
                 message: "persistent value hash mismatch".into(),
             });
         }
-        self.hot_cache.lock().insert(value_ref.clone(), &value);
+        if self.hot_cache_capacity_bytes > 0 {
+            self.hot_cache.lock().insert(value_ref.clone(), &value);
+        }
         Ok(value)
     }
 
@@ -239,8 +269,50 @@ impl PersistentValueStore {
     }
 
     pub fn hot_cache_capacity_bytes(&self) -> usize {
-        self.hot_cache.lock().capacity_bytes()
+        self.hot_cache_capacity_bytes
     }
+
+    fn try_read_mapped_value(
+        &self,
+        start: usize,
+        end: usize,
+    ) -> Result<Option<Vec<u8>>, AedbError> {
+        let mmap = self.mmap.read();
+        if end > mmap.len() {
+            return Ok(None);
+        }
+        let Some(bytes) = mmap.get(start..end) else {
+            return Err(AedbError::IntegrityError {
+                message: "persistent value reference outside mapped value store".into(),
+            });
+        };
+        Ok(Some(bytes.to_vec()))
+    }
+}
+
+fn append_value_to_writer<W: Write>(
+    writer: &mut W,
+    write_buf: &mut Vec<u8>,
+    value: &[u8],
+) -> Result<(), AedbError> {
+    if value.len() > VALUE_STORE_WRITE_BUFFER_BYTES {
+        flush_write_buffer(writer, write_buf)?;
+        writer.write_all(value)?;
+        return Ok(());
+    }
+    if write_buf.len() + value.len() > VALUE_STORE_WRITE_BUFFER_BYTES {
+        flush_write_buffer(writer, write_buf)?;
+    }
+    write_buf.extend_from_slice(value);
+    Ok(())
+}
+
+fn flush_write_buffer<W: Write>(writer: &mut W, write_buf: &mut Vec<u8>) -> Result<(), AedbError> {
+    if !write_buf.is_empty() {
+        writer.write_all(write_buf)?;
+        write_buf.clear();
+    }
+    Ok(())
 }
 
 fn map_file(file: &File) -> Result<Mmap, AedbError> {
@@ -273,10 +345,6 @@ impl HotValueCache {
             values: HashMap::new(),
             access_order: BTreeMap::new(),
         }
-    }
-
-    fn capacity_bytes(&self) -> usize {
-        self.capacity_bytes
     }
 
     fn resident_bytes(&self) -> usize {
@@ -362,7 +430,7 @@ mod tests {
             !cache.values.contains_key(&second),
             "least recently used value should be cold"
         );
-        assert!(cache.resident_bytes() <= cache.capacity_bytes());
+        assert!(cache.resident_bytes() <= cache.capacity_bytes);
     }
 
     #[test]
@@ -399,6 +467,66 @@ mod tests {
         for (value_ref, expected) in refs.iter().zip(values.iter()) {
             assert_eq!(store.read(value_ref).expect("read batch value"), *expected);
         }
+    }
+
+    #[test]
+    fn append_many_hot_writes_contiguous_values_and_populates_hot_cache() {
+        let dir = tempdir().expect("temp");
+        let store =
+            PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 128).expect("open store");
+        let values = [
+            b"batch-one".as_slice(),
+            b"batch-two-longer".as_slice(),
+            b"batch-three".as_slice(),
+        ];
+
+        let refs = store.append_many_hot_slices(&values).expect("append batch");
+
+        assert_eq!(refs.len(), values.len());
+        assert_eq!(refs[0].offset, super::VALUE_STORE_MAGIC.len() as u64);
+        for pair in refs.windows(2) {
+            assert_eq!(pair[0].offset + pair[0].len, pair[1].offset);
+        }
+        assert!(store.hot_cache_resident_bytes() > 0);
+        for value_ref in &refs {
+            assert!(
+                store.hot_cache.lock().values.contains_key(value_ref),
+                "hot batch append should cache each written value"
+            );
+        }
+        for (value_ref, expected) in refs.iter().zip(values.iter()) {
+            assert_eq!(store.read(value_ref).expect("read batch value"), *expected);
+        }
+    }
+
+    #[test]
+    fn concurrent_cold_reads_share_mapped_file_without_hot_cache() {
+        let dir = tempdir().expect("temp");
+        let store = std::sync::Arc::new(
+            PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 0).expect("open store"),
+        );
+        let values = (0..64u8)
+            .map(|i| vec![i; 513 + usize::from(i % 23)])
+            .collect::<Vec<_>>();
+        let refs = store.append_many_cold(&values).expect("append batch");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = std::sync::Arc::clone(&store);
+            let refs = refs.clone();
+            let values = values.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..16 {
+                    for (value_ref, expected) in refs.iter().zip(values.iter()) {
+                        assert_eq!(store.read(value_ref).expect("read value"), *expected);
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("join");
+        }
+        assert_eq!(store.hot_cache_resident_bytes(), 0);
     }
 
     #[test]

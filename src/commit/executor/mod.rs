@@ -64,6 +64,8 @@ struct CommitRequest {
     enqueue_micros: u64,
     prevalidated: bool,
     assertions_engine_verified: bool,
+    has_read_set: bool,
+    has_assertions: bool,
     write_partitions: HashSet<String>,
     read_partitions: HashSet<String>,
     defer_count: u8,
@@ -132,8 +134,8 @@ fn estimate_row_size_upper_bound(row: &Row) -> usize {
     estimate_values_size_upper_bound(&row.values)
 }
 
-const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 384;
-const MUTATION_OVERHEAD_UPPER_BOUND: usize = 192;
+pub(crate) const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 384;
+pub(crate) const MUTATION_OVERHEAD_UPPER_BOUND: usize = 192;
 
 fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
     match mutation {
@@ -959,6 +961,10 @@ impl CommitExecutor {
                             } else {
                                 derive_write_partitions(&req.envelope.write_intent.mutations)
                             }
+                        } else if let Some(partitions) =
+                            direct_write_partition_tokens(&req.envelope.write_intent.mutations)
+                        {
+                            partitions
                         } else {
                             derive_write_partitions(&req.envelope.write_intent.mutations)
                         };
@@ -1194,6 +1200,15 @@ impl CommitExecutor {
         self.submit_envelope_with_mode(envelope, false, false).await
     }
 
+    pub(crate) async fn submit_envelope_with_size_hint(
+        &self,
+        envelope: TransactionEnvelope,
+        encoded_size_hint: Option<usize>,
+    ) -> Result<CommitResult, AedbError> {
+        self.submit_envelope_with_mode_size_hint(envelope, false, false, encoded_size_hint)
+            .await
+    }
+
     pub(crate) async fn submit_envelope_prevalidated(
         &self,
         envelope: TransactionEnvelope,
@@ -1308,15 +1323,20 @@ impl CommitExecutor {
         let ingress_tx = self
             .ingress_txs
             .get(shard)
-            .ok_or_else(|| AedbError::Validation("no ingress shard available".into()))?
-            .clone();
+            .ok_or_else(|| AedbError::Validation("no ingress shard available".into()))?;
+        let mutation_count = envelope.write_intent.mutations.len();
+        let has_read_set =
+            !envelope.read_set.points.is_empty() || !envelope.read_set.ranges.is_empty();
+        let has_assertions = !envelope.assertions.is_empty();
         let request = CommitRequest {
-            mutation_count: envelope.write_intent.mutations.len(),
+            mutation_count,
             envelope,
             encoded_len: encoded_size_bytes,
             enqueue_micros: now_micros(),
             prevalidated,
             assertions_engine_verified,
+            has_read_set,
+            has_assertions,
             write_partitions: HashSet::new(),
             read_partitions: HashSet::new(),
             defer_count: 0,

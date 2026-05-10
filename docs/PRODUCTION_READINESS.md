@@ -12,17 +12,7 @@ Passing everything here is necessary before production rollout. It is not suffic
 - Keep strict recovery enabled.
 - Keep hash-chain enforcement enabled.
 - Configure a manifest HMAC key.
-- Keep `StorageMode::DiskBacked` enabled.
-- Keep `persistent_value_inline_threshold_bytes = 0` in production/secure profiles so all non-empty KV payloads live in the append-only value store.
 - Prefer checkpoint encryption via `with_checkpoint_key([u8; 32])` for production deployments.
-
-## Storage Boundary
-
-AEDB production profiles are disk-backed for WAL/checkpoint durability and KV payload storage. This supports KV payload sets larger than memory when the hot working set fits the configured cache and the in-memory metadata stays below `max_memory_estimate_bytes`.
-
-AEDB is not yet a general larger-than-memory table/index engine. KV keys, entry metadata, table rows, secondary indexes, async projections, accumulators, snapshots, and version metadata are memory-resident. Production deployments must size `max_memory_estimate_bytes` for that metadata/row/index working set; commits that still exceed the ceiling after KV payload spill are rejected before WAL append.
-
-See [HYBRID_STORAGE_ROADMAP.md](HYBRID_STORAGE_ROADMAP.md) for the disk-authoritative storage roadmap. This PR introduces the paged storage primitive that future disk-backed row and index structures will use.
 
 ## Mandatory Repo Gates
 

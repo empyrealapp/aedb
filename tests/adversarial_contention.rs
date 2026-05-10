@@ -4,6 +4,7 @@ use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::tx::{ReadAssertion, TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::Mutation;
+use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use aedb::error::AedbError;
 use aedb::query::plan::{ConsistencyMode, Expr, Query};
 use std::sync::Arc;
@@ -23,6 +24,17 @@ fn u256_from_be(bytes: &[u8; 32]) -> u64 {
     u64::from_be_bytes(out)
 }
 
+fn contention_config() -> AedbConfig {
+    AedbConfig {
+        durability_mode: DurabilityMode::Batch,
+        batch_interval_ms: 60_000,
+        batch_max_bytes: usize::MAX,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        ..AedbConfig::default()
+    }
+}
+
 /// Test Case 1: Single-Row Thundering Herd (Hot Account)
 ///
 /// Stress-tests lock contention on a single hot partition.
@@ -30,7 +42,7 @@ fn u256_from_be(bytes: &[u8; 32]) -> u64 {
 #[tokio::test]
 async fn test_single_row_thundering_herd() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -167,7 +179,7 @@ async fn test_single_row_thundering_herd() {
 #[tokio::test]
 async fn test_cross_partition_deadlock_prevention() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     // Setup: Create 4 tables in same scope (to test partition locking)
@@ -294,7 +306,7 @@ async fn test_cross_partition_deadlock_prevention() {
 #[tokio::test]
 async fn test_read_set_conflict_under_write_load() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -414,7 +426,7 @@ async fn test_read_set_conflict_under_write_load() {
 #[tokio::test]
 async fn test_high_concurrency_stress() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {

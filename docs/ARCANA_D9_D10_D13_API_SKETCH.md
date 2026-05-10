@@ -210,10 +210,9 @@ In Arcana effect processor:
 - stop pre-reading and calculating next numeric values in shadow maps for common u256 ops
 - emit `KvAddU256Ex`/`KvSubU256Ex`/`KvMaxU256`/`KvMinU256` directly
 
-## 3) Use KV/table integer state for shared numeric keys
-For house-balance style keys, use the same numeric KV mutation family as other
-balances and counters. Keep the value in one place, and wrap related metadata/table
-writes in the same action envelope when they must commit atomically.
+## 3) Keep accumulators for hot shared keys
+For house-balance style contention keys, keep accumulator mutations as primary path.
+For isolated per-user keys, numeric KV mutations provide low-overhead direct updates.
 
 ## Acceptance tests (AEDB)
 - `action_envelope_applied_once`: single envelope applies all writes atomically.

@@ -1,8 +1,14 @@
 use aedb::AedbInstance;
-use aedb::backup::{load_backup_manifest, sha256_file_hex, write_backup_manifest};
-use aedb::commit::validation::Mutation;
+use aedb::backup::{
+    load_backup_manifest, sha256_file_hex, verify_backup_files, write_backup_manifest,
+};
+use aedb::catalog::DdlOperation;
+use aedb::catalog::schema::ColumnDef;
+use aedb::catalog::types::{ColumnType, Row, Value};
+use aedb::commit::tx::{TransactionEnvelope, WriteClass, WriteIntent};
+use aedb::commit::validation::{KvU64MissingPolicy, KvU64OverflowPolicy, Mutation};
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
-use aedb::query::plan::ConsistencyMode;
+use aedb::query::plan::{ConsistencyMode, Query};
 use aedb::recovery::recover_with_config;
 use aedb::wal::frame::{FrameError, FrameReader};
 use aedb::wal::segment::SEGMENT_HEADER_SIZE;
@@ -12,6 +18,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tempfile::tempdir;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, timeout};
 
 type CommitLog = Arc<tokio::sync::Mutex<Vec<(u64, Vec<u8>)>>>;
@@ -36,6 +43,57 @@ fn strict_backup_chain_config() -> AedbConfig {
     cfg.batch_interval_ms = 60_000;
     cfg.batch_max_bytes = usize::MAX;
     cfg
+}
+
+fn production_e2e_config() -> AedbConfig {
+    let mut cfg = AedbConfig::production([73u8; 32]).with_checkpoint_key([91u8; 32]);
+    cfg.max_segment_bytes = 32 * 1024;
+    cfg.persistent_value_hot_cache_bytes = 64 * 1024;
+    cfg.max_kv_value_bytes = 128 * 1024;
+    cfg.max_transaction_bytes = 512 * 1024;
+    cfg.max_inflight_commits = 128;
+    cfg.epoch_max_commits = 32;
+    cfg.parallel_worker_threads = 4;
+    cfg
+}
+
+fn e2e_blob(worker_id: usize, op_id: usize) -> Vec<u8> {
+    let mut blob = vec![u8::try_from((worker_id * 31 + op_id) % 251).unwrap(); 4096];
+    blob[..8].copy_from_slice(&(worker_id as u64).to_be_bytes());
+    blob[8..16].copy_from_slice(&(op_id as u64).to_be_bytes());
+    blob
+}
+
+async fn assert_parallel_e2e_state(db: &AedbInstance, expected_rows: usize) {
+    let counter = db
+        .kv_get_no_auth("p", "app", b"total", ConsistencyMode::AtLatest)
+        .await
+        .expect("get total")
+        .expect("total present");
+    let counter_value = u64::from_be_bytes(counter.value.try_into().expect("u64 counter encoding"));
+    assert_eq!(counter_value, expected_rows as u64);
+
+    let rows = db
+        .query(
+            "p",
+            "app",
+            Query::select(&["id"])
+                .from("events")
+                .limit(expected_rows + 1),
+        )
+        .await
+        .expect("query events");
+    assert_eq!(rows.rows.len(), expected_rows);
+
+    for (worker_id, op_id) in [(0usize, 0usize), (1, 7), (3, 11)] {
+        let key = format!("blob:{worker_id}:{op_id}");
+        let value = db
+            .kv_get_no_auth("p", "app", key.as_bytes(), ConsistencyMode::AtLatest)
+            .await
+            .expect("get blob")
+            .expect("blob present");
+        assert_eq!(value.value, e2e_blob(worker_id, op_id));
+    }
 }
 
 fn read_wal_frame_seq_times(backup_dir: &Path) -> Vec<(u64, u64)> {
@@ -234,6 +292,7 @@ async fn full_backup_of_disk_backed_values_is_self_contained() {
 
     let backup = db.backup_full(backup_dir.path()).await.expect("backup");
     assert_eq!(backup.wal_head_seq, backup.checkpoint_seq);
+    verify_backup_files(backup_dir.path(), &backup).expect("backup manifest verifies");
     assert!(
         !backup_dir.path().join("values.aedbdat").exists(),
         "backup must be self-contained in checkpoint/WAL artifacts, not sidecar-dependent"
@@ -897,6 +956,167 @@ async fn single_file_encrypted_backup_roundtrip_and_wrong_key_fails() {
     )
     .expect_err("wrong key must fail");
     assert!(format!("{err}").contains("decryption failed"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_disk_backed_updates_checkpoint_and_encrypted_file_restore_are_consistent() {
+    const WORKERS: usize = 4;
+    const OPS_PER_WORKER: usize = 16;
+    const EXPECTED_ROWS: usize = WORKERS * OPS_PER_WORKER;
+
+    let live_dir = tempdir().expect("live dir");
+    let restore_dir = tempdir().expect("restore dir");
+    let backup_file_dir = tempdir().expect("backup file dir");
+    let backup_file = backup_file_dir.path().join("parallel_disk_backed.aedbarc");
+    let config = production_e2e_config();
+
+    let db = Arc::new(AedbInstance::open(config.clone(), live_dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "events".into(),
+        owner_id: None,
+        if_not_exists: false,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "worker".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "op".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "status".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("create events table");
+
+    let mut commits = JoinSet::new();
+    for worker_id in 0..WORKERS {
+        for op_id in 0..OPS_PER_WORKER {
+            let db = Arc::clone(&db);
+            commits.spawn(async move {
+                let row_id = (worker_id * 10_000 + op_id) as i64;
+                let base_seq = db
+                    .snapshot_probe(ConsistencyMode::AtLatest)
+                    .await
+                    .expect("snapshot probe");
+                db.commit_envelope(TransactionEnvelope {
+                    caller: None,
+                    idempotency_key: None,
+                    write_class: WriteClass::Standard,
+                    assertions: Vec::new(),
+                    read_set: Default::default(),
+                    write_intent: WriteIntent {
+                        mutations: vec![
+                            Mutation::KvAddU64Ex {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                key: b"total".to_vec(),
+                                amount_be: 1u64.to_be_bytes(),
+                                on_missing: KvU64MissingPolicy::TreatAsZero,
+                                on_overflow: KvU64OverflowPolicy::Reject,
+                            },
+                            Mutation::KvSet {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                key: format!("blob:{worker_id}:{op_id}").into_bytes(),
+                                value: e2e_blob(worker_id, op_id),
+                            },
+                            Mutation::Upsert {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                table_name: "events".into(),
+                                primary_key: vec![Value::Integer(row_id)],
+                                row: Row::from_values(vec![
+                                    Value::Integer(row_id),
+                                    Value::Integer(worker_id as i64),
+                                    Value::Integer(op_id as i64),
+                                    Value::Text("committed".into()),
+                                ]),
+                            },
+                        ],
+                    },
+                    base_seq,
+                })
+                .await
+            });
+        }
+    }
+
+    let checkpoint_db = Arc::clone(&db);
+    let checkpoint = tokio::spawn(async move { checkpoint_db.checkpoint_now().await });
+
+    let mut commit_seqs = Vec::with_capacity(EXPECTED_ROWS);
+    while let Some(result) = commits.join_next().await {
+        let committed = result.expect("commit task panicked").expect("commit");
+        commit_seqs.push(committed.commit_seq);
+    }
+    assert_eq!(commit_seqs.len(), EXPECTED_ROWS);
+    commit_seqs.sort_unstable();
+    commit_seqs.dedup();
+    assert_eq!(
+        commit_seqs.len(),
+        EXPECTED_ROWS,
+        "parallel commits must get unique monotonic sequence numbers"
+    );
+    checkpoint
+        .await
+        .expect("checkpoint task panicked")
+        .expect("concurrent checkpoint");
+
+    assert_parallel_e2e_state(&db, EXPECTED_ROWS).await;
+    let metrics = db.operational_metrics().await;
+    assert!(
+        metrics.persistent_value_store_bytes >= (EXPECTED_ROWS * 4096) as u64,
+        "disk-backed value store should carry the committed payloads"
+    );
+    assert!(
+        db.estimated_memory_bytes().await < EXPECTED_ROWS * 4096,
+        "spilled payload bytes should not be counted as inline keyspace memory"
+    );
+    assert!(
+        fs::metadata(live_dir.path().join("values.aedbdat"))
+            .expect("value store metadata")
+            .len()
+            >= (EXPECTED_ROWS * 4096) as u64,
+        "value store file should contain the committed payloads"
+    );
+
+    db.checkpoint_now().await.expect("final checkpoint");
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    let reopened = AedbInstance::open(config.clone(), live_dir.path()).expect("reopen");
+    assert_parallel_e2e_state(&reopened, EXPECTED_ROWS).await;
+    let backup = reopened
+        .backup_full_to_file(&backup_file)
+        .await
+        .expect("backup file");
+    reopened.shutdown().await.expect("shutdown reopened");
+
+    let restored_seq =
+        AedbInstance::restore_from_backup_file(&backup_file, restore_dir.path(), &config)
+            .expect("restore file");
+    assert_eq!(restored_seq, backup.wal_head_seq);
+
+    let restored = AedbInstance::open(config, restore_dir.path()).expect("open restored");
+    assert_parallel_e2e_state(&restored, EXPECTED_ROWS).await;
+    restored.shutdown().await.expect("shutdown restored");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

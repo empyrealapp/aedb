@@ -23,7 +23,7 @@ use aggregate::{aggregate_col_idx, aggregate_output_name};
 use cursor::{
     CursorToken, decode_cursor, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor,
 };
-use indexing::{indexed_pks_for_predicate, indexed_pks_for_predicate_with_trace};
+use indexing::{indexed_pks_for_predicate_limited, indexed_pks_for_predicate_with_trace};
 use predicate::extract_primary_key_values;
 use validate::validate_query;
 
@@ -297,14 +297,25 @@ pub fn execute_query_with_options(
             let rows: Vec<Row> = projection.rows.values().cloned().collect();
             Box::new(rows.into_iter())
         } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
-            let indexed_pks = indexed_pks_for_predicate(
+            let candidate_limit = if cursor_state.is_none()
+                && query.order_by.is_empty()
+                && query.aggregates.is_empty()
+                && query.having.is_none()
+            {
+                Some(effective_page_size.saturating_add(1))
+            } else {
+                None
+            };
+            let indexed_pks = indexed_pks_for_predicate_limited(
                 catalog,
                 project_id,
                 scope_id,
                 &query.table,
                 table,
                 predicate,
-            )?;
+                candidate_limit,
+            )?
+            .map(|result| result.pks);
             match indexed_pks {
                 Some(pks) => {
                     estimated_rows = pks.len();
