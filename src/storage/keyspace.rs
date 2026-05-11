@@ -621,10 +621,6 @@ impl Keyspace {
             })
     }
 
-    pub fn namespace(&self, namespace_id: &NamespaceId) -> Option<&Namespace> {
-        self.namespaces.get(namespace_id)
-    }
-
     pub fn table_mut(
         &mut self,
         project_id: &str,
@@ -646,6 +642,43 @@ impl Keyspace {
             .tables
             .entry(table_name.to_string())
             .or_default()
+    }
+
+    pub fn namespace(&self, namespace_id: &NamespaceId) -> Option<&Namespace> {
+        self.namespaces.get(namespace_id)
+    }
+
+    pub fn kv_set_inline(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        commit_seq: u64,
+    ) {
+        let kv = self.kv_data_mut(project_id, scope_id);
+        let (created_at, old_cost) = match kv.entries.get(&key) {
+            Some(entry) => (
+                entry.created_at,
+                kv_entry_cost(key.len(), entry.value.len()),
+            ),
+            None => {
+                kv.structural_version = commit_seq;
+                (commit_seq, 0)
+            }
+        };
+        let entry = KvEntry {
+            value,
+            version: commit_seq,
+            created_at,
+            value_ref: None,
+        };
+        let new_cost = kv_entry_cost(key.len(), entry.value.len());
+        kv.entries.insert(key, entry);
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost)
+            .saturating_sub(old_cost);
     }
 
     pub fn table_by_namespace_key(&self, namespace: &str, table_name: &str) -> Option<&TableData> {
@@ -1449,6 +1482,47 @@ impl Keyspace {
         {
             let kv = self.kv_data_mut(project_id, scope_id);
             for (key, value) in entries {
+                let (created_at, old_cost) = match kv.entries.get(key) {
+                    Some(entry) => (
+                        entry.created_at,
+                        kv_entry_cost(key.len(), entry.value.len()),
+                    ),
+                    None => {
+                        kv.structural_version = commit_seq;
+                        (commit_seq, 0)
+                    }
+                };
+                let entry = KvEntry {
+                    value: value.clone(),
+                    version: commit_seq,
+                    created_at,
+                    value_ref: None,
+                };
+                new_cost_total =
+                    new_cost_total.saturating_add(kv_entry_cost(key.len(), entry.value.len()));
+                old_cost_total = old_cost_total.saturating_add(old_cost);
+                kv.entries.insert(key.clone(), entry);
+            }
+        }
+        self.mem_bytes = self
+            .mem_bytes
+            .saturating_add(new_cost_total)
+            .saturating_sub(old_cost_total);
+    }
+
+    pub fn kv_set_many_inline_same_namespace_with_seq<'a, I>(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        entries: I,
+    ) where
+        I: IntoIterator<Item = (&'a Vec<u8>, &'a Vec<u8>, u64)>,
+    {
+        let mut new_cost_total = 0usize;
+        let mut old_cost_total = 0usize;
+        {
+            let kv = self.kv_data_mut(project_id, scope_id);
+            for (key, value, commit_seq) in entries {
                 let (created_at, old_cost) = match kv.entries.get(key) {
                     Some(entry) => (
                         entry.created_at,

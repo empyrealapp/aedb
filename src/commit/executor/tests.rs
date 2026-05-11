@@ -75,6 +75,7 @@ fn request_with_mutations(mutations: Vec<Mutation>) -> CommitRequest {
         enqueue_micros: 0,
         prevalidated: false,
         assertions_engine_verified: false,
+        kv_sizes_prechecked: false,
         has_read_set: false,
         has_assertions: false,
         write_partitions,
@@ -109,6 +110,7 @@ fn request_with_assertions_and_mutations(
         enqueue_micros: 0,
         prevalidated: false,
         assertions_engine_verified: false,
+        kv_sizes_prechecked: false,
         has_read_set: false,
         has_assertions,
         write_partitions,
@@ -168,9 +170,13 @@ fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
         base_seq: 0,
     };
 
-    let (write_partitions, read_partitions) =
-        super::pre_stage_validate(&validation_catalog, &envelope, &AedbConfig::default())
-            .expect("prestage validate");
+    let (write_partitions, read_partitions) = super::pre_stage_validate(
+        &validation_catalog,
+        &envelope,
+        &AedbConfig::default(),
+        false,
+    )
+    .expect("prestage validate");
 
     assert!(read_partitions.is_empty());
     assert!(
@@ -227,9 +233,13 @@ fn prestage_kv_fast_path_preserves_explicit_read_set_dependencies() {
         base_seq: 0,
     };
 
-    let (_write_partitions, read_partitions) =
-        super::pre_stage_validate(&validation_catalog, &envelope, &AedbConfig::default())
-            .expect("prestage validate");
+    let (_write_partitions, read_partitions) = super::pre_stage_validate(
+        &validation_catalog,
+        &envelope,
+        &AedbConfig::default(),
+        false,
+    )
+    .expect("prestage validate");
 
     assert!(
         read_partitions
@@ -1054,6 +1064,77 @@ async fn single_request_epoch_applies_inline_without_parallel_worker_roundtrip()
 }
 
 #[tokio::test]
+async fn multi_kv_set_epoch_applies_inline_without_parallel_worker_roundtrip() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+
+    let req_a = request_with_mutations(vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"batch:a".to_vec(),
+            value: b"a".to_vec(),
+        },
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"batch:b".to_vec(),
+            value: b"b".to_vec(),
+        },
+    ]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"batch:c".to_vec(),
+        value: b"c".to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert_eq!(epoch.parallel_apply_micros, 0);
+    assert!(epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()));
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"batch:a")
+            .map(|entry| entry.value),
+        Some(b"a".to_vec())
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"batch:b")
+            .map(|entry| entry.value),
+        Some(b"b".to_vec())
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"batch:c")
+            .map(|entry| entry.value),
+        Some(b"c".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn same_table_different_rows_can_merge_after_parallel_apply() {
     let dir = tempdir().expect("temp");
     let exec = CommitExecutor::with_state(
@@ -1325,6 +1406,7 @@ fn assertion_read_dependency_conflicts_with_write_token_in_epoch_selection() {
         enqueue_micros: 0,
         prevalidated: false,
         assertions_engine_verified: false,
+        kv_sizes_prechecked: false,
         has_read_set: true,
         has_assertions: false,
         write_partitions,

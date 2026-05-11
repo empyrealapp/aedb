@@ -64,6 +64,7 @@ struct CommitRequest {
     enqueue_micros: u64,
     prevalidated: bool,
     assertions_engine_verified: bool,
+    kv_sizes_prechecked: bool,
     has_read_set: bool,
     has_assertions: bool,
     write_partitions: HashSet<String>,
@@ -817,6 +818,16 @@ impl CommitExecutor {
                     loop_durable_notify.notify_waiters();
                 }
 
+                let completion_micros = now_micros();
+                let mut total_latency_micros = 0u64;
+                let mut completed_count = 0usize;
+                let mut completed_encoded_bytes = 0usize;
+                let mut commit_errors = 0u64;
+                let mut permission_rejections = 0u64;
+                let mut validation_rejections = 0u64;
+                let mut conflict_rejections = 0u64;
+                let mut coordinator_lock_timeouts = 0u64;
+                let mut parallel_apply_timeouts = 0u64;
                 for outcome in outcomes {
                     if loop_post_apply_refresh_needed.load(Ordering::Acquire)
                         && let Some(delta) = outcome.post_apply_delta
@@ -828,7 +839,7 @@ impl CommitExecutor {
                         }
                     }
                     let elapsed_micros =
-                        now_micros().saturating_sub(outcome.request.enqueue_micros);
+                        completion_micros.saturating_sub(outcome.request.enqueue_micros);
                     let elapsed_ms = elapsed_micros / 1_000;
                     if should_log_commit_phase(elapsed_ms) {
                         let queue_wait_micros = elapsed_micros.saturating_sub(epoch_elapsed_micros);
@@ -862,48 +873,77 @@ impl CommitExecutor {
                             "aedb commit phase timing"
                         );
                     }
-                    loop_telemetry
-                        .total_latency_micros
-                        .fetch_add(elapsed_micros, Ordering::Relaxed);
-                    loop_telemetry.commits_total.fetch_add(1, Ordering::Relaxed);
+                    total_latency_micros = total_latency_micros.saturating_add(elapsed_micros);
+                    completed_count = completed_count.saturating_add(1);
+                    completed_encoded_bytes =
+                        completed_encoded_bytes.saturating_add(outcome.request.encoded_len);
                     if outcome.result.is_err() {
-                        loop_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
+                        commit_errors = commit_errors.saturating_add(1);
                         if let Err(err) = &outcome.result {
                             if is_permission_rejection_error(err) {
-                                loop_telemetry
-                                    .permission_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
+                                permission_rejections = permission_rejections.saturating_add(1);
                             }
                             if is_validation_rejection_error(err) {
-                                loop_telemetry
-                                    .validation_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
+                                validation_rejections = validation_rejections.saturating_add(1);
                             }
                             if is_conflict_rejection_error(err) {
-                                loop_telemetry
-                                    .conflict_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
+                                conflict_rejections = conflict_rejections.saturating_add(1);
                             }
                             if is_coordinator_timeout_error(err) {
-                                loop_telemetry
-                                    .coordinator_lock_timeouts
-                                    .fetch_add(1, Ordering::Relaxed);
+                                coordinator_lock_timeouts =
+                                    coordinator_lock_timeouts.saturating_add(1);
                             }
                             if is_parallel_apply_timeout_error(err) {
-                                loop_telemetry
-                                    .parallel_apply_timeouts
-                                    .fetch_add(1, Ordering::Relaxed);
+                                parallel_apply_timeouts = parallel_apply_timeouts.saturating_add(1);
                             }
                         }
                     }
-                    queue_counter.fetch_sub(outcome.request.encoded_len, Ordering::Relaxed);
+                    let _ = outcome.request.result_tx.send(outcome.result);
+                }
+                if completed_count > 0 {
+                    loop_telemetry
+                        .total_latency_micros
+                        .fetch_add(total_latency_micros, Ordering::Relaxed);
+                    loop_telemetry
+                        .commits_total
+                        .fetch_add(completed_count as u64, Ordering::Relaxed);
+                    queue_counter.fetch_sub(completed_encoded_bytes, Ordering::Relaxed);
                     loop_telemetry
                         .queued_commits
-                        .fetch_sub(1, Ordering::Relaxed);
+                        .fetch_sub(completed_count, Ordering::Relaxed);
                     loop_telemetry
                         .inflight_commits
-                        .fetch_sub(1, Ordering::Relaxed);
-                    let _ = outcome.request.result_tx.send(outcome.result);
+                        .fetch_sub(completed_count, Ordering::Relaxed);
+                    if commit_errors > 0 {
+                        loop_telemetry
+                            .commit_errors
+                            .fetch_add(commit_errors, Ordering::Relaxed);
+                    }
+                    if permission_rejections > 0 {
+                        loop_telemetry
+                            .permission_rejections
+                            .fetch_add(permission_rejections, Ordering::Relaxed);
+                    }
+                    if validation_rejections > 0 {
+                        loop_telemetry
+                            .validation_rejections
+                            .fetch_add(validation_rejections, Ordering::Relaxed);
+                    }
+                    if conflict_rejections > 0 {
+                        loop_telemetry
+                            .conflict_rejections
+                            .fetch_add(conflict_rejections, Ordering::Relaxed);
+                    }
+                    if coordinator_lock_timeouts > 0 {
+                        loop_telemetry
+                            .coordinator_lock_timeouts
+                            .fetch_add(coordinator_lock_timeouts, Ordering::Relaxed);
+                    }
+                    if parallel_apply_timeouts > 0 {
+                        loop_telemetry
+                            .parallel_apply_timeouts
+                            .fetch_add(parallel_apply_timeouts, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -975,6 +1015,7 @@ impl CommitExecutor {
                             &pre_validation_catalog,
                             &req.envelope,
                             pre_config.as_ref(),
+                            req.kv_sizes_prechecked,
                         );
                         prevalidate_elapsed_us =
                             Some(prevalidate_started.elapsed().as_micros() as u64);
@@ -1134,6 +1175,32 @@ impl CommitExecutor {
             },
             false,
             false,
+            false,
+            fast_size_hint,
+        )
+        .await
+    }
+
+    pub(crate) async fn submit_kv_sizes_prechecked(
+        &self,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        let fast_size_hint = estimate_single_mutation_size_upper_bound(&mutation);
+        self.submit_envelope_with_mode_size_hint(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![mutation],
+                },
+                base_seq: 0,
+            },
+            false,
+            false,
+            true,
             fast_size_hint,
         )
         .await
@@ -1157,6 +1224,7 @@ impl CommitExecutor {
                 base_seq: 0,
             },
             true,
+            false,
             false,
             fast_size_hint,
         )
@@ -1188,6 +1256,7 @@ impl CommitExecutor {
             },
             false,
             false,
+            false,
             fast_size_hint,
         )
         .await
@@ -1205,7 +1274,7 @@ impl CommitExecutor {
         envelope: TransactionEnvelope,
         encoded_size_hint: Option<usize>,
     ) -> Result<CommitResult, AedbError> {
-        self.submit_envelope_with_mode_size_hint(envelope, false, false, encoded_size_hint)
+        self.submit_envelope_with_mode_size_hint(envelope, false, false, false, encoded_size_hint)
             .await
     }
 
@@ -1261,6 +1330,7 @@ impl CommitExecutor {
             envelope,
             prevalidated,
             assertions_engine_verified,
+            false,
             encoded_size_hint,
         )
         .await
@@ -1271,6 +1341,7 @@ impl CommitExecutor {
         envelope: TransactionEnvelope,
         prevalidated: bool,
         assertions_engine_verified: bool,
+        kv_sizes_prechecked: bool,
         encoded_size_hint: Option<usize>,
     ) -> Result<CommitResult, AedbError> {
         let config = &self.config;
@@ -1335,6 +1406,7 @@ impl CommitExecutor {
             enqueue_micros: now_micros(),
             prevalidated,
             assertions_engine_verified,
+            kv_sizes_prechecked,
             has_read_set,
             has_assertions,
             write_partitions: HashSet::new(),

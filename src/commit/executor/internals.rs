@@ -467,9 +467,12 @@ pub(super) fn pre_stage_validate(
     validation_catalog: &Arc<RwLock<Catalog>>,
     envelope: &TransactionEnvelope,
     config: &AedbConfig,
+    kv_sizes_prechecked: bool,
 ) -> Result<(HashSet<String>, HashSet<String>), AedbError> {
     let catalog = validation_catalog.read();
-    if let Some(result) = pre_stage_validate_kv_only(&catalog, envelope, config) {
+    if let Some(result) =
+        pre_stage_validate_kv_only(&catalog, envelope, config, kv_sizes_prechecked)
+    {
         return result;
     }
     if !envelope.assertions.is_empty() {
@@ -503,6 +506,7 @@ fn pre_stage_validate_kv_only(
     catalog: &Catalog,
     envelope: &TransactionEnvelope,
     config: &AedbConfig,
+    kv_sizes_prechecked: bool,
 ) -> Option<Result<(HashSet<String>, HashSet<String>), AedbError>> {
     if envelope.caller.is_some()
         || !envelope.assertions.is_empty()
@@ -510,6 +514,29 @@ fn pre_stage_validate_kv_only(
         || !envelope.read_set.ranges.is_empty()
     {
         return None;
+    }
+
+    if let [mutation] = envelope.write_intent.mutations.as_slice() {
+        let Some(parts) = kv_validation_parts(mutation) else {
+            return None;
+        };
+        let validate_result = if kv_sizes_prechecked {
+            validate_kv_fast_path_scope(catalog, parts.project_id, parts.scope_id)
+                .and_then(|()| validate_kv_fast_path_counter_shards(&parts))
+        } else {
+            validate_kv_fast_path_parts(catalog, config, &parts)
+        };
+        if let Err(err) = validate_result {
+            return Some(Err(err));
+        }
+
+        let namespace = namespace_key(parts.project_id, parts.scope_id);
+        let mut write_partitions = HashSet::with_capacity(1);
+        write_partitions.insert(kv_key_partition_token(
+            &namespace,
+            parts.partition_key.as_ref(),
+        ));
+        return Some(Ok((write_partitions, HashSet::new())));
     }
 
     let mut seen_scopes: Vec<KvFastPathScope<'_>> = Vec::new();
@@ -530,17 +557,9 @@ fn pre_stage_validate_kv_only(
         {
             index
         } else {
-            if !catalog.projects.contains_key(parts.project_id) {
-                return Some(Err(AedbError::Validation(format!(
-                    "project does not exist: {}",
-                    parts.project_id
-                ))));
-            }
-            if !catalog_scope_exists(catalog, parts.project_id, parts.scope_id) {
-                return Some(Err(AedbError::Validation(format!(
-                    "scope does not exist: {}.{}",
-                    parts.project_id, parts.scope_id
-                ))));
+            if let Err(err) = validate_kv_fast_path_scope(catalog, parts.project_id, parts.scope_id)
+            {
+                return Some(Err(err));
             }
             seen_scopes.push(KvFastPathScope {
                 project_id: parts.project_id,
@@ -550,26 +569,8 @@ fn pre_stage_validate_kv_only(
             seen_scopes.len() - 1
         };
         last_scope_index = Some(scope_index);
-        if parts.key.len() > config.max_kv_key_bytes {
-            return Some(Err(AedbError::Validation("kv key too large".into())));
-        }
-        if let Some(len) = parts.value_len
-            && len > config.max_kv_value_bytes
-        {
-            return Some(Err(AedbError::Validation("kv value too large".into())));
-        }
-        if let Some(shard_count) = parts.counter_shards {
-            if shard_count == 0 {
-                return Some(Err(AedbError::Validation(
-                    "counter shard_count must be > 0".into(),
-                )));
-            }
-            if shard_count > crate::commit::validation::MAX_COUNTER_SHARDS {
-                return Some(Err(AedbError::Validation(format!(
-                    "counter shard_count exceeds maximum {}",
-                    crate::commit::validation::MAX_COUNTER_SHARDS
-                ))));
-            }
+        if let Err(err) = validate_kv_fast_path_sizes(config, &parts) {
+            return Some(Err(err));
         }
         write_partitions.insert(kv_key_partition_token(
             &seen_scopes[scope_index].namespace,
@@ -578,6 +579,73 @@ fn pre_stage_validate_kv_only(
     }
 
     Some(Ok((write_partitions, HashSet::new())))
+}
+
+fn validate_kv_fast_path_parts(
+    catalog: &Catalog,
+    config: &AedbConfig,
+    parts: &KvFastPathParts<'_>,
+) -> Result<(), AedbError> {
+    validate_kv_fast_path_scope(catalog, parts.project_id, parts.scope_id)?;
+    validate_kv_fast_path_sizes(config, parts)
+}
+
+fn validate_kv_fast_path_scope(
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+) -> Result<(), AedbError> {
+    if !catalog.projects.contains_key(project_id) {
+        return Err(AedbError::Validation(format!(
+            "project does not exist: {project_id}"
+        )));
+    }
+    if !catalog_scope_exists(catalog, project_id, scope_id) {
+        return Err(AedbError::Validation(format!(
+            "scope does not exist: {project_id}.{scope_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_kv_fast_path_sizes(
+    config: &AedbConfig,
+    parts: &KvFastPathParts<'_>,
+) -> Result<(), AedbError> {
+    if parts.key.len() > config.max_kv_key_bytes {
+        return Err(AedbError::Validation("kv key too large".into()));
+    }
+    if let Some(len) = parts.value_len
+        && len > config.max_kv_value_bytes
+    {
+        return Err(AedbError::Validation("kv value too large".into()));
+    }
+    if let Some(shard_count) = parts.counter_shards {
+        validate_counter_shard_count(shard_count)?;
+    }
+    Ok(())
+}
+
+fn validate_kv_fast_path_counter_shards(parts: &KvFastPathParts<'_>) -> Result<(), AedbError> {
+    if let Some(shard_count) = parts.counter_shards {
+        validate_counter_shard_count(shard_count)?;
+    }
+    Ok(())
+}
+
+fn validate_counter_shard_count(shard_count: u16) -> Result<(), AedbError> {
+    if shard_count == 0 {
+        return Err(AedbError::Validation(
+            "counter shard_count must be > 0".into(),
+        ));
+    }
+    if shard_count > crate::commit::validation::MAX_COUNTER_SHARDS {
+        return Err(AedbError::Validation(format!(
+            "counter shard_count exceeds maximum {}",
+            crate::commit::validation::MAX_COUNTER_SHARDS
+        )));
+    }
+    Ok(())
 }
 
 fn catalog_scope_exists(catalog: &Catalog, project_id: &str, scope_id: &str) -> bool {
@@ -1405,7 +1473,7 @@ pub(super) async fn build_epoch_requests(
         if selected.len() >= min_commits && pending.is_empty() {
             break;
         }
-        if Instant::now() >= deadline {
+        if selected.len() >= min_commits && Instant::now() >= deadline {
             break;
         }
     }
@@ -1559,6 +1627,9 @@ pub(super) fn process_commit_epoch(
     if requests.is_empty() {
         return EpochProcessResult::default();
     }
+    if inline_kv_set_epoch_fast_path_eligible(state, &requests) {
+        return process_inline_kv_set_epoch_fast_path(state, requests, process_started);
+    }
 
     let epoch_request_count = requests.len();
     let mut outcomes = Vec::with_capacity(requests.len());
@@ -1685,16 +1756,15 @@ pub(super) fn process_commit_epoch(
         }
 
         let mut mutations = std::mem::take(&mut request.envelope.write_intent.mutations);
-        augment_mutations_with_caller(&mut mutations, request.envelope.caller.as_ref());
+        let caller = request.envelope.caller.as_ref();
+        if caller.is_some() {
+            augment_mutations_with_caller(&mut mutations, caller);
+        }
         let mutation_class = classify_commit_mutations(&mutations);
-        if !request.prevalidated {
+        if !request.prevalidated && caller.is_some() {
             let mut permission_error = None;
             for mutation in &mutations {
-                if let Err(err) = validate_permissions(
-                    &working_catalog,
-                    request.envelope.caller.as_ref(),
-                    mutation,
-                ) {
+                if let Err(err) = validate_permissions(&working_catalog, caller, mutation) {
                     permission_error = Some(err);
                     break;
                 }
@@ -2436,6 +2506,348 @@ pub(super) fn process_commit_epoch(
         sync_executed,
         catalog_changed,
     }
+}
+
+fn inline_kv_set_epoch_fast_path_eligible(
+    state: &ExecutorState,
+    requests: &[CommitRequest],
+) -> bool {
+    if requests.is_empty() {
+        return false;
+    }
+    let mut memory_upper_bound = state.keyspace.estimate_memory_bytes();
+    for request in requests {
+        if request.has_read_set
+            || request.has_assertions
+            || request.envelope.caller.is_some()
+            || request.envelope.idempotency_key.is_some()
+            || !matches!(request.envelope.write_class, WriteClass::Standard)
+            || request.envelope.write_intent.mutations.is_empty()
+            || request.envelope.write_intent.mutations.len()
+                >= SINGLE_REQUEST_PARALLEL_APPLY_MUTATION_THRESHOLD
+            || request.write_partitions.is_empty()
+            || keyspace_mutations_cross_partition(&request.envelope.write_intent.mutations)
+        {
+            return false;
+        }
+        for mutation in &request.envelope.write_intent.mutations {
+            let Mutation::KvSet { key, value, .. } = mutation else {
+                return false;
+            };
+            if parallel_worker_test_hook_key(key)
+                || value.len() > state.keyspace.persistent_value_inline_threshold_bytes
+            {
+                return false;
+            }
+            memory_upper_bound = memory_upper_bound.saturating_add(
+                crate::storage::keyspace::kv_entry_cost(key.len(), value.len()),
+            );
+            if memory_upper_bound > state.config.max_memory_estimate_bytes {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn process_inline_kv_set_epoch_fast_path(
+    state: &mut ExecutorState,
+    requests: Vec<CommitRequest>,
+    process_started: Instant,
+) -> EpochProcessResult {
+    let mut outcomes = Vec::with_capacity(requests.len());
+    let mut sequenced = Vec::with_capacity(requests.len());
+    let mut next_seq = state.current_seq;
+
+    for mut request in requests {
+        let mutations = std::mem::take(&mut request.envelope.write_intent.mutations);
+        next_seq = next_seq.saturating_add(1);
+        let commit_seq = next_seq;
+        let payload = match encode_wal_payload_from_parts(
+            &mutations,
+            &[],
+            None,
+            None,
+            Some(request.encoded_len),
+        ) {
+            Ok(payload) => payload,
+            Err(err) => {
+                next_seq = next_seq.saturating_sub(1);
+                outcomes.push(EpochOutcome {
+                    request,
+                    result: Err(err),
+                    post_apply_delta: None,
+                });
+                continue;
+            }
+        };
+        let delta = Arc::new(CommitDelta {
+            seq: commit_seq,
+            mutations,
+        });
+        sequenced.push(SequencedCommit {
+            request,
+            seq: commit_seq,
+            commit_ts_micros: now_micros(),
+            payload_type: 0x04,
+            payload,
+            delta,
+        });
+    }
+
+    if sequenced.is_empty() {
+        return EpochProcessResult {
+            outcomes,
+            pre_wal_micros: process_started.elapsed().as_micros() as u64,
+            ..EpochProcessResult::default()
+        };
+    }
+
+    let mut wal_payload_size_bytes = 0usize;
+    let wal_frames = sequenced
+        .iter()
+        .map(|commit| {
+            wal_payload_size_bytes = wal_payload_size_bytes.saturating_add(commit.payload.len());
+            PendingFrame {
+                seq: commit.seq,
+                timestamp_micros: commit.commit_ts_micros,
+                payload_type: commit.payload_type,
+                payload: &commit.payload,
+            }
+        })
+        .collect::<Vec<_>>();
+    let pre_wal_micros = process_started.elapsed().as_micros() as u64;
+    let append_started = Instant::now();
+    let mut wal_append_ops = 0u64;
+    let mut wal_append_bytes = 0u64;
+    let mut wal_append_micros = 0u64;
+    let mut wal_sync_ops = 0u64;
+    let mut wal_sync_micros = 0u64;
+    let mut sync_executed = false;
+
+    if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
+        let err = AedbError::Io(std::io::Error::other(err.to_string()));
+        for failed in sequenced {
+            outcomes.push(EpochOutcome {
+                request: failed.request,
+                result: Err(AedbError::Validation(format!(
+                    "epoch aborted before WAL commit: {err}"
+                ))),
+                post_apply_delta: None,
+            });
+        }
+        return EpochProcessResult {
+            outcomes,
+            pre_wal_micros,
+            wal_append_ops,
+            wal_append_bytes,
+            wal_append_micros,
+            wal_sync_ops,
+            wal_sync_micros,
+            ..EpochProcessResult::default()
+        };
+    }
+    wal_append_ops = 1;
+    wal_append_bytes = wal_payload_size_bytes as u64;
+    wal_append_micros = append_started.elapsed().as_micros() as u64;
+
+    if matches!(state.config.durability_mode, DurabilityMode::Full) {
+        let sync_started = Instant::now();
+        if let Err(err) = state.wal.sync_active() {
+            let err = AedbError::Io(std::io::Error::other(err.to_string()));
+            for failed in sequenced {
+                outcomes.push(EpochOutcome {
+                    request: failed.request,
+                    result: Err(AedbError::Validation(format!(
+                        "epoch aborted during WAL sync: {err}"
+                    ))),
+                    post_apply_delta: None,
+                });
+            }
+            return EpochProcessResult {
+                outcomes,
+                pre_wal_micros,
+                wal_append_ops,
+                wal_append_bytes,
+                wal_append_micros,
+                wal_sync_ops,
+                wal_sync_micros,
+                ..EpochProcessResult::default()
+            };
+        }
+        wal_sync_ops = 1;
+        wal_sync_micros = sync_started.elapsed().as_micros() as u64;
+        sync_executed = true;
+    }
+
+    if let Some((project_id, scope_id)) = inline_kv_set_epoch_namespace(&sequenced) {
+        state.keyspace.kv_set_many_inline_same_namespace_with_seq(
+            project_id,
+            scope_id,
+            sequenced.iter().flat_map(|commit| {
+                commit.delta.mutations.iter().map(move |mutation| {
+                    let Mutation::KvSet { key, value, .. } = mutation else {
+                        unreachable!("inline KV fast path only sequences KvSet commits");
+                    };
+                    (key, value, commit.seq)
+                })
+            }),
+        );
+    } else {
+        for commit in &sequenced {
+            for mutation in &commit.delta.mutations {
+                let Mutation::KvSet {
+                    project_id,
+                    scope_id,
+                    key,
+                    value,
+                } = mutation
+                else {
+                    unreachable!("inline KV fast path only sequences KvSet commits");
+                };
+                state.keyspace.kv_set_inline(
+                    project_id,
+                    scope_id,
+                    key.clone(),
+                    value.clone(),
+                    commit.seq,
+                );
+            }
+        }
+    }
+
+    let last_seq = sequenced
+        .last()
+        .map(|commit| commit.seq)
+        .unwrap_or(state.current_seq);
+    state.current_seq = last_seq;
+    state.visible_head_seq = last_seq;
+    match state.config.durability_mode {
+        DurabilityMode::Full => {
+            state.durable_head_seq = last_seq;
+            state.pending_batch_bytes = 0;
+            state.pending_batch_max_seq = state.durable_head_seq;
+        }
+        DurabilityMode::Batch => {
+            state.pending_batch_bytes = state
+                .pending_batch_bytes
+                .saturating_add(wal_payload_size_bytes);
+            state.pending_batch_max_seq = last_seq;
+            if state.pending_batch_bytes >= state.config.batch_max_bytes {
+                let sync_started = Instant::now();
+                if state.keyspace.sync_persistent_value_store().is_ok()
+                    && state.wal.sync_active().is_ok()
+                {
+                    wal_sync_ops = wal_sync_ops.saturating_add(1);
+                    wal_sync_micros =
+                        wal_sync_micros.saturating_add(sync_started.elapsed().as_micros() as u64);
+                    sync_executed = true;
+                    state.durable_head_seq = state.pending_batch_max_seq;
+                    state.pending_batch_bytes = 0;
+                    state.pending_batch_max_seq = state.durable_head_seq;
+                }
+            }
+        }
+        DurabilityMode::OsBuffered => {}
+    }
+    debug_assert!(
+        state.durable_head_seq <= state.visible_head_seq,
+        "durable head cannot exceed visible head"
+    );
+    prune_idempotency(state);
+
+    let forced_full_snapshot = state.version_store.publish_deltas(
+        sequenced
+            .iter()
+            .map(|commit| (commit.seq, Arc::clone(&commit.delta))),
+    );
+    let snapshot_due = now_micros().saturating_sub(state.last_full_snapshot_micros)
+        >= state.config.max_snapshot_age_ms.saturating_mul(1000);
+    if snapshot_due || forced_full_snapshot {
+        state.version_store.publish_full(
+            state.visible_head_seq,
+            state.keyspace.snapshot(),
+            state.catalog.snapshot(),
+        );
+        state.last_full_snapshot_micros = now_micros();
+    }
+
+    let now_micros = now_micros();
+    if now_micros.saturating_sub(state.last_memory_estimate_micros)
+        >= MEMORY_ESTIMATE_INTERVAL_MICROS
+    {
+        state.last_memory_estimate_micros = now_micros;
+        let mem_estimate = state.keyspace.estimate_memory_bytes();
+        if mem_estimate > state.config.max_memory_estimate_bytes {
+            warn!(
+                mem_estimate,
+                max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
+                "aedb memory estimate exceeded threshold"
+            );
+        }
+    }
+    if state.wal.should_rotate().is_some() {
+        let _ = state
+            .wal
+            .rotate()
+            .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())));
+    }
+
+    let durable_head = state.durable_head_seq;
+    let finalize_started = Instant::now();
+    for commit in sequenced {
+        outcomes.push(EpochOutcome {
+            request: commit.request,
+            result: Ok(CommitResult {
+                commit_seq: commit.seq,
+                durable_head_seq: durable_head,
+                idempotency: IdempotencyOutcome::Applied,
+                canonical_commit_seq: commit.seq,
+            }),
+            post_apply_delta: Some(commit.delta),
+        });
+    }
+
+    EpochProcessResult {
+        outcomes,
+        pre_wal_micros,
+        finalize_micros: finalize_started.elapsed().as_micros() as u64,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        sync_executed,
+        ..EpochProcessResult::default()
+    }
+}
+
+fn inline_kv_set_epoch_namespace(sequenced: &[SequencedCommit]) -> Option<(&str, &str)> {
+    let first_mutation = sequenced.first()?.delta.mutations.first()?;
+    let Mutation::KvSet {
+        project_id,
+        scope_id,
+        ..
+    } = first_mutation
+    else {
+        return None;
+    };
+    for commit in sequenced {
+        for mutation in &commit.delta.mutations {
+            let Mutation::KvSet {
+                project_id: candidate_project,
+                scope_id: candidate_scope,
+                ..
+            } = mutation
+            else {
+                return None;
+            };
+            if candidate_project != project_id || candidate_scope != scope_id {
+                return None;
+            }
+        }
+    }
+    Some((project_id, scope_id))
 }
 
 fn overwrite_assertion_failures_with_wal_error(
@@ -3848,6 +4260,10 @@ fn apply_kv_set_batch_same_namespace(
 }
 
 fn kv_set_mutations_same_namespace(mutations: &[Mutation]) -> bool {
+    if let [Mutation::KvSet { key, .. }] = mutations {
+        return !parallel_worker_test_hook_key(key);
+    }
+
     let [first, ..] = mutations else {
         return false;
     };
@@ -3897,9 +4313,7 @@ fn apply_inline_kv_set_same_namespace(
     ] = mutations
     {
         if value.len() <= keyspace.persistent_value_inline_threshold_bytes {
-            keyspace
-                .kv_set(project_id, scope_id, key.clone(), value.clone(), commit_seq)
-                .expect("inline single kv set should not spill");
+            keyspace.kv_set_inline(project_id, scope_id, key.clone(), value.clone(), commit_seq);
             return true;
         }
         return false;
@@ -4653,6 +5067,9 @@ fn is_cross_partition_write_set(write_set: &HashSet<String>) -> bool {
 }
 
 pub(super) fn keyspace_mutations_cross_partition(mutations: &[Mutation]) -> bool {
+    if mutations.len() <= 1 {
+        return false;
+    }
     let mut first: Option<(&str, &str)> = None;
     for mutation in mutations {
         let Some((project_id, scope_id)) = keyspace_mutation_project_scope(mutation) else {

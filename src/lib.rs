@@ -1351,7 +1351,10 @@ impl AedbInstance {
     }
 
     pub async fn commit(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
-        let started = Instant::now();
+        let started = self
+            .telemetry_hooks_present
+            .load(Ordering::Acquire)
+            .then(Instant::now);
         if self.require_authenticated_calls {
             return Err(AedbError::PermissionDenied(
                 "authenticated caller required; use commit_as in secure mode".into(),
@@ -1360,8 +1363,10 @@ impl AedbInstance {
         // Early size validation to prevent DoS via oversized keys/values
         crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
 
-        let result = self.executor.submit(mutation).await;
-        self.emit_commit_telemetry("commit", started, &result);
+        let result = self.executor.submit_kv_sizes_prechecked(mutation).await;
+        if let Some(started) = started {
+            self.emit_commit_telemetry("commit", started, &result);
+        }
         let result = result?;
         self.dispatch_lifecycle_events_for_commit(result.commit_seq)
             .await;
@@ -1567,7 +1572,10 @@ impl AedbInstance {
         envelope: TransactionEnvelope,
         encoded_size_hint: Option<usize>,
     ) -> Result<CommitResult, AedbError> {
-        let started = Instant::now();
+        let started = self
+            .telemetry_hooks_present
+            .load(Ordering::Acquire)
+            .then(Instant::now);
         if self.require_authenticated_calls && envelope.caller.is_none() {
             return Err(AedbError::PermissionDenied(
                 "authenticated caller required; provide envelope.caller in secure mode".into(),
@@ -1589,7 +1597,9 @@ impl AedbInstance {
             }
             None => self.executor.submit_envelope(envelope).await,
         };
-        self.emit_commit_telemetry("commit_envelope", started, &result);
+        if let Some(started) = started {
+            self.emit_commit_telemetry("commit_envelope", started, &result);
+        }
         let result = result?;
         self.dispatch_lifecycle_events_for_commit(result.commit_seq)
             .await;

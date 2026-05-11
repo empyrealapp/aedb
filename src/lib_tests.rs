@@ -11208,6 +11208,23 @@ async fn preflight_uses_instance_config_limits() {
 }
 
 #[tokio::test]
+async fn commit_rejects_oversized_kv_before_enqueue() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_kv_value_bytes: 4,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let err = db
+        .kv_set("p", "app", b"k".to_vec(), b"too-large".to_vec())
+        .await
+        .expect_err("oversized kv write should fail");
+    assert!(matches!(err, AedbError::Validation(ref msg) if msg.contains("kv value size")));
+}
+
+#[tokio::test]
 async fn queries_reject_oversized_in_lists_and_like_patterns() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
