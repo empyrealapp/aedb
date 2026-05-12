@@ -5,6 +5,7 @@ use crate::config::PrimaryIndexBackend;
 use crate::error::AedbError;
 use crate::permission::CallerContext;
 use crate::storage::keyspace::{Keyspace, Namespace, NamespaceId};
+use crate::storage::kv_segment::KvSegmentStore;
 use crate::storage::value_store::PersistentValueStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,6 +25,7 @@ pub(super) struct ParallelTask {
     pub(super) commit_seq: u64,
     pub(super) backend: PrimaryIndexBackend,
     pub(super) value_store: Option<Arc<PersistentValueStore>>,
+    pub(super) kv_segment_store: Option<Arc<KvSegmentStore>>,
     pub(super) persistent_value_inline_threshold_bytes: usize,
     pub(super) catalog: Arc<Catalog>,
     pub(super) max_scan_rows: usize,
@@ -91,6 +93,9 @@ fn execute_task(task: ParallelTask) -> Result<(), AedbError> {
     if let Some(store) = task.value_store {
         local_keyspace
             .set_persistent_value_store(store, task.persistent_value_inline_threshold_bytes);
+    }
+    if let Some(store) = task.kv_segment_store {
+        local_keyspace.attach_kv_segment_store(store);
     }
     local_keyspace.insert_namespace_unchecked(task.namespace_id.clone(), task.base_namespace);
     for mutation in &task.mutations {

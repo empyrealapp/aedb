@@ -21,6 +21,7 @@ use crate::order_book::{
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
+use crate::storage::kv_segment::KvSegmentStore;
 use crate::storage::value_store::PersistentValueStore;
 use crate::wal::frame::FrameReader;
 use primitive_types::U256;
@@ -1100,6 +1101,82 @@ async fn parallel_apply_merge_counts_spilled_kv_ref_memory() {
         assert!(entry.value.is_empty());
         assert!(entry.value_ref.is_some());
     }
+}
+
+#[tokio::test]
+async fn parallel_rmw_reads_segment_resident_kv_entries() {
+    let dir = tempdir().expect("temp");
+    let segment_store = Arc::new(KvSegmentStore::open(dir.path()).expect("open segment store"));
+    let mut keyspace = Keyspace::default();
+    keyspace.attach_kv_segment_store(Arc::clone(&segment_store));
+    keyspace
+        .kv_set(
+            "p",
+            "app",
+            b"balance".to_vec(),
+            7u64.to_be_bytes().to_vec(),
+            1,
+        )
+        .expect("seed balance");
+    keyspace
+        .flush_kv_to_segments_to_memory_target(0)
+        .expect("flush to segment");
+    let namespace = keyspace
+        .namespace(&NamespaceId::project_scope("p", "app"))
+        .expect("namespace");
+    assert_eq!(namespace.kv.segments.len(), 1);
+    assert!(namespace.kv.entries.is_empty());
+    assert!(namespace.kv.small_entries.is_empty());
+
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        keyspace,
+        Catalog::default(),
+        1,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+    let req_a = request_with_mutations(vec![Mutation::KvAddU64Ex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"balance".to_vec(),
+        amount_be: 5u64.to_be_bytes(),
+        on_missing: KvU64MissingPolicy::Reject,
+        on_overflow: KvU64OverflowPolicy::Reject,
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"__slow_parallel_worker__".to_vec(),
+        value: b"marker".to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()),
+        "parallel RMW over segment-resident keys should succeed: {:?}",
+        epoch
+            .outcomes
+            .iter()
+            .map(|outcome| &outcome.result)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        epoch.parallel_apply_micros >= 20_000,
+        "test should exercise the parallel worker path"
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"balance")
+            .map(|entry| entry.value),
+        Some(12u64.to_be_bytes().to_vec())
+    );
 }
 
 #[tokio::test]

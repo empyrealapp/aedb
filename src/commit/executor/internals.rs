@@ -3149,6 +3149,7 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
             commit_seq: seq,
             backend,
             value_store: keyspace.value_store.clone(),
+            kv_segment_store: keyspace.kv_segment_store.clone(),
             persistent_value_inline_threshold_bytes: keyspace
                 .persistent_value_inline_threshold_bytes,
             catalog: Arc::clone(&shared_catalog),

@@ -1536,6 +1536,23 @@ impl CommitExecutor {
         view
     }
 
+    pub(crate) async fn reclaim_unused_kv_segments(
+        &self,
+        mut referenced_filenames: HashSet<String>,
+    ) -> Result<usize, AedbError> {
+        let state = self.state.lock().await;
+        let store = state
+            .keyspace
+            .kv_segment_store
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AedbError::Unavailable {
+                message: "KV segment store is not attached".into(),
+            })?;
+        referenced_filenames.extend(state.keyspace.kv_segment_filenames());
+        store.reclaim_unreferenced_segments(&referenced_filenames)
+    }
+
     pub async fn snapshot_at_seq(&self, seq: u64) -> Result<SnapshotReadView, AedbError> {
         let mut state = self.state.lock().await;
         let view = state.version_store.acquire_at_seq(seq)?.into_view();

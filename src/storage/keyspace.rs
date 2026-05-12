@@ -1110,13 +1110,16 @@ impl Keyspace {
                 continue;
             }
             let meta = segment_store.write_segment(&format!("{namespace_id:?}"), entries)?;
+            let filename = meta.filename.clone();
             let meta_cost = kv_segment_meta_cost(&meta);
             let Some(namespace) = self.namespaces_mut().get_mut(&namespace_id) else {
+                segment_store.mark_segment_published(&filename);
                 continue;
             };
             namespace.kv.entries.clear();
             namespace.kv.small_entries.clear();
             namespace.kv.segments.push(meta);
+            segment_store.mark_segment_published(&filename);
             self.mem_bytes = self
                 .mem_bytes
                 .saturating_sub(resident_cost)
@@ -1187,12 +1190,15 @@ impl Keyspace {
             .map(|(key, entry)| KvSegmentEntry { key, entry })
             .collect::<Vec<_>>();
         let meta = segment_store.write_segment(&format!("{namespace_id:?}"), entries)?;
+        let filename = meta.filename.clone();
         let Some(namespace) = self.namespaces_mut().get_mut(namespace_id) else {
+            segment_store.mark_segment_published(&filename);
             return Ok(());
         };
         namespace.kv.segments.clear();
         namespace.kv.segments.push(meta);
         namespace.kv.segment_tombstones.clear();
+        segment_store.mark_segment_published(&filename);
         Ok(())
     }
 

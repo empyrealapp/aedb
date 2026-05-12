@@ -9425,16 +9425,7 @@ impl AedbInstance {
         if !matches!(self._config.storage_mode, StorageMode::DiskBacked) {
             return Ok(0);
         }
-        let latest_view = self.executor.snapshot_latest_view().await;
-        let store = latest_view
-            .keyspace
-            .kv_segment_store
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| AedbError::Unavailable {
-                message: "KV segment store is not attached".into(),
-            })?;
-        let mut referenced_filenames = latest_view.keyspace.kv_segment_filenames();
+        let mut referenced_filenames = HashSet::new();
         {
             let manager = self.snapshot_manager.lock();
             referenced_filenames.extend(manager.active_kv_segment_filenames());
@@ -9443,7 +9434,9 @@ impl AedbInstance {
             let mut recovery_cache = self.recovery_cache.lock();
             referenced_filenames.extend(recovery_cache.kv_segment_filenames());
         }
-        store.reclaim_unreferenced_segments(&referenced_filenames)
+        self.executor
+            .reclaim_unused_kv_segments(referenced_filenames)
+            .await
     }
 
     pub async fn wait_for_durable(&self, seq: u64) -> Result<(), AedbError> {

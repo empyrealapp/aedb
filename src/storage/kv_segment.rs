@@ -56,6 +56,7 @@ pub struct KvSegmentStore {
     dir: PathBuf,
     block_cache_capacity_bytes: usize,
     block_cache: Mutex<KvSegmentBlockCache>,
+    pending_publish_filenames: Mutex<HashSet<String>>,
 }
 
 impl PartialEq for KvSegmentStore {
@@ -81,6 +82,7 @@ impl KvSegmentStore {
             dir,
             block_cache_capacity_bytes,
             block_cache: Mutex::new(KvSegmentBlockCache::new(block_cache_capacity_bytes)),
+            pending_publish_filenames: Mutex::new(HashSet::new()),
         })
     }
 
@@ -111,8 +113,11 @@ impl KvSegmentStore {
         referenced_filenames: &HashSet<String>,
     ) -> Result<usize, AedbError> {
         let mut reclaimed_count = 0usize;
+        let pending_publish_filenames = self.pending_publish_filenames.lock();
         for filename in self.list_segment_filenames()? {
-            if referenced_filenames.contains(&filename) {
+            if referenced_filenames.contains(&filename)
+                || pending_publish_filenames.contains(&filename)
+            {
                 continue;
             }
             validate_segment_filename(&filename)?;
@@ -188,8 +193,13 @@ impl KvSegmentStore {
         tmp.write_all(&payload)?;
         tmp.flush()?;
         tmp.as_file().sync_all()?;
-        tmp.persist(&final_path)
-            .map_err(|e| AedbError::Io(e.error))?;
+        self.pending_publish_filenames
+            .lock()
+            .insert(filename.clone());
+        if let Err(e) = tmp.persist(&final_path) {
+            self.pending_publish_filenames.lock().remove(&filename);
+            return Err(AedbError::Io(e.error));
+        }
 
         Ok(KvSegmentMeta {
             filename,
@@ -201,6 +211,10 @@ impl KvSegmentStore {
             bloom_bits,
             blocks,
         })
+    }
+
+    pub(crate) fn mark_segment_published(&self, filename: &str) {
+        self.pending_publish_filenames.lock().remove(filename);
     }
 
     pub fn read_segment(&self, meta: &KvSegmentMeta) -> Result<Vec<KvSegmentEntry>, AedbError> {
@@ -833,6 +847,43 @@ mod tests {
             created_at: version,
             value_ref: None,
         }
+    }
+
+    #[test]
+    fn reclaim_skips_pending_publish_segment_until_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = KvSegmentStore::open(dir.path()).expect("open store");
+        let meta = store
+            .write_segment(
+                "test",
+                vec![KvSegmentEntry {
+                    key: b"key".to_vec(),
+                    entry: entry(1, 1),
+                }],
+            )
+            .expect("write segment");
+        let referenced = HashSet::new();
+
+        let reclaimed = store
+            .reclaim_unreferenced_segments(&referenced)
+            .expect("reclaim pending");
+        assert_eq!(reclaimed, 0);
+        assert_eq!(
+            store.list_segment_filenames().expect("list pending"),
+            vec![meta.filename.clone()]
+        );
+
+        store.mark_segment_published(&meta.filename);
+        let reclaimed = store
+            .reclaim_unreferenced_segments(&referenced)
+            .expect("reclaim published");
+        assert_eq!(reclaimed, 1);
+        assert!(
+            store
+                .list_segment_filenames()
+                .expect("list after reclaim")
+                .is_empty()
+        );
     }
 
     #[test]
