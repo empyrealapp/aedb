@@ -462,6 +462,11 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
             message: "snapshot limits must be > 0".into(),
         });
     }
+    if config.commit_broadcast_capacity == 0 {
+        return Err(AedbError::InvalidConfig {
+            message: "commit_broadcast_capacity must be > 0".into(),
+        });
+    }
     if matches!(config.durability_mode, DurabilityMode::Batch)
         && (config.batch_interval_ms == 0 || config.batch_max_bytes == 0)
     {

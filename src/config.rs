@@ -102,6 +102,11 @@ pub struct AedbConfig {
     pub recovery_mode: RecoveryMode,
     pub hash_chain_required: bool,
     pub primary_index_backend: PrimaryIndexBackend,
+    /// Capacity of the public commit-delta broadcast channel
+    /// exposed via `AedbInstance::subscribe_commits`. Subscribers
+    /// that fall behind beyond this many buffered deltas will
+    /// receive `RecvError::Lagged` from `broadcast::Receiver::recv`.
+    pub commit_broadcast_capacity: usize,
 }
 
 impl Default for AedbConfig {
@@ -163,6 +168,7 @@ impl Default for AedbConfig {
             recovery_mode: RecoveryMode::Strict,
             hash_chain_required: true,
             primary_index_backend: PrimaryIndexBackend::OrdMap,
+            commit_broadcast_capacity: 1024,
         }
     }
 }
