@@ -38,6 +38,8 @@ pub enum QueryError {
     CursorExpired {
         original_seq: u64,
     },
+    /// Cursor was malformed, tampered with, or failed HMAC verification.
+    InvalidCursor,
     SnapshotExpired,
     SnapshotLimitReached,
     InternalError(String),
@@ -98,6 +100,7 @@ impl fmt::Display for QueryError {
             QueryError::CursorExpired { original_seq } => {
                 write!(f, "cursor expired (original_seq={original_seq})")
             }
+            QueryError::InvalidCursor => write!(f, "invalid cursor (tampered or malformed)"),
             QueryError::SnapshotExpired => write!(f, "snapshot expired"),
             QueryError::SnapshotLimitReached => write!(f, "snapshot limit reached"),
             QueryError::InternalError(msg) => write!(f, "internal query error: {msg}"),

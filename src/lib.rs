@@ -2023,6 +2023,7 @@ impl AedbInstance {
             &options,
             caller,
             self._config.max_scan_rows,
+            self._config.cursor_signing_key(),
         );
         tokio::task::yield_now().await;
         let execute_micros = execute_started.elapsed().as_micros() as u64;
@@ -9898,6 +9899,7 @@ impl ReadTx<'_> {
             &options,
             self.caller.as_ref(),
             self.db._config.max_scan_rows,
+            self.db._config.cursor_signing_key(),
         );
         tokio::task::yield_now().await;
         let mut result = result?;
@@ -10115,6 +10117,7 @@ impl ReadTx<'_> {
                     truncated: false,
                     snapshot_seq: self.lease.view.seq,
                     materialized_seq: None,
+                    split_recommended: false,
                 },
             ));
         }
@@ -10170,6 +10173,7 @@ impl ReadTx<'_> {
             truncated: false,
             snapshot_seq: self.lease.view.seq,
             materialized_seq,
+            split_recommended: false,
         };
         Ok((source, hydrated))
     }

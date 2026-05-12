@@ -35,6 +35,28 @@ pub struct QueryResult {
     pub truncated: bool,
     pub snapshot_seq: u64,
     pub materialized_seq: Option<u64>,
+    /// `true` when this page consumed at least 75% of the effective scan
+    /// budget (the smaller of the caller's `limit` and the configured
+    /// `max_scan_rows`). Clients that observe this flag should issue another
+    /// paginated request rather than re-running the same query without a
+    /// cursor — useful for soft-fanout and rate-limiting decisions.
+    pub split_recommended: bool,
+}
+
+/// 75% of the effective scan budget; once `rows_examined` crosses this
+/// threshold we hint to the caller that they should paginate.
+pub(crate) const SOFT_LIMIT_PCT_NUM: usize = 3;
+pub(crate) const SOFT_LIMIT_PCT_DEN: usize = 4;
+
+#[inline]
+pub(crate) fn compute_split_recommended(rows_examined: usize, budget: usize) -> bool {
+    if budget == 0 {
+        return false;
+    }
+    // rows_examined * 4 >= budget * 3 — integer-safe comparison for >= 75%.
+    rows_examined
+        .saturating_mul(SOFT_LIMIT_PCT_DEN)
+        .ge(&budget.saturating_mul(SOFT_LIMIT_PCT_NUM))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +82,7 @@ pub fn execute_query(
         &QueryOptions::default(),
         0,
         10_000,
+        None,
     )
 }
 
@@ -199,6 +222,7 @@ pub fn execute_query_with_options(
     options: &QueryOptions,
     snapshot_seq: u64,
     max_scan_rows: usize,
+    cursor_signing_key: Option<&[u8; 32]>,
 ) -> Result<QueryResult, QueryError> {
     let mut options = options.clone();
     if options.async_index.is_none() {
@@ -233,7 +257,7 @@ pub fn execute_query_with_options(
     }
 
     let cursor_state = match &options.cursor {
-        Some(encoded) => Some(decode_cursor(encoded)?),
+        Some(encoded) => Some(decode_cursor(encoded, cursor_signing_key)?),
         None => None,
     };
     if let Some(cursor) = &cursor_state
@@ -255,6 +279,7 @@ pub fn execute_query_with_options(
             snapshot_seq,
             max_scan_rows,
             cursor_state,
+            cursor_signing_key,
         );
     }
 
@@ -511,29 +536,61 @@ pub fn execute_query_with_options(
     } else {
         sliced
     };
+    let returned_rows = sliced.len();
+    let remaining_limit_after_page = compute_remaining_limit_after_page(
+        query.limit,
+        cursor_state.as_ref().and_then(|c| c.remaining_limit),
+        returned_rows,
+    );
     let cursor = if has_more {
         let last_row = cursor_last_row.ok_or_else(|| QueryError::InvalidQuery {
             reason: "invalid cursor state".into(),
         })?;
-        Some(encode_cursor(&CursorToken {
-            snapshot_seq,
-            last_sort_key: extract_sort_key(&last_row, &sort_indices),
-            last_pk: extract_pk_key(&last_row, &pk_indices),
-            page_size,
-            remaining_limit: None,
-        })?)
+        Some(encode_cursor(
+            &CursorToken {
+                snapshot_seq,
+                last_sort_key: extract_sort_key(&last_row, &sort_indices),
+                last_pk: extract_pk_key(&last_row, &pk_indices),
+                page_size,
+                remaining_limit: remaining_limit_after_page,
+            },
+            cursor_signing_key,
+        )?)
     } else {
         None
     };
 
+    let rows_examined = root.rows_examined();
+    let split_budget = query.limit.unwrap_or(max_scan_rows);
+    let split_recommended = compute_split_recommended(rows_examined, split_budget);
     Ok(QueryResult {
         rows: sliced,
-        rows_examined: root.rows_examined(),
+        rows_examined,
         truncated: cursor.is_some(),
         cursor,
         snapshot_seq,
         materialized_seq,
+        split_recommended,
     })
+}
+
+/// Compute `remaining_limit` for the cursor we are about to emit.
+///
+/// If the user did not supply a `query.limit` and the incoming cursor did not
+/// carry one either, the chain is uncapped and we propagate `None`. Otherwise
+/// we subtract this page's returned rows from the smallest applicable cap.
+#[inline]
+pub(crate) fn compute_remaining_limit_after_page(
+    query_limit: Option<usize>,
+    cursor_remaining: Option<usize>,
+    returned_this_page: usize,
+) -> Option<usize> {
+    match (query_limit, cursor_remaining) {
+        (None, None) => None,
+        (Some(q), None) => Some(q.saturating_sub(returned_this_page)),
+        (None, Some(c)) => Some(c.saturating_sub(returned_this_page)),
+        (Some(q), Some(c)) => Some(q.min(c).saturating_sub(returned_this_page)),
+    }
 }
 
 fn query_requires_full_evaluation(query: &Query, has_cursor: bool) -> bool {
@@ -568,6 +625,7 @@ fn try_primary_key_point_query(
             truncated: false,
             snapshot_seq,
             materialized_seq: None,
+            split_recommended: false,
         }));
     }
 
@@ -594,6 +652,7 @@ fn try_primary_key_point_query(
         truncated: false,
         snapshot_seq,
         materialized_seq: None,
+        split_recommended: false,
     }))
 }
 
