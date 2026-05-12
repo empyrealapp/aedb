@@ -195,10 +195,10 @@ impl PersistentValueStore {
     }
 
     pub fn read(&self, value_ref: &PersistentValueRef) -> Result<Vec<u8>, AedbError> {
-        if self.hot_cache_capacity_bytes > 0 {
-            if let Some(value) = { self.hot_cache.lock().get(value_ref) } {
-                return Ok(value.as_ref().to_vec());
-            }
+        if self.hot_cache_capacity_bytes > 0
+            && let Some(value) = { self.hot_cache.lock().get(value_ref) }
+        {
+            return Ok(value.as_ref().to_vec());
         }
 
         let end = value_ref.offset.checked_add(value_ref.len).ok_or_else(|| {

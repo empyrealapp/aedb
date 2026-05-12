@@ -1449,17 +1449,17 @@ pub fn read_recent_trades(
         .map(Bound::Excluded)
         .unwrap_or(Bound::Unbounded);
     let mut out = Vec::with_capacity(limit);
-    let Some(namespace) = snapshot.namespaces.get(&ns) else {
+    if !snapshot.namespaces.contains_key(&ns) {
         return Ok(Vec::new());
-    };
-    let keys: Vec<Vec<u8>> = namespace
-        .kv
-        .entries
-        .range((start, end))
-        .rev()
-        .take(limit)
-        .map(|(key, _)| key.clone())
+    }
+    let mut keys: Vec<Vec<u8>> = snapshot
+        .try_kv_scan_range(project_id, scope_id, start, end, usize::MAX)?
+        .into_iter()
+        .map(|(key, _)| key)
         .collect();
+    keys.sort_by(|a, b| b.cmp(a));
+    keys.dedup();
+    keys.truncate(limit);
     for key in keys {
         let entry = snapshot
             .try_kv_get(project_id, scope_id, &key)?
@@ -1481,14 +1481,14 @@ pub fn read_last_execution_report(
     else {
         return Ok(None);
     };
-    if let Some((commit_seq, order_id)) = decode_last_report_pointer(&entry.value) {
-        if let Some(report_entry) = snapshot.try_kv_get(
+    if let Some((commit_seq, order_id)) = decode_last_report_pointer(&entry.value)
+        && let Some(report_entry) = snapshot.try_kv_get(
             project_id,
             scope_id,
             &key_execution_report(instrument, commit_seq, order_id),
-        )? {
-            return deserialize::<ExecutionReport>(&report_entry.value).map(Some);
-        }
+        )?
+    {
+        return deserialize::<ExecutionReport>(&report_entry.value).map(Some);
     }
     deserialize::<ExecutionReport>(&entry.value).map(Some)
 }

@@ -502,12 +502,14 @@ pub(super) fn pre_stage_validate(
     Ok((write_partitions, read_partitions))
 }
 
+type KvPartitionValidation = Result<(HashSet<String>, HashSet<String>), AedbError>;
+
 fn pre_stage_validate_kv_only(
     catalog: &Catalog,
     envelope: &TransactionEnvelope,
     config: &AedbConfig,
     kv_sizes_prechecked: bool,
-) -> Option<Result<(HashSet<String>, HashSet<String>), AedbError>> {
+) -> Option<KvPartitionValidation> {
     if envelope.caller.is_some()
         || !envelope.assertions.is_empty()
         || !envelope.read_set.points.is_empty()
@@ -517,9 +519,7 @@ fn pre_stage_validate_kv_only(
     }
 
     if let [mutation] = envelope.write_intent.mutations.as_slice() {
-        let Some(parts) = kv_validation_parts(mutation) else {
-            return None;
-        };
+        let parts = kv_validation_parts(mutation)?;
         let validate_result = if kv_sizes_prechecked {
             validate_kv_fast_path_scope(catalog, parts.project_id, parts.scope_id)
                 .and_then(|()| validate_kv_fast_path_counter_shards(&parts))
@@ -543,9 +543,7 @@ fn pre_stage_validate_kv_only(
     let mut last_scope_index: Option<usize> = None;
     let mut write_partitions = HashSet::with_capacity(envelope.write_intent.mutations.len());
     for mutation in &envelope.write_intent.mutations {
-        let Some(parts) = kv_validation_parts(mutation) else {
-            return None;
-        };
+        let parts = kv_validation_parts(mutation)?;
         let scope_index = if let Some(index) = last_scope_index
             && seen_scopes[index].project_id == parts.project_id
             && seen_scopes[index].scope_id == parts.scope_id
@@ -2230,6 +2228,45 @@ pub(super) fn process_commit_epoch(
         };
     }
     if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
+        pre_wal_memory_estimate = match working_keyspace
+            .flush_kv_to_segments_to_memory_target(state.config.max_memory_estimate_bytes)
+        {
+            Ok(memory_estimate) => memory_estimate,
+            Err(err) => {
+                overwrite_assertion_failures_with_wal_error(
+                    &mut outcomes,
+                    &err,
+                    "epoch aborted during KV segment flush",
+                );
+                for failed in sequenced {
+                    outcomes.push(EpochOutcome {
+                        request: failed.request,
+                        result: Err(AedbError::Validation(format!(
+                            "epoch aborted during KV segment flush: {err}"
+                        ))),
+                        post_apply_delta: None,
+                    });
+                }
+                return EpochProcessResult {
+                    outcomes,
+                    coordinator_apply_attempts,
+                    coordinator_apply_micros,
+                    parallel_apply_micros,
+                    pre_wal_micros,
+                    finalize_micros: 0,
+                    read_set_conflicts,
+                    wal_append_ops,
+                    wal_append_bytes,
+                    wal_append_micros,
+                    wal_sync_ops,
+                    wal_sync_micros,
+                    sync_executed,
+                    catalog_changed,
+                };
+            }
+        };
+    }
+    if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
         let err_message = format!(
             "memory estimate exceeded before WAL commit: memory_estimate_bytes={}, max_memory_estimate_bytes={}",
             pre_wal_memory_estimate, state.config.max_memory_estimate_bytes
@@ -2540,7 +2577,7 @@ fn inline_kv_set_epoch_fast_path_eligible(
                 return false;
             }
             memory_upper_bound = memory_upper_bound.saturating_add(
-                crate::storage::keyspace::kv_entry_cost(key.len(), value.len()),
+                crate::storage::keyspace::kv_inline_entry_cost(key.len(), value.len()),
             );
             if memory_upper_bound > state.config.max_memory_estimate_bytes {
                 return false;
@@ -3295,7 +3332,8 @@ fn merge_parallel_namespace_result(
     targets: &ParallelMergeTargets,
 ) {
     use crate::storage::keyspace::{
-        accumulator_data_mem_cost, kv_entry_cost, row_mem_cost, table_data_mem_cost,
+        accumulator_data_mem_cost, compact_kv_key, kv_entry_cost, kv_tombstone_cost, row_mem_cost,
+        small_kv_entry_cost, table_data_mem_cost,
     };
     let mut added: usize = 0;
     let mut removed: usize = 0;
@@ -3367,18 +3405,55 @@ fn merge_parallel_namespace_result(
     for key in kv_keys {
         let prev_kv_cost = dest
             .kv
-            .entries
-            .get(&key)
-            .map(|e| kv_entry_cost(key.len(), e.value.len()))
+            .small_entries
+            .get(&compact_kv_key(&key))
+            .map(|e| small_kv_entry_cost(key.len(), e.resident_value_len()))
+            .or_else(|| {
+                dest.kv
+                    .entries
+                    .get(&key)
+                    .map(|e| kv_entry_cost(key.len(), e.resident_memory_value_len()))
+            })
+            .or_else(|| {
+                dest.kv
+                    .segment_tombstones
+                    .get(&key)
+                    .map(|_| kv_tombstone_cost(key.len()))
+            })
             .unwrap_or(0);
-        match namespace.kv.entries.get(&key) {
+        match namespace.kv.small_entries.get(&compact_kv_key(&key)) {
             Some(entry) => {
-                added = added.saturating_add(kv_entry_cost(key.len(), entry.value.len()));
-                dest.kv.entries.insert(key, entry.clone());
-            }
-            None => {
+                added = added
+                    .saturating_add(small_kv_entry_cost(key.len(), entry.resident_value_len()));
                 dest.kv.entries.remove(&key);
+                dest.kv.segment_tombstones.remove(&key);
+                dest.kv
+                    .small_entries
+                    .insert(compact_kv_key(&key), entry.clone());
             }
+            None => match namespace.kv.entries.get(&key) {
+                Some(entry) => {
+                    added = added.saturating_add(kv_entry_cost(
+                        key.len(),
+                        entry.resident_memory_value_len(),
+                    ));
+                    dest.kv.small_entries.remove(&compact_kv_key(&key));
+                    dest.kv.segment_tombstones.remove(&key);
+                    dest.kv.entries.insert(key, entry.clone());
+                }
+                None => {
+                    if let Some(version) = namespace.kv.segment_tombstones.get(&key) {
+                        added = added.saturating_add(kv_tombstone_cost(key.len()));
+                        dest.kv.entries.remove(&key);
+                        dest.kv.small_entries.remove(&compact_kv_key(&key));
+                        dest.kv.segment_tombstones.insert(key, *version);
+                    } else {
+                        dest.kv.entries.remove(&key);
+                        dest.kv.small_entries.remove(&compact_kv_key(&key));
+                        dest.kv.segment_tombstones.remove(&key);
+                    }
+                }
+            },
         }
         removed = removed.saturating_add(prev_kv_cost);
     }

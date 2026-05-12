@@ -21,6 +21,7 @@ use crate::order_book::{
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
+use crate::storage::value_store::PersistentValueStore;
 use crate::wal::frame::FrameReader;
 use primitive_types::U256;
 use std::collections::HashMap;
@@ -1030,6 +1031,78 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_integer_updates() {
 }
 
 #[tokio::test]
+async fn parallel_apply_merge_counts_spilled_kv_ref_memory() {
+    let dir = tempdir().expect("temp");
+    let value_dir = tempdir().expect("value temp");
+    let mut keyspace = Keyspace::default();
+    keyspace
+        .attach_persistent_value_store(
+            Arc::new(
+                PersistentValueStore::open_with_hot_cache_bytes(value_dir.path(), 0)
+                    .expect("open value store"),
+            ),
+            4,
+        )
+        .expect("attach value store");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        keyspace,
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+    let req_a = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"spilled:a".to_vec(),
+        value: vec![0xA1; 128],
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"spilled:b".to_vec(),
+        value: vec![0xB2; 128],
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()),
+        "parallel spilled KV writes should succeed"
+    );
+    assert_eq!(
+        state.keyspace.mem_bytes,
+        state.keyspace.recompute_memory_bytes_full()
+    );
+    let namespace = state
+        .keyspace
+        .namespace(&NamespaceId::project_scope("p", "app"))
+        .expect("namespace");
+    for key in [b"spilled:a".as_slice(), b"spilled:b".as_slice()] {
+        let entry = namespace
+            .kv
+            .entries
+            .get(key)
+            .expect("spilled entry should be merged");
+        assert!(entry.value.is_empty());
+        assert!(entry.value_ref.is_some());
+    }
+}
+
+#[tokio::test]
 async fn single_request_epoch_applies_inline_without_parallel_worker_roundtrip() {
     let dir = tempdir().expect("temp");
     let exec = CommitExecutor::with_state(
@@ -1131,6 +1204,56 @@ async fn multi_kv_set_epoch_applies_inline_without_parallel_worker_roundtrip() {
             .kv_get("p", "app", b"batch:c")
             .map(|entry| entry.value),
         Some(b"c".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn compact_kv_fast_path_uses_small_entry_memory_estimate() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_memory_estimate_bytes: 120,
+        ..AedbConfig::default()
+    };
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        config,
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    let req_a = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"compact:a".to_vec(),
+        value: [0xA1; 32].to_vec(),
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"compact:b".to_vec(),
+        value: [0xB2; 32].to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()),
+        "compact KV writes should fit under the tight memory limit"
+    );
+    assert_eq!(
+        epoch.parallel_apply_micros, 0,
+        "compact KV writes should stay on the inline fast path"
+    );
+    assert!(state.keyspace.estimate_memory_bytes() <= 120);
+    assert_eq!(
+        state.keyspace.mem_bytes,
+        state.keyspace.recompute_memory_bytes_full()
     );
 }
 

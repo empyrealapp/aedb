@@ -12,6 +12,7 @@ use crate::manifest::schema::Manifest;
 use crate::recovery::replay::replay_segments;
 use crate::recovery::scanner::scan_segments;
 use crate::storage::keyspace::Keyspace;
+use crate::storage::kv_segment::KvSegmentStore;
 use crate::storage::value_store::PersistentValueStore;
 use std::collections::HashMap;
 use std::fs::File;
@@ -155,9 +156,15 @@ fn attach_configured_value_store(
             data_dir,
             config.persistent_value_hot_cache_bytes,
         )?);
+        let segment_store = Arc::new(KvSegmentStore::open_with_block_cache_bytes(
+            data_dir,
+            config.kv_segment_block_cache_bytes,
+        )?);
         keyspace
             .attach_persistent_value_store(store, config.persistent_value_inline_threshold_bytes)?;
+        keyspace.attach_kv_segment_store(segment_store);
         keyspace.spill_kv_values_to_memory_target(config.max_memory_estimate_bytes)?;
+        keyspace.flush_kv_to_segments_to_memory_target(config.max_memory_estimate_bytes)?;
     } else {
         keyspace.detach_persistent_value_store();
     }

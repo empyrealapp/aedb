@@ -1036,6 +1036,86 @@ async fn benchmark_many_small_kv_no_pressure() {
 
 #[tokio::test]
 #[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_many_u256_sized_kv_no_pressure() {
+    const SEED_COUNT: usize = 4_096;
+    const OPS: usize = 512;
+    const VALUE_BYTES: usize = 32;
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::OsBuffered,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        persistent_value_inline_threshold_bytes: 1024,
+        max_kv_value_bytes: 1024,
+        max_transaction_bytes: 4096,
+        max_memory_estimate_bytes: 512 * 1024 * 1024,
+        ..AedbConfig::default()
+    };
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project(PROJECT_ID).await.expect("project");
+
+    for i in 0..SEED_COUNT {
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("u256-sized:{i:04}").into_bytes(),
+            value: vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES],
+        })
+        .await
+        .expect("seed u256-sized kv");
+    }
+
+    let mut update_lat = Vec::new();
+    for i in 0..OPS {
+        let t0 = Instant::now();
+        db.commit(Mutation::KvSet {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            key: format!("u256-sized:{:04}", i % SEED_COUNT).into_bytes(),
+            value: vec![u8::try_from((i + 1) % 251).expect("byte"); VALUE_BYTES],
+        })
+        .await
+        .expect("update u256-sized kv");
+        update_lat.push(t0.elapsed().as_micros());
+    }
+    update_lat.sort_unstable();
+    let update_p50 = percentile(&update_lat, 0.50) as u64;
+    let update_p99 = percentile(&update_lat, 0.99) as u64;
+
+    let mut get_lat = Vec::new();
+    for i in 0..OPS {
+        let key = format!("u256-sized:{:04}", i % SEED_COUNT);
+        let t0 = Instant::now();
+        let got = db
+            .kv_get_no_auth(
+                PROJECT_ID,
+                SCOPE_ID,
+                key.as_bytes(),
+                ConsistencyMode::AtLatest,
+            )
+            .await
+            .expect("get u256-sized kv")
+            .expect("u256-sized kv");
+        assert_eq!(got.value.len(), VALUE_BYTES);
+        get_lat.push(t0.elapsed().as_micros());
+    }
+    get_lat.sort_unstable();
+    let get_p50 = percentile(&get_lat, 0.50) as u64;
+    let get_p99 = percentile(&get_lat, 0.99) as u64;
+
+    let memory_estimate = db.estimated_memory_bytes().await;
+    eprintln!(
+        "many_u256_sized_kv_no_pressure: seed_count={} ops={} value_bytes={} update_p50={}us update_p99={}us get_p50={}us get_p99={}us memory_estimate={}",
+        SEED_COUNT, OPS, VALUE_BYTES, update_p50, update_p99, get_p50, get_p99, memory_estimate
+    );
+
+    assert!(update_p99 > 0);
+    assert!(get_p99 <= update_p99);
+    assert!(memory_estimate < SEED_COUNT * 80);
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
 async fn benchmark_durability_profile_write_matrix() {
     const OPS: usize = 160;
     let profiles = [

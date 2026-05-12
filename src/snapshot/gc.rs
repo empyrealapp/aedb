@@ -1,6 +1,6 @@
 use crate::error::AedbError;
 use crate::snapshot::reader::SnapshotReadView;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +117,17 @@ impl SnapshotManager {
             return Err(AedbError::SnapshotExpired);
         }
         Ok(&snapshot.view)
+    }
+
+    pub fn active_kv_segment_filenames(&self) -> HashSet<String> {
+        let mut filenames = HashSet::new();
+        for snapshot in self.active_snapshots.values() {
+            if snapshot.released {
+                continue;
+            }
+            filenames.extend(snapshot.view.keyspace.kv_segment_filenames());
+        }
+        filenames
     }
 
     pub fn eligible_segment_reclaims(

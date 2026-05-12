@@ -184,6 +184,7 @@ fn materialized_dump_keyspace(keyspace: &Keyspace) -> Result<Keyspace, AedbError
     Ok(Keyspace {
         primary_index_backend: materialized.primary_index_backend,
         value_store: None,
+        kv_segment_store: None,
         persistent_value_inline_threshold_bytes: materialized
             .persistent_value_inline_threshold_bytes,
         namespaces: materialized.namespaces,
@@ -219,6 +220,10 @@ fn checksum_state(state: &SnapshotDumpState) -> Result<String, AedbError> {
         hash_bytes(&mut h, &ns_key_bytes);
 
         hash_label(&mut h, "kv_entries");
+        for (key, entry) in namespace.kv.small_entries.iter() {
+            hash_bytes(&mut h, key);
+            hash_encoded(&mut h, entry)?;
+        }
         for (key, entry) in namespace.kv.entries.iter() {
             hash_bytes(&mut h, key);
             hash_encoded(&mut h, entry)?;
@@ -384,7 +389,13 @@ fn state_counts(state: &SnapshotDumpState) -> (u64, u64) {
     let mut table_rows = 0u64;
     let mut kv_entries = 0u64;
     for namespace in state.keyspace.namespaces.values() {
-        kv_entries = kv_entries.saturating_add(namespace.kv.entries.len() as u64);
+        kv_entries = kv_entries.saturating_add(
+            namespace
+                .kv
+                .entries
+                .len()
+                .saturating_add(namespace.kv.small_entries.len()) as u64,
+        );
         for table in namespace.tables.values() {
             table_rows = table_rows.saturating_add(table.rows.len() as u64);
         }
@@ -399,7 +410,12 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
     let mut kv_entries = 0u64;
 
     for (ns_id, ns) in recovered.keyspace.namespaces.iter() {
-        kv_entries = kv_entries.saturating_add(ns.kv.entries.len() as u64);
+        kv_entries = kv_entries.saturating_add(
+            ns.kv
+                .entries
+                .len()
+                .saturating_add(ns.kv.small_entries.len()) as u64,
+        );
         for (table_name, table_data) in &ns.tables {
             table_count = table_count.saturating_add(1);
             table_rows = table_rows.saturating_add(table_data.rows.len() as u64);

@@ -109,9 +109,8 @@ impl std::io::Write for CountingWriter {
 }
 
 fn estimate_prevalidated_single_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
-    match mutation {
-        _ => None,
-    }
+    let _ = mutation;
+    None
 }
 
 fn estimate_value_size_upper_bound(value: &Value) -> usize {
@@ -477,6 +476,8 @@ pub struct ExecutorRuntimeState {
     pub persistent_value_store_bytes: u64,
     pub persistent_value_hot_cache_bytes: usize,
     pub persistent_value_hot_cache_capacity_bytes: usize,
+    pub kv_segment_block_cache_bytes: usize,
+    pub kv_segment_block_cache_capacity_bytes: usize,
 }
 
 impl CommitExecutor {
@@ -1738,17 +1739,39 @@ impl CommitExecutor {
             persistent_value_store_bytes,
             persistent_value_hot_cache_bytes,
             persistent_value_hot_cache_capacity_bytes,
+            kv_segment_block_cache_bytes,
+            kv_segment_block_cache_capacity_bytes,
         ) = {
             let state = self.state.lock().await;
-            if let Some(store) = &state.keyspace.value_store {
-                (
-                    store.len_bytes(),
-                    store.hot_cache_resident_bytes(),
-                    store.hot_cache_capacity_bytes(),
-                )
-            } else {
-                (0, 0, 0)
-            }
+            let value_metrics = state
+                .keyspace
+                .value_store
+                .as_ref()
+                .map_or((0, 0, 0), |store| {
+                    (
+                        store.len_bytes(),
+                        store.hot_cache_resident_bytes(),
+                        store.hot_cache_capacity_bytes(),
+                    )
+                });
+            let segment_metrics =
+                state
+                    .keyspace
+                    .kv_segment_store
+                    .as_ref()
+                    .map_or((0, 0), |store| {
+                        (
+                            store.block_cache_resident_bytes(),
+                            store.block_cache_capacity_bytes(),
+                        )
+                    });
+            (
+                value_metrics.0,
+                value_metrics.1,
+                value_metrics.2,
+                segment_metrics.0,
+                segment_metrics.1,
+            )
         };
         ExecutorRuntimeState {
             current_seq: self.current_seq.load(Ordering::Acquire),
@@ -1758,6 +1781,8 @@ impl CommitExecutor {
             persistent_value_store_bytes,
             persistent_value_hot_cache_bytes,
             persistent_value_hot_cache_capacity_bytes,
+            kv_segment_block_cache_bytes,
+            kv_segment_block_cache_capacity_bytes,
         }
     }
 }

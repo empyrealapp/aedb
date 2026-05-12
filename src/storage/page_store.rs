@@ -217,7 +217,7 @@ impl PagedStore {
                 .iter()
                 .zip(payloads[cache_start..].iter())
             {
-                cache.insert(page_ref.page_id, page_ref.blake3_hash, *payload);
+                cache.insert(page_ref.page_id, page_ref.blake3_hash, payload);
             }
         }
         Ok(refs)
@@ -235,15 +235,15 @@ impl PagedStore {
     }
 
     pub fn read_page(&self, page_ref: &PageRef) -> Result<Vec<u8>, AedbError> {
-        if self.cache_capacity_pages > 0 {
-            if let Some((page, cached_hash)) = self.cache.read().get(&page_ref.page_id) {
-                if cached_hash != page_ref.blake3_hash {
-                    return Err(AedbError::IntegrityError {
-                        message: "cached page hash mismatch".into(),
-                    });
-                }
-                return Ok(page.as_ref().to_vec());
+        if self.cache_capacity_pages > 0
+            && let Some((page, cached_hash)) = self.cache.read().get(&page_ref.page_id)
+        {
+            if cached_hash != page_ref.blake3_hash {
+                return Err(AedbError::IntegrityError {
+                    message: "cached page hash mismatch".into(),
+                });
             }
+            return Ok(page.as_ref().to_vec());
         }
 
         let current_count = self.page_count.load(Ordering::Acquire);
@@ -496,14 +496,11 @@ impl PageCache {
         if self.capacity_pages == 0 {
             return;
         }
-        if self.pages.contains_key(&page_id) {
-            self.pages.insert(
-                page_id,
-                CachedPage {
-                    payload: Arc::from(payload),
-                    blake3_hash,
-                },
-            );
+        if let std::collections::hash_map::Entry::Occupied(mut cached) = self.pages.entry(page_id) {
+            cached.insert(CachedPage {
+                payload: Arc::from(payload),
+                blake3_hash,
+            });
             return;
         }
         self.insertion_order.push_back(page_id);

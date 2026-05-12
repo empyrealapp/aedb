@@ -2848,6 +2848,101 @@ async fn production_profile_spills_all_kv_payloads_by_default() {
 }
 
 #[tokio::test]
+async fn unused_kv_segment_reclaim_keeps_live_disk_state() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 0,
+        persistent_value_hot_cache_bytes: 0,
+        kv_segment_block_cache_bytes: 16 * 1024,
+        max_memory_estimate_bytes: 10 * 1024,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    for generation_number in 0..5u8 {
+        let entries = (0..512u16)
+            .map(|entry_number| {
+                (
+                    format!("k{entry_number:04}").into_bytes(),
+                    vec![generation_number; 32],
+                )
+            })
+            .collect::<Vec<_>>();
+        db.kv_set_many_atomic("p", "app", entries)
+            .await
+            .expect("set generation");
+    }
+    let read_tx = db
+        .begin_read_tx(ConsistencyMode::AtLatest)
+        .await
+        .expect("read tx");
+    let read_tx_seq = read_tx.snapshot_seq();
+    for generation_number in 5..10u8 {
+        let entries = (0..512u16)
+            .map(|entry_number| {
+                (
+                    format!("k{entry_number:04}").into_bytes(),
+                    vec![generation_number; 32],
+                )
+            })
+            .collect::<Vec<_>>();
+        db.kv_set_many_atomic("p", "app", entries)
+            .await
+            .expect("set later generation");
+    }
+
+    let segment_dir = dir.path().join("kv_segments");
+    let before_reclaim = fs::read_dir(&segment_dir)
+        .expect("segment dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".aedbkv"))
+        .count();
+    assert!(before_reclaim > 1);
+
+    let reclaimed = db
+        .reclaim_unused_kv_segments()
+        .await
+        .expect("reclaim unused segments");
+    assert!(reclaimed > 0);
+    let after_reclaim_with_read_tx = fs::read_dir(&segment_dir)
+        .expect("segment dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".aedbkv"))
+        .count();
+    assert!(after_reclaim_with_read_tx < before_reclaim);
+    let old_key = b"k0000".to_vec();
+    let old_value = db
+        .kv_get_no_auth("p", "app", &old_key, ConsistencyMode::AtSeq(read_tx_seq))
+        .await
+        .expect("old read")
+        .expect("old value");
+    assert_eq!(old_value.value, vec![4u8; 32]);
+    drop(read_tx);
+    let reclaimed_after_drop = db
+        .reclaim_unused_kv_segments()
+        .await
+        .expect("reclaim after read tx");
+    assert!(reclaimed_after_drop > 0);
+    let after_reclaim = fs::read_dir(&segment_dir)
+        .expect("segment dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".aedbkv"))
+        .count();
+    assert!(after_reclaim < after_reclaim_with_read_tx);
+
+    for entry_number in [0u16, 1, 127, 255, 511] {
+        let key = format!("k{entry_number:04}").into_bytes();
+        let got = db
+            .kv_get_no_auth("p", "app", &key, ConsistencyMode::AtLatest)
+            .await
+            .expect("read after reclaim")
+            .expect("value");
+        assert_eq!(got.value, vec![9u8; 32]);
+    }
+}
+
+#[tokio::test]
 async fn disk_backed_small_kv_values_spill_under_memory_pressure() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {
