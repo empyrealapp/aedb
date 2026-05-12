@@ -1937,6 +1937,88 @@ impl AedbInstance {
             .await
     }
 
+    /// Run a query and capture the read-set it touched (point keys and key
+    /// ranges with row versions). Used by reactive subscriptions to drive
+    /// per-query invalidation. The query semantics mirror [`Self::query`].
+    pub async fn query_with_read_set(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+    ) -> Result<(QueryResult, ReadSet), QueryError> {
+        if self.require_authenticated_calls {
+            return Err(QueryError::PermissionDenied {
+                permission: "authenticated caller required in secure mode".into(),
+                scope: "anonymous".into(),
+            });
+        }
+        self.query_with_options_capturing_as(
+            None,
+            project_id,
+            scope_id,
+            query,
+            QueryOptions::default(),
+        )
+        .await
+    }
+
+    /// Run a query with caller context + options and capture the read-set it
+    /// touched. Mirrors [`Self::query_with_options_as`].
+    pub async fn query_with_options_capturing_as(
+        &self,
+        caller: Option<&CallerContext>,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+        mut options: QueryOptions,
+    ) -> Result<(QueryResult, ReadSet), QueryError> {
+        if self.require_authenticated_calls && caller.is_none() {
+            return Err(QueryError::PermissionDenied {
+                permission: "authenticated caller required in secure mode".into(),
+                scope: "anonymous".into(),
+            });
+        }
+        if let Some(caller) = caller {
+            ensure_query_caller_allowed(caller)?;
+        }
+        if options.async_index.is_none() {
+            options.async_index = query.use_index.clone();
+        }
+        self.normalize_query_cursor_options(&mut options)?;
+
+        let view = self
+            .snapshot_for_consistency(options.consistency)
+            .await
+            .map_err(QueryError::from)?;
+        let snapshot = &view.keyspace;
+        let catalog = &view.catalog;
+        let seq = view.seq;
+
+        let query = crate::lib_helpers::authorize_and_bind_query_for_caller(
+            project_id,
+            scope_id,
+            query,
+            &options,
+            caller,
+            catalog.as_ref(),
+        )?;
+
+        let mut collector = crate::query::executor::ReadSetCollector::new();
+        let mut result = crate::query::executor::execute_query_with_options_capturing(
+            snapshot.as_ref(),
+            catalog.as_ref(),
+            project_id,
+            scope_id,
+            query,
+            &options,
+            seq,
+            self._config.max_scan_rows,
+            Some(&mut collector),
+        )?;
+        self.sign_query_result_cursor(&mut result)?;
+        Ok((result, collector.into_inner()))
+    }
+
     pub(crate) async fn query_unchecked(
         &self,
         project_id: &str,

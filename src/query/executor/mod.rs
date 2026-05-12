@@ -17,6 +17,7 @@ mod cursor;
 mod indexing;
 mod join;
 mod predicate;
+mod read_set;
 mod validate;
 
 use aggregate::{aggregate_col_idx, aggregate_output_name};
@@ -25,6 +26,7 @@ use cursor::{
 };
 use indexing::{indexed_pks_for_predicate_limited, indexed_pks_for_predicate_with_trace};
 use predicate::extract_primary_key_values;
+pub use read_set::ReadSetCollector;
 use validate::validate_query;
 
 #[derive(Debug, Clone)]
@@ -200,6 +202,31 @@ pub fn execute_query_with_options(
     snapshot_seq: u64,
     max_scan_rows: usize,
 ) -> Result<QueryResult, QueryError> {
+    execute_query_with_options_capturing(
+        snapshot,
+        catalog,
+        project_id,
+        scope_id,
+        query,
+        options,
+        snapshot_seq,
+        max_scan_rows,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn execute_query_with_options_capturing(
+    snapshot: &KeyspaceSnapshot,
+    catalog: &Catalog,
+    project_id: &str,
+    scope_id: &str,
+    query: Query,
+    options: &QueryOptions,
+    snapshot_seq: u64,
+    max_scan_rows: usize,
+    mut read_set: Option<&mut ReadSetCollector>,
+) -> Result<QueryResult, QueryError> {
     let mut options = options.clone();
     if options.async_index.is_none() {
         options.async_index = query.use_index.clone();
@@ -245,6 +272,16 @@ pub fn execute_query_with_options(
     }
 
     if !query.joins.is_empty() {
+        // Join paths fall back to coarse table-range capture: record each
+        // touched table as a full structural-version-bounded range so the
+        // reactive layer stays correct without per-row pk capture.
+        if let Some(collector) = read_set.as_deref_mut() {
+            collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
+            for join in &query.joins {
+                let (jp, js, jt) = join::resolve_table_ref(project_id, scope_id, &join.table);
+                collector.record_full_table_scan(snapshot, &jp, &js, &jt);
+            }
+        }
         return join::execute_join_query(
             snapshot,
             catalog,
@@ -268,9 +305,17 @@ pub fn execute_query_with_options(
         })?;
     let table = snapshot.table(project_id, scope_id, &query.table);
     let mut materialized_seq = None;
-    if let Some(result) =
-        try_primary_key_point_query(schema, table, &query, &cursor_state, snapshot_seq)?
-    {
+    if let Some(result) = try_primary_key_point_query(
+        snapshot,
+        schema,
+        table,
+        project_id,
+        scope_id,
+        &query,
+        &cursor_state,
+        snapshot_seq,
+        read_set.as_deref_mut(),
+    )? {
         return Ok(result);
     }
     validate_query(schema, &query)?;
@@ -294,6 +339,12 @@ pub fn execute_query_with_options(
                 })?;
             materialized_seq = Some(projection.materialized_seq);
             estimated_rows = projection.rows.len();
+            // Async-index projections expose their own materialized_seq; fall
+            // back to recording a coarse table range for the underlying table
+            // so writes invalidate subscribers.
+            if let Some(collector) = read_set.as_deref_mut() {
+                collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
+            }
             let rows: Vec<Row> = projection.rows.values().cloned().collect();
             Box::new(rows.into_iter())
         } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
@@ -318,6 +369,16 @@ pub fn execute_query_with_options(
             .map(|result| result.pks);
             match indexed_pks {
                 Some(pks) => {
+                    if let Some(collector) = read_set.as_deref_mut() {
+                        collector.record_touched_pks(
+                            snapshot,
+                            schema,
+                            project_id,
+                            scope_id,
+                            &query.table,
+                            &pks,
+                        );
+                    }
                     estimated_rows = pks.len();
                     let rows: Vec<Row> = pks
                         .into_iter()
@@ -326,12 +387,23 @@ pub fn execute_query_with_options(
                     Box::new(rows.into_iter())
                 }
                 None => {
+                    if let Some(collector) = read_set.as_deref_mut() {
+                        collector.record_full_table_scan(
+                            snapshot,
+                            project_id,
+                            scope_id,
+                            &query.table,
+                        );
+                    }
                     estimated_rows = table.rows.len();
                     let rows: Vec<Row> = table.rows.values().cloned().collect();
                     Box::new(rows.into_iter())
                 }
             }
         } else {
+            if let Some(collector) = read_set.as_deref_mut() {
+                collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
+            }
             let rows: Vec<Row> = table
                 .map(|t| t.rows.values().cloned().collect())
                 .unwrap_or_default();
@@ -544,12 +616,17 @@ fn query_requires_full_evaluation(query: &Query, has_cursor: bool) -> bool {
         || query.limit.is_none()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_primary_key_point_query(
+    snapshot: &KeyspaceSnapshot,
     schema: &TableSchema,
     table: Option<&crate::storage::keyspace::TableData>,
+    project_id: &str,
+    scope_id: &str,
     query: &Query,
     cursor_state: &Option<CursorToken>,
     snapshot_seq: u64,
+    read_set: Option<&mut ReadSetCollector>,
 ) -> Result<Option<QueryResult>, QueryError> {
     if cursor_state.is_some()
         || query.predicate.is_none()
@@ -578,6 +655,16 @@ fn try_primary_key_point_query(
     let Some(primary_key) = extract_primary_key_values(predicate, &schema.primary_key) else {
         return Ok(None);
     };
+
+    if let Some(collector) = read_set {
+        collector.record_point(
+            snapshot,
+            project_id,
+            scope_id,
+            &query.table,
+            primary_key.clone(),
+        );
+    }
 
     let selected_indices = resolve_selected_indices(schema, query)?;
     let encoded_pk = EncodedKey::from_values(&primary_key);
