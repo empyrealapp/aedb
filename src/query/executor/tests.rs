@@ -1671,9 +1671,7 @@ fn split_recommended_set_on_full_consumption() {
         &catalog,
         "A",
         "app",
-        Query::select(&["*"])
-            .from("users")
-            .aggregate(Aggregate::Count),
+        Query::select(&["*"]).from("users").aggregate(Aggregate::Count),
         &QueryOptions {
             allow_full_scan: true,
             ..QueryOptions::default()
@@ -1720,10 +1718,6 @@ fn split_not_recommended_when_consumption_below_threshold() {
 
 #[test]
 fn cursor_remaining_limit_is_threaded_across_pages() {
-    // Verify that when the user supplies an overall limit, `remaining_limit`
-    // is propagated through the cursor on each page and decremented by the
-    // rows returned. We don't need signing for this assertion — encode/decode
-    // with key=None round-trip the CursorToken faithfully.
     let token = super::cursor::CursorToken {
         snapshot_seq: 1,
         last_sort_key: vec![],
@@ -1735,25 +1729,121 @@ fn cursor_remaining_limit_is_threaded_across_pages() {
     let decoded = super::cursor::decode_cursor(&encoded, None).expect("decode");
     assert_eq!(decoded.remaining_limit, Some(10));
 
-    // First page from nothing: returned=3, limit=10 → remaining=7.
-    assert_eq!(
-        super::compute_remaining_limit_after_page(Some(10), None, 3),
-        Some(7),
+    assert_eq!(super::compute_remaining_limit_after_page(Some(10), None, 3), Some(7));
+    assert_eq!(super::compute_remaining_limit_after_page(Some(10), Some(7), 3), Some(4));
+    assert_eq!(super::compute_remaining_limit_after_page(None, None, 5), None);
+    assert_eq!(super::compute_remaining_limit_after_page(Some(2), None, 5), Some(0));
+}
+
+#[test]
+fn read_set_captures_primary_key_point_lookup() {
+    use super::execute_query_with_options_capturing;
+    use super::ReadSetCollector;
+    use crate::commit::tx::ReadKey;
+
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+
+    let mut collector = ReadSetCollector::new();
+    let result = execute_query_with_options_capturing(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id", "name"])
+            .from("users")
+            .where_(Expr::Eq("id".into(), Value::Integer(7))),
+        &QueryOptions {
+            allow_full_scan: true,
+            ..QueryOptions::default()
+        },
+        0,
+        usize::MAX,
+        Some(&mut collector),
+    )
+    .expect("query");
+    assert_eq!(result.rows.len(), 1);
+
+    let read_set = collector.into_inner();
+    assert_eq!(read_set.points.len(), 1, "expected one point entry");
+    assert!(read_set.ranges.is_empty(), "no ranges for PK lookup");
+    let entry = &read_set.points[0];
+    let ReadKey::TableRow { project_id, scope_id, table_name, primary_key } = &entry.key else {
+        panic!("expected TableRow read key");
+    };
+    assert_eq!(project_id, "A");
+    assert_eq!(scope_id, "app");
+    assert_eq!(table_name, "users");
+    assert_eq!(primary_key, &vec![Value::Integer(7)]);
+}
+
+#[test]
+fn read_set_captures_indexed_range_as_touched_pks() {
+    use super::execute_query_with_options_capturing;
+    use super::ReadSetCollector;
+
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+
+    let mut collector = ReadSetCollector::new();
+    let result = execute_query_with_options_capturing(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id", "age"])
+            .from("users")
+            .where_(Expr::Gte("age".into(), Value::Integer(60)))
+            .limit(10),
+        &QueryOptions {
+            allow_full_scan: true,
+            ..QueryOptions::default()
+        },
+        0,
+        usize::MAX,
+        Some(&mut collector),
+    )
+    .expect("query");
+    assert!(!result.rows.is_empty());
+
+    let read_set = collector.into_inner();
+    assert!(
+        !read_set.points.is_empty(),
+        "indexed range scan should capture touched pks as points"
     );
-    // Subsequent page: returned=3, cursor.remaining=7, query.limit=10
-    // → min(10,7) - 3 = 4.
-    assert_eq!(
-        super::compute_remaining_limit_after_page(Some(10), Some(7), 3),
-        Some(4),
-    );
-    // No limit anywhere: remains None.
-    assert_eq!(
-        super::compute_remaining_limit_after_page(None, None, 5),
-        None,
-    );
-    // Saturating: returned exceeds remaining, clamp at zero.
-    assert_eq!(
-        super::compute_remaining_limit_after_page(Some(2), None, 5),
-        Some(0),
-    );
+    assert!(read_set.ranges.is_empty(), "no coarse range expected");
+}
+
+#[test]
+fn read_set_captures_full_table_scan_as_range() {
+    use super::execute_query_with_options_capturing;
+    use super::ReadSetCollector;
+    use crate::commit::tx::ReadRange;
+
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+
+    let mut collector = ReadSetCollector::new();
+    let _ = execute_query_with_options_capturing(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["*"]).from("users"),
+        &QueryOptions {
+            allow_full_scan: true,
+            ..QueryOptions::default()
+        },
+        0,
+        usize::MAX,
+        Some(&mut collector),
+    )
+    .expect("query");
+
+    let read_set = collector.into_inner();
+    assert_eq!(read_set.ranges.len(), 1, "full scan should record one coarse range");
+    let ReadRange::TableRange { table_name, .. } = &read_set.ranges[0].range else {
+        panic!("expected TableRange");
+    };
+    assert_eq!(table_name, "users");
 }

@@ -44,4 +44,4 @@ flamegraph.svg
 # Backup/temporary files
 *~
 
-artifacts/
+artifacts/.claude/worktrees/
