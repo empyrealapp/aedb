@@ -1,6 +1,7 @@
 use super::{
-    CursorToken, QueryResult, aggregate_col_idx, aggregate_output_name, encode_cursor,
-    extract_pk_key, extract_sort_key, row_after_cursor,
+    CursorToken, QueryResult, aggregate_col_idx, aggregate_output_name,
+    compute_remaining_limit_after_page, compute_split_recommended, encode_cursor, extract_pk_key,
+    extract_sort_key, row_after_cursor,
 };
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
@@ -23,6 +24,7 @@ pub(super) fn execute_join_query(
     snapshot_seq: u64,
     max_scan_rows: usize,
     cursor_state: Option<CursorToken>,
+    cursor_signing_key: Option<&[u8; 32]>,
 ) -> Result<QueryResult, QueryError> {
     let (base_ns_project, base_ns_scope, base_table) =
         resolve_table_ref(project_id, scope_id, &query.table);
@@ -383,20 +385,31 @@ pub(super) fn execute_join_query(
             .collect();
     }
 
+    let returned_rows = sliced.len();
+    let remaining_limit_after_page = compute_remaining_limit_after_page(
+        query.limit,
+        cursor_state.as_ref().and_then(|c| c.remaining_limit),
+        returned_rows,
+    );
     let cursor = if has_more {
         let last_row = cursor_last_row.ok_or_else(|| QueryError::InvalidQuery {
             reason: "invalid cursor state".into(),
         })?;
-        Some(encode_cursor(&CursorToken {
-            snapshot_seq,
-            last_sort_key: extract_sort_key(&last_row, &sort_indices),
-            last_pk: extract_pk_key(&last_row, &pk_indices),
-            page_size,
-            remaining_limit: None,
-        })?)
+        Some(encode_cursor(
+            &CursorToken {
+                snapshot_seq,
+                last_sort_key: extract_sort_key(&last_row, &sort_indices),
+                last_pk: extract_pk_key(&last_row, &pk_indices),
+                page_size,
+                remaining_limit: remaining_limit_after_page,
+            },
+            cursor_signing_key,
+        )?)
     } else {
         None
     };
+    let split_budget = query.limit.unwrap_or(max_scan_rows);
+    let split_recommended = compute_split_recommended(rows_examined, split_budget);
     Ok(QueryResult {
         rows_examined,
         rows: sliced,
@@ -404,6 +417,7 @@ pub(super) fn execute_join_query(
         cursor,
         snapshot_seq,
         materialized_seq: None,
+        split_recommended,
     })
 }
 

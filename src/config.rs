@@ -93,6 +93,12 @@ pub struct AedbConfig {
     /// HMAC key for manifest integrity. Wrapped in Arc<Zeroizing<>> to ensure
     /// the key is securely zeroed from memory when the last reference is dropped.
     pub manifest_hmac_key: Option<Arc<Zeroizing<Vec<u8>>>>,
+    /// HMAC-SHA256 key used to sign query pagination cursor tokens so that
+    /// clients cannot tamper with `last_sort_key`, `last_pk`, `page_size`, or
+    /// `snapshot_seq`. When `None`, cursors are emitted unsigned (legacy
+    /// behaviour) for back-compat with existing tests and embedders. When
+    /// `Some`, both encode and decode paths require a valid 32-byte HMAC tag.
+    pub cursor_signing_key: Option<Arc<Zeroizing<[u8; 32]>>>,
     pub recovery_mode: RecoveryMode,
     pub hash_chain_required: bool,
     pub primary_index_backend: PrimaryIndexBackend,
@@ -153,6 +159,7 @@ impl Default for AedbConfig {
             checkpoint_key_id: None,
             checkpoint_compression_level: 3,
             manifest_hmac_key: None,
+            cursor_signing_key: None,
             recovery_mode: RecoveryMode::Strict,
             hash_chain_required: true,
             primary_index_backend: PrimaryIndexBackend::OrdMap,
@@ -223,6 +230,20 @@ impl AedbConfig {
     /// the Arc<Zeroizing<>> wrapper for use with manifest functions.
     pub fn hmac_key(&self) -> Option<&[u8]> {
         self.manifest_hmac_key.as_ref().map(|arc| &***arc as &[u8])
+    }
+
+    /// Returns a reference to the cursor signing HMAC key, dereferencing
+    /// through the Arc<Zeroizing<>> wrapper. Returns `None` when cursor
+    /// signing is disabled (legacy back-compat).
+    pub fn cursor_signing_key(&self) -> Option<&[u8; 32]> {
+        self.cursor_signing_key.as_ref().map(|arc| &***arc)
+    }
+
+    /// Sets the cursor signing HMAC key, wrapping it in Arc<Zeroizing<>> for
+    /// secure memory handling.
+    pub fn with_cursor_signing_key(mut self, key: [u8; 32]) -> Self {
+        self.cursor_signing_key = Some(Arc::new(Zeroizing::new(key)));
+        self
     }
 
     /// Sets the checkpoint encryption key, wrapping it in Arc<Zeroizing<>> for
