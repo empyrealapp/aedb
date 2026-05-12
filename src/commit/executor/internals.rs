@@ -1,7 +1,7 @@
 use super::parallel_runtime::ParallelTask;
 use super::*;
 use crate::catalog::SYSTEM_PROJECT_ID;
-use crate::commit::assertions::{evaluate_assertions, validate_assertions};
+use crate::commit::assertions::validate_assertions;
 use crate::commit::tx::{AssertionActual, ReadAssertion};
 use crate::commit::validation::KvIntegerAmount;
 use crate::lib_helpers::{
@@ -1726,14 +1726,17 @@ pub(super) fn process_commit_epoch(
             continue;
         }
 
+        let mut envelope_read_byte_budget =
+            crate::commit::ReadByteBudget::new(state.config.max_read_bytes_per_envelope);
         let skip_assertions = request.prevalidated && request.assertions_engine_verified;
         if request.has_assertions
             && !skip_assertions
-            && let Err(err) = evaluate_assertions(
+            && let Err(err) = crate::commit::assertions::evaluate_assertions_with_read_budget(
                 &working_catalog,
                 &working_keyspace,
                 &request.envelope.assertions,
                 state.config.max_scan_rows,
+                Some(&mut envelope_read_byte_budget),
             )
         {
             if let Some(internal) = build_assertion_audit_commit(
@@ -1892,6 +1895,7 @@ pub(super) fn process_commit_epoch(
                         max_scan_rows: state.config.max_scan_rows,
                     },
                     request.envelope.caller.as_ref(),
+                    Some(&mut envelope_read_byte_budget),
                 );
                 result.map(|()| {
                     working_keyspace = trial_keyspace;
@@ -1975,13 +1979,14 @@ pub(super) fn process_commit_epoch(
                             break;
                         }
                         None => {
-                            if let Err(err) = apply_mutation(
+                            if let Err(err) = crate::commit::apply::apply_mutation_with_read_budget(
                                 &mut trial_catalog,
                                 &mut trial_keyspace,
                                 mutation.clone(),
                                 commit_seq,
                                 Some(state.config.max_scan_rows),
                                 request.envelope.caller.as_ref(),
+                                Some(&mut envelope_read_byte_budget),
                             ) {
                                 apply_error = Some(err);
                                 break;
@@ -4161,6 +4166,7 @@ pub(super) fn apply_via_coordinator(
     ordered_partitions: &[String],
     options: CoordinatorApplyOptions<'_>,
     caller: Option<&CallerContext>,
+    mut read_bytes: Option<&mut crate::commit::ReadByteBudget>,
 ) -> Result<(), AedbError> {
     let started = Instant::now();
     let _lock_guard = if options.coordinator_locking_enabled {
@@ -4187,13 +4193,14 @@ pub(super) fn apply_via_coordinator(
         } else {
             enforce_global_unique_scope_invariants(catalog, keyspace, mutation)?;
         }
-        apply_mutation(
+        crate::commit::apply::apply_mutation_with_read_budget(
             catalog,
             keyspace,
             mutation.clone(),
             commit_seq,
             Some(options.max_scan_rows),
             caller,
+            read_bytes.as_deref_mut(),
         )?;
         if matches!(mutation, Mutation::Ddl(_)) {
             *global_unique_index = GlobalUniqueIndexState::from_snapshot(catalog, keyspace)?;
