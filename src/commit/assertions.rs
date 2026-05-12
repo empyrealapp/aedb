@@ -3,6 +3,7 @@ use crate::catalog::types::{ColumnType, Row, Value};
 use crate::catalog::{Catalog, namespace_key};
 use crate::commit::tx::{AssertionActual, ReadAssertion};
 use crate::commit::validation::CompareOp;
+use crate::commit::{ReadByteBudget, row_byte_size, value_byte_size};
 use crate::error::AedbError;
 use crate::query::plan::{Expr, MAX_EXPR_IN_LIST_VALUES, MAX_LIKE_PATTERN_BYTES};
 use crate::storage::encoded_key::EncodedKey;
@@ -28,8 +29,28 @@ pub fn evaluate_assertions(
     assertions: &[ReadAssertion],
     max_scan_rows: usize,
 ) -> Result<(), AedbError> {
+    evaluate_assertions_with_read_budget(catalog, keyspace, assertions, max_scan_rows, None)
+}
+
+/// Same as [`evaluate_assertions`], but also charges scanned bytes against an
+/// envelope-wide read-byte budget. Used by the commit pipeline to bound the
+/// aggregate read cost of assertion evaluation.
+pub fn evaluate_assertions_with_read_budget(
+    catalog: &Catalog,
+    keyspace: &Keyspace,
+    assertions: &[ReadAssertion],
+    max_scan_rows: usize,
+    mut read_bytes: Option<&mut ReadByteBudget>,
+) -> Result<(), AedbError> {
     for (index, assertion) in assertions.iter().enumerate() {
-        match evaluate_assertion(catalog, keyspace, assertion, 1, max_scan_rows)? {
+        match evaluate_assertion(
+            catalog,
+            keyspace,
+            assertion,
+            1,
+            max_scan_rows,
+            read_bytes.as_deref_mut(),
+        )? {
             None => {}
             Some(actual) => {
                 return Err(AedbError::AssertionFailed {
@@ -208,6 +229,7 @@ fn evaluate_assertion(
     assertion: &ReadAssertion,
     depth: usize,
     max_scan_rows: usize,
+    mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<Option<AssertionActual>, AedbError> {
     if depth > MAX_ASSERTION_DEPTH {
         return Err(AedbError::Validation(format!(
@@ -275,6 +297,11 @@ fn evaluate_assertion(
             expected,
         } => {
             let current = keyspace.kv_get(project_id, scope_id, key);
+            if let Some(entry) = current.as_ref()
+                && let Some(budget) = read_bytes.as_deref_mut()
+            {
+                budget.charge(key.len().saturating_add(entry.value.len()))?;
+            }
             let actual = current.map(|entry| entry.value.clone());
             if actual.as_ref() == Some(expected) {
                 Ok(None)
@@ -294,6 +321,9 @@ fn evaluate_assertion(
             let Some(current) = keyspace.kv_get(project_id, scope_id, key) else {
                 return Ok(Some(AssertionActual::Missing));
             };
+            if let Some(budget) = read_bytes.as_deref_mut() {
+                budget.charge(key.len().saturating_add(current.value.len()))?;
+            }
             if compare_bytes(&current.value, threshold, *op) {
                 Ok(None)
             } else {
@@ -378,6 +408,9 @@ fn evaluate_assertion(
             let Some(row) = table.rows.get(&EncodedKey::from_values(primary_key)) else {
                 return Ok(Some(AssertionActual::Missing));
             };
+            if let Some(budget) = read_bytes.as_deref_mut() {
+                budget.charge(row_byte_size(row))?;
+            }
             let Some(current) = row.values.get(column_idx) else {
                 return Ok(Some(AssertionActual::Missing));
             };
@@ -400,7 +433,13 @@ fn evaluate_assertion(
             let count = keyspace
                 .table_by_namespace_key(&ns, table_name)
                 .map(|table| {
-                    count_matching_rows(table.rows.values(), schema, filter, max_scan_rows)
+                    count_matching_rows(
+                        table.rows.values(),
+                        schema,
+                        filter,
+                        max_scan_rows,
+                        read_bytes.as_deref_mut(),
+                    )
                 })
                 .transpose()?
                 .unwrap_or(0);
@@ -432,6 +471,7 @@ fn evaluate_assertion(
                     column_idx,
                     filter,
                     max_scan_rows,
+                    read_bytes.as_deref_mut(),
                 )?,
             };
             if compare_values(&sum, threshold, *op) {
@@ -442,9 +482,14 @@ fn evaluate_assertion(
         }
         ReadAssertion::All(assertions) => {
             for assertion in assertions {
-                if let Some(actual) =
-                    evaluate_assertion(catalog, keyspace, assertion, depth + 1, max_scan_rows)?
-                {
+                if let Some(actual) = evaluate_assertion(
+                    catalog,
+                    keyspace,
+                    assertion,
+                    depth + 1,
+                    max_scan_rows,
+                    read_bytes.as_deref_mut(),
+                )? {
                     return Ok(Some(actual));
                 }
             }
@@ -453,7 +498,14 @@ fn evaluate_assertion(
         ReadAssertion::Any(assertions) => {
             let mut last_actual = AssertionActual::Missing;
             for assertion in assertions {
-                match evaluate_assertion(catalog, keyspace, assertion, depth + 1, max_scan_rows)? {
+                match evaluate_assertion(
+                    catalog,
+                    keyspace,
+                    assertion,
+                    depth + 1,
+                    max_scan_rows,
+                    read_bytes.as_deref_mut(),
+                )? {
                     None => return Ok(None),
                     Some(actual) => last_actual = actual,
                 }
@@ -461,7 +513,14 @@ fn evaluate_assertion(
             Ok(Some(last_actual))
         }
         ReadAssertion::Not(assertion) => {
-            match evaluate_assertion(catalog, keyspace, assertion, depth + 1, max_scan_rows)? {
+            match evaluate_assertion(
+                catalog,
+                keyspace,
+                assertion,
+                depth + 1,
+                max_scan_rows,
+                read_bytes.as_deref_mut(),
+            )? {
                 None => Ok(Some(AssertionActual::Bool(true))),
                 Some(_) => Ok(None),
             }
@@ -591,6 +650,7 @@ fn sum_rows_for_column<'a>(
     column_idx: usize,
     filter: &Option<Expr>,
     max_scan_rows: usize,
+    mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<Value, AedbError> {
     let col_type = &schema.columns[column_idx].col_type;
     match col_type {
@@ -598,6 +658,14 @@ fn sum_rows_for_column<'a>(
             let mut sum: i64 = 0;
             for (scanned, row) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+                if let Some(budget) = read_bytes.as_deref_mut() {
+                    let touched_bytes = row
+                        .values
+                        .get(column_idx)
+                        .map(value_byte_size)
+                        .unwrap_or(0);
+                    budget.charge(touched_bytes)?;
+                }
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
@@ -627,6 +695,14 @@ fn sum_rows_for_column<'a>(
             let mut sum = 0.0f64;
             for (scanned, row) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+                if let Some(budget) = read_bytes.as_deref_mut() {
+                    let touched_bytes = row
+                        .values
+                        .get(column_idx)
+                        .map(value_byte_size)
+                        .unwrap_or(0);
+                    budget.charge(touched_bytes)?;
+                }
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
@@ -640,6 +716,14 @@ fn sum_rows_for_column<'a>(
             let mut sum = U256::zero();
             for (scanned, row) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+                if let Some(budget) = read_bytes.as_deref_mut() {
+                    let touched_bytes = row
+                        .values
+                        .get(column_idx)
+                        .map(value_byte_size)
+                        .unwrap_or(0);
+                    budget.charge(touched_bytes)?;
+                }
                 if !match_filter(row, schema, filter)? {
                     continue;
                 }
@@ -663,10 +747,14 @@ fn count_matching_rows<'a>(
     schema: &TableSchema,
     filter: &Option<Expr>,
     max_scan_rows: usize,
+    mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<u64, AedbError> {
     let mut count = 0u64;
     for (scanned, row) in rows.enumerate() {
         ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+        if let Some(budget) = read_bytes.as_deref_mut() {
+            budget.charge(row_byte_size(row))?;
+        }
         if match_filter(row, schema, filter)? {
             count = count.saturating_add(1);
         }

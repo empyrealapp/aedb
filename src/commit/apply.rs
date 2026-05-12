@@ -2,6 +2,8 @@ use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
 use crate::catalog::schema::{ColumnDef, Constraint, ForeignKeyAction, TableSchema};
 use crate::catalog::types::{ColumnType, Row, Value};
+use crate::commit::ReadByteBudget;
+use crate::commit::row_byte_size;
 use crate::commit::tx::{AssertionActual, ReadAssertion};
 use crate::commit::validation::{
     ConflictAction, ConflictTarget, Mutation, TableUpdateExpr, UpdateExpr,
@@ -35,6 +37,21 @@ pub fn apply_mutation(
     commit_seq: u64,
     scan_budget: Option<usize>,
     caller: Option<&CallerContext>,
+) -> Result<(), AedbError> {
+    apply_mutation_with_read_budget(catalog, keyspace, mutation, commit_seq, scan_budget, caller, None)
+}
+
+/// Same as [`apply_mutation`], but also charges scanned bytes against an
+/// envelope-wide read-byte budget. Used by the commit pipeline to bound the
+/// aggregate read cost of a single transaction.
+pub fn apply_mutation_with_read_budget(
+    catalog: &mut Catalog,
+    keyspace: &mut Keyspace,
+    mutation: Mutation,
+    commit_seq: u64,
+    scan_budget: Option<usize>,
+    caller: Option<&CallerContext>,
+    read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<(), AedbError> {
     match mutation {
         Mutation::Insert {
@@ -218,6 +235,7 @@ pub fn apply_mutation(
                 commit_seq,
                 scan_budget,
                 caller,
+                read_bytes,
             )?;
         }
         Mutation::UpdateWhere {
@@ -240,6 +258,7 @@ pub fn apply_mutation(
                 commit_seq,
                 scan_budget,
                 caller,
+                read_bytes,
             )?;
         }
         Mutation::UpdateWhereExpr {
@@ -262,6 +281,7 @@ pub fn apply_mutation(
                 commit_seq,
                 scan_budget,
                 caller,
+                read_bytes,
             )?;
         }
         Mutation::Ddl(op) => {
@@ -2693,6 +2713,7 @@ fn apply_delete_where_internal(
     commit_seq: u64,
     scan_budget: Option<usize>,
     caller: Option<&CallerContext>,
+    mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
@@ -2710,6 +2731,9 @@ fn apply_delete_where_internal(
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
         for (scanned_rows, (encoded_pk, row)) in table.rows.iter().enumerate() {
             ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+            if let Some(budget) = read_bytes.as_deref_mut() {
+                budget.charge(row_byte_size(row))?;
+            }
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
@@ -2748,6 +2772,7 @@ fn apply_update_where_internal(
     commit_seq: u64,
     scan_budget: Option<usize>,
     caller: Option<&CallerContext>,
+    mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
@@ -2776,6 +2801,9 @@ fn apply_update_where_internal(
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
         for (scanned_rows, row) in table.rows.values().enumerate() {
             ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+            if let Some(budget) = read_bytes.as_deref_mut() {
+                budget.charge(row_byte_size(row))?;
+            }
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }
@@ -2823,6 +2851,7 @@ fn apply_update_where_expr_internal(
     commit_seq: u64,
     scan_budget: Option<usize>,
     caller: Option<&CallerContext>,
+    mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
     let schema = catalog
@@ -2867,6 +2896,9 @@ fn apply_update_where_expr_internal(
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
         for (scanned_rows, row) in table.rows.values().enumerate() {
             ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+            if let Some(budget) = read_bytes.as_deref_mut() {
+                budget.charge(row_byte_size(row))?;
+            }
             if !eval_compiled_expr_public(&compiled, row) {
                 continue;
             }

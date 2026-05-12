@@ -46,6 +46,17 @@ pub struct AedbConfig {
     pub max_inflight_commits: usize,
     pub max_commit_queue_bytes: usize,
     pub max_transaction_bytes: usize,
+    /// Maximum number of mutations allowed in a single envelope. Enforced
+    /// before any work is performed to bound DoS surface from oversized
+    /// envelopes.
+    pub max_mutations_per_envelope: usize,
+    /// Maximum number of read assertions allowed in a single envelope.
+    /// Enforced before any work is performed.
+    pub max_read_assertions_per_envelope: usize,
+    /// Aggregate cap on bytes scanned by reads (mutation Read-Modify-Write
+    /// scans and assertion evaluation) within a single envelope. Enforced
+    /// incrementally during read traversal.
+    pub max_read_bytes_per_envelope: usize,
     pub commit_timeout_ms: u64,
     pub durable_ack_coalescing_enabled: bool,
     pub durable_ack_coalesce_window_us: u64,
@@ -93,9 +104,20 @@ pub struct AedbConfig {
     /// HMAC key for manifest integrity. Wrapped in Arc<Zeroizing<>> to ensure
     /// the key is securely zeroed from memory when the last reference is dropped.
     pub manifest_hmac_key: Option<Arc<Zeroizing<Vec<u8>>>>,
+    /// HMAC-SHA256 key used to sign query pagination cursor tokens so that
+    /// clients cannot tamper with `last_sort_key`, `last_pk`, `page_size`, or
+    /// `snapshot_seq`. When `None`, cursors are emitted unsigned (legacy
+    /// behaviour) for back-compat with existing tests and embedders. When
+    /// `Some`, both encode and decode paths require a valid 32-byte HMAC tag.
+    pub cursor_signing_key: Option<Arc<Zeroizing<[u8; 32]>>>,
     pub recovery_mode: RecoveryMode,
     pub hash_chain_required: bool,
     pub primary_index_backend: PrimaryIndexBackend,
+    /// Capacity of the public commit-delta broadcast channel
+    /// exposed via `AedbInstance::subscribe_commits`. Subscribers
+    /// that fall behind beyond this many buffered deltas will
+    /// receive `RecvError::Lagged` from `broadcast::Receiver::recv`.
+    pub commit_broadcast_capacity: usize,
 }
 
 impl Default for AedbConfig {
@@ -111,6 +133,9 @@ impl Default for AedbConfig {
             max_inflight_commits: 64,
             max_commit_queue_bytes: 64 * 1024 * 1024,
             max_transaction_bytes: 16 * 1024 * 1024,
+            max_mutations_per_envelope: 16_384,
+            max_read_assertions_per_envelope: 32_768,
+            max_read_bytes_per_envelope: 16 * 1024 * 1024,
             commit_timeout_ms: 5000,
             durable_ack_coalescing_enabled: false,
             durable_ack_coalesce_window_us: 0,
@@ -153,9 +178,11 @@ impl Default for AedbConfig {
             checkpoint_key_id: None,
             checkpoint_compression_level: 3,
             manifest_hmac_key: None,
+            cursor_signing_key: None,
             recovery_mode: RecoveryMode::Strict,
             hash_chain_required: true,
             primary_index_backend: PrimaryIndexBackend::OrdMap,
+            commit_broadcast_capacity: 1024,
         }
     }
 }
@@ -223,6 +250,20 @@ impl AedbConfig {
     /// the Arc<Zeroizing<>> wrapper for use with manifest functions.
     pub fn hmac_key(&self) -> Option<&[u8]> {
         self.manifest_hmac_key.as_ref().map(|arc| &***arc as &[u8])
+    }
+
+    /// Returns a reference to the cursor signing HMAC key, dereferencing
+    /// through the Arc<Zeroizing<>> wrapper. Returns `None` when cursor
+    /// signing is disabled (legacy back-compat).
+    pub fn cursor_signing_key(&self) -> Option<&[u8; 32]> {
+        self.cursor_signing_key.as_ref().map(|arc| &***arc)
+    }
+
+    /// Sets the cursor signing HMAC key, wrapping it in Arc<Zeroizing<>> for
+    /// secure memory handling.
+    pub fn with_cursor_signing_key(mut self, key: [u8; 32]) -> Self {
+        self.cursor_signing_key = Some(Arc::new(Zeroizing::new(key)));
+        self
     }
 
     /// Sets the checkpoint encryption key, wrapping it in Arc<Zeroizing<>> for

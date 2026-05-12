@@ -2749,6 +2749,233 @@ fn checkpoint_compression_level_is_validated() {
 }
 
 #[tokio::test]
+async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_mutations_per_envelope: 4,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let too_many: Vec<Mutation> = (0..5u8)
+        .map(|i| Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![b'k', i],
+            value: vec![i],
+        })
+        .collect();
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent { mutations: too_many },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("envelope mutation count cap must reject");
+    match err {
+        AedbError::Validation(msg) => {
+            assert!(
+                msg.contains("max_mutations_per_envelope") && msg.contains("mutations=5"),
+                "informative limit message expected, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+
+    let ok_batch: Vec<Mutation> = (0..4u8)
+        .map(|i| Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![b'k', i],
+            value: vec![i],
+        })
+        .collect();
+    db.commit_envelope(TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: crate::commit::tx::ReadSet::default(),
+        write_intent: WriteIntent { mutations: ok_batch },
+        base_seq: 0,
+    })
+    .await
+    .expect("envelope within mutation cap commits");
+}
+
+#[tokio::test]
+async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_read_assertions_per_envelope: 2,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let too_many: Vec<ReadAssertion> = (0..3u8)
+        .map(|i| ReadAssertion::KeyExists {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![b'k', i],
+            expected: false,
+        })
+        .collect();
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: too_many,
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("envelope assertion count cap must reject");
+    match err {
+        AedbError::Validation(msg) => {
+            assert!(
+                msg.contains("max_read_assertions_per_envelope")
+                    && msg.contains("assertions=3"),
+                "informative limit message expected, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn envelope_read_bytes_budget_passes_for_tiny_envelope() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_read_bytes_per_envelope: 1024,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.commit_envelope(TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: vec![ReadAssertion::KeyExists {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"absent".to_vec(),
+            expected: false,
+        }],
+        read_set: crate::commit::tx::ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    })
+    .await
+    .expect("tiny envelope must fit budget");
+}
+
+#[tokio::test]
+async fn envelope_read_bytes_budget_rejects_large_scan() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_scan_rows: 1_000_000,
+        max_read_bytes_per_envelope: 512,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "items".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "blob".into(),
+                col_type: ColumnType::Blob,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("create table");
+
+    for i in 0..64i64 {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(i)],
+            row: Row::from_values(vec![Value::Integer(i), Value::Blob(vec![0xAB; 128])]),
+        })
+        .await
+        .expect("seed row");
+    }
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::CountCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "items".into(),
+                filter: None,
+                op: crate::commit::validation::CompareOp::Gte,
+                threshold: 0,
+            }],
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"_".to_vec(),
+                    value: b"_".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("aggregate read byte budget must reject large scan");
+    match err {
+        AedbError::Validation(msg) => {
+            assert!(
+                msg.contains("max_read_bytes_per_envelope"),
+                "informative limit message expected, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {
@@ -11926,4 +12153,287 @@ async fn memory_limit_is_enforced_before_wal_commit() {
         rows.rows.is_empty(),
         "rejected commit must leave no row behind"
     );
+}
+
+#[tokio::test]
+async fn subscribe_commits_delivers_delta_after_commit() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+
+    db.create_project("p").await.expect("project");
+    // Subscribe AFTER setup so we observe only the deltas under test.
+    let mut rx = db.subscribe_commits();
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"hello".to_vec(),
+        value: b"world".to_vec(),
+    })
+    .await
+    .expect("commit");
+
+    // Drain until we find our KvSet — internal subsystems may also produce
+    // bookkeeping deltas, but ours must arrive within the timeout window.
+    let mut saw_kv_set = false;
+    let mut last_seq = 0u64;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(delta)) => {
+                last_seq = last_seq.max(delta.seq);
+                if delta
+                    .mutations
+                    .iter()
+                    .any(|m| matches!(m, Mutation::KvSet { key, .. } if key == b"hello"))
+                {
+                    saw_kv_set = true;
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(last_seq > 0, "broadcast delivered at least one delta");
+    assert!(
+        saw_kv_set,
+        "broadcast delta must include the committed KvSet mutation"
+    );
+
+    db.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn subscribe_commits_lagged_subscriber_can_resume() {
+    let mut config = AedbConfig::default();
+    config.commit_broadcast_capacity = 2;
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+
+    let mut rx = db.subscribe_commits();
+    db.create_project("p").await.expect("project");
+
+    for i in 0..8u8 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![i],
+            value: vec![i],
+        })
+        .await
+        .expect("commit");
+    }
+
+    let mut saw_lagged = false;
+    let mut delivered = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(_delta)) => {
+                delivered += 1;
+                if saw_lagged && delivered >= 2 {
+                    break;
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                saw_lagged = true;
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_lagged,
+        "slow subscriber must observe RecvError::Lagged with capacity=2 + burst"
+    );
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: vec![99],
+        value: vec![99],
+    })
+    .await
+    .expect("post-burst commit");
+
+    let post = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("post-burst delivery within timeout")
+        .expect("post-burst delta");
+    let resumed = post.mutations.iter().any(|m| {
+        matches!(
+            m,
+            Mutation::KvSet { key, .. } if key == &[99u8]
+        )
+    });
+    assert!(resumed, "subscriber must resume after Lagged error");
+
+    db.shutdown().await.expect("shutdown");
+}
+
+#[test]
+fn mutation_write_keys_table_row_variants() {
+    use crate::commit::tx::WriteKey;
+
+    let row = Row {
+        values: vec![Value::Integer(7), Value::Text("a".into())],
+    };
+    let pk = vec![Value::Integer(7)];
+
+    let insert = Mutation::Insert {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        table_name: "t".into(),
+        primary_key: pk.clone(),
+        row: row.clone(),
+    };
+    let keys = insert.write_keys();
+    assert_eq!(keys.len(), 1);
+    assert!(matches!(
+        &keys[0],
+        WriteKey::TableRow { project_id, scope_id, table_name, primary_key }
+            if project_id == "p" && scope_id == "s" && table_name == "t" && primary_key == &pk
+    ));
+
+    let delete = Mutation::Delete {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        table_name: "t".into(),
+        primary_key: pk.clone(),
+    };
+    let keys = delete.write_keys();
+    assert!(matches!(&keys[0], WriteKey::TableRow { primary_key, .. } if primary_key == &pk));
+
+    let batch = Mutation::InsertBatch {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        table_name: "t".into(),
+        rows: vec![row.clone()],
+    };
+    let keys = batch.write_keys();
+    assert!(matches!(
+        &keys[0],
+        WriteKey::TableRange { table_name, .. } if table_name == "t"
+    ));
+}
+
+#[test]
+fn mutation_write_keys_kv_and_scope_variants() {
+    use crate::commit::tx::WriteKey;
+
+    let kv = Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        key: b"k".to_vec(),
+        value: b"v".to_vec(),
+    };
+    let keys = kv.write_keys();
+    assert_eq!(keys.len(), 1);
+    assert!(matches!(
+        &keys[0],
+        WriteKey::KvKey { project_id, scope_id, key }
+            if project_id == "p" && scope_id == "s" && key == b"k"
+    ));
+
+    let emit = Mutation::EmitEvent {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        topic: "topic".into(),
+        event_key: "ek".into(),
+        payload_json: "{}".into(),
+    };
+    let keys = emit.write_keys();
+    assert!(matches!(
+        &keys[0],
+        WriteKey::ScopeAll { project_id, scope_id }
+            if project_id == "p" && scope_id == "s"
+    ));
+}
+
+#[test]
+fn read_set_intersects_positive_and_negative_cases() {
+    use crate::commit::tx::{
+        ReadBound, ReadKey, ReadRange, ReadRangeEntry, ReadSet, ReadSetEntry, WriteKey,
+    };
+
+    let mut rs = ReadSet::default();
+    rs.points.push(ReadSetEntry {
+        key: ReadKey::TableRow {
+            project_id: "p".into(),
+            scope_id: "s".into(),
+            table_name: "t".into(),
+            primary_key: vec![Value::Integer(1)],
+        },
+        version_at_read: 0,
+    });
+    rs.ranges.push(ReadRangeEntry {
+        range: ReadRange::KvRange {
+            project_id: "p".into(),
+            scope_id: "s".into(),
+            start: ReadBound::Included(b"a".to_vec()),
+            end: ReadBound::Excluded(b"c".to_vec()),
+        },
+        max_version_at_read: 0,
+        structural_version_at_read: 0,
+    });
+
+    // positive: same TableRow
+    assert!(rs.intersects(&[WriteKey::TableRow {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        table_name: "t".into(),
+        primary_key: vec![Value::Integer(1)],
+    }]));
+    // positive: KvRange covers KvKey "b"
+    assert!(rs.intersects(&[WriteKey::KvKey {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        key: b"b".to_vec(),
+    }]));
+    // positive: ScopeAll matches any read in the scope
+    assert!(rs.intersects(&[WriteKey::ScopeAll {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+    }]));
+    // negative: disjoint scope
+    assert!(!rs.intersects(&[WriteKey::TableRow {
+        project_id: "p".into(),
+        scope_id: "other".into(),
+        table_name: "t".into(),
+        primary_key: vec![Value::Integer(1)],
+    }]));
+    // negative: disjoint table
+    assert!(!rs.intersects(&[WriteKey::TableRow {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        table_name: "other".into(),
+        primary_key: vec![Value::Integer(1)],
+    }]));
+    // negative: KvKey outside range ("c" is excluded end)
+    assert!(!rs.intersects(&[WriteKey::KvKey {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        key: b"c".to_vec(),
+    }]));
+    // negative: empty write set
+    assert!(!rs.intersects(&[]));
+    // negative: mismatching kinds (TableRow read vs KvKey write at same proj/scope)
+    let rs_table_only = ReadSet {
+        points: vec![ReadSetEntry {
+            key: ReadKey::TableRow {
+                project_id: "p".into(),
+                scope_id: "s".into(),
+                table_name: "t".into(),
+                primary_key: vec![Value::Integer(1)],
+            },
+            version_at_read: 0,
+        }],
+        ranges: Vec::new(),
+    };
+    assert!(!rs_table_only.intersects(&[WriteKey::KvKey {
+        project_id: "p".into(),
+        scope_id: "s".into(),
+        key: b"k".to_vec(),
+    }]));
 }

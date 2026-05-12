@@ -446,6 +446,319 @@ pub enum Mutation {
     },
 }
 
+/// Enforce envelope-level count caps before any actual work is done. Mirrors
+/// the byte-cap (`max_transaction_bytes`) check on the commit submit path, but
+/// bounds DoS surface from large mutation / assertion vectors that may each be
+/// small individually yet collectively expensive to process.
+///
+/// Counts are read directly from the envelope without iterating their
+/// contents, so the check is O(1) and safe to run before allocation- or
+/// CPU-intensive work.
+pub fn validate_envelope_limits(
+    envelope: &crate::commit::tx::TransactionEnvelope,
+    config: &AedbConfig,
+) -> Result<(), AedbError> {
+    let mutation_count = envelope.write_intent.mutations.len();
+    if mutation_count > config.max_mutations_per_envelope {
+        return Err(AedbError::Validation(format!(
+            "envelope exceeds max_mutations_per_envelope: mutations={mutation_count}, max_mutations_per_envelope={}",
+            config.max_mutations_per_envelope
+        )));
+    }
+    let assertion_count = envelope.assertions.len();
+    if assertion_count > config.max_read_assertions_per_envelope {
+        return Err(AedbError::Validation(format!(
+            "envelope exceeds max_read_assertions_per_envelope: assertions={assertion_count}, max_read_assertions_per_envelope={}",
+            config.max_read_assertions_per_envelope
+        )));
+    }
+    Ok(())
+}
+
+impl Mutation {
+    /// Returns the concrete keys and ranges this mutation writes to,
+    /// expressed as [`crate::commit::tx::WriteKey`] values suitable for
+    /// intersecting against a [`crate::commit::tx::ReadSet`].
+    ///
+    /// Point mutations return precise `TableRow` / `KvKey` entries.
+    /// Predicate-driven mutations (e.g. `DeleteWhere`, `UpdateWhere`)
+    /// and batch inserts without resolved primary keys return a
+    /// conservative `TableRange` over the full table. Mutations that
+    /// touch catalog or internal scope state (DDL, accumulators,
+    /// event outbox, order-book bookkeeping) return `ScopeAll` over
+    /// the affected (project, scope).
+    pub fn write_keys(&self) -> Vec<crate::commit::tx::WriteKey> {
+        use crate::commit::tx::{ReadBound, WriteKey};
+        match self {
+            Mutation::Insert {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                ..
+            }
+            | Mutation::Upsert {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                ..
+            }
+            | Mutation::Delete {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+            }
+            | Mutation::TableIncU256 {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                ..
+            }
+            | Mutation::TableDecU256 {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                ..
+            } => vec![WriteKey::TableRow {
+                project_id: project_id.clone(),
+                scope_id: scope_id.clone(),
+                table_name: table_name.clone(),
+                primary_key: primary_key.clone(),
+            }],
+            Mutation::InsertBatch {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::UpsertBatch {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::UpsertOnConflict {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::UpsertBatchOnConflict {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::DeleteWhere {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::UpdateWhere {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            }
+            | Mutation::UpdateWhereExpr {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            } => vec![WriteKey::TableRange {
+                project_id: project_id.clone(),
+                scope_id: scope_id.clone(),
+                table_name: table_name.clone(),
+                start: ReadBound::Unbounded,
+                end: ReadBound::Unbounded,
+            }],
+            Mutation::Ddl(_) => Vec::new(),
+            Mutation::KvSet {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvDel {
+                project_id,
+                scope_id,
+                key,
+            }
+            | Mutation::KvIncU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvDecU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvAddU256Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvSubU256Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMaxU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMinU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMutateU256 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvAddU64Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvSubU64Ex {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvSubIntEx {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::CounterAdd {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMaxU64 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMinU64 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
+            | Mutation::KvMutateU64 {
+                project_id,
+                scope_id,
+                key,
+                ..
+            } => vec![WriteKey::KvKey {
+                project_id: project_id.clone(),
+                scope_id: scope_id.clone(),
+                key: key.clone(),
+            }],
+            Mutation::Accumulate {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::ExposeAccumulator {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::ExposeAccumulatorBatch {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::ReleaseAccumulatorExposure {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::EmitEvent {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookNew {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookCancel {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookCancelReplace {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookMassCancel {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookReduce {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookMatch {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookDefineTable {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookDropTable {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookSetInstrumentConfig {
+                project_id,
+                scope_id,
+                ..
+            }
+            | Mutation::OrderBookSetInstrumentHalted {
+                project_id,
+                scope_id,
+                ..
+            } => vec![WriteKey::ScopeAll {
+                project_id: project_id.clone(),
+                scope_id: scope_id.clone(),
+            }],
+        }
+    }
+}
+
 /// Early validation of KV mutation sizes to prevent DoS via oversized keys/values.
 /// This check happens BEFORE the mutation is queued, preventing memory allocation
 /// of oversized data. Called at the API boundary before committing.

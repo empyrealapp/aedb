@@ -30,6 +30,7 @@ pub(crate) fn execute_query_against_view(
     options: &QueryOptions,
     caller: Option<&CallerContext>,
     max_scan_rows: usize,
+    cursor_signing_key: Option<&[u8; 32]>,
 ) -> Result<QueryResult, QueryError> {
     let snapshot = &view.keyspace;
     let catalog = &view.catalog;
@@ -53,6 +54,7 @@ pub(crate) fn execute_query_against_view(
         options,
         seq,
         max_scan_rows,
+        cursor_signing_key,
     )
 }
 
@@ -460,6 +462,11 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
             message: "snapshot limits must be > 0".into(),
         });
     }
+    if config.commit_broadcast_capacity == 0 {
+        return Err(AedbError::InvalidConfig {
+            message: "commit_broadcast_capacity must be > 0".into(),
+        });
+    }
     if matches!(config.durability_mode, DurabilityMode::Batch)
         && (config.batch_interval_ms == 0 || config.batch_max_bytes == 0)
     {
@@ -506,6 +513,12 @@ pub(crate) fn validate_config(config: &AedbConfig) -> Result<(), AedbError> {
 
 pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbError> {
     validate_config(config)?;
+    if config.cursor_signing_key().is_none() {
+        tracing::warn!(
+            target: "aedb.config",
+            "secure config has cursor_signing_key disabled; pagination cursors will not be HMAC-signed at the executor layer"
+        );
+    }
     let Some(hmac_key) = &config.manifest_hmac_key else {
         return Err(AedbError::InvalidConfig {
             message: "secure mode requires manifest_hmac_key".into(),
@@ -548,6 +561,12 @@ pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbErro
 
 pub fn validate_arcana_config(config: &AedbConfig) -> Result<(), AedbError> {
     validate_config(config)?;
+    if config.cursor_signing_key().is_none() {
+        tracing::warn!(
+            target: "aedb.config",
+            "Arcana production profile has cursor_signing_key disabled; pagination cursors will not be HMAC-signed at the executor layer"
+        );
+    }
     let Some(hmac_key) = &config.manifest_hmac_key else {
         return Err(AedbError::InvalidConfig {
             message: "manifest_hmac_key is required for Arcana production profile".into(),
@@ -607,14 +626,15 @@ pub(crate) fn parse_cursor_seq(cursor: &str) -> Result<u64, AedbError> {
             .ok_or_else(|| AedbError::Decode("invalid cursor".into()))?;
         bytes.push((hi << 4) | lo);
     }
+    /// Inner cursor tokens optionally carry a 32-byte HMAC-SHA256 tag suffix.
+    /// We treat the suffix as opaque here — outer-layer verification has
+    /// already happened — and just peel it off so msgpack decode sees only
+    /// the payload prefix.
+    const INNER_HMAC_TAG_LEN: usize = 32;
     #[derive(serde::Deserialize)]
     struct CursorSeq {
         snapshot_seq: u64,
     }
-    if let Ok(token) = rmp_serde::from_slice::<CursorSeq>(&bytes) {
-        return Ok(token.snapshot_seq);
-    }
-
     #[derive(serde::Deserialize)]
     struct CursorToken {
         snapshot_seq: u64,
@@ -623,15 +643,33 @@ pub(crate) fn parse_cursor_seq(cursor: &str) -> Result<u64, AedbError> {
         page_size: usize,
         remaining_limit: Option<usize>,
     }
-    let token: CursorToken =
-        rmp_serde::from_slice(&bytes).map_err(|_| AedbError::Decode("invalid cursor".into()))?;
-    let _ = (
-        token.last_sort_key,
-        token.last_pk,
-        token.page_size,
-        token.remaining_limit,
-    );
-    Ok(token.snapshot_seq)
+
+    let try_parse = |slice: &[u8]| -> Option<u64> {
+        if let Ok(token) = rmp_serde::from_slice::<CursorSeq>(slice) {
+            return Some(token.snapshot_seq);
+        }
+        if let Ok(token) = rmp_serde::from_slice::<CursorToken>(slice) {
+            let _ = (
+                token.last_sort_key,
+                token.last_pk,
+                token.page_size,
+                token.remaining_limit,
+            );
+            return Some(token.snapshot_seq);
+        }
+        None
+    };
+
+    if let Some(seq) = try_parse(&bytes) {
+        return Ok(seq);
+    }
+    if bytes.len() > INNER_HMAC_TAG_LEN {
+        let trimmed = &bytes[..bytes.len() - INNER_HMAC_TAG_LEN];
+        if let Some(seq) = try_parse(trimmed) {
+            return Ok(seq);
+        }
+    }
+    Err(AedbError::Decode("invalid cursor".into()))
 }
 
 fn decode_hex_nibble(byte: u8) -> Option<u8> {
