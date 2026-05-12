@@ -1392,6 +1392,19 @@ impl AedbInstance {
         Ok(result)
     }
 
+    /// Subscribe to the public commit-delta broadcast stream.
+    ///
+    /// Each successful commit produces one `Arc<CommitDelta>` on the channel
+    /// after the commit's deltas have been applied and the durable / visible
+    /// head has advanced. Lagged subscribers receive
+    /// `tokio::sync::broadcast::error::RecvError::Lagged(n)` and may resume.
+    /// The channel capacity is `AedbConfig::commit_broadcast_capacity`.
+    pub fn subscribe_commits(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<Arc<crate::version_store::CommitDelta>> {
+        self.executor.subscribe_commits()
+    }
+
     async fn commit_prevalidated_internal(
         &self,
         op_name: &'static str,

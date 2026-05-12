@@ -33,7 +33,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Notify, mpsc as tokio_mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -373,6 +373,7 @@ pub struct CommitExecutor {
     latest_snapshot_generation: Arc<AtomicU64>,
     cached_snapshot_generation: Arc<AtomicU64>,
     durable_notify: Arc<Notify>,
+    commit_broadcast: broadcast::Sender<Arc<CommitDelta>>,
     current_seq: Arc<AtomicU64>,
     visible_head_seq: Arc<AtomicU64>,
     durable_head_seq: Arc<AtomicU64>,
@@ -571,6 +572,10 @@ impl CommitExecutor {
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let telemetry = Arc::new(ExecutorTelemetry::default());
         let durable_notify = Arc::new(Notify::new());
+        let commit_broadcast_capacity = config.commit_broadcast_capacity.max(1);
+        let (commit_broadcast, _initial_receiver) =
+            broadcast::channel::<Arc<CommitDelta>>(commit_broadcast_capacity);
+        drop(_initial_receiver);
         let current_seq_atomic = Arc::new(AtomicU64::new(current_seq));
         let visible_head_seq = Arc::new(AtomicU64::new(current_seq));
         let durable_head_seq = Arc::new(AtomicU64::new(current_seq));
@@ -624,6 +629,7 @@ impl CommitExecutor {
         let queue_counter = Arc::clone(&queued_bytes);
         let loop_telemetry = Arc::clone(&telemetry);
         let loop_durable_notify = Arc::clone(&durable_notify);
+        let loop_commit_broadcast = commit_broadcast.clone();
         let loop_current_seq = Arc::clone(&current_seq_atomic);
         let loop_visible_head = Arc::clone(&visible_head_seq);
         let loop_durable_head = Arc::clone(&durable_head_seq);
@@ -830,6 +836,16 @@ impl CommitExecutor {
                 let mut coordinator_lock_timeouts = 0u64;
                 let mut parallel_apply_timeouts = 0u64;
                 for outcome in outcomes {
+                    if outcome.result.is_ok()
+                        && let Some(delta) = outcome.post_apply_delta.as_ref()
+                    {
+                        // Fan-out to public commit-delta subscribers.
+                        // `send` only fails when there are no receivers — that
+                        // is the intended no-op case. Lagged subscribers see
+                        // `RecvError::Lagged` on their own receivers and can
+                        // resume from there.
+                        let _ = loop_commit_broadcast.send(Arc::clone(delta));
+                    }
                     if loop_post_apply_refresh_needed.load(Ordering::Acquire)
                         && let Some(delta) = outcome.post_apply_delta
                     {
@@ -1148,6 +1164,7 @@ impl CommitExecutor {
             latest_snapshot_generation,
             cached_snapshot_generation,
             durable_notify,
+            commit_broadcast,
             current_seq: current_seq_atomic,
             visible_head_seq,
             durable_head_seq,
@@ -1503,6 +1520,21 @@ impl CommitExecutor {
     #[inline]
     pub fn durable_head_seq_now(&self) -> u64 {
         self.durable_head_seq.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to the public commit-delta broadcast stream.
+    ///
+    /// Each successful commit produces one `Arc<CommitDelta>` on the channel
+    /// after the commit is durable (in `DurabilityMode::Full`) or visible
+    /// (in batched modes — subscribers see commits at the same moment the
+    /// apply loop wakes up `durable_notify` waiters).
+    ///
+    /// Subscribers that fall behind the configured
+    /// `commit_broadcast_capacity` receive `RecvError::Lagged(n)` from
+    /// `Receiver::recv` and can continue from there. The send side never
+    /// blocks the apply loop.
+    pub fn subscribe_commits(&self) -> broadcast::Receiver<Arc<CommitDelta>> {
+        self.commit_broadcast.subscribe()
     }
 
     pub async fn head_state(&self) -> HeadState {
