@@ -2749,6 +2749,233 @@ fn checkpoint_compression_level_is_validated() {
 }
 
 #[tokio::test]
+async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_mutations_per_envelope: 4,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let too_many: Vec<Mutation> = (0..5u8)
+        .map(|i| Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![b'k', i],
+            value: vec![i],
+        })
+        .collect();
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent { mutations: too_many },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("envelope mutation count cap must reject");
+    match err {
+        AedbError::Validation(msg) => {
+            assert!(
+                msg.contains("max_mutations_per_envelope") && msg.contains("mutations=5"),
+                "informative limit message expected, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+
+    let ok_batch: Vec<Mutation> = (0..4u8)
+        .map(|i| Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![b'k', i],
+            value: vec![i],
+        })
+        .collect();
+    db.commit_envelope(TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: crate::commit::tx::ReadSet::default(),
+        write_intent: WriteIntent { mutations: ok_batch },
+        base_seq: 0,
+    })
+    .await
+    .expect("envelope within mutation cap commits");
+}
+
+#[tokio::test]
+async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_read_assertions_per_envelope: 2,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let too_many: Vec<ReadAssertion> = (0..3u8)
+        .map(|i| ReadAssertion::KeyExists {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: vec![b'k', i],
+            expected: false,
+        })
+        .collect();
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: too_many,
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("envelope assertion count cap must reject");
+    match err {
+        AedbError::Validation(msg) => {
+            assert!(
+                msg.contains("max_read_assertions_per_envelope")
+                    && msg.contains("assertions=3"),
+                "informative limit message expected, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn envelope_read_bytes_budget_passes_for_tiny_envelope() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_read_bytes_per_envelope: 1024,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.commit_envelope(TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: vec![ReadAssertion::KeyExists {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"absent".to_vec(),
+            expected: false,
+        }],
+        read_set: crate::commit::tx::ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    })
+    .await
+    .expect("tiny envelope must fit budget");
+}
+
+#[tokio::test]
+async fn envelope_read_bytes_budget_rejects_large_scan() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_scan_rows: 1_000_000,
+        max_read_bytes_per_envelope: 512,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "items".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "blob".into(),
+                col_type: ColumnType::Blob,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("create table");
+
+    for i in 0..64i64 {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(i)],
+            row: Row::from_values(vec![Value::Integer(i), Value::Blob(vec![0xAB; 128])]),
+        })
+        .await
+        .expect("seed row");
+    }
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::CountCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "items".into(),
+                filter: None,
+                op: crate::commit::validation::CompareOp::Gte,
+                threshold: 0,
+            }],
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"_".to_vec(),
+                    value: b"_".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("aggregate read byte budget must reject large scan");
+    match err {
+        AedbError::Validation(msg) => {
+            assert!(
+                msg.contains("max_read_bytes_per_envelope"),
+                "informative limit message expected, got: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {

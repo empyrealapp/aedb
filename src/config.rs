@@ -46,6 +46,17 @@ pub struct AedbConfig {
     pub max_inflight_commits: usize,
     pub max_commit_queue_bytes: usize,
     pub max_transaction_bytes: usize,
+    /// Maximum number of mutations allowed in a single envelope. Enforced
+    /// before any work is performed to bound DoS surface from oversized
+    /// envelopes.
+    pub max_mutations_per_envelope: usize,
+    /// Maximum number of read assertions allowed in a single envelope.
+    /// Enforced before any work is performed.
+    pub max_read_assertions_per_envelope: usize,
+    /// Aggregate cap on bytes scanned by reads (mutation Read-Modify-Write
+    /// scans and assertion evaluation) within a single envelope. Enforced
+    /// incrementally during read traversal.
+    pub max_read_bytes_per_envelope: usize,
     pub commit_timeout_ms: u64,
     pub durable_ack_coalescing_enabled: bool,
     pub durable_ack_coalesce_window_us: u64,
@@ -122,6 +133,9 @@ impl Default for AedbConfig {
             max_inflight_commits: 64,
             max_commit_queue_bytes: 64 * 1024 * 1024,
             max_transaction_bytes: 16 * 1024 * 1024,
+            max_mutations_per_envelope: 16_384,
+            max_read_assertions_per_envelope: 32_768,
+            max_read_bytes_per_envelope: 16 * 1024 * 1024,
             commit_timeout_ms: 5000,
             durable_ack_coalescing_enabled: false,
             durable_ack_coalesce_window_us: 0,

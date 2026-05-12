@@ -1363,6 +1363,10 @@ impl CommitExecutor {
         encoded_size_hint: Option<usize>,
     ) -> Result<CommitResult, AedbError> {
         let config = &self.config;
+        // Enforce envelope count caps before doing any encoding or queueing work.
+        // These are SECURITY-sensitive caps; checking up front bounds the cost of a
+        // malicious envelope to constant time.
+        crate::commit::validation::validate_envelope_limits(&envelope, config)?;
         let encoded_size_bytes = if let Some(upper_bound) = encoded_size_hint {
             if upper_bound <= config.max_transaction_bytes {
                 upper_bound

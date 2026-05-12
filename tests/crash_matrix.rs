@@ -41,6 +41,10 @@ fn timeout_config() -> AedbConfig {
         hash_chain_required: false,
         partition_lock_timeout_ms: 1,
         epoch_apply_timeout_ms: 1,
+        // Crash-matrix timeout tests submit 25,000-mutation envelopes to
+        // force epoch apply timeouts; raise the per-envelope mutation cap
+        // above that so the test exercises the timeout path it intends to.
+        max_mutations_per_envelope: 64 * 1024,
         ..AedbConfig::default()
     }
 }

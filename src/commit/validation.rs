@@ -446,6 +446,35 @@ pub enum Mutation {
     },
 }
 
+/// Enforce envelope-level count caps before any actual work is done. Mirrors
+/// the byte-cap (`max_transaction_bytes`) check on the commit submit path, but
+/// bounds DoS surface from large mutation / assertion vectors that may each be
+/// small individually yet collectively expensive to process.
+///
+/// Counts are read directly from the envelope without iterating their
+/// contents, so the check is O(1) and safe to run before allocation- or
+/// CPU-intensive work.
+pub fn validate_envelope_limits(
+    envelope: &crate::commit::tx::TransactionEnvelope,
+    config: &AedbConfig,
+) -> Result<(), AedbError> {
+    let mutation_count = envelope.write_intent.mutations.len();
+    if mutation_count > config.max_mutations_per_envelope {
+        return Err(AedbError::Validation(format!(
+            "envelope exceeds max_mutations_per_envelope: mutations={mutation_count}, max_mutations_per_envelope={}",
+            config.max_mutations_per_envelope
+        )));
+    }
+    let assertion_count = envelope.assertions.len();
+    if assertion_count > config.max_read_assertions_per_envelope {
+        return Err(AedbError::Validation(format!(
+            "envelope exceeds max_read_assertions_per_envelope: assertions={assertion_count}, max_read_assertions_per_envelope={}",
+            config.max_read_assertions_per_envelope
+        )));
+    }
+    Ok(())
+}
+
 impl Mutation {
     /// Returns the concrete keys and ranges this mutation writes to,
     /// expressed as [`crate::commit::tx::WriteKey`] values suitable for
