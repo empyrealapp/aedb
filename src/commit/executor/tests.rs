@@ -10,7 +10,9 @@ use crate::commit::tx::{
     ReadAssertion, ReadBound, ReadKey, ReadRange, ReadRangeEntry, ReadSet, ReadSetEntry,
     TransactionEnvelope, WriteClass, WriteIntent,
 };
-use crate::commit::validation::{ConflictAction, ConflictTarget, Mutation, UpdateExpr};
+use crate::commit::validation::{
+    ConflictAction, ConflictTarget, KvU64MissingPolicy, KvU64OverflowPolicy, Mutation, UpdateExpr,
+};
 use crate::config::AedbConfig;
 use crate::error::AedbError;
 use crate::order_book::{
@@ -19,6 +21,8 @@ use crate::order_book::{
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndexStore};
+use crate::storage::kv_segment::KvSegmentStore;
+use crate::storage::value_store::PersistentValueStore;
 use crate::wal::frame::FrameReader;
 use primitive_types::U256;
 use std::collections::HashMap;
@@ -73,6 +77,9 @@ fn request_with_mutations(mutations: Vec<Mutation>) -> CommitRequest {
         enqueue_micros: 0,
         prevalidated: false,
         assertions_engine_verified: false,
+        kv_sizes_prechecked: false,
+        has_read_set: false,
+        has_assertions: false,
         write_partitions,
         read_partitions: HashSet::new(),
         defer_count: 0,
@@ -97,6 +104,7 @@ fn request_with_assertions_and_mutations(
     let write_partitions = super::derive_write_partitions(&envelope.write_intent.mutations);
     let read_partitions = super::derive_read_partitions(&envelope);
     let mutation_count = envelope.write_intent.mutations.len();
+    let has_assertions = !envelope.assertions.is_empty();
     CommitRequest {
         envelope,
         mutation_count,
@@ -104,6 +112,9 @@ fn request_with_assertions_and_mutations(
         enqueue_micros: 0,
         prevalidated: false,
         assertions_engine_verified: false,
+        kv_sizes_prechecked: false,
+        has_read_set: false,
+        has_assertions,
         write_partitions,
         read_partitions,
         defer_count: 0,
@@ -161,9 +172,13 @@ fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
         base_seq: 0,
     };
 
-    let (write_partitions, read_partitions) =
-        super::pre_stage_validate(&validation_catalog, &envelope, &AedbConfig::default())
-            .expect("prestage validate");
+    let (write_partitions, read_partitions) = super::pre_stage_validate(
+        &validation_catalog,
+        &envelope,
+        &AedbConfig::default(),
+        false,
+    )
+    .expect("prestage validate");
 
     assert!(read_partitions.is_empty());
     assert!(
@@ -171,6 +186,68 @@ fn prestage_validate_applies_staged_ddl_before_partition_derivation() {
             .iter()
             .any(|token| token.starts_with("tr:p::app:users:")),
         "expected staged table row partition token, got {write_partitions:?}"
+    );
+}
+
+#[test]
+fn prestage_kv_fast_path_preserves_explicit_read_set_dependencies() {
+    let mut catalog = Catalog::default();
+    catalog
+        .apply_ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        })
+        .expect("project");
+    catalog
+        .apply_ddl(DdlOperation::CreateScope {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+            scope_id: "app".into(),
+        })
+        .expect("scope");
+    let validation_catalog = Arc::new(parking_lot::RwLock::new(catalog));
+    let envelope = TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Standard,
+        assertions: Vec::new(),
+        read_set: ReadSet {
+            points: vec![ReadSetEntry {
+                key: ReadKey::KvKey {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"watched".to_vec(),
+                },
+                version_at_read: 1,
+            }],
+            ranges: Vec::new(),
+        },
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"written".to_vec(),
+                value: b"v".to_vec(),
+            }],
+        },
+        base_seq: 0,
+    };
+
+    let (_write_partitions, read_partitions) = super::pre_stage_validate(
+        &validation_catalog,
+        &envelope,
+        &AedbConfig::default(),
+        false,
+    )
+    .expect("prestage validate");
+
+    assert!(
+        read_partitions
+            .iter()
+            .any(|token| token.starts_with("k:p::app:")),
+        "expected explicit KV read partition, got {read_partitions:?}"
     );
 }
 
@@ -343,7 +420,7 @@ fn write_partitions_after_lifecycle_reuses_request_when_unchanged() {
         &request.envelope.write_intent.mutations,
         false,
     );
-    assert_eq!(reused, request.write_partitions);
+    assert_eq!(reused.as_ref(), &request.write_partitions);
 
     let expanded_mutations = vec![
         Mutation::KvSet {
@@ -365,8 +442,70 @@ fn write_partitions_after_lifecycle_reuses_request_when_unchanged() {
         &expanded_mutations,
         true,
     );
-    assert_ne!(expanded, request.write_partitions);
+    assert_ne!(expanded.as_ref(), &request.write_partitions);
     assert!(expanded.len() > request.write_partitions.len());
+}
+
+#[test]
+fn derive_write_partitions_uses_direct_tokens_for_multi_kv_batch() {
+    let mutations = vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"alpha".to_vec(),
+            value: b"1".to_vec(),
+        },
+        Mutation::KvIncU256 {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"beta".to_vec(),
+            amount_be: [0u8; 32],
+        },
+    ];
+    let direct = super::internals::direct_write_partition_tokens(&mutations)
+        .expect("direct tokens for kv batch");
+    let derived =
+        super::internals::derive_write_partitions_for_envelope(&Catalog::default(), &mutations);
+    assert_eq!(derived, direct);
+    assert_eq!(derived.len(), 2);
+}
+
+#[test]
+fn keyspace_cross_partition_check_uses_mutation_scopes() {
+    let same_scope = vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"alpha".to_vec(),
+            value: b"1".to_vec(),
+        },
+        Mutation::KvDel {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"beta".to_vec(),
+        },
+    ];
+    assert!(!super::internals::keyspace_mutations_cross_partition(
+        &same_scope
+    ));
+
+    let cross_scope = vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"alpha".to_vec(),
+            value: b"1".to_vec(),
+        },
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "other".into(),
+            key: b"beta".to_vec(),
+            value: b"2".to_vec(),
+        },
+    ];
+    assert!(super::internals::keyspace_mutations_cross_partition(
+        &cross_scope
+    ));
 }
 
 #[test]
@@ -818,7 +957,7 @@ async fn parallel_worker_panic_rejects_entire_epoch_without_state_publish() {
 }
 
 #[tokio::test]
-async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_updates() {
+async fn same_namespace_disjoint_parallel_apply_merges_kv_integer_updates() {
     let dir = tempdir().expect("temp");
     let exec = CommitExecutor::with_state(
         dir.path(),
@@ -838,20 +977,6 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
     }))
     .await
     .expect("project");
-    exec.submit(Mutation::Ddl(DdlOperation::CreateAccumulator {
-        project_id: "p".into(),
-        scope_id: "app".into(),
-        accumulator_name: "house_balance".into(),
-        if_not_exists: false,
-        value_type: crate::catalog::schema::AccumulatorValueType::BigInt,
-        dedupe_retain_commits: Some(10_000),
-        snapshot_every: 1_000,
-        exposure_margin_bps: 1_000,
-        exposure_ttl_commits: Some(10_000),
-    }))
-    .await
-    .expect("accumulator");
-
     let req_a = request_with_mutations(vec![
         Mutation::KvSet {
             project_id: "p".into(),
@@ -859,14 +984,13 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
             key: b"user:u1".to_vec(),
             value: b"v1".to_vec(),
         },
-        Mutation::Accumulate {
+        Mutation::KvAddU64Ex {
             project_id: "p".into(),
             scope_id: "app".into(),
-            accumulator_name: "house_balance".into(),
-            delta: 5,
-            dedupe_key: "tx-a".into(),
-            order_key: 1,
-            release_exposure_id: None,
+            key: b"house_balance".to_vec(),
+            amount_be: 5u64.to_be_bytes(),
+            on_missing: KvU64MissingPolicy::TreatAsZero,
+            on_overflow: KvU64OverflowPolicy::Reject,
         },
     ]);
     let req_b = request_with_mutations(vec![Mutation::KvSet {
@@ -888,23 +1012,325 @@ async fn same_namespace_disjoint_parallel_apply_merges_kv_and_accumulator_update
         state
             .keyspace
             .kv_get("p", "app", b"user:u1")
-            .map(|entry| entry.value.as_slice()),
-        Some(&b"v1"[..])
+            .map(|entry| entry.value),
+        Some(b"v1".to_vec())
     );
     assert_eq!(
         state
             .keyspace
             .kv_get("p", "app", b"user:u2")
-            .map(|entry| entry.value.as_slice()),
-        Some(&b"v2"[..])
+            .map(|entry| entry.value),
+        Some(b"v2".to_vec())
     );
     assert_eq!(
         state
             .keyspace
-            .accumulator_effective_value("p", "app", "house_balance")
-            .expect("effective value")
-            .expect("accumulator"),
-        5
+            .kv_get("p", "app", b"house_balance")
+            .map(|entry| entry.value),
+        Some(5u64.to_be_bytes().to_vec())
+    );
+}
+
+#[tokio::test]
+async fn parallel_apply_merge_counts_spilled_kv_ref_memory() {
+    let dir = tempdir().expect("temp");
+    let value_dir = tempdir().expect("value temp");
+    let mut keyspace = Keyspace::default();
+    keyspace
+        .attach_persistent_value_store(
+            Arc::new(
+                PersistentValueStore::open_with_hot_cache_bytes(value_dir.path(), 0)
+                    .expect("open value store"),
+            ),
+            4,
+        )
+        .expect("attach value store");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        keyspace,
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+    let req_a = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"spilled:a".to_vec(),
+        value: vec![0xA1; 128],
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"spilled:b".to_vec(),
+        value: vec![0xB2; 128],
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()),
+        "parallel spilled KV writes should succeed"
+    );
+    assert_eq!(
+        state.keyspace.mem_bytes,
+        state.keyspace.recompute_memory_bytes_full()
+    );
+    let namespace = state
+        .keyspace
+        .namespace(&NamespaceId::project_scope("p", "app"))
+        .expect("namespace");
+    for key in [b"spilled:a".as_slice(), b"spilled:b".as_slice()] {
+        let entry = namespace
+            .kv
+            .entries
+            .get(key)
+            .expect("spilled entry should be merged");
+        assert!(entry.value.is_empty());
+        assert!(entry.value_ref.is_some());
+    }
+}
+
+#[tokio::test]
+async fn parallel_rmw_reads_segment_resident_kv_entries() {
+    let dir = tempdir().expect("temp");
+    let segment_store = Arc::new(KvSegmentStore::open(dir.path()).expect("open segment store"));
+    let mut keyspace = Keyspace::default();
+    keyspace.attach_kv_segment_store(Arc::clone(&segment_store));
+    keyspace
+        .kv_set(
+            "p",
+            "app",
+            b"balance".to_vec(),
+            7u64.to_be_bytes().to_vec(),
+            1,
+        )
+        .expect("seed balance");
+    keyspace
+        .flush_kv_to_segments_to_memory_target(0)
+        .expect("flush to segment");
+    let namespace = keyspace
+        .namespace(&NamespaceId::project_scope("p", "app"))
+        .expect("namespace");
+    assert_eq!(namespace.kv.segments.len(), 1);
+    assert!(namespace.kv.entries.is_empty());
+    assert!(namespace.kv.small_entries.is_empty());
+
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        keyspace,
+        Catalog::default(),
+        1,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+    let req_a = request_with_mutations(vec![Mutation::KvAddU64Ex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"balance".to_vec(),
+        amount_be: 5u64.to_be_bytes(),
+        on_missing: KvU64MissingPolicy::Reject,
+        on_overflow: KvU64OverflowPolicy::Reject,
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"__slow_parallel_worker__".to_vec(),
+        value: b"marker".to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()),
+        "parallel RMW over segment-resident keys should succeed: {:?}",
+        epoch
+            .outcomes
+            .iter()
+            .map(|outcome| &outcome.result)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        epoch.parallel_apply_micros >= 20_000,
+        "test should exercise the parallel worker path"
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"balance")
+            .map(|entry| entry.value),
+        Some(12u64.to_be_bytes().to_vec())
+    );
+}
+
+#[tokio::test]
+async fn single_request_epoch_applies_inline_without_parallel_worker_roundtrip() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![kv_request("app", b"inline")]);
+    assert_eq!(epoch.parallel_apply_micros, 0);
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"inline")
+            .map(|entry| entry.value),
+        Some(b"v".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn multi_kv_set_epoch_applies_inline_without_parallel_worker_roundtrip() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        AedbConfig::default(),
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "p".into(),
+    }))
+    .await
+    .expect("project");
+
+    let req_a = request_with_mutations(vec![
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"batch:a".to_vec(),
+            value: b"a".to_vec(),
+        },
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"batch:b".to_vec(),
+            value: b"b".to_vec(),
+        },
+    ]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"batch:c".to_vec(),
+        value: b"c".to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert_eq!(epoch.parallel_apply_micros, 0);
+    assert!(epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()));
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"batch:a")
+            .map(|entry| entry.value),
+        Some(b"a".to_vec())
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"batch:b")
+            .map(|entry| entry.value),
+        Some(b"b".to_vec())
+    );
+    assert_eq!(
+        state
+            .keyspace
+            .kv_get("p", "app", b"batch:c")
+            .map(|entry| entry.value),
+        Some(b"c".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn compact_kv_fast_path_uses_small_entry_memory_estimate() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        max_memory_estimate_bytes: 120,
+        ..AedbConfig::default()
+    };
+    let exec = CommitExecutor::with_state(
+        dir.path(),
+        Keyspace::default(),
+        Catalog::default(),
+        0,
+        1,
+        config,
+        HashMap::new(),
+    )
+    .expect("executor");
+
+    let req_a = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"compact:a".to_vec(),
+        value: [0xA1; 32].to_vec(),
+    }]);
+    let req_b = request_with_mutations(vec![Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"compact:b".to_vec(),
+        value: [0xB2; 32].to_vec(),
+    }]);
+
+    let mut state = exec.state.lock().await;
+    let epoch = super::process_commit_epoch(&mut state, vec![req_a, req_b]);
+
+    assert_eq!(epoch.outcomes.len(), 2);
+    assert!(
+        epoch.outcomes.iter().all(|outcome| outcome.result.is_ok()),
+        "compact KV writes should fit under the tight memory limit"
+    );
+    assert_eq!(
+        epoch.parallel_apply_micros, 0,
+        "compact KV writes should stay on the inline fast path"
+    );
+    assert!(state.keyspace.estimate_memory_bytes() <= 120);
+    assert_eq!(
+        state.keyspace.mem_bytes,
+        state.keyspace.recompute_memory_bytes_full()
     );
 }
 
@@ -1180,6 +1606,9 @@ fn assertion_read_dependency_conflicts_with_write_token_in_epoch_selection() {
         enqueue_micros: 0,
         prevalidated: false,
         assertions_engine_verified: false,
+        kv_sizes_prechecked: false,
+        has_read_set: true,
+        has_assertions: false,
         write_partitions,
         read_partitions,
         defer_count: 0,
@@ -1235,79 +1664,6 @@ fn assertion_read_dependency_non_conflicting_key_can_coexist_in_epoch_selection(
         candidate_index,
         Some(0),
         "assertion-derived token on one key should not block unrelated-key writes"
-    );
-}
-
-#[test]
-fn accumulator_assertion_dependency_conflicts_with_same_accumulator_write_token() {
-    let candidate = request_with_assertions_and_mutations(
-        vec![ReadAssertion::AccumulatorAvailableAtLeast {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            accumulator_name: "house_balance".into(),
-            min_amount: 100,
-        }],
-        vec![Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: b"marker".to_vec(),
-            value: b"v".to_vec(),
-        }],
-    );
-
-    let mut pending = VecDeque::new();
-    pending.push_back(candidate);
-    let mut epoch_writes = HashSet::new();
-    epoch_writes.insert(format!(
-        "acc:{}:{}",
-        namespace_key("p", "app"),
-        "house_balance"
-    ));
-    let candidate_index = super::find_compatible_candidate_index(
-        &pending,
-        &epoch_writes,
-        &HashSet::new(),
-        false,
-        false,
-    );
-    assert!(
-        candidate_index.is_none(),
-        "accumulator assertion token must conflict with same-accumulator write token"
-    );
-}
-
-#[test]
-fn accumulator_assertion_dependency_allows_different_accumulator_parallel_selection() {
-    let candidate = request_with_assertions_and_mutations(
-        vec![ReadAssertion::AccumulatorExposureWithinMargin {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            accumulator_name: "house_balance".into(),
-            additional_exposure: 50,
-        }],
-        vec![Mutation::KvSet {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            key: b"marker".to_vec(),
-            value: b"v".to_vec(),
-        }],
-    );
-
-    let mut pending = VecDeque::new();
-    pending.push_back(candidate);
-    let mut epoch_writes = HashSet::new();
-    epoch_writes.insert(format!("acc:{}:{}", namespace_key("p", "app"), "vip_pool"));
-    let candidate_index = super::find_compatible_candidate_index(
-        &pending,
-        &epoch_writes,
-        &HashSet::new(),
-        false,
-        false,
-    );
-    assert_eq!(
-        candidate_index,
-        Some(0),
-        "accumulator assertion token should allow unrelated accumulator writes"
     );
 }
 
@@ -2596,7 +2952,7 @@ async fn check_and_default_constraints_are_enforced() {
         })
         .await
         .expect_err("check must fail");
-    assert!(matches!(err, AedbError::Validation(_)));
+    assert!(matches!(err, AedbError::CheckConstraintFailed { .. }));
 }
 
 #[tokio::test]

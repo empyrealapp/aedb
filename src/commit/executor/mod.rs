@@ -64,6 +64,9 @@ struct CommitRequest {
     enqueue_micros: u64,
     prevalidated: bool,
     assertions_engine_verified: bool,
+    kv_sizes_prechecked: bool,
+    has_read_set: bool,
+    has_assertions: bool,
     write_partitions: HashSet<String>,
     read_partitions: HashSet<String>,
     defer_count: u8,
@@ -106,50 +109,8 @@ impl std::io::Write for CountingWriter {
 }
 
 fn estimate_prevalidated_single_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
-    const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 256;
-    match mutation {
-        Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposure_id,
-            ..
-        } => Some(
-            ENVELOPE_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + accumulator_name.len()
-                + exposure_id.len(),
-        ),
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            dedupe_key,
-            release_exposure_id,
-            ..
-        } => Some(
-            ENVELOPE_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + accumulator_name.len()
-                + dedupe_key.len()
-                + release_exposure_id.as_ref().map(|id| id.len()).unwrap_or(0),
-        ),
-        Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-        } => Some(
-            ENVELOPE_OVERHEAD_UPPER_BOUND
-                + project_id.len()
-                + scope_id.len()
-                + accumulator_name.len()
-                + exposures.iter().map(|(_, id)| id.len() + 16).sum::<usize>(),
-        ),
-        _ => None,
-    }
+    let _ = mutation;
+    None
 }
 
 fn estimate_value_size_upper_bound(value: &Value) -> usize {
@@ -173,8 +134,8 @@ fn estimate_row_size_upper_bound(row: &Row) -> usize {
     estimate_values_size_upper_bound(&row.values)
 }
 
-const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 384;
-const MUTATION_OVERHEAD_UPPER_BOUND: usize = 192;
+pub(crate) const ENVELOPE_OVERHEAD_UPPER_BOUND: usize = 384;
+pub(crate) const MUTATION_OVERHEAD_UPPER_BOUND: usize = 192;
 
 fn estimate_mutation_size_upper_bound(mutation: &Mutation) -> Option<usize> {
     match mutation {
@@ -512,6 +473,11 @@ pub struct ExecutorRuntimeState {
     pub visible_head_seq: u64,
     pub durable_head_seq: u64,
     pub last_full_snapshot_micros: u64,
+    pub persistent_value_store_bytes: u64,
+    pub persistent_value_hot_cache_bytes: usize,
+    pub persistent_value_hot_cache_capacity_bytes: usize,
+    pub kv_segment_block_cache_bytes: usize,
+    pub kv_segment_block_cache_capacity_bytes: usize,
 }
 
 impl CommitExecutor {
@@ -853,6 +819,16 @@ impl CommitExecutor {
                     loop_durable_notify.notify_waiters();
                 }
 
+                let completion_micros = now_micros();
+                let mut total_latency_micros = 0u64;
+                let mut completed_count = 0usize;
+                let mut completed_encoded_bytes = 0usize;
+                let mut commit_errors = 0u64;
+                let mut permission_rejections = 0u64;
+                let mut validation_rejections = 0u64;
+                let mut conflict_rejections = 0u64;
+                let mut coordinator_lock_timeouts = 0u64;
+                let mut parallel_apply_timeouts = 0u64;
                 for outcome in outcomes {
                     if loop_post_apply_refresh_needed.load(Ordering::Acquire)
                         && let Some(delta) = outcome.post_apply_delta
@@ -864,7 +840,7 @@ impl CommitExecutor {
                         }
                     }
                     let elapsed_micros =
-                        now_micros().saturating_sub(outcome.request.enqueue_micros);
+                        completion_micros.saturating_sub(outcome.request.enqueue_micros);
                     let elapsed_ms = elapsed_micros / 1_000;
                     if should_log_commit_phase(elapsed_ms) {
                         let queue_wait_micros = elapsed_micros.saturating_sub(epoch_elapsed_micros);
@@ -898,48 +874,77 @@ impl CommitExecutor {
                             "aedb commit phase timing"
                         );
                     }
-                    loop_telemetry
-                        .total_latency_micros
-                        .fetch_add(elapsed_micros, Ordering::Relaxed);
-                    loop_telemetry.commits_total.fetch_add(1, Ordering::Relaxed);
+                    total_latency_micros = total_latency_micros.saturating_add(elapsed_micros);
+                    completed_count = completed_count.saturating_add(1);
+                    completed_encoded_bytes =
+                        completed_encoded_bytes.saturating_add(outcome.request.encoded_len);
                     if outcome.result.is_err() {
-                        loop_telemetry.commit_errors.fetch_add(1, Ordering::Relaxed);
+                        commit_errors = commit_errors.saturating_add(1);
                         if let Err(err) = &outcome.result {
                             if is_permission_rejection_error(err) {
-                                loop_telemetry
-                                    .permission_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
+                                permission_rejections = permission_rejections.saturating_add(1);
                             }
                             if is_validation_rejection_error(err) {
-                                loop_telemetry
-                                    .validation_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
+                                validation_rejections = validation_rejections.saturating_add(1);
                             }
                             if is_conflict_rejection_error(err) {
-                                loop_telemetry
-                                    .conflict_rejections
-                                    .fetch_add(1, Ordering::Relaxed);
+                                conflict_rejections = conflict_rejections.saturating_add(1);
                             }
                             if is_coordinator_timeout_error(err) {
-                                loop_telemetry
-                                    .coordinator_lock_timeouts
-                                    .fetch_add(1, Ordering::Relaxed);
+                                coordinator_lock_timeouts =
+                                    coordinator_lock_timeouts.saturating_add(1);
                             }
                             if is_parallel_apply_timeout_error(err) {
-                                loop_telemetry
-                                    .parallel_apply_timeouts
-                                    .fetch_add(1, Ordering::Relaxed);
+                                parallel_apply_timeouts = parallel_apply_timeouts.saturating_add(1);
                             }
                         }
                     }
-                    queue_counter.fetch_sub(outcome.request.encoded_len, Ordering::Relaxed);
+                    let _ = outcome.request.result_tx.send(outcome.result);
+                }
+                if completed_count > 0 {
+                    loop_telemetry
+                        .total_latency_micros
+                        .fetch_add(total_latency_micros, Ordering::Relaxed);
+                    loop_telemetry
+                        .commits_total
+                        .fetch_add(completed_count as u64, Ordering::Relaxed);
+                    queue_counter.fetch_sub(completed_encoded_bytes, Ordering::Relaxed);
                     loop_telemetry
                         .queued_commits
-                        .fetch_sub(1, Ordering::Relaxed);
+                        .fetch_sub(completed_count, Ordering::Relaxed);
                     loop_telemetry
                         .inflight_commits
-                        .fetch_sub(1, Ordering::Relaxed);
-                    let _ = outcome.request.result_tx.send(outcome.result);
+                        .fetch_sub(completed_count, Ordering::Relaxed);
+                    if commit_errors > 0 {
+                        loop_telemetry
+                            .commit_errors
+                            .fetch_add(commit_errors, Ordering::Relaxed);
+                    }
+                    if permission_rejections > 0 {
+                        loop_telemetry
+                            .permission_rejections
+                            .fetch_add(permission_rejections, Ordering::Relaxed);
+                    }
+                    if validation_rejections > 0 {
+                        loop_telemetry
+                            .validation_rejections
+                            .fetch_add(validation_rejections, Ordering::Relaxed);
+                    }
+                    if conflict_rejections > 0 {
+                        loop_telemetry
+                            .conflict_rejections
+                            .fetch_add(conflict_rejections, Ordering::Relaxed);
+                    }
+                    if coordinator_lock_timeouts > 0 {
+                        loop_telemetry
+                            .coordinator_lock_timeouts
+                            .fetch_add(coordinator_lock_timeouts, Ordering::Relaxed);
+                    }
+                    if parallel_apply_timeouts > 0 {
+                        loop_telemetry
+                            .parallel_apply_timeouts
+                            .fetch_add(parallel_apply_timeouts, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -997,6 +1002,10 @@ impl CommitExecutor {
                             } else {
                                 derive_write_partitions(&req.envelope.write_intent.mutations)
                             }
+                        } else if let Some(partitions) =
+                            direct_write_partition_tokens(&req.envelope.write_intent.mutations)
+                        {
+                            partitions
                         } else {
                             derive_write_partitions(&req.envelope.write_intent.mutations)
                         };
@@ -1007,6 +1016,7 @@ impl CommitExecutor {
                             &pre_validation_catalog,
                             &req.envelope,
                             pre_config.as_ref(),
+                            req.kv_sizes_prechecked,
                         );
                         prevalidate_elapsed_us =
                             Some(prevalidate_started.elapsed().as_micros() as u64);
@@ -1089,7 +1099,9 @@ impl CommitExecutor {
                 }
                 if s.pending_batch_bytes > 0 {
                     let sync_started = Instant::now();
-                    if s.wal.sync_active().is_ok() {
+                    if s.keyspace.sync_persistent_value_store().is_ok()
+                        && s.wal.sync_active().is_ok()
+                    {
                         let sync_us = sync_started.elapsed().as_micros() as u64;
                         s.durable_head_seq = s.pending_batch_max_seq.max(s.durable_head_seq);
                         s.pending_batch_bytes = 0;
@@ -1164,6 +1176,32 @@ impl CommitExecutor {
             },
             false,
             false,
+            false,
+            fast_size_hint,
+        )
+        .await
+    }
+
+    pub(crate) async fn submit_kv_sizes_prechecked(
+        &self,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        let fast_size_hint = estimate_single_mutation_size_upper_bound(&mutation);
+        self.submit_envelope_with_mode_size_hint(
+            TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: Default::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![mutation],
+                },
+                base_seq: 0,
+            },
+            false,
+            false,
+            true,
             fast_size_hint,
         )
         .await
@@ -1187,6 +1225,7 @@ impl CommitExecutor {
                 base_seq: 0,
             },
             true,
+            false,
             false,
             fast_size_hint,
         )
@@ -1218,6 +1257,7 @@ impl CommitExecutor {
             },
             false,
             false,
+            false,
             fast_size_hint,
         )
         .await
@@ -1228,6 +1268,15 @@ impl CommitExecutor {
         envelope: TransactionEnvelope,
     ) -> Result<CommitResult, AedbError> {
         self.submit_envelope_with_mode(envelope, false, false).await
+    }
+
+    pub(crate) async fn submit_envelope_with_size_hint(
+        &self,
+        envelope: TransactionEnvelope,
+        encoded_size_hint: Option<usize>,
+    ) -> Result<CommitResult, AedbError> {
+        self.submit_envelope_with_mode_size_hint(envelope, false, false, false, encoded_size_hint)
+            .await
     }
 
     pub(crate) async fn submit_envelope_prevalidated(
@@ -1282,6 +1331,7 @@ impl CommitExecutor {
             envelope,
             prevalidated,
             assertions_engine_verified,
+            false,
             encoded_size_hint,
         )
         .await
@@ -1292,6 +1342,7 @@ impl CommitExecutor {
         envelope: TransactionEnvelope,
         prevalidated: bool,
         assertions_engine_verified: bool,
+        kv_sizes_prechecked: bool,
         encoded_size_hint: Option<usize>,
     ) -> Result<CommitResult, AedbError> {
         let config = &self.config;
@@ -1344,15 +1395,21 @@ impl CommitExecutor {
         let ingress_tx = self
             .ingress_txs
             .get(shard)
-            .ok_or_else(|| AedbError::Validation("no ingress shard available".into()))?
-            .clone();
+            .ok_or_else(|| AedbError::Validation("no ingress shard available".into()))?;
+        let mutation_count = envelope.write_intent.mutations.len();
+        let has_read_set =
+            !envelope.read_set.points.is_empty() || !envelope.read_set.ranges.is_empty();
+        let has_assertions = !envelope.assertions.is_empty();
         let request = CommitRequest {
-            mutation_count: envelope.write_intent.mutations.len(),
+            mutation_count,
             envelope,
             encoded_len: encoded_size_bytes,
             enqueue_micros: now_micros(),
             prevalidated,
             assertions_engine_verified,
+            kv_sizes_prechecked,
+            has_read_set,
+            has_assertions,
             write_partitions: HashSet::new(),
             read_partitions: HashSet::new(),
             defer_count: 0,
@@ -1479,6 +1536,23 @@ impl CommitExecutor {
         view
     }
 
+    pub(crate) async fn reclaim_unused_kv_segments(
+        &self,
+        mut referenced_filenames: HashSet<String>,
+    ) -> Result<usize, AedbError> {
+        let state = self.state.lock().await;
+        let store = state
+            .keyspace
+            .kv_segment_store
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| AedbError::Unavailable {
+                message: "KV segment store is not attached".into(),
+            })?;
+        referenced_filenames.extend(state.keyspace.kv_segment_filenames());
+        store.reclaim_unreferenced_segments(&referenced_filenames)
+    }
+
     pub async fn snapshot_at_seq(&self, seq: u64) -> Result<SnapshotReadView, AedbError> {
         let mut state = self.state.lock().await;
         let view = state.version_store.acquire_at_seq(seq)?.into_view();
@@ -1502,6 +1576,7 @@ impl CommitExecutor {
         }
         let durable_before = s.durable_head_seq;
         let sync_started = Instant::now();
+        s.keyspace.sync_persistent_value_store()?;
         s.wal
             .sync_active()
             .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
@@ -1677,11 +1752,54 @@ impl CommitExecutor {
     }
 
     pub async fn runtime_state_metrics(&self) -> ExecutorRuntimeState {
+        let (
+            persistent_value_store_bytes,
+            persistent_value_hot_cache_bytes,
+            persistent_value_hot_cache_capacity_bytes,
+            kv_segment_block_cache_bytes,
+            kv_segment_block_cache_capacity_bytes,
+        ) = {
+            let state = self.state.lock().await;
+            let value_metrics = state
+                .keyspace
+                .value_store
+                .as_ref()
+                .map_or((0, 0, 0), |store| {
+                    (
+                        store.len_bytes(),
+                        store.hot_cache_resident_bytes(),
+                        store.hot_cache_capacity_bytes(),
+                    )
+                });
+            let segment_metrics =
+                state
+                    .keyspace
+                    .kv_segment_store
+                    .as_ref()
+                    .map_or((0, 0), |store| {
+                        (
+                            store.block_cache_resident_bytes(),
+                            store.block_cache_capacity_bytes(),
+                        )
+                    });
+            (
+                value_metrics.0,
+                value_metrics.1,
+                value_metrics.2,
+                segment_metrics.0,
+                segment_metrics.1,
+            )
+        };
         ExecutorRuntimeState {
             current_seq: self.current_seq.load(Ordering::Acquire),
             visible_head_seq: self.visible_head_seq.load(Ordering::Acquire),
             durable_head_seq: self.durable_head_seq.load(Ordering::Acquire),
             last_full_snapshot_micros: self.last_full_snapshot_micros.load(Ordering::Acquire),
+            persistent_value_store_bytes,
+            persistent_value_hot_cache_bytes,
+            persistent_value_hot_cache_capacity_bytes,
+            kv_segment_block_cache_bytes,
+            kv_segment_block_cache_capacity_bytes,
         }
     }
 }

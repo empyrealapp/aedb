@@ -531,6 +531,18 @@ pub(crate) fn validate_secure_config(config: &AedbConfig) -> Result<(), AedbErro
             message: "secure mode requires hash_chain_required=true".into(),
         });
     }
+    if !matches!(config.storage_mode, StorageMode::DiskBacked) {
+        return Err(AedbError::InvalidConfig {
+            message: "secure mode requires StorageMode::DiskBacked".into(),
+        });
+    }
+    if config.persistent_value_inline_threshold_bytes != 0 {
+        return Err(AedbError::InvalidConfig {
+            message:
+                "secure mode requires persistent_value_inline_threshold_bytes=0 so KV payloads are disk-backed"
+                    .into(),
+        });
+    }
     Ok(())
 }
 
@@ -562,6 +574,18 @@ pub fn validate_arcana_config(config: &AedbConfig) -> Result<(), AedbError> {
     if !config.hash_chain_required {
         return Err(AedbError::InvalidConfig {
             message: "Arcana production profile requires hash_chain_required=true".into(),
+        });
+    }
+    if !matches!(config.storage_mode, StorageMode::DiskBacked) {
+        return Err(AedbError::InvalidConfig {
+            message: "Arcana production profile requires StorageMode::DiskBacked".into(),
+        });
+    }
+    if config.persistent_value_inline_threshold_bytes != 0 {
+        return Err(AedbError::InvalidConfig {
+            message:
+                "Arcana production profile requires persistent_value_inline_threshold_bytes=0 so KV payloads are disk-backed"
+                    .into(),
         });
     }
     Ok(())
@@ -1493,11 +1517,18 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
 
 pub(crate) fn copy_file_prefix(src: &Path, dst: &Path, size_bytes: u64) -> Result<(), AedbError> {
     let mut reader = File::open(src)?;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut writer = File::create(dst)?;
     std::io::copy(
         &mut std::io::Read::by_ref(&mut reader).take(size_bytes),
         &mut writer,
     )?;
+    writer.sync_all()?;
+    if let Some(parent) = dst.parent() {
+        File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

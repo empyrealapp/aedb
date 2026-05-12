@@ -1,15 +1,13 @@
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
-use aedb::catalog::schema::{AccumulatorValueType, ColumnDef};
+use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
-use aedb::engine_interface::{
-    EffectBatch, EffectBatchCommitResult, EffectEvent, EffectOperation, EffectPrecondition,
-    KeyedStateQueryRequest,
-};
+use aedb::engine_interface::{EffectBatch, EffectEvent, EffectOperation, KeyedStateQueryRequest};
 use aedb::error::AedbError;
 use aedb::query::plan::ConsistencyMode;
 use std::sync::{Arc, mpsc};
+use std::thread;
 
 fn user_state_columns() -> Vec<ColumnDef> {
     vec![
@@ -27,7 +25,7 @@ fn user_state_columns() -> Vec<ColumnDef> {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn effect_batch_precondition_rejects_without_side_effects() {
+async fn effect_batch_validation_rejects_without_side_effects() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
 
@@ -44,29 +42,12 @@ async fn effect_batch_precondition_rejects_without_side_effects() {
     })
     .await
     .expect("create table");
-    db.commit_ddl(DdlOperation::CreateAccumulator {
-        project_id: "arcana".into(),
-        scope_id: "game".into(),
-        accumulator_name: "house_balance".into(),
-        if_not_exists: false,
-        value_type: AccumulatorValueType::BigInt,
-        dedupe_retain_commits: Some(10_000),
-        snapshot_every: 1_000,
-        exposure_margin_bps: 1_000,
-        exposure_ttl_commits: Some(10_000),
-    })
-    .await
-    .expect("create accumulator");
-
     let batch = EffectBatch {
-        preconditions: vec![EffectPrecondition::RequireAvailable {
-            accumulator: "house_balance".into(),
-            min_amount: 1,
-        }],
+        preconditions: Vec::new(),
         effects: vec![EffectOperation::Write {
             keyed_state: "user_state".into(),
             key: Value::Text("u1".into()),
-            value: Row::from_values(vec![Value::Text("u1".into()), Value::Integer(10)]),
+            value: Row::from_values(vec![Value::Text("u2".into()), Value::Integer(10)]),
         }],
         events: vec![EffectEvent {
             event_name: "hand_settled".into(),
@@ -75,16 +56,11 @@ async fn effect_batch_precondition_rejects_without_side_effects() {
         }],
     };
 
-    let outcome = db
+    let err = db
         .commit_effect_batch("arcana", "game", batch)
         .await
-        .expect("effect batch result");
-    match outcome {
-        EffectBatchCommitResult::Rejected(rejected) => {
-            assert_eq!(rejected.error_code, "available_below_min");
-        }
-        EffectBatchCommitResult::Applied(_) => panic!("expected rejection"),
-    }
+        .expect_err("effect batch must reject mismatched keyed state row");
+    assert!(matches!(err, AedbError::Validation(_)));
 
     let row = db
         .keyed_state_read(
@@ -106,41 +82,6 @@ async fn effect_batch_precondition_rejects_without_side_effects() {
         page.events.is_empty(),
         "rejected batch must not emit events"
     );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn release_accumulator_exposure_is_first_class_operation() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
-
-    db.create_project("arcana").await.expect("project");
-    db.create_scope("arcana", "game").await.expect("scope");
-    db.create_accumulator("arcana", "game", "house_balance", Some(10_000), 1_000)
-        .await
-        .expect("create accumulator");
-
-    db.accumulate("arcana", "game", "house_balance", 1_000, "seed".into(), 1)
-        .await
-        .expect("seed accumulator");
-    db.expose_accumulator("arcana", "game", "house_balance", 200, "exp-1".into())
-        .await
-        .expect("expose");
-
-    let before = db
-        .accumulator_exposure_metrics("arcana", "game", "house_balance", ConsistencyMode::AtLatest)
-        .await
-        .expect("metrics before release");
-    assert_eq!(before.total_exposure, 200);
-
-    db.release_accumulator_exposure("arcana", "game", "house_balance", "exp-1".into())
-        .await
-        .expect("release exposure");
-
-    let after = db
-        .accumulator_exposure_metrics("arcana", "game", "house_balance", ConsistencyMode::AtLatest)
-        .await
-        .expect("metrics after release");
-    assert_eq!(after.total_exposure, 0);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -341,30 +282,36 @@ async fn keyed_state_update_rejects_concurrent_overwrite() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let db_for_task = Arc::clone(&db);
-    let update_task = tokio::spawn(async move {
-        db_for_task
-            .keyed_state_update(
-                "arcana",
-                "game",
-                "user_state",
-                Value::Text("u1".into()),
-                move |current| {
-                    assert_eq!(
-                        current,
-                        Some(Row::from_values(vec![
+    let update_thread = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build update runtime");
+        runtime.block_on(async move {
+            db_for_task
+                .keyed_state_update(
+                    "arcana",
+                    "game",
+                    "user_state",
+                    Value::Text("u1".into()),
+                    move |current| {
+                        assert_eq!(
+                            current,
+                            Some(Row::from_values(vec![
+                                Value::Text("u1".into()),
+                                Value::Integer(5),
+                            ]))
+                        );
+                        started_tx.send(()).expect("signal start");
+                        release_rx.recv().expect("wait for concurrent write");
+                        Ok(Some(Row::from_values(vec![
                             Value::Text("u1".into()),
-                            Value::Integer(5),
-                        ]))
-                    );
-                    started_tx.send(()).expect("signal start");
-                    release_rx.recv().expect("wait for concurrent write");
-                    Ok(Some(Row::from_values(vec![
-                        Value::Text("u1".into()),
-                        Value::Integer(12),
-                    ])))
-                },
-            )
-            .await
+                            Value::Integer(12),
+                        ])))
+                    },
+                )
+                .await
+        })
     });
 
     started_rx.recv().expect("update has read the row");
@@ -379,9 +326,9 @@ async fn keyed_state_update_rejects_concurrent_overwrite() {
     .expect("concurrent overwrite");
     release_tx.send(()).expect("release update");
 
-    let err = update_task
-        .await
-        .expect("join update task")
+    let err = update_thread
+        .join()
+        .expect("join update thread")
         .expect_err("stale update must fail");
     assert!(matches!(err, AedbError::AssertionFailed { .. }));
 

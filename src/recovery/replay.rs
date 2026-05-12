@@ -2,7 +2,7 @@ use crate::catalog::Catalog;
 use crate::commit::apply::apply_mutation;
 use crate::commit::tx::{IdempotencyKey, IdempotencyRecord, WalCommitPayload};
 use crate::error::AedbError;
-use crate::recovery::scanner::validated_hash_chain_prefix_len;
+use crate::recovery::scanner::validated_hash_chain_prefix_len_from_checkpoint;
 use crate::storage::keyspace::Keyspace;
 use crate::wal::frame::{FrameError, FrameReader};
 use crate::wal::segment::SEGMENT_HEADER_SIZE;
@@ -24,8 +24,12 @@ pub fn replay_segments(
     catalog: &mut Catalog,
     idempotency: &mut HashMap<IdempotencyKey, IdempotencyRecord>,
 ) -> Result<u64, AedbError> {
-    let valid_segment_count =
-        validated_hash_chain_prefix_len(segments, hash_chain_required, strict_recovery)?;
+    let valid_segment_count = validated_hash_chain_prefix_len_from_checkpoint(
+        segments,
+        hash_chain_required,
+        strict_recovery,
+        from_seq_exclusive > 0,
+    )?;
     let replay_segments = &segments[..valid_segment_count];
 
     let mut max_seq = from_seq_exclusive;

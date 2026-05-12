@@ -273,7 +273,10 @@ pub fn preflight_with_config(
             expected_seq,
         } => {
             let current_entry = snapshot.kv_get(project_id, scope_id, key);
-            let current_version = current_entry.map(|entry| entry.version).unwrap_or(0);
+            let current_version = current_entry
+                .as_ref()
+                .map(|entry| entry.version)
+                .unwrap_or(0);
             if let Some(expected_seq) = expected_seq
                 && current_version != *expected_seq
             {
@@ -457,7 +460,10 @@ pub fn preflight_with_config(
             expected_seq,
         } => {
             let current_entry = snapshot.kv_get(project_id, scope_id, key);
-            let current_version = current_entry.map(|entry| entry.version).unwrap_or(0);
+            let current_version = current_entry
+                .as_ref()
+                .map(|entry| entry.version)
+                .unwrap_or(0);
             if let Some(expected_seq) = expected_seq
                 && current_version != *expected_seq
             {
@@ -1524,7 +1530,9 @@ mod tests {
         catalog.create_project("p").expect("project");
 
         let mut keyspace = Keyspace::default();
-        keyspace.kv_set("p", "app", b"balance".to_vec(), u256_be(125).to_vec(), 1);
+        keyspace
+            .kv_set("p", "app", b"balance".to_vec(), u256_be(125).to_vec(), 1)
+            .expect("set balance");
         let snapshot = keyspace.snapshot();
 
         let ok = preflight(
@@ -1555,7 +1563,9 @@ mod tests {
         ));
 
         let mut bad_keyspace = Keyspace::default();
-        bad_keyspace.kv_set("p", "app", b"balance".to_vec(), vec![1, 2, 3], 1);
+        bad_keyspace
+            .kv_set("p", "app", b"balance".to_vec(), vec![1, 2, 3], 1)
+            .expect("set malformed balance");
         let bad_snapshot = bad_keyspace.snapshot();
         let bad = preflight(
             &bad_snapshot,

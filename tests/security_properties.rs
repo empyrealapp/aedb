@@ -1,17 +1,37 @@
 use aedb::AedbInstance;
-use aedb::commit::tx::{IdempotencyKey, ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
-use aedb::commit::validation::Mutation;
+use aedb::catalog::DdlOperation;
+use aedb::catalog::schema::ColumnDef;
+use aedb::catalog::types::{ColumnType, Row, Value};
+use aedb::commit::tx::{
+    IdempotencyKey, ReadAssertion, ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass,
+    WriteIntent,
+};
+use aedb::commit::validation::{
+    KvU64MissingPolicy, KvU64OverflowPolicy, KvU64UnderflowPolicy, Mutation,
+};
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::offline;
 use aedb::permission::{CallerContext, Permission};
-use aedb::query::plan::ConsistencyMode;
+use aedb::query::plan::{ConsistencyMode, Query};
+use std::sync::Arc;
 use tempfile::tempdir;
 
 fn one_u256() -> [u8; 32] {
     let mut out = [0u8; 32];
     out[31] = 1;
     out
+}
+
+fn u64_be(value: u64) -> [u8; 8] {
+    value.to_be_bytes()
+}
+
+fn decode_u64(bytes: &[u8]) -> u64 {
+    assert_eq!(bytes.len(), 8, "u64 values must use 8 bytes");
+    let mut out = [0u8; 8];
+    out.copy_from_slice(bytes);
+    u64::from_be_bytes(out)
 }
 
 #[tokio::test]
@@ -57,6 +77,322 @@ async fn security_atomicity_no_partial_apply_on_envelope_failure() {
         .await
         .expect("kv read");
     assert!(entry.is_none(), "failing envelope must not partially apply");
+}
+
+#[tokio::test]
+async fn security_stale_kv_read_set_cannot_overwrite_key() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let seed = db
+        .commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"guarded".to_vec(),
+            value: b"v1".to_vec(),
+        })
+        .await
+        .expect("seed");
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"guarded".to_vec(),
+        value: b"v2".to_vec(),
+    })
+    .await
+    .expect("concurrent update");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet {
+                points: vec![ReadSetEntry {
+                    key: ReadKey::KvKey {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"guarded".to_vec(),
+                    },
+                    version_at_read: seed.commit_seq,
+                }],
+                ranges: Vec::new(),
+            },
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"guarded".to_vec(),
+                    value: b"stale-overwrite".to_vec(),
+                }],
+            },
+            base_seq: db
+                .snapshot_probe(ConsistencyMode::AtLatest)
+                .await
+                .expect("probe"),
+        })
+        .await
+        .expect_err("stale read-set overwrite must conflict");
+    assert!(
+        matches!(err, AedbError::Conflict(ref msg) if msg.contains("read set conflict")),
+        "expected read set conflict, got {err:?}"
+    );
+
+    let current = db
+        .kv_get_no_auth("p", "app", b"guarded", ConsistencyMode::AtLatest)
+        .await
+        .expect("read guarded")
+        .expect("guarded value");
+    assert_eq!(current.value, b"v2".to_vec());
+}
+
+#[tokio::test]
+async fn security_stale_table_preflight_plan_cannot_overwrite_row() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "state".into(),
+        owner_id: None,
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "value".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+        if_not_exists: false,
+    }))
+    .await
+    .expect("create state table");
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "state".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::Integer(10)]),
+    })
+    .await
+    .expect("seed row");
+
+    let plan = db
+        .preflight_plan(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "state".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![Value::Integer(1), Value::Integer(20)]),
+        })
+        .await;
+    assert!(plan.valid, "preflight plan should be valid");
+    assert_eq!(plan.read_set.points.len(), 1);
+
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "state".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::Integer(30)]),
+    })
+    .await
+    .expect("concurrent state transition");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: plan.read_set,
+            write_intent: plan.write_intent,
+            base_seq: plan.base_seq,
+        })
+        .await
+        .expect_err("stale table plan must conflict");
+    assert!(
+        matches!(err, AedbError::Conflict(ref msg) if msg.contains("read set conflict")),
+        "expected read set conflict, got {err:?}"
+    );
+
+    let rows = db
+        .query("p", "app", Query::select(&["*"]).from("state").limit(10))
+        .await
+        .expect("query state");
+    assert_eq!(rows.rows.len(), 1);
+    assert_eq!(rows.rows[0].values.get(1), Some(&Value::Integer(30)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn security_parallel_asserted_state_transition_has_single_winner() {
+    let dir = tempdir().expect("temp dir");
+    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"machine:1".to_vec(), b"open".to_vec())
+        .await
+        .expect("seed machine state");
+    let base_seq = db
+        .snapshot_probe(ConsistencyMode::AtLatest)
+        .await
+        .expect("probe");
+
+    let mut tasks = Vec::new();
+    for _ in 0..32 {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            db.commit_envelope(TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: vec![ReadAssertion::KeyEquals {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"machine:1".to_vec(),
+                    expected: b"open".to_vec(),
+                }],
+                read_set: ReadSet::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"machine:1".to_vec(),
+                        value: b"closed".to_vec(),
+                    }],
+                },
+                base_seq,
+            })
+            .await
+        }));
+    }
+
+    let mut applied = 0usize;
+    let mut rejected = 0usize;
+    for task in tasks {
+        match task.await.expect("transition task") {
+            Ok(_) => applied += 1,
+            Err(AedbError::AssertionFailed { .. }) | Err(AedbError::Conflict(_)) => rejected += 1,
+            Err(err) => panic!("unexpected transition error: {err:?}"),
+        }
+    }
+    assert_eq!(applied, 1, "only one asserted transition may win");
+    assert_eq!(rejected, 31, "all stale transitions must be rejected");
+
+    let current = db
+        .kv_get_no_auth("p", "app", b"machine:1", ConsistencyMode::AtLatest)
+        .await
+        .expect("read machine")
+        .expect("machine state");
+    assert_eq!(current.value, b"closed".to_vec());
+}
+
+#[tokio::test]
+async fn security_multi_key_atomic_update_reverts_all_on_failure() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"from".to_vec(), u64_be(5).to_vec())
+        .await
+        .expect("seed from");
+    db.kv_set("p", "app", b"to".to_vec(), u64_be(7).to_vec())
+        .await
+        .expect("seed to");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![
+                    Mutation::KvAddU64Ex {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"to".to_vec(),
+                        amount_be: u64_be(10),
+                        on_missing: KvU64MissingPolicy::Reject,
+                        on_overflow: KvU64OverflowPolicy::Reject,
+                    },
+                    Mutation::KvSubU64Ex {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"from".to_vec(),
+                        amount_be: u64_be(10),
+                        on_missing: KvU64MissingPolicy::Reject,
+                        on_underflow: KvU64UnderflowPolicy::Reject,
+                    },
+                ],
+            },
+            base_seq: db
+                .snapshot_probe(ConsistencyMode::AtLatest)
+                .await
+                .expect("probe"),
+        })
+        .await
+        .expect_err("underflow must abort the whole transaction");
+    assert!(matches!(err, AedbError::Underflow));
+
+    let from = db
+        .kv_get_no_auth("p", "app", b"from", ConsistencyMode::AtLatest)
+        .await
+        .expect("read from")
+        .expect("from key");
+    let to = db
+        .kv_get_no_auth("p", "app", b"to", ConsistencyMode::AtLatest)
+        .await
+        .expect("read to")
+        .expect("to key");
+    assert_eq!(decode_u64(&from.value), 5);
+    assert_eq!(decode_u64(&to.value), 7);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn security_parallel_atomic_adds_do_not_lose_updates() {
+    let dir = tempdir().expect("temp dir");
+    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"counter".to_vec(), u64_be(0).to_vec())
+        .await
+        .expect("seed counter");
+
+    let mut tasks = Vec::new();
+    for _ in 0..64 {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            db.commit(Mutation::KvAddU64Ex {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"counter".to_vec(),
+                amount_be: u64_be(1),
+                on_missing: KvU64MissingPolicy::Reject,
+                on_overflow: KvU64OverflowPolicy::Reject,
+            })
+            .await
+        }));
+    }
+
+    for task in tasks {
+        task.await
+            .expect("atomic add task")
+            .expect("atomic add should commit");
+    }
+    let counter = db
+        .kv_get_no_auth("p", "app", b"counter", ConsistencyMode::AtLatest)
+        .await
+        .expect("read counter")
+        .expect("counter key");
+    assert_eq!(decode_u64(&counter.value), 64);
 }
 
 #[tokio::test]

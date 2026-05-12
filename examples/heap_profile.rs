@@ -27,14 +27,8 @@ const TABLE: &str = "users";
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let seed: i64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
-    let measure: i64 = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_000);
+    let seed: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+    let measure: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10_000);
 
     let dir = tempdir().expect("tempdir");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");

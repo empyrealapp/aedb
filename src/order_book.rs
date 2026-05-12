@@ -311,7 +311,7 @@ pub fn apply_order_book_define_table(
         key_order_book_table_spec(table_id),
         serialize(&spec)?,
         commit_seq,
-    );
+    )?;
     Ok(())
 }
 
@@ -359,7 +359,7 @@ pub fn apply_set_instrument_config(
         key_instrument_config(instrument),
         serialize(config)?,
         commit_seq,
-    );
+    )?;
     Ok(())
 }
 
@@ -389,7 +389,7 @@ pub fn apply_set_instrument_halted(
         key_instrument_config(instrument),
         serialize(&config)?,
         commit_seq,
-    );
+    )?;
     Ok(())
 }
 
@@ -633,25 +633,30 @@ pub fn apply_order_book_new(
         &request.owner,
         &request.client_order_id,
     );
-    if keyspace.kv_get(project_id, scope_id, &client_key).is_some() {
+    if keyspace
+        .try_kv_get(project_id, scope_id, &client_key)?
+        .is_some()
+    {
         return Err(AedbError::Validation("duplicate client_order_id".into()));
     }
 
-    if effective_request.exec_instructions.post_only()
-        && let Some(best_price) = best_price_for_side(
+    if effective_request.exec_instructions.post_only() {
+        let best_price = best_price_for_side(
             keyspace,
             project_id,
             scope_id,
             &effective_request.instrument,
             effective_request.side.opposite(),
-        )
-        && crosses(
-            effective_request.side,
-            effective_request.price_ticks,
-            best_price,
-        )
-    {
-        return Err(AedbError::Validation("post_only would cross".into()));
+        )?;
+        if best_price.is_some_and(|best_price| {
+            crosses(
+                effective_request.side,
+                effective_request.price_ticks,
+                best_price,
+            )
+        }) {
+            return Err(AedbError::Validation("post_only would cross".into()));
+        }
     }
 
     if matches!(effective_request.time_in_force, TimeInForce::Fok)
@@ -666,7 +671,7 @@ pub fn apply_order_book_new(
             scope_id,
             &effective_request.instrument,
             effective_request.side.opposite(),
-        )
+        )?
         .is_none()
     {
         return Err(AedbError::Validation(
@@ -804,7 +809,7 @@ pub fn apply_order_book_new(
             best_price,
         );
         preferred_passive_price = keyspace
-            .kv_get(project_id, scope_id, &level_key)
+            .try_kv_get(project_id, scope_id, &level_key)?
             .and_then(|entry| decode_u256_bytes(&entry.value).ok())
             .filter(|qty| !qty.is_zero())
             .map(|_| best_price);
@@ -874,7 +879,7 @@ pub fn apply_order_book_new(
             ),
             vec![1],
             commit_seq,
-        );
+        )?;
         keyspace.kv_inc_u256(
             project_id,
             scope_id,
@@ -896,7 +901,7 @@ pub fn apply_order_book_new(
             ),
             vec![1],
             commit_seq,
-        );
+        )?;
     }
 
     keyspace.kv_set(
@@ -909,14 +914,14 @@ pub fn apply_order_book_new(
         ),
         order_id.to_be_bytes().to_vec(),
         commit_seq,
-    );
+    )?;
     keyspace.kv_set(
         project_id,
         scope_id,
         key_owner_nonce(&effective_request.instrument, &effective_request.owner),
         effective_request.nonce.to_be_bytes().to_vec(),
         commit_seq,
-    );
+    )?;
     write_execution_report(
         keyspace,
         project_id,
@@ -1163,7 +1168,7 @@ pub fn apply_order_book_cancel_replace(
         ),
         vec![1],
         commit_seq,
-    );
+    )?;
 
     if matches!(order.time_in_force, TimeInForce::Ioc | TimeInForce::Fok) {
         apply_order_book_cancel(
@@ -1390,7 +1395,7 @@ pub fn read_order_status(
     order_id: u64,
 ) -> Result<Option<OrderRecord>, AedbError> {
     snapshot
-        .kv_get(project_id, scope_id, &key_order(instrument, order_id))
+        .try_kv_get(project_id, scope_id, &key_order(instrument, order_id))?
         .map(|entry| deserialize::<OrderRecord>(&entry.value))
         .transpose()
 }
@@ -1408,7 +1413,7 @@ pub fn read_open_orders(
         &open_orders_prefix(instrument, owner),
         OPEN_ORDERS_SCAN_LIMIT.saturating_add(1),
         snapshot,
-    );
+    )?;
     if open.len() > OPEN_ORDERS_SCAN_LIMIT {
         return Err(AedbError::Validation(
             "open_orders scan limit exceeded".into(),
@@ -1438,16 +1443,27 @@ pub fn read_recent_trades(
         return Ok(Vec::new());
     }
     let ns = crate::storage::keyspace::NamespaceId::project_scope(project_id, scope_id);
-    let Some(namespace) = snapshot.namespaces.get(&ns) else {
-        return Ok(Vec::new());
-    };
     let prefix = trade_prefix(instrument);
     let start = Bound::Included(prefix.clone());
     let end = prefix_range_end(&prefix)
         .map(Bound::Excluded)
         .unwrap_or(Bound::Unbounded);
     let mut out = Vec::with_capacity(limit);
-    for (_, entry) in namespace.kv.entries.range((start, end)).rev().take(limit) {
+    if !snapshot.namespaces.contains_key(&ns) {
+        return Ok(Vec::new());
+    }
+    let mut keys: Vec<Vec<u8>> = snapshot
+        .try_kv_scan_range(project_id, scope_id, start, end, usize::MAX)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort_by(|a, b| b.cmp(a));
+    keys.dedup();
+    keys.truncate(limit);
+    for key in keys {
+        let entry = snapshot
+            .try_kv_get(project_id, scope_id, &key)?
+            .ok_or_else(|| AedbError::Validation("trade vanished during snapshot scan".into()))?;
         out.push(deserialize::<FillRecord>(&entry.value)?);
     }
     out.reverse();
@@ -1460,16 +1476,17 @@ pub fn read_last_execution_report(
     scope_id: &str,
     instrument: &str,
 ) -> Result<Option<ExecutionReport>, AedbError> {
-    let Some(entry) = snapshot.kv_get(project_id, scope_id, &key_execution_report_last(instrument))
+    let Some(entry) =
+        snapshot.try_kv_get(project_id, scope_id, &key_execution_report_last(instrument))?
     else {
         return Ok(None);
     };
     if let Some((commit_seq, order_id)) = decode_last_report_pointer(&entry.value)
-        && let Some(report_entry) = snapshot.kv_get(
+        && let Some(report_entry) = snapshot.try_kv_get(
             project_id,
             scope_id,
             &key_execution_report(instrument, commit_seq, order_id),
-        )
+        )?
     {
         return deserialize::<ExecutionReport>(&report_entry.value).map(Some);
     }
@@ -1484,9 +1501,9 @@ pub fn read_spread(
     seq: u64,
 ) -> Result<Spread, AedbError> {
     let best_bid =
-        best_price_for_side_snapshot(snapshot, project_id, scope_id, instrument, OrderSide::Bid);
+        best_price_for_side_snapshot(snapshot, project_id, scope_id, instrument, OrderSide::Bid)?;
     let best_ask =
-        best_price_for_side_snapshot(snapshot, project_id, scope_id, instrument, OrderSide::Ask);
+        best_price_for_side_snapshot(snapshot, project_id, scope_id, instrument, OrderSide::Ask)?;
     let mid = match (best_bid, best_ask) {
         (Some(b), Some(a)) => Some((b + a) / 2),
         _ => None,
@@ -1545,7 +1562,7 @@ fn top_side(
         &plqty_prefix(instrument, side),
         TOP_LEVEL_SCAN_LIMIT.saturating_add(1),
         snapshot,
-    );
+    )?;
     if entries.len() > TOP_LEVEL_SCAN_LIMIT {
         return Err(AedbError::Validation("top_n scan limit exceeded".into()));
     }
@@ -1564,7 +1581,7 @@ fn top_side(
             &fifo_prefix(instrument, side, price),
             FIFO_COUNT_SCAN_LIMIT.saturating_add(1),
             snapshot,
-        )
+        )?
         .len();
         if order_count > FIFO_COUNT_SCAN_LIMIT {
             return Err(AedbError::Validation(
@@ -1589,7 +1606,7 @@ fn load_u64(
     scope_id: &str,
     key: &[u8],
 ) -> Result<Option<u64>, AedbError> {
-    let Some(entry) = keyspace.kv_get(project_id, scope_id, key) else {
+    let Some(entry) = keyspace.try_kv_get(project_id, scope_id, key)? else {
         return Ok(None);
     };
     if entry.value.len() != 8 {
@@ -1607,7 +1624,7 @@ fn load_instrument_config(
     instrument: &str,
 ) -> Result<Option<InstrumentConfig>, AedbError> {
     keyspace
-        .kv_get(project_id, scope_id, &key_instrument_config(instrument))
+        .try_kv_get(project_id, scope_id, &key_instrument_config(instrument))?
         .map(|entry| deserialize::<InstrumentConfig>(&entry.value))
         .transpose()
 }
@@ -1622,7 +1639,7 @@ fn validate_instrument_against_table_mode(
         return Ok(());
     };
     let spec_key = key_order_book_table_spec(table_id);
-    let Some(entry) = keyspace.kv_get(project_id, scope_id, &spec_key) else {
+    let Some(entry) = keyspace.try_kv_get(project_id, scope_id, &spec_key)? else {
         return Err(AedbError::Validation(format!(
             "order book table not defined: {table_id}"
         )));
@@ -1660,22 +1677,8 @@ fn snapshot_scan_prefix(
     prefix: &[u8],
     limit: usize,
     snapshot: &KeyspaceSnapshot,
-) -> Vec<(Vec<u8>, crate::storage::keyspace::KvEntry)> {
-    let ns = crate::storage::keyspace::NamespaceId::project_scope(project_id, scope_id);
-    let Some(namespace) = snapshot.namespaces.get(&ns) else {
-        return Vec::new();
-    };
-    let start = Bound::Included(prefix.to_vec());
-    let end = prefix_range_end(prefix)
-        .map(Bound::Excluded)
-        .unwrap_or(Bound::Unbounded);
-    namespace
-        .kv
-        .entries
-        .range((start, end))
-        .take(limit)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+) -> Result<Vec<(Vec<u8>, crate::storage::keyspace::KvEntry)>, AedbError> {
+    snapshot.try_kv_scan_prefix(project_id, scope_id, prefix, limit)
 }
 
 fn prefix_range_end(prefix: &[u8]) -> Option<Vec<u8>> {
@@ -1707,7 +1710,7 @@ fn allocate_next_id(
         key.to_vec(),
         next.to_be_bytes().to_vec(),
         commit_seq,
-    );
+    )?;
     Ok(current)
 }
 
@@ -1733,7 +1736,8 @@ fn load_order(
     instrument: &str,
     order_id: u64,
 ) -> Result<Option<OrderRecord>, AedbError> {
-    let Some(entry) = keyspace.kv_get(project_id, scope_id, &key_order(instrument, order_id))
+    let Some(entry) =
+        keyspace.try_kv_get(project_id, scope_id, &key_order(instrument, order_id))?
     else {
         return Ok(None);
     };
@@ -1764,7 +1768,7 @@ fn store_order(
         key_order(&order.instrument, order.order_id),
         serialize(order)?,
         commit_seq,
-    );
+    )?;
     Ok(())
 }
 
@@ -1774,25 +1778,18 @@ fn best_price_for_side(
     scope_id: &str,
     instrument: &str,
     side: OrderSide,
-) -> Option<i64> {
-    let mut out = None;
-    keyspace.kv_visit_prefix_ref(
+) -> Result<Option<i64>, AedbError> {
+    for (key, entry) in keyspace.try_kv_scan_prefix(
         project_id,
         scope_id,
         &plqty_prefix(instrument, side),
         usize::MAX,
-        |k, v| {
-            if decode_u256_bytes(&v.value)
-                .ok()
-                .is_some_and(|x| !x.is_zero())
-            {
-                out = parse_plqty_price(side, k);
-                return false;
-            }
-            true
-        },
-    );
-    out
+    )? {
+        if !decode_u256_bytes(&entry.value)?.is_zero() {
+            return Ok(parse_plqty_price(side, &key));
+        }
+    }
+    Ok(None)
 }
 
 fn best_price_for_side_snapshot(
@@ -1801,23 +1798,23 @@ fn best_price_for_side_snapshot(
     scope_id: &str,
     instrument: &str,
     side: OrderSide,
-) -> Option<i64> {
+) -> Result<Option<i64>, AedbError> {
     let entries = snapshot_scan_prefix(
         project_id,
         scope_id,
         &plqty_prefix(instrument, side),
         usize::MAX,
         snapshot,
-    );
+    )?;
     for (k, v) in entries {
         if decode_u256_bytes(&v.value)
             .ok()
             .is_some_and(|x| !x.is_zero())
         {
-            return parse_plqty_price(side, &k);
+            return Ok(parse_plqty_price(side, &k));
         }
     }
-    None
+    Ok(None)
 }
 
 fn crosses(aggressor_side: OrderSide, aggressor_price: i64, passive_price: i64) -> bool {
@@ -1848,61 +1845,45 @@ fn best_passive_order(
     passive_side: OrderSide,
     request: &OrderRequest,
 ) -> Result<Option<(i64, OrderRecord)>, AedbError> {
-    let mut out = None;
-    let mut error: Option<AedbError> = None;
-    keyspace.kv_visit_prefix_ref(
+    for (k, v) in keyspace.try_kv_scan_prefix(
         project_id,
         scope_id,
         &plqty_prefix(instrument, passive_side),
         usize::MAX,
-        |k, v| {
-            let level_qty = match decode_u256_bytes(&v.value) {
-                Ok(q) => q,
-                Err(e) => {
-                    error = Some(e);
-                    return false;
-                }
-            };
-            if level_qty.is_zero() {
-                return true;
+    )? {
+        let level_qty = decode_u256_bytes(&v.value)?;
+        if level_qty.is_zero() {
+            continue;
+        }
+        let Some(price) = parse_plqty_price(passive_side, &k) else {
+            continue;
+        };
+        if !price_allows(request, price) {
+            if matches!(request.order_type, OrderType::Limit) {
+                break;
             }
-            let Some(price) = parse_plqty_price(passive_side, k) else {
-                return true;
-            };
-            if !price_allows(request, price) {
-                return !matches!(request.order_type, OrderType::Limit);
-            }
-            let mut first_fifo_order_id = None;
-            keyspace.kv_visit_prefix_ref(
+            continue;
+        }
+        let Some((fifo_key, _)) = keyspace
+            .try_kv_scan_prefix(
                 project_id,
                 scope_id,
                 &fifo_prefix(instrument, passive_side, price),
                 1,
-                |fifo_key, _| {
-                    first_fifo_order_id = parse_fifo_order_id(fifo_key);
-                    false
-                },
-            );
-            let Some(order_id) = first_fifo_order_id else {
-                return true;
-            };
-            match load_order(keyspace, project_id, scope_id, instrument, order_id) {
-                Ok(Some(order)) => {
-                    out = Some((price, order));
-                    false
-                }
-                Ok(None) => true,
-                Err(e) => {
-                    error = Some(e);
-                    false
-                }
-            }
-        },
-    );
-    if let Some(e) = error {
-        return Err(e);
+            )?
+            .into_iter()
+            .next()
+        else {
+            continue;
+        };
+        let Some(order_id) = parse_fifo_order_id(&fifo_key) else {
+            continue;
+        };
+        if let Some(order) = load_order(keyspace, project_id, scope_id, instrument, order_id)? {
+            return Ok(Some((price, order)));
+        }
     }
-    Ok(out)
+    Ok(None)
 }
 
 fn first_passive_order_at_price(
@@ -1917,16 +1898,16 @@ fn first_passive_order_at_price(
     if !price_allows(request, price) {
         return Ok(None);
     }
-    let fifo = keyspace.kv_scan_prefix_ref(
+    let fifo = keyspace.try_kv_scan_prefix(
         project_id,
         scope_id,
         &fifo_prefix(instrument, passive_side, price),
         1,
-    );
+    )?;
     let Some((fifo_key, _)) = fifo.into_iter().next() else {
         return Ok(None);
     };
-    let Some(order_id) = parse_fifo_order_id(fifo_key) else {
+    let Some(order_id) = parse_fifo_order_id(&fifo_key) else {
         return Ok(None);
     };
     load_order(keyspace, project_id, scope_id, instrument, order_id)
@@ -1939,38 +1920,27 @@ fn can_fok_fill(
     request: &OrderRequest,
 ) -> Result<bool, AedbError> {
     let mut needed = u256_from_be(request.qty_be);
-    let mut error: Option<AedbError> = None;
-    keyspace.kv_visit_prefix_ref(
+    for (k, v) in keyspace.try_kv_scan_prefix(
         project_id,
         scope_id,
         &plqty_prefix(&request.instrument, request.side.opposite()),
         usize::MAX,
-        |k, v| {
-            let Some(price) = parse_plqty_price(request.side.opposite(), k) else {
-                return true;
-            };
-            if !price_allows(request, price) {
-                return !matches!(request.order_type, OrderType::Limit);
+    )? {
+        let Some(price) = parse_plqty_price(request.side.opposite(), &k) else {
+            continue;
+        };
+        if !price_allows(request, price) {
+            if matches!(request.order_type, OrderType::Limit) {
+                break;
             }
-            match decode_u256_bytes(&v.value) {
-                Ok(qty) => {
-                    if qty >= needed {
-                        needed = U256::zero();
-                        false
-                    } else {
-                        needed -= qty;
-                        true
-                    }
-                }
-                Err(e) => {
-                    error = Some(e);
-                    false
-                }
-            }
-        },
-    );
-    if let Some(e) = error {
-        return Err(e);
+            continue;
+        }
+        let qty = decode_u256_bytes(&v.value)?;
+        if qty >= needed {
+            needed = U256::zero();
+            break;
+        }
+        needed -= qty;
     }
     Ok(needed.is_zero())
 }
@@ -2112,7 +2082,7 @@ fn write_fill(
         key_trade(instrument, fill_id),
         serialize(&fill)?,
         commit_seq,
-    );
+    )?;
     Ok(fill)
 }
 
@@ -2131,14 +2101,14 @@ fn write_execution_report(
         key_execution_report(instrument, commit_seq, report.order_id),
         bytes,
         commit_seq,
-    );
+    )?;
     keyspace.kv_set(
         project_id,
         scope_id,
         key_execution_report_last(instrument),
         encode_last_report_pointer(commit_seq, report.order_id),
         commit_seq,
-    );
+    )?;
     Ok(())
 }
 
@@ -2164,7 +2134,7 @@ fn would_cross_now(
     price_ticks: i64,
 ) -> Result<bool, AedbError> {
     let Some(best_opposite) =
-        best_price_for_side(keyspace, project_id, scope_id, instrument, side.opposite())
+        best_price_for_side(keyspace, project_id, scope_id, instrument, side.opposite())?
     else {
         return Ok(false);
     };
@@ -2190,14 +2160,14 @@ fn effective_request_for_config(
         scope_id,
         &request.instrument,
         OrderSide::Bid,
-    );
+    )?;
     let ask = best_price_for_side(
         keyspace,
         project_id,
         scope_id,
         &request.instrument,
         OrderSide::Ask,
-    );
+    )?;
     let Some(mid) = (match (bid, ask) {
         (Some(b), Some(a)) => Some((b + a) / 2),
         _ => None,
@@ -2247,7 +2217,8 @@ mod tests {
                 key_trade("BTC-USD", i),
                 encode_fill(i, 100 + i),
                 100 + i,
-            );
+            )
+            .expect("set trade");
         }
         let snapshot = ks.snapshot();
         let recent =
@@ -2265,7 +2236,8 @@ mod tests {
             key_trade("BTC-USD", 1),
             encode_fill(1, 101),
             101,
-        );
+        )
+        .expect("set trade");
         let snapshot = ks.snapshot();
         let recent =
             read_recent_trades(&snapshot, "p", "app", "BTC-USD", 0).expect("read recent trades");
@@ -2282,14 +2254,16 @@ mod tests {
                 key_trade("BTC-USD", i),
                 encode_fill(i, 100 + i),
                 100 + i,
-            );
+            )
+            .expect("set btc trade");
             ks.kv_set(
                 "p",
                 "app",
                 key_trade("ETH-USD", i),
                 encode_fill(100 + i, 200 + i),
                 200 + i,
-            );
+            )
+            .expect("set eth trade");
         }
         let snapshot = ks.snapshot();
         let recent =
@@ -2301,7 +2275,8 @@ mod tests {
     #[test]
     fn read_recent_trades_rejects_malformed_trade_payload() {
         let mut ks = Keyspace::default();
-        ks.kv_set("p", "app", key_trade("BTC-USD", 1), vec![0, 1, 2, 3], 101);
+        ks.kv_set("p", "app", key_trade("BTC-USD", 1), vec![0, 1, 2, 3], 101)
+            .expect("set malformed trade");
         let snapshot = ks.snapshot();
         let err = read_recent_trades(&snapshot, "p", "app", "BTC-USD", 1)
             .expect_err("malformed payload should fail decode");
@@ -2370,28 +2345,32 @@ mod tests {
             key_order("BTC-USD", order_a.order_id),
             serialize(&order_a).expect("encode"),
             1,
-        );
+        )
+        .expect("set order a");
         ks.kv_set(
             "p",
             "app",
             key_order("BTC-USD", order_b.order_id),
             serialize(&order_b).expect("encode"),
             1,
-        );
+        )
+        .expect("set order b");
         ks.kv_set(
             "p",
             "app",
             key_open_order("BTC-USD", &order_a.owner, order_a.order_id),
             vec![1],
             1,
-        );
+        )
+        .expect("set open order a");
         ks.kv_set(
             "p",
             "app",
             key_open_order("BTC-USD", &order_b.owner, order_b.order_id),
             vec![1],
             1,
-        );
+        )
+        .expect("set open order b");
 
         let snapshot = ks.snapshot();
         let open =

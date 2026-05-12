@@ -14,6 +14,18 @@ pub enum RecoveryMode {
     Permissive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageMode {
+    InMemory,
+    /// Durable WAL/checkpoint state plus append-only disk storage for KV payloads.
+    ///
+    /// This mode keeps table rows, indexes, KV keys, versions, and metadata in
+    /// memory. Set `persistent_value_inline_threshold_bytes` to `0` when KV
+    /// payloads must not remain inline in memory.
+    #[default]
+    DiskBacked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PrimaryIndexBackend {
     #[default]
@@ -43,6 +55,10 @@ pub struct AedbConfig {
     pub max_batch_rows: usize,
     pub max_kv_key_bytes: usize,
     pub max_kv_value_bytes: usize,
+    pub storage_mode: StorageMode,
+    pub persistent_value_inline_threshold_bytes: usize,
+    pub persistent_value_hot_cache_bytes: usize,
+    pub kv_segment_block_cache_bytes: usize,
     pub max_table_value_bytes: usize,
     pub max_event_payload_bytes: usize,
     pub max_memory_estimate_bytes: usize,
@@ -104,6 +120,10 @@ impl Default for AedbConfig {
             max_batch_rows: 10_000,
             max_kv_key_bytes: 1024,
             max_kv_value_bytes: 1024 * 1024,
+            storage_mode: StorageMode::DiskBacked,
+            persistent_value_inline_threshold_bytes: 64 * 1024,
+            persistent_value_hot_cache_bytes: 64 * 1024 * 1024,
+            kv_segment_block_cache_bytes: 16 * 1024 * 1024,
             max_table_value_bytes: 1024 * 1024,
             max_event_payload_bytes: 64 * 1024,
             max_memory_estimate_bytes: 2 * 1024 * 1024 * 1024,
@@ -147,6 +167,8 @@ impl AedbConfig {
             recovery_mode: RecoveryMode::Strict,
             durability_mode: DurabilityMode::Full,
             hash_chain_required: true,
+            storage_mode: StorageMode::DiskBacked,
+            persistent_value_inline_threshold_bytes: 0,
             ..Self::default()
         }
     }
@@ -181,6 +203,8 @@ impl AedbConfig {
             durable_ack_coalesce_window_us: 500,
             epoch_max_wait_us: 50,
             adaptive_epoch_target_latency_us: 1_000,
+            storage_mode: StorageMode::DiskBacked,
+            persistent_value_inline_threshold_bytes: 0,
             ..Self::default()
         }
     }

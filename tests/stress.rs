@@ -989,7 +989,7 @@ async fn stress_effective_tps_independent_scopes() {
     assert!(committed > 0, "expected at least one committed transfer");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "long-running mixed insert/update/read/query throughput benchmark"]
 async fn stress_mixed_ops_independent_scopes() {
     const PROJECT_PREFIX: &str = "mixbench";

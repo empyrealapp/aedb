@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 pub const BACKUP_MANIFEST_FILE: &str = "backup_manifest.json";
@@ -16,9 +17,12 @@ pub const BACKUP_MANIFEST_HMAC_FILE: &str = "backup_manifest.hmac";
 const BACKUP_ARCHIVE_MAGIC: &[u8; 8] = b"AEDBARC1";
 const BACKUP_ARCHIVE_FLAG_ENCRYPTED: u8 = 0x01;
 const BACKUP_ARCHIVE_ENTRY_FILE: u8 = 0x01;
+const BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE: u8 = 0x02;
 const BACKUP_ARCHIVE_ENTRY_END: u8 = 0xFF;
 const MAX_BACKUP_ARCHIVE_PATH_BYTES: u32 = 4_096;
 const MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const BACKUP_ARCHIVE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupManifest {
@@ -45,12 +49,13 @@ pub fn write_backup_manifest(
     fs::create_dir_all(dir)?;
     let bytes =
         serde_json::to_vec_pretty(manifest).map_err(|e| AedbError::Encode(e.to_string()))?;
-    fs::write(dir.join(BACKUP_MANIFEST_FILE), &bytes)?;
+    write_file_atomic_synced(dir, BACKUP_MANIFEST_FILE, &bytes)?;
     if let Some(key) = signing_key {
         let sig = hmac_hex(key, &bytes)?;
-        fs::write(dir.join(BACKUP_MANIFEST_HMAC_FILE), sig)?;
+        write_file_atomic_synced(dir, BACKUP_MANIFEST_HMAC_FILE, sig.as_bytes())?;
     } else {
         let _ = fs::remove_file(dir.join(BACKUP_MANIFEST_HMAC_FILE));
+        sync_dir(dir)?;
     }
     Ok(())
 }
@@ -113,43 +118,43 @@ pub fn write_backup_archive(
     };
     let salt = *Uuid::new_v4().as_bytes();
 
-    let mut writer = BufWriter::new(fs::File::create(archive_path)?);
+    let archive_file = fs::File::create(archive_path)?;
+    let mut writer = BufWriter::new(archive_file);
     writer.write_all(BACKUP_ARCHIVE_MAGIC)?;
     writer.write_all(&[archive_flags])?;
     writer.write_all(&salt)?;
 
     for (entry_index, rel) in rel_files.iter().enumerate() {
         let resolved = resolve_backup_path(dir, rel)?;
-        let raw = fs::read(&resolved)?;
-        let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
-            .map_err(|e| AedbError::Encode(e.to_string()))?;
-
-        let payload = if let Some(key) = encryption_key {
-            let nonce = derive_archive_nonce(&salt, entry_index as u64, rel);
-            encrypt_archive_payload(&compressed, key, &nonce)?
+        let file_len = resolved.metadata()?.len();
+        if file_len >= BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES {
+            write_chunked_archive_file(
+                &mut writer,
+                rel,
+                &resolved,
+                file_len,
+                &salt,
+                entry_index as u64,
+                encryption_key,
+            )?;
         } else {
-            compressed
-        };
-        if rel.len() > MAX_BACKUP_ARCHIVE_PATH_BYTES as usize {
-            return Err(AedbError::Validation(
-                "backup archive path exceeds max length".into(),
-            ));
+            write_legacy_archive_file(
+                &mut writer,
+                rel,
+                &resolved,
+                &salt,
+                entry_index as u64,
+                encryption_key,
+            )?;
         }
-        if payload.len() as u64 > MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES {
-            return Err(AedbError::Validation(
-                "backup archive payload exceeds max size".into(),
-            ));
-        }
-
-        write_u8(&mut writer, BACKUP_ARCHIVE_ENTRY_FILE)?;
-        write_u32(&mut writer, rel.len() as u32)?;
-        writer.write_all(rel.as_bytes())?;
-        write_u64(&mut writer, payload.len() as u64)?;
-        writer.write_all(&payload)?;
     }
 
     write_u8(&mut writer, BACKUP_ARCHIVE_ENTRY_END)?;
     writer.flush()?;
+    writer.get_ref().sync_all()?;
+    if let Some(parent) = archive_path.parent() {
+        sync_dir(parent)?;
+    }
     Ok(())
 }
 
@@ -190,62 +195,35 @@ pub fn extract_backup_archive(
         if entry == BACKUP_ARCHIVE_ENTRY_END {
             break;
         }
-        if entry != BACKUP_ARCHIVE_ENTRY_FILE {
-            return Err(AedbError::Validation("invalid backup archive entry".into()));
+        let rel = read_archive_relative_path(&mut reader)?;
+        match entry {
+            BACKUP_ARCHIVE_ENTRY_FILE => {
+                extract_legacy_archive_file(
+                    &mut reader,
+                    dir,
+                    &rel,
+                    &salt,
+                    entry_index,
+                    encrypted,
+                    encryption_key,
+                )?;
+            }
+            BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE => {
+                extract_chunked_archive_file(
+                    &mut reader,
+                    dir,
+                    &rel,
+                    &salt,
+                    entry_index,
+                    encrypted,
+                    encryption_key,
+                )?;
+            }
+            _ => return Err(AedbError::Validation("invalid backup archive entry".into())),
         }
-
-        let path_len_u32 = read_u32(&mut reader)?;
-        if path_len_u32 == 0 {
-            return Err(AedbError::Validation(
-                "backup archive path must not be empty".into(),
-            ));
-        }
-        if path_len_u32 > MAX_BACKUP_ARCHIVE_PATH_BYTES {
-            return Err(AedbError::Validation(
-                "backup archive path exceeds max length".into(),
-            ));
-        }
-        let path_len = usize::try_from(path_len_u32).map_err(|_| {
-            AedbError::Validation("backup archive path exceeds platform limits".into())
-        })?;
-        let mut path_bytes = vec![0u8; path_len];
-        reader.read_exact(&mut path_bytes)?;
-        let rel = String::from_utf8(path_bytes)
-            .map_err(|_| AedbError::Validation("backup archive path is not utf-8".into()))?;
-
-        validate_safe_relative_path(&rel, "backup archive path")?;
-
-        let payload_len_u64 = read_u64(&mut reader)?;
-        if payload_len_u64 > MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES {
-            return Err(AedbError::Validation(
-                "backup archive payload exceeds max size".into(),
-            ));
-        }
-        let payload_len = usize::try_from(payload_len_u64).map_err(|_| {
-            AedbError::Validation("backup archive payload exceeds platform limits".into())
-        })?;
-        let mut payload = vec![0u8; payload_len];
-        reader.read_exact(&mut payload)?;
-
-        let compressed = if encrypted {
-            let Some(key) = encryption_key else {
-                return Err(AedbError::Validation(
-                    "backup archive missing encryption key".into(),
-                ));
-            };
-            let expected_nonce = derive_archive_nonce(&salt, entry_index, &rel);
-            decrypt_archive_payload(&payload, key, &expected_nonce)?
-        } else {
-            payload
-        };
-
-        let bytes = zstd::stream::decode_all(compressed.as_slice())
-            .map_err(|e| AedbError::Decode(e.to_string()))?;
-
-        let out = resolve_backup_output_path(dir, &rel)?;
-        fs::write(out, bytes)?;
         entry_index = entry_index.saturating_add(1);
     }
+    sync_dir(dir)?;
     Ok(())
 }
 
@@ -270,6 +248,258 @@ fn hmac_hex(key: &[u8], bytes: &[u8]) -> Result<String, AedbError> {
         .map_err(|e| AedbError::Validation(format!("invalid hmac key: {e}")))?;
     mac.update(bytes);
     Ok(hex_string(&mac.finalize().into_bytes()))
+}
+
+fn write_file_atomic_synced(dir: &Path, filename: &str, bytes: &[u8]) -> Result<(), AedbError> {
+    let final_path = dir.join(filename);
+    let mut tmp = NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&final_path)
+        .map_err(|e| AedbError::Io(e.error))?;
+    fs::File::open(&final_path)?.sync_all()?;
+    sync_dir(dir)?;
+    Ok(())
+}
+
+fn write_output_file_synced(path: &Path, bytes: &[u8]) -> Result<(), AedbError> {
+    let mut file = fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn write_legacy_archive_file<W: Write>(
+    writer: &mut W,
+    rel: &str,
+    resolved: &Path,
+    salt: &[u8; 16],
+    entry_index: u64,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<(), AedbError> {
+    validate_archive_path_len(rel)?;
+    let raw = fs::read(resolved)?;
+    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
+        .map_err(|e| AedbError::Encode(e.to_string()))?;
+
+    let payload = if let Some(key) = encryption_key {
+        let nonce = derive_archive_nonce(salt, entry_index, rel);
+        encrypt_archive_payload(&compressed, key, &nonce)?
+    } else {
+        compressed
+    };
+    validate_archive_payload_len(payload.len() as u64)?;
+
+    write_u8(writer, BACKUP_ARCHIVE_ENTRY_FILE)?;
+    write_u32(writer, rel.len() as u32)?;
+    writer.write_all(rel.as_bytes())?;
+    write_u64(writer, payload.len() as u64)?;
+    writer.write_all(&payload)?;
+    Ok(())
+}
+
+fn write_chunked_archive_file<W: Write>(
+    writer: &mut W,
+    rel: &str,
+    resolved: &Path,
+    file_len: u64,
+    salt: &[u8; 16],
+    entry_index: u64,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<(), AedbError> {
+    validate_archive_path_len(rel)?;
+    write_u8(writer, BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE)?;
+    write_u32(writer, rel.len() as u32)?;
+    writer.write_all(rel.as_bytes())?;
+    write_u64(writer, file_len)?;
+
+    let mut reader = BufReader::new(fs::File::open(resolved)?);
+    let mut buf = vec![0u8; BACKUP_ARCHIVE_CHUNK_BYTES];
+    let mut chunk_index = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let raw = &buf[..n];
+        let compressed =
+            zstd::stream::encode_all(raw, 3).map_err(|e| AedbError::Encode(e.to_string()))?;
+        let payload = if let Some(key) = encryption_key {
+            let nonce = derive_archive_chunk_nonce(salt, entry_index, chunk_index, rel);
+            encrypt_archive_payload(&compressed, key, &nonce)?
+        } else {
+            compressed
+        };
+        validate_archive_payload_len(payload.len() as u64)?;
+        write_u32(writer, n as u32)?;
+        write_u64(writer, payload.len() as u64)?;
+        writer.write_all(&payload)?;
+        chunk_index = chunk_index.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn read_archive_relative_path<R: Read>(reader: &mut R) -> Result<String, AedbError> {
+    let path_len_u32 = read_u32(reader)?;
+    if path_len_u32 == 0 {
+        return Err(AedbError::Validation(
+            "backup archive path must not be empty".into(),
+        ));
+    }
+    if path_len_u32 > MAX_BACKUP_ARCHIVE_PATH_BYTES {
+        return Err(AedbError::Validation(
+            "backup archive path exceeds max length".into(),
+        ));
+    }
+    let path_len = usize::try_from(path_len_u32)
+        .map_err(|_| AedbError::Validation("backup archive path exceeds platform limits".into()))?;
+    let mut path_bytes = vec![0u8; path_len];
+    reader.read_exact(&mut path_bytes)?;
+    let rel = String::from_utf8(path_bytes)
+        .map_err(|_| AedbError::Validation("backup archive path is not utf-8".into()))?;
+    validate_safe_relative_path(&rel, "backup archive path")?;
+    Ok(rel)
+}
+
+fn extract_legacy_archive_file<R: Read>(
+    reader: &mut R,
+    dir: &Path,
+    rel: &str,
+    salt: &[u8; 16],
+    entry_index: u64,
+    encrypted: bool,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<(), AedbError> {
+    let payload = read_archive_payload(reader)?;
+    let compressed = if encrypted {
+        let Some(key) = encryption_key else {
+            return Err(AedbError::Validation(
+                "backup archive missing encryption key".into(),
+            ));
+        };
+        let expected_nonce = derive_archive_nonce(salt, entry_index, rel);
+        decrypt_archive_payload(&payload, key, &expected_nonce)?
+    } else {
+        payload
+    };
+
+    let bytes = zstd::stream::decode_all(compressed.as_slice())
+        .map_err(|e| AedbError::Decode(e.to_string()))?;
+
+    let out = resolve_backup_output_path(dir, rel)?;
+    write_output_file_synced(&out, &bytes)?;
+    Ok(())
+}
+
+fn extract_chunked_archive_file<R: Read>(
+    reader: &mut R,
+    dir: &Path,
+    rel: &str,
+    salt: &[u8; 16],
+    entry_index: u64,
+    encrypted: bool,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<(), AedbError> {
+    let file_len = read_u64(reader)?;
+    let out = resolve_backup_output_path(dir, rel)?;
+    let mut file = BufWriter::new(fs::File::create(&out)?);
+    let mut remaining = file_len;
+    let mut chunk_index = 0u64;
+    while remaining > 0 {
+        let raw_len_u32 = read_u32(reader)?;
+        if raw_len_u32 == 0 {
+            return Err(AedbError::Validation(
+                "chunked backup archive contains empty chunk".into(),
+            ));
+        }
+        let raw_len = usize::try_from(raw_len_u32).map_err(|_| {
+            AedbError::Validation("backup archive chunk exceeds platform limits".into())
+        })?;
+        if raw_len > BACKUP_ARCHIVE_CHUNK_BYTES || raw_len as u64 > remaining {
+            return Err(AedbError::Validation(
+                "chunked backup archive chunk length is invalid".into(),
+            ));
+        }
+
+        let payload = read_archive_payload(reader)?;
+        let compressed = if encrypted {
+            let Some(key) = encryption_key else {
+                return Err(AedbError::Validation(
+                    "backup archive missing encryption key".into(),
+                ));
+            };
+            let expected_nonce = derive_archive_chunk_nonce(salt, entry_index, chunk_index, rel);
+            decrypt_archive_payload(&payload, key, &expected_nonce)?
+        } else {
+            payload
+        };
+
+        let bytes = decode_archive_chunk(&compressed, raw_len)?;
+        file.write_all(&bytes)?;
+        remaining -= raw_len as u64;
+        chunk_index = chunk_index.saturating_add(1);
+    }
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    if let Some(parent) = out.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn read_archive_payload<R: Read>(reader: &mut R) -> Result<Vec<u8>, AedbError> {
+    let payload_len_u64 = read_u64(reader)?;
+    validate_archive_payload_len(payload_len_u64)?;
+    let payload_len = usize::try_from(payload_len_u64).map_err(|_| {
+        AedbError::Validation("backup archive payload exceeds platform limits".into())
+    })?;
+    let mut payload = vec![0u8; payload_len];
+    reader.read_exact(&mut payload)?;
+    Ok(payload)
+}
+
+fn decode_archive_chunk(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, AedbError> {
+    let decoder =
+        zstd::stream::Decoder::new(compressed).map_err(|e| AedbError::Decode(e.to_string()))?;
+    let mut limited = decoder.take(expected_len as u64 + 1);
+    let mut bytes = Vec::with_capacity(expected_len);
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|e| AedbError::Decode(e.to_string()))?;
+    if bytes.len() != expected_len {
+        return Err(AedbError::Decode(
+            "chunked backup archive decoded length mismatch".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_archive_path_len(rel: &str) -> Result<(), AedbError> {
+    if rel.len() > MAX_BACKUP_ARCHIVE_PATH_BYTES as usize {
+        return Err(AedbError::Validation(
+            "backup archive path exceeds max length".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_archive_payload_len(payload_len: u64) -> Result<(), AedbError> {
+    if payload_len > MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES {
+        return Err(AedbError::Validation(
+            "backup archive payload exceeds max size".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<(), AedbError> {
+    fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 fn verify_hmac_hex(key: &[u8], bytes: &[u8], expected_hex: &str) -> Result<(), AedbError> {
@@ -469,6 +699,23 @@ fn derive_archive_nonce(salt: &[u8; 16], index: u64, rel: &str) -> [u8; 12] {
     nonce
 }
 
+fn derive_archive_chunk_nonce(
+    salt: &[u8; 16],
+    index: u64,
+    chunk_index: u64,
+    rel: &str,
+) -> [u8; 12] {
+    let mut input = Vec::with_capacity(16 + 8 + 8 + rel.len());
+    input.extend_from_slice(salt);
+    input.extend_from_slice(&index.to_le_bytes());
+    input.extend_from_slice(&chunk_index.to_le_bytes());
+    input.extend_from_slice(rel.as_bytes());
+    let hash = blake3::hash(&input);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&hash.as_bytes()[..12]);
+    nonce
+}
+
 fn encrypt_archive_payload(
     payload: &[u8],
     key: &[u8; 32],
@@ -610,8 +857,11 @@ mod tests {
         let archive_plain = src.path().join("backup_plain.aedbarc");
         let archive_enc = src.path().join("backup_enc.aedbarc");
         std::fs::create_dir_all(src.path().join("wal_tail")).expect("wal dir");
+        std::fs::create_dir_all(src.path().join("pages")).expect("pages dir");
         std::fs::write(src.path().join("backup_manifest.json"), b"{\"x\":1}").expect("manifest");
         std::fs::write(src.path().join("wal_tail/segment_1.aedbwal"), b"segment").expect("wal");
+        std::fs::write(src.path().join("pages/rows.aedbpg"), b"page-data")
+            .expect("page store file");
 
         write_backup_archive(src.path(), &archive_plain, None).expect("write plain");
         extract_backup_archive(&archive_plain, dst_plain.path(), None).expect("extract plain");
@@ -627,11 +877,61 @@ mod tests {
             std::fs::read(dst_enc.path().join("wal_tail/segment_1.aedbwal")).expect("read wal"),
             b"segment".to_vec()
         );
+        assert_eq!(
+            std::fs::read(dst_enc.path().join("pages/rows.aedbpg")).expect("read page store file"),
+            b"page-data".to_vec()
+        );
 
         let wrong = [7u8; 32];
         let err = extract_backup_archive(
             &archive_enc,
             tempfile::tempdir().expect("tmp").path(),
+            Some(&wrong),
+        )
+        .expect_err("wrong key must fail");
+        assert!(format!("{err}").contains("decryption failed"));
+    }
+
+    #[test]
+    fn backup_archive_streams_large_page_file_in_encrypted_chunks() {
+        let src = tempfile::tempdir().expect("src");
+        let dst = tempfile::tempdir().expect("dst");
+        let archive = src.path().join("backup_large_page.aedbarc");
+        let page_rel = "pages/rows.aedbpg";
+        let page_path = src.path().join(page_rel);
+        std::fs::create_dir_all(page_path.parent().expect("page parent")).expect("pages dir");
+        std::fs::write(src.path().join("backup_manifest.json"), b"{\"x\":1}").expect("manifest");
+
+        let large_len =
+            BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES as usize + BACKUP_ARCHIVE_CHUNK_BYTES + 17;
+        let mut large_page = Vec::with_capacity(large_len);
+        for i in 0..large_len {
+            large_page.push(((i.wrapping_mul(31) ^ (i >> 7)) & 0xff) as u8);
+        }
+        std::fs::write(&page_path, &large_page).expect("large page file");
+
+        let key = [11u8; 32];
+        write_backup_archive(src.path(), &archive, Some(&key)).expect("write archive");
+        let archive_bytes = std::fs::read(&archive).expect("read archive");
+        assert!(
+            archive_bytes.contains(&BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE),
+            "large page file should use chunked archive entry"
+        );
+
+        extract_backup_archive(&archive, dst.path(), Some(&key)).expect("extract archive");
+        assert_eq!(
+            sha256_file_hex(&page_path).expect("source hash"),
+            sha256_file_hex(&dst.path().join(page_rel)).expect("restored hash")
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("backup_manifest.json")).expect("manifest"),
+            b"{\"x\":1}".to_vec()
+        );
+
+        let wrong = [12u8; 32];
+        let err = extract_backup_archive(
+            &archive,
+            tempfile::tempdir().expect("bad dst").path(),
             Some(&wrong),
         )
         .expect_err("wrong key must fail");

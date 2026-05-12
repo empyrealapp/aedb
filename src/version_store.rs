@@ -85,15 +85,31 @@ impl VersionStore {
     }
 
     pub fn publish_delta(&mut self, seq: u64, delta: Arc<CommitDelta>) -> bool {
-        self.versions.push_back(Version {
-            seq,
-            keyspace: None,
-            catalog: None,
-            delta: Some(delta),
-            created_at: Instant::now(),
-            ref_count: Arc::new(AtomicU64::new(0)),
-        });
-        self.deltas_since_full_snapshot = self.deltas_since_full_snapshot.saturating_add(1);
+        self.publish_deltas(std::iter::once((seq, delta)))
+    }
+
+    pub fn publish_deltas<I>(&mut self, deltas: I) -> bool
+    where
+        I: IntoIterator<Item = (u64, Arc<CommitDelta>)>,
+    {
+        let created_at = Instant::now();
+        let mut delta_count = 0usize;
+        for (seq, delta) in deltas {
+            delta_count = delta_count.saturating_add(1);
+            self.versions.push_back(Version {
+                seq,
+                keyspace: None,
+                catalog: None,
+                delta: Some(delta),
+                created_at,
+                ref_count: Arc::new(AtomicU64::new(0)),
+            });
+        }
+        if delta_count == 0 {
+            return self.deltas_since_full_snapshot >= self.full_snapshot_interval_deltas;
+        }
+        self.deltas_since_full_snapshot =
+            self.deltas_since_full_snapshot.saturating_add(delta_count);
         self.prune();
         self.deltas_since_full_snapshot >= self.full_snapshot_interval_deltas
     }
@@ -291,6 +307,9 @@ fn acquire(version: &Version) -> ReadViewGuard {
 fn snapshot_to_keyspace(snapshot: &KeyspaceSnapshot) -> Keyspace {
     Keyspace {
         primary_index_backend: snapshot.primary_index_backend,
+        value_store: snapshot.value_store.clone(),
+        kv_segment_store: snapshot.kv_segment_store.clone(),
+        persistent_value_inline_threshold_bytes: snapshot.persistent_value_inline_threshold_bytes,
         namespaces: snapshot.namespaces.clone(),
         async_indexes: snapshot.async_indexes.clone(),
         mem_bytes: snapshot.mem_bytes,
@@ -361,5 +380,31 @@ mod tests {
             mutations: Vec::new(),
         });
         assert!(!store.publish_delta(3, third));
+    }
+
+    #[test]
+    fn publish_deltas_batches_prune_and_snapshot_interval_accounting() {
+        let mut store = VersionStore::new(8, 3, 0);
+        store.bootstrap(
+            0,
+            Keyspace::default().snapshot(),
+            crate::catalog::Catalog::default(),
+        );
+        let first = Arc::new(CommitDelta {
+            seq: 1,
+            mutations: Vec::new(),
+        });
+        let second = Arc::new(CommitDelta {
+            seq: 2,
+            mutations: Vec::new(),
+        });
+        assert!(!store.publish_deltas([(1, first), (2, second)]));
+
+        let third = Arc::new(CommitDelta {
+            seq: 3,
+            mutations: Vec::new(),
+        });
+        assert!(store.publish_deltas([(3, third)]));
+        assert_eq!(store.deltas_since(0, 3).expect("delta range").len(), 3);
     }
 }

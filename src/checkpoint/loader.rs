@@ -58,6 +58,9 @@ pub fn load_checkpoint_with_key(
         rmp_serde::from_slice(&decompressed).map_err(|e| AedbError::Decode(e.to_string()))?;
     let mut keyspace = Keyspace {
         primary_index_backend: data.keyspace.primary_index_backend,
+        value_store: None,
+        kv_segment_store: None,
+        persistent_value_inline_threshold_bytes: usize::MAX,
         namespaces: data.keyspace.namespaces,
         async_indexes: data.keyspace.async_indexes,
         mem_bytes: 0,

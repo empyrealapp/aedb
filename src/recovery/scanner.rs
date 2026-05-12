@@ -67,6 +67,15 @@ pub fn validated_hash_chain_prefix_len(
     required: bool,
     strict: bool,
 ) -> Result<usize, AedbError> {
+    validated_hash_chain_prefix_len_from_checkpoint(paths, required, strict, false)
+}
+
+pub fn validated_hash_chain_prefix_len_from_checkpoint(
+    paths: &[PathBuf],
+    required: bool,
+    strict: bool,
+    allow_checkpoint_tail_anchor: bool,
+) -> Result<usize, AedbError> {
     if !required {
         return Ok(paths.len());
     }
@@ -117,7 +126,9 @@ pub fn validated_hash_chain_prefix_len(
                 break;
             }
         };
-        if parsed.prev_segment_hash != prev_hash {
+        if parsed.prev_segment_hash != prev_hash
+            && !(allow_checkpoint_tail_anchor && valid_segment_count == 0 && parsed.segment_seq > 1)
+        {
             if strict {
                 return Err(AedbError::Validation("segment hash chain mismatch".into()));
             }
@@ -210,6 +221,36 @@ mod tests {
             validated_hash_chain_prefix_len(&paths, true, true).expect("strict valid"),
             2
         );
+    }
+
+    #[test]
+    fn checkpoint_tail_anchor_allows_first_retained_segment_to_reference_reclaimed_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seg2 = dir.path().join("segment_0000000000000002.aedbwal");
+        let seg3 = dir.path().join("segment_0000000000000003.aedbwal");
+
+        let reclaimed_hash = [7u8; 32];
+        let h2 = SegmentHeader::new(1, 2, reclaimed_hash);
+        write_segment(&seg2, h2, b"frame-data-2");
+        let hash2 = segment_hash(&seg2);
+
+        let h3 = SegmentHeader::new(1, 3, hash2);
+        write_segment(&seg3, h3, b"frame-data-3");
+
+        let paths = vec![seg2.clone(), seg3.clone()];
+        let err = validated_hash_chain_prefix_len(&paths, true, true).expect_err("strict");
+        assert!(err.to_string().contains("segment hash chain mismatch"));
+        assert_eq!(
+            validated_hash_chain_prefix_len_from_checkpoint(&paths, true, true, true)
+                .expect("checkpoint anchored tail"),
+            2
+        );
+
+        let h3_bad = SegmentHeader::new(1, 3, [9u8; 32]);
+        write_segment(&seg3, h3_bad, b"frame-data-3");
+        let err = validated_hash_chain_prefix_len_from_checkpoint(&paths, true, true, true)
+            .expect_err("broken retained tail must still fail");
+        assert!(err.to_string().contains("segment hash chain mismatch"));
     }
 
     #[test]

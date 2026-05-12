@@ -26,7 +26,11 @@ const SCOPE: &str = "app";
 
 fn rss_bytes() -> u64 {
     let s = fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: u64 = s.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let pages: u64 = s
+        .split_whitespace()
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     pages * 4096
 }
 
@@ -50,12 +54,26 @@ async fn seed_rows(db: &AedbInstance, count: i64) {
         owner_id: None,
         if_not_exists: false,
         columns: vec![
-            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
-            ColumnDef { name: "name".into(), col_type: ColumnType::Text, nullable: false },
-            ColumnDef { name: "age".into(), col_type: ColumnType::Integer, nullable: false },
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "age".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
         ],
         primary_key: vec!["id".into()],
-    })).await.expect("table");
+    }))
+    .await
+    .expect("table");
     let batch = 256_i64;
     let mut id = 0_i64;
     while id < count {
@@ -76,7 +94,9 @@ async fn seed_rows(db: &AedbInstance, count: i64) {
             scope_id: SCOPE.into(),
             table_name: "users".into(),
             rows,
-        }).await.expect("seed");
+        })
+        .await
+        .expect("seed");
     }
 }
 
@@ -88,7 +108,9 @@ async fn seed_kv(db: &AedbInstance, count: i64, value_size: usize) {
             scope_id: SCOPE.into(),
             key: format!("k:{i:08}").into_bytes(),
             value: payload.clone(),
-        }).await.expect("kv set");
+        })
+        .await
+        .expect("kv set");
     }
 }
 
@@ -105,9 +127,18 @@ async fn main() {
     db.create_scope(PROJECT, SCOPE).await.expect("scope");
 
     let label = match shape.as_str() {
-        "rows" => { seed_rows(&db, seed).await; "rows-3col".to_string() }
-        "kv" => { seed_kv(&db, seed, 64).await; "kv-64B".to_string() }
-        "kv-large" => { seed_kv(&db, seed, 16 * 1024).await; "kv-16KB".to_string() }
+        "rows" => {
+            seed_rows(&db, seed).await;
+            "rows-3col".to_string()
+        }
+        "kv" => {
+            seed_kv(&db, seed, 64).await;
+            "kv-64B".to_string()
+        }
+        "kv-large" => {
+            seed_kv(&db, seed, 16 * 1024).await;
+            "kv-16KB".to_string()
+        }
         other => panic!("unknown shape: {other}"),
     };
 
@@ -118,13 +149,34 @@ async fn main() {
 
     println!("=== aedb ram_probe — shape={label}, seed={seed} ===");
     println!();
-    println!("aedb counter (estimated_memory_bytes): {} ({})", counter, human(counter as u64));
-    println!("process RSS baseline                 : {} ({})", rss_baseline, human(rss_baseline));
-    println!("process RSS now                      : {} ({})", rss_now, human(rss_now));
-    println!("process RSS delta                    : {} ({})", rss_delta, human(rss_delta));
+    println!(
+        "aedb counter (estimated_memory_bytes): {} ({})",
+        counter,
+        human(counter as u64)
+    );
+    println!(
+        "process RSS baseline                 : {} ({})",
+        rss_baseline,
+        human(rss_baseline)
+    );
+    println!(
+        "process RSS now                      : {} ({})",
+        rss_now,
+        human(rss_now)
+    );
+    println!(
+        "process RSS delta                    : {} ({})",
+        rss_delta,
+        human(rss_delta)
+    );
     if counter > 0 {
-        println!("RSS-delta / counter ratio            : {:.2}x", rss_delta as f64 / counter as f64);
-        println!("  (>1 = redundant caches, OrdMap node overhead, version_store, secondary indexes,");
+        println!(
+            "RSS-delta / counter ratio            : {:.2}x",
+            rss_delta as f64 / counter as f64
+        );
+        println!(
+            "  (>1 = redundant caches, OrdMap node overhead, version_store, secondary indexes,"
+        );
         println!("   accumulator deltas, async projections, allocator fragmentation, etc.)");
     }
     if seed > 0 {

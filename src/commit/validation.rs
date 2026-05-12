@@ -755,7 +755,14 @@ pub fn validate_mutation_with_config(
             scope_id,
             key,
             value,
-        } => validate_kv(catalog, project_id, scope_id, key, Some(value), config),
+        } => validate_kv(
+            catalog,
+            project_id,
+            scope_id,
+            key,
+            Some(value.len()),
+            config,
+        ),
         Mutation::KvDel {
             project_id,
             scope_id,
@@ -802,14 +809,7 @@ pub fn validate_mutation_with_config(
             scope_id,
             key,
             ..
-        } => validate_kv(
-            catalog,
-            project_id,
-            scope_id,
-            key,
-            Some(&vec![0u8; 32]),
-            config,
-        ),
+        } => validate_kv(catalog, project_id, scope_id, key, Some(32), config),
         Mutation::KvAddU64Ex {
             project_id,
             scope_id,
@@ -839,14 +839,7 @@ pub fn validate_mutation_with_config(
             scope_id,
             key,
             ..
-        } => validate_kv(
-            catalog,
-            project_id,
-            scope_id,
-            key,
-            Some(&vec![0u8; 8]),
-            config,
-        ),
+        } => validate_kv(catalog, project_id, scope_id, key, Some(8), config),
         Mutation::KvSubIntEx {
             project_id,
             scope_id,
@@ -855,10 +848,10 @@ pub fn validate_mutation_with_config(
             ..
         } => {
             let encoded = match amount {
-                KvIntegerAmount::U64(_) => vec![0u8; 8],
-                KvIntegerAmount::U256(_) => vec![0u8; 32],
+                KvIntegerAmount::U64(_) => 8,
+                KvIntegerAmount::U256(_) => 32,
             };
-            validate_kv(catalog, project_id, scope_id, key, Some(&encoded), config)
+            validate_kv(catalog, project_id, scope_id, key, Some(encoded), config)
         }
         Mutation::CounterAdd {
             project_id,
@@ -867,14 +860,7 @@ pub fn validate_mutation_with_config(
             shard_count,
             ..
         } => {
-            validate_kv(
-                catalog,
-                project_id,
-                scope_id,
-                key,
-                Some(&vec![0u8; 8]),
-                config,
-            )?;
+            validate_kv(catalog, project_id, scope_id, key, Some(8), config)?;
             if *shard_count == 0 {
                 return Err(AedbError::Validation(
                     "counter shard_count must be > 0".into(),
@@ -2045,7 +2031,7 @@ fn validate_kv(
     project_id: &str,
     scope_id: &str,
     key: &[u8],
-    value: Option<&Vec<u8>>,
+    value_len: Option<usize>,
     config: &AedbConfig,
 ) -> Result<(), AedbError> {
     if !catalog.projects.contains_key(project_id) {
@@ -2064,8 +2050,8 @@ fn validate_kv(
     if key.len() > config.max_kv_key_bytes {
         return Err(AedbError::Validation("kv key too large".into()));
     }
-    if let Some(v) = value
-        && v.len() > config.max_kv_value_bytes
+    if let Some(len) = value_len
+        && len > config.max_kv_value_bytes
     {
         return Err(AedbError::Validation("kv value too large".into()));
     }
