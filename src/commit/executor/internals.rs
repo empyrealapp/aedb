@@ -301,6 +301,24 @@ fn apply_keyspace_only_mutation(
             *on_underflow,
             commit_seq,
         )),
+        Mutation::KvAddI64Bounded {
+            project_id,
+            scope_id,
+            key,
+            delta,
+            on_missing,
+            min_value,
+            max_value,
+        } => Some(keyspace.kv_add_i64_bounded(
+            project_id,
+            scope_id,
+            key.clone(),
+            *delta,
+            on_missing,
+            *min_value,
+            *max_value,
+            commit_seq,
+        )),
         Mutation::CounterAdd {
             project_id,
             scope_id,
@@ -428,6 +446,7 @@ fn classify_commit_mutations(mutations: &[Mutation]) -> CommitMutationClass {
             | Mutation::KvAddU64Ex { .. }
             | Mutation::KvSubU64Ex { .. }
             | Mutation::KvSubIntEx { .. }
+            | Mutation::KvAddI64Bounded { .. }
             | Mutation::CounterAdd { .. }
             | Mutation::KvMaxU64 { .. }
             | Mutation::KvMinU64 { .. }
@@ -795,6 +814,19 @@ fn kv_validation_parts(mutation: &Mutation) -> Option<KvFastPathParts<'_>> {
                 KvIntegerAmount::U64(_) => 8,
                 KvIntegerAmount::U256(_) => 32,
             }),
+            counter_shards: None,
+        }),
+        Mutation::KvAddI64Bounded {
+            project_id,
+            scope_id,
+            key,
+            ..
+        } => Some(KvFastPathParts {
+            project_id,
+            scope_id,
+            key,
+            partition_key: Cow::Borrowed(key),
+            value_len: Some(8),
             counter_shards: None,
         }),
         Mutation::CounterAdd {
@@ -1212,6 +1244,11 @@ fn hash_scope_shard_key<H: Hasher>(mutations: &[Mutation], state: &mut H) {
             ..
         }
         | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddI64Bounded {
             project_id,
             scope_id,
             ..
@@ -3230,6 +3267,7 @@ fn collect_parallel_merge_targets_if_safe(
             | Mutation::KvAddU64Ex { key, .. }
             | Mutation::KvSubU64Ex { key, .. }
             | Mutation::KvSubIntEx { key, .. }
+            | Mutation::KvAddI64Bounded { key, .. }
             | Mutation::KvMaxU64 { key, .. }
             | Mutation::KvMinU64 { key, .. }
             | Mutation::KvMutateU64 { key, .. } => {
@@ -3553,6 +3591,11 @@ pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<
             ..
         }
         | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddI64Bounded {
             project_id,
             scope_id,
             ..
@@ -4682,6 +4725,12 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
                 key,
                 ..
             }
+            | Mutation::KvAddI64Bounded {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
             | Mutation::KvMaxU64 {
                 project_id,
                 scope_id,
@@ -5227,6 +5276,11 @@ fn keyspace_mutation_project_scope(mutation: &Mutation) -> Option<(&str, &str)> 
             ..
         }
         | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddI64Bounded {
             project_id,
             scope_id,
             ..

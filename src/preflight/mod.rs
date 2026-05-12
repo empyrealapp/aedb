@@ -402,6 +402,7 @@ pub fn preflight_with_config(
             *on_missing,
             *on_underflow,
         ),
+        Mutation::KvAddI64Bounded { .. } => PreflightResult::Ok { affected_rows: 1 },
         Mutation::CounterAdd {
             project_id,
             scope_id,
@@ -1029,6 +1030,7 @@ pub fn preflight_plan_with_config(
             });
         }
         Mutation::KvSubIntEx { .. } => {}
+        Mutation::KvAddI64Bounded { .. } => {}
         Mutation::KvMaxU64 { .. } => {}
         Mutation::KvMinU64 { .. } => {}
         Mutation::TableIncU256 {

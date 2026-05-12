@@ -292,6 +292,17 @@ pub enum Mutation {
         on_missing: KvIntegerMissingPolicy,
         on_underflow: KvIntegerUnderflowPolicy,
     },
+    KvAddI64Bounded {
+        project_id: String,
+        scope_id: String,
+        key: Vec<u8>,
+        delta: i64,
+        on_missing: KvIntegerMissingPolicy,
+        #[serde(default)]
+        min_value: Option<i64>,
+        #[serde(default)]
+        max_value: Option<i64>,
+    },
     CounterAdd {
         project_id: String,
         scope_id: String,
@@ -649,6 +660,12 @@ impl Mutation {
                 key,
                 ..
             }
+            | Mutation::KvAddI64Bounded {
+                project_id,
+                scope_id,
+                key,
+                ..
+            }
             | Mutation::CounterAdd {
                 project_id,
                 scope_id,
@@ -791,6 +808,7 @@ pub fn validate_kv_sizes_early(mutation: &Mutation, config: &AedbConfig) -> Resu
         | Mutation::KvAddU64Ex { key, .. }
         | Mutation::KvSubU64Ex { key, .. }
         | Mutation::KvSubIntEx { key, .. }
+        | Mutation::KvAddI64Bounded { key, .. }
         | Mutation::KvMaxU64 { key, .. }
         | Mutation::KvMinU64 { key, .. }
         | Mutation::KvMutateU64 { key, .. } => {
@@ -1165,6 +1183,23 @@ pub fn validate_mutation_with_config(
                 KvIntegerAmount::U256(_) => 32,
             };
             validate_kv(catalog, project_id, scope_id, key, Some(encoded), config)
+        }
+        Mutation::KvAddI64Bounded {
+            project_id,
+            scope_id,
+            key,
+            min_value,
+            max_value,
+            ..
+        } => {
+            if let (Some(min_value), Some(max_value)) = (min_value, max_value)
+                && min_value > max_value
+            {
+                return Err(AedbError::Validation(
+                    "KvAddI64Bounded min_value cannot exceed max_value".into(),
+                ));
+            }
+            validate_kv(catalog, project_id, scope_id, key, Some(8), config)
         }
         Mutation::CounterAdd {
             project_id,
@@ -2130,6 +2165,11 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             ..
         }
         | Mutation::KvSubIntEx {
+            project_id,
+            scope_id,
+            ..
+        }
+        | Mutation::KvAddI64Bounded {
             project_id,
             scope_id,
             ..

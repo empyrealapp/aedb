@@ -1812,10 +1812,12 @@ impl Keyspace {
             .pending_delta_sum
             .checked_add(delta as i128)
             .ok_or(crate::error::AedbError::Overflow)?;
+        let next_effective_i128 = (accumulator.value as i128)
+            .checked_add(next_pending_delta_sum)
+            .ok_or(crate::error::AedbError::Overflow)?;
         let next_exposure_limit = if accumulator.projector_error.is_none() {
-            (accumulator.value as i128)
-                .checked_add(next_pending_delta_sum)
-                .and_then(|next_effective| i64::try_from(next_effective).ok())
+            i64::try_from(next_effective_i128)
+                .ok()
                 .map(|next_effective| {
                     compute_exposure_limit(next_effective, accumulator.exposure_margin_bps)
                 })
@@ -2784,6 +2786,49 @@ impl Keyspace {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn kv_add_i64_bounded(
+        &mut self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        delta: i64,
+        on_missing: &KvIntegerMissingPolicy,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        commit_seq: u64,
+    ) -> Result<(), crate::error::AedbError> {
+        let current = self.try_kv_get(project_id, scope_id, &key)?;
+        let current_value = match (current, on_missing) {
+            (Some(entry), _) => decode_i64(&entry.value)?,
+            (None, KvIntegerMissingPolicy::TreatAsZero) => 0i64,
+            (None, KvIntegerMissingPolicy::Reject) => {
+                return Err(crate::error::AedbError::Validation(
+                    "i64 key missing and policy is Reject".into(),
+                ));
+            }
+        };
+        let next = current_value
+            .checked_add(delta)
+            .ok_or(crate::error::AedbError::Overflow)?;
+        if let Some(min_value) = min_value
+            && next < min_value
+        {
+            return Err(crate::error::AedbError::Validation(format!(
+                "i64 minimum would be violated: projected={next}, min={min_value}"
+            )));
+        }
+        if let Some(max_value) = max_value
+            && next > max_value
+        {
+            return Err(crate::error::AedbError::Validation(format!(
+                "i64 maximum would be violated: projected={next}, max={max_value}"
+            )));
+        }
+        self.kv_set(project_id, scope_id, key, encode_i64(next), commit_seq)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn counter_add_sharded(
         &mut self,
         project_id: &str,
@@ -3268,6 +3313,10 @@ fn encode_u64(v: u64) -> Vec<u8> {
     v.to_be_bytes().to_vec()
 }
 
+fn encode_i64(v: i64) -> Vec<u8> {
+    v.to_be_bytes().to_vec()
+}
+
 fn decode_u256(bytes: &[u8]) -> Result<U256, crate::error::AedbError> {
     let value_size_bytes = bytes.len();
     if value_size_bytes != 32 {
@@ -3287,6 +3336,17 @@ fn decode_u64(bytes: &[u8]) -> Result<u64, crate::error::AedbError> {
     let mut out = [0u8; 8];
     out.copy_from_slice(bytes);
     Ok(u64::from_be_bytes(out))
+}
+
+fn decode_i64(bytes: &[u8]) -> Result<i64, crate::error::AedbError> {
+    if bytes.len() != 8 {
+        return Err(crate::error::AedbError::Validation(
+            "invalid i64 bytes length".into(),
+        ));
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(bytes);
+    Ok(i64::from_be_bytes(out))
 }
 
 fn estimate_row_bytes(row: &Row) -> usize {
@@ -3457,6 +3517,7 @@ mod tests {
         segments_are_sorted_non_overlapping, small_kv_entry_cost,
     };
     use crate::catalog::types::{Row, Value};
+    use crate::commit::validation::KvIntegerMissingPolicy;
     use crate::config::PrimaryIndexBackend;
     use crate::error::AedbError;
     use crate::storage::encoded_key::EncodedKey;
@@ -4383,6 +4444,52 @@ mod tests {
         assert_eq!(acc.pending_delta_sum, i128::MAX);
         assert!(acc.deltas.is_empty());
         assert!(acc.dedupe.is_empty());
+    }
+
+    #[test]
+    fn kv_add_i64_bounded_enforces_min_value_without_accumulator() {
+        let mut ks = Keyspace::default();
+        ks.kv_add_i64_bounded(
+            "p",
+            "app",
+            b"house/balance".to_vec(),
+            100,
+            &KvIntegerMissingPolicy::TreatAsZero,
+            Some(-3_000),
+            None,
+            1,
+        )
+        .expect("seed signed kv value");
+        ks.kv_add_i64_bounded(
+            "p",
+            "app",
+            b"house/balance".to_vec(),
+            -3_000,
+            &KvIntegerMissingPolicy::TreatAsZero,
+            Some(-3_000),
+            None,
+            2,
+        )
+        .expect("drawdown above floor should apply");
+        let err = ks
+            .kv_add_i64_bounded(
+                "p",
+                "app",
+                b"house/balance".to_vec(),
+                -101,
+                &KvIntegerMissingPolicy::TreatAsZero,
+                Some(-3_000),
+                None,
+                3,
+            )
+            .expect_err("drawdown below floor must fail");
+        assert!(matches!(err, AedbError::Validation(_)));
+        let value = ks
+            .try_kv_get("p", "app", b"house/balance")
+            .expect("read key")
+            .expect("value exists")
+            .value;
+        assert_eq!(super::decode_i64(&value).expect("decode i64"), -2_900);
     }
 
     #[test]
