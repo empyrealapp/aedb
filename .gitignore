@@ -45,3 +45,6 @@ flamegraph.svg
 *~
 
 artifacts/.claude/worktrees/
+
+# nix
+.direnv/
