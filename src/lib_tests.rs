@@ -10032,7 +10032,7 @@ async fn strict_restore_rejects_older_backup_version() {
 
     let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
         .expect("manifest");
-    manifest.aedb_version = "0.1.0".into();
+    manifest.aedb_version = "0.2.0".into();
     crate::backup::write_backup_manifest(backup_dir.path(), &manifest, config.hmac_key())
         .expect("rewrite manifest");
 

@@ -742,6 +742,26 @@ pub fn apply_mutation_with_read_budget(
                 commit_seq,
             )?;
         }
+        Mutation::KvAddI64Bounded {
+            project_id,
+            scope_id,
+            key,
+            delta,
+            on_missing,
+            min_value,
+            max_value,
+        } => {
+            keyspace.kv_add_i64_bounded(
+                &project_id,
+                &scope_id,
+                key,
+                delta,
+                &on_missing,
+                min_value,
+                max_value,
+                commit_seq,
+            )?;
+        }
         Mutation::CounterAdd {
             project_id,
             scope_id,
