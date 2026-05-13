@@ -69,7 +69,8 @@ pub fn write_checkpoint_with_key(
         encrypt_checkpoint_payload(&compressed, key)?
     } else {
         let hash = Sha256::digest(&compressed);
-        let mut out = compressed.clone();
+        let mut out = Vec::with_capacity(compressed.len() + hash.len());
+        out.extend_from_slice(&compressed);
         out.extend_from_slice(&hash);
         out
     };

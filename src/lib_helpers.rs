@@ -309,6 +309,10 @@ pub(crate) async fn commit_from_preflight_plan(
             .unwrap_or_else(|| "preflight failed".to_string());
         return Err(preflight_reason_to_error(reason));
     }
+    // Preflight is an advisory snapshot read. The read set captured in the
+    // plan is what makes the eventual commit safe: if the values/ranges used
+    // by preflight changed before this envelope reaches the executor, conflict
+    // detection rejects the write instead of applying a stale decision.
     db.commit_envelope(TransactionEnvelope {
         caller,
         idempotency_key: None,

@@ -562,155 +562,6 @@ pub fn preflight_with_config(
             }
             PreflightResult::Ok { affected_rows: 1 }
         }
-        Mutation::Accumulate { .. } => PreflightResult::Ok { affected_rows: 1 },
-        Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            amount,
-            exposure_id,
-        } => {
-            let Some(acc) = snapshot.accumulator(project_id, scope_id, accumulator_name) else {
-                return PreflightResult::Err {
-                    reason: AedbError::Validation(format!(
-                        "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                    ))
-                    .to_string(),
-                };
-            };
-            if let Some(existing) = acc.open_exposures.get(exposure_id.as_str()) {
-                if existing.amount == *amount {
-                    return PreflightResult::Ok { affected_rows: 1 };
-                }
-                return PreflightResult::Err {
-                    reason: AedbError::Validation(format!(
-                        "exposure id already exists with different amount: {exposure_id}"
-                    ))
-                    .to_string(),
-                };
-            }
-            let Some(new_total) = acc.total_exposure.checked_add(*amount) else {
-                return PreflightResult::Err {
-                    reason: AedbError::Overflow.to_string(),
-                };
-            };
-            let effective_value = match snapshot.accumulator_effective_value(
-                project_id,
-                scope_id,
-                accumulator_name,
-            ) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return PreflightResult::Err {
-                        reason: AedbError::Validation(format!(
-                            "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                        ))
-                        .to_string(),
-                    };
-                }
-                Err(err) => {
-                    return PreflightResult::Err {
-                        reason: err.to_string(),
-                    };
-                }
-            };
-            let max_exposure_allowed =
-                (((effective_value as i128) * (10_000i128 - acc.exposure_margin_bps as i128))
-                    / 10_000)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-            if new_total > max_exposure_allowed {
-                return PreflightResult::Err {
-                    reason: AedbError::Validation(format!(
-                        "exposure margin exceeded: requested_total={new_total}, allowed={max_exposure_allowed}"
-                    ))
-                    .to_string(),
-                };
-            }
-            PreflightResult::Ok { affected_rows: 1 }
-        }
-        Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-        } => {
-            let Some(acc) = snapshot.accumulator(project_id, scope_id, accumulator_name) else {
-                return PreflightResult::Err {
-                    reason: AedbError::Validation(format!(
-                        "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                    ))
-                    .to_string(),
-                };
-            };
-            let mut running_total = acc.total_exposure;
-            let effective_value = match snapshot.accumulator_effective_value(
-                project_id,
-                scope_id,
-                accumulator_name,
-            ) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    return PreflightResult::Err {
-                        reason: AedbError::Validation(format!(
-                            "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                        ))
-                        .to_string(),
-                    };
-                }
-                Err(err) => {
-                    return PreflightResult::Err {
-                        reason: err.to_string(),
-                    };
-                }
-            };
-            let max_exposure_allowed =
-                (((effective_value as i128) * (10_000i128 - acc.exposure_margin_bps as i128))
-                    / 10_000)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-            let mut seen = std::collections::HashMap::new();
-            for (amount, exposure_id) in exposures {
-                if let Some(existing) = acc.open_exposures.get(exposure_id.as_str()) {
-                    if existing.amount != *amount {
-                        return PreflightResult::Err {
-                            reason: AedbError::Validation(format!(
-                                "exposure id already exists with different amount: {exposure_id}"
-                            ))
-                            .to_string(),
-                        };
-                    }
-                    continue;
-                }
-                if let Some(seen_amount) = seen.get(exposure_id.as_str()) {
-                    if *seen_amount != *amount {
-                        return PreflightResult::Err {
-                            reason: AedbError::Validation(format!(
-                                "duplicate exposure id with different amount in batch: {exposure_id}"
-                            ))
-                            .to_string(),
-                        };
-                    }
-                    continue;
-                }
-                let Some(next) = running_total.checked_add(*amount) else {
-                    return PreflightResult::Err {
-                        reason: AedbError::Overflow.to_string(),
-                    };
-                };
-                running_total = next;
-                seen.insert(exposure_id.as_str(), *amount);
-                if running_total > max_exposure_allowed {
-                    return PreflightResult::Err {
-                        reason: AedbError::Validation(format!(
-                            "exposure margin exceeded: requested_total={running_total}, allowed={max_exposure_allowed}"
-                        ))
-                        .to_string(),
-                    };
-                }
-            }
-            PreflightResult::Ok {
-                affected_rows: exposures.len() as u64,
-            }
-        }
         Mutation::EmitEvent { .. } => PreflightResult::Ok { affected_rows: 1 },
         _ => PreflightResult::Ok { affected_rows: 1 },
     }
@@ -746,7 +597,6 @@ pub fn preflight_plan_with_config(
         Mutation::InsertBatch { rows, .. }
         | Mutation::UpsertBatch { rows, .. }
         | Mutation::UpsertBatchOnConflict { rows, .. } => rows.len(),
-        Mutation::ExposeAccumulatorBatch { exposures, .. } => exposures.len(),
         Mutation::DeleteWhere { limit, .. }
         | Mutation::UpdateWhere { limit, .. }
         | Mutation::UpdateWhereExpr { limit, .. } => limit.unwrap_or(1),
@@ -1033,6 +883,12 @@ pub fn preflight_plan_with_config(
         Mutation::KvAddI64Bounded { .. } => {}
         Mutation::KvMaxU64 { .. } => {}
         Mutation::KvMinU64 { .. } => {}
+        Mutation::PostflightCheck { .. } => {
+            // Postflight checks intentionally do not enter the advisory read set:
+            // they are evaluated after prior atomic updates against the
+            // transaction-local trial state, so they avoid turning a hot-key
+            // atomic update into a pre-apply read/write conflict.
+        }
         Mutation::TableIncU256 {
             project_id,
             scope_id,
@@ -1065,10 +921,6 @@ pub fn preflight_plan_with_config(
                 version_at_read: version,
             });
         }
-        Mutation::Accumulate { .. } => {}
-        Mutation::ExposeAccumulator { .. } => {}
-        Mutation::ExposeAccumulatorBatch { .. } => {}
-        Mutation::ReleaseAccumulatorExposure { .. } => {}
         Mutation::EmitEvent { .. } => {}
         Mutation::OrderBookNew {
             project_id,

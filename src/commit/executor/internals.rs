@@ -24,7 +24,6 @@ pub(super) struct ParallelMergeTargets {
     kv_keys: HashSet<Vec<u8>>,
     tables: HashSet<String>,
     table_rows: HashMap<String, HashSet<EncodedKey>>,
-    accumulators: HashSet<String>,
 }
 
 pub(super) struct DeferredParallelCommit {
@@ -32,85 +31,11 @@ pub(super) struct DeferredParallelCommit {
     merge_targets: ParallelMergeTargets,
 }
 
-fn apply_accumulator_hot_mutation(
-    keyspace: &mut Keyspace,
-    mutation: &Mutation,
-    commit_seq: u64,
-) -> Option<Result<(), AedbError>> {
-    match mutation {
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            delta,
-            dedupe_key,
-            order_key,
-            release_exposure_id,
-        } => {
-            let appended = keyspace.append_accumulator_delta(
-                project_id,
-                scope_id,
-                accumulator_name,
-                *delta,
-                dedupe_key,
-                *order_key,
-                commit_seq,
-            );
-            Some(appended.and_then(|append_result| {
-                if let Some(exposure_id) = release_exposure_id
-                    && matches!(
-                        append_result,
-                        crate::storage::keyspace::AccumulatorAppendResult::Applied
-                    )
-                {
-                    keyspace.release_accumulator_exposure(
-                        project_id,
-                        scope_id,
-                        accumulator_name,
-                        exposure_id,
-                    )?;
-                }
-                Ok(())
-            }))
-        }
-        Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            amount,
-            exposure_id,
-        } => Some(keyspace.expose_accumulator(
-            project_id,
-            scope_id,
-            accumulator_name,
-            *amount,
-            exposure_id,
-            commit_seq,
-        )),
-        Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-        } => Some(keyspace.expose_accumulator_batch(
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-            commit_seq,
-        )),
-        _ => None,
-    }
-}
-
 fn apply_keyspace_only_mutation(
     keyspace: &mut Keyspace,
     mutation: &Mutation,
     commit_seq: u64,
 ) -> Option<Result<(), AedbError>> {
-    if let Some(result) = apply_accumulator_hot_mutation(keyspace, mutation, commit_seq) {
-        return Some(result);
-    }
     match mutation {
         Mutation::KvSet {
             project_id,
@@ -398,17 +323,6 @@ fn apply_keyspace_only_mutation(
                 commit_seq,
             )
         })()),
-        Mutation::ReleaseAccumulatorExposure {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposure_id,
-        } => Some(keyspace.release_accumulator_exposure(
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposure_id,
-        )),
         _ => None,
     }
 }
@@ -450,11 +364,7 @@ fn classify_commit_mutations(mutations: &[Mutation]) -> CommitMutationClass {
             | Mutation::CounterAdd { .. }
             | Mutation::KvMaxU64 { .. }
             | Mutation::KvMinU64 { .. }
-            | Mutation::KvMutateU64 { .. }
-            | Mutation::Accumulate { .. }
-            | Mutation::ExposeAccumulator { .. }
-            | Mutation::ExposeAccumulatorBatch { .. }
-            | Mutation::ReleaseAccumulatorExposure { .. } => {}
+            | Mutation::KvMutateU64 { .. } => {}
             _ => {
                 is_keyspace_only = false;
             }
@@ -986,33 +896,6 @@ pub(super) fn single_write_partition_token(mutation: &Mutation) -> Option<String
             let shard_key = crate::commit::validation::counter_shard_storage_key(key, shard);
             Some(kv_key_partition_token(&ns, &shard_key))
         }
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ReleaseAccumulatorExposure {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        } => {
-            let ns = namespace_key(project_id, scope_id);
-            Some(format!("acc:{ns}:{accumulator_name}"))
-        }
         Mutation::EmitEvent {
             project_id,
             scope_id,
@@ -1277,35 +1160,6 @@ fn hash_scope_shard_key<H: Hasher>(mutations: &[Mutation], state: &mut H) {
             project_id.hash(state);
             scope_id.hash(state);
         }
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ReleaseAccumulatorExposure {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        } => {
-            "acc".hash(state);
-            project_id.hash(state);
-            scope_id.hash(state);
-            accumulator_name.hash(state);
-        }
         Mutation::EmitEvent {
             project_id,
             scope_id,
@@ -1399,6 +1253,10 @@ fn hash_scope_shard_key<H: Hasher>(mutations: &[Mutation], state: &mut H) {
             "ddl".hash(state);
             std::mem::discriminant(ddl).hash(state);
             format!("{ddl:?}").hash(state);
+        }
+        Mutation::PostflightCheck { assertions } => {
+            "postflight".hash(state);
+            assertions.len().hash(state);
         }
     }
 }
@@ -3179,7 +3037,6 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
                     id: ns_id.clone(),
                     tables: Default::default(),
                     kv: KvData::default(),
-                    accumulators: Default::default(),
                 });
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std_mpsc::channel::<Result<(NamespaceId, Namespace), AedbError>>();
@@ -3287,17 +3144,6 @@ fn collect_parallel_merge_targets_if_safe(
                         key, shard,
                     ));
             }
-            Mutation::Accumulate {
-                accumulator_name, ..
-            }
-            | Mutation::ExposeAccumulator {
-                accumulator_name, ..
-            }
-            | Mutation::ExposeAccumulatorBatch {
-                accumulator_name, ..
-            } => {
-                targets.accumulators.insert(accumulator_name.clone());
-            }
             Mutation::Insert {
                 table_name,
                 primary_key,
@@ -3376,8 +3222,8 @@ fn merge_parallel_namespace_result(
     targets: &ParallelMergeTargets,
 ) {
     use crate::storage::keyspace::{
-        accumulator_data_mem_cost, compact_kv_key, kv_entry_cost, kv_tombstone_cost, row_mem_cost,
-        small_kv_entry_cost, table_data_mem_cost,
+        compact_kv_key, kv_entry_cost, kv_tombstone_cost, row_mem_cost, small_kv_entry_cost,
+        table_data_mem_cost,
     };
     let mut added: usize = 0;
     let mut removed: usize = 0;
@@ -3507,26 +3353,6 @@ fn merge_parallel_namespace_result(
             .structural_version
             .max(namespace.kv.structural_version);
     }
-    let mut accumulator_names: Vec<_> = targets.accumulators.iter().cloned().collect();
-    accumulator_names.sort();
-    for accumulator_name in accumulator_names {
-        let prev_acc_cost = dest
-            .accumulators
-            .get(&accumulator_name)
-            .map(accumulator_data_mem_cost)
-            .unwrap_or(0);
-        match namespace.accumulators.get(&accumulator_name) {
-            Some(accumulator) => {
-                added = added.saturating_add(accumulator_data_mem_cost(accumulator));
-                dest.accumulators
-                    .insert(accumulator_name, accumulator.clone());
-            }
-            None => {
-                dest.accumulators.remove(&accumulator_name);
-            }
-        }
-        removed = removed.saturating_add(prev_acc_cost);
-    }
     keyspace.mem_bytes = keyspace
         .mem_bytes
         .saturating_add(added)
@@ -3616,21 +3442,6 @@ pub(super) fn namespace_id_for_parallel_mutation(mutation: &Mutation) -> Option<
             ..
         }
         | Mutation::KvMutateU64 {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::Accumulate {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ExposeAccumulatorBatch {
             project_id,
             scope_id,
             ..
@@ -3731,10 +3542,7 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
         | Mutation::CounterAdd { .. }
         | Mutation::KvMaxU64 { .. }
         | Mutation::KvMinU64 { .. }
-        | Mutation::KvMutateU64 { .. }
-        | Mutation::Accumulate { .. }
-        | Mutation::ExposeAccumulator { .. }
-        | Mutation::ExposeAccumulatorBatch { .. } => true,
+        | Mutation::KvMutateU64 { .. } => true,
         Mutation::Insert {
             project_id,
             scope_id,
@@ -4513,10 +4321,6 @@ pub(super) fn payload_type_for_mutations(mutations: &[Mutation]) -> u8 {
                 | Mutation::KvMaxU64 { .. }
                 | Mutation::KvMinU64 { .. }
                 | Mutation::KvMutateU64 { .. }
-                | Mutation::Accumulate { .. }
-                | Mutation::ExposeAccumulator { .. }
-                | Mutation::ExposeAccumulatorBatch { .. }
-                | Mutation::ReleaseAccumulatorExposure { .. }
                 | Mutation::EmitEvent { .. }
                 | Mutation::OrderBookNew { .. }
                 | Mutation::OrderBookCancel { .. }
@@ -4766,33 +4570,6 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
                 let shard_key = crate::commit::validation::counter_shard_storage_key(key, shard);
                 out.insert(kv_key_partition_token(&ns, &shard_key));
             }
-            Mutation::Accumulate {
-                project_id,
-                scope_id,
-                accumulator_name,
-                ..
-            }
-            | Mutation::ExposeAccumulator {
-                project_id,
-                scope_id,
-                accumulator_name,
-                ..
-            }
-            | Mutation::ExposeAccumulatorBatch {
-                project_id,
-                scope_id,
-                accumulator_name,
-                ..
-            }
-            | Mutation::ReleaseAccumulatorExposure {
-                project_id,
-                scope_id,
-                accumulator_name,
-                ..
-            } => {
-                let ns = namespace_key(project_id, scope_id);
-                out.insert(format!("acc:{ns}:{accumulator_name}"));
-            }
             Mutation::EmitEvent {
                 project_id,
                 scope_id,
@@ -4875,6 +4652,7 @@ pub(super) fn derive_write_partitions_with_fk_expansion(
             Mutation::Ddl(_) => {
                 out.insert(GLOBAL_PARTITION_TOKEN.to_string());
             }
+            Mutation::PostflightCheck { .. } => {}
         }
     }
 
@@ -5034,21 +4812,6 @@ fn derive_tokens_for_assertions(out: &mut HashSet<String>, assertions: &[ReadAss
 
 fn derive_tokens_for_assertion(out: &mut HashSet<String>, assertion: &ReadAssertion) {
     match assertion {
-        ReadAssertion::AccumulatorAvailableAtLeast {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | ReadAssertion::AccumulatorExposureWithinMargin {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        } => {
-            let ns = namespace_key(project_id, scope_id);
-            out.insert(format!("acc:{ns}:{accumulator_name}"));
-        }
         ReadAssertion::KeyEquals {
             project_id,
             scope_id,
@@ -5301,26 +5064,6 @@ fn keyspace_mutation_project_scope(mutation: &Mutation) -> Option<(&str, &str)> 
             ..
         }
         | Mutation::KvMutateU64 {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::Accumulate {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ReleaseAccumulatorExposure {
             project_id,
             scope_id,
             ..
@@ -5683,173 +5426,6 @@ pub(super) fn refresh_async_indexes(
     }
     if refresh_kv_projection_tables(state, pending_delta)? {
         changed = true;
-    }
-    if refresh_accumulators(state)? {
-        changed = true;
-    }
-    Ok(changed)
-}
-
-fn refresh_accumulators(state: &mut ExecutorState) -> Result<bool, AedbError> {
-    let mut changed = false;
-    let accumulator_defs = &state.catalog.accumulators;
-    for ((ns, accumulator_name), def) in accumulator_defs {
-        let Some(acc) = state
-            .keyspace
-            .namespace_mut(NamespaceId::Project(ns.clone()))
-            .accumulators
-            .get_mut(accumulator_name)
-        else {
-            continue;
-        };
-
-        let previous_error = acc.projector_error.clone();
-        acc.projector_error = None;
-        let mut next_value = acc.value;
-        let mut next_last_applied = acc.last_applied_order_key;
-        let mut next_materialized_seq = acc.materialized_seq;
-        let mut pending_sum_overflowed = false;
-        let mut next_pending_delta_sum = if acc.pending_delta_sum_cache_valid {
-            acc.pending_delta_sum
-        } else {
-            let mut recomputed = 0i128;
-            for (_, record) in acc.deltas.range((
-                Bound::Excluded(acc.last_applied_order_key),
-                Bound::Unbounded,
-            )) {
-                let Some(next) = recomputed.checked_add(record.delta as i128) else {
-                    acc.projector_error = Some("accumulator pending delta overflow".to_string());
-                    pending_sum_overflowed = true;
-                    break;
-                };
-                recomputed = next;
-            }
-            recomputed
-        };
-        if !pending_sum_overflowed {
-            for (order_key, record) in acc.deltas.range((
-                Bound::Excluded(acc.last_applied_order_key),
-                Bound::Unbounded,
-            )) {
-                let Some(sum) = next_value.checked_add(record.delta) else {
-                    acc.projector_error =
-                        Some("accumulator overflow during projection".to_string());
-                    break;
-                };
-                let Some(next_pending) = next_pending_delta_sum.checked_sub(record.delta as i128)
-                else {
-                    acc.projector_error = Some("accumulator pending delta overflow".to_string());
-                    break;
-                };
-                next_value = sum;
-                next_last_applied = *order_key;
-                next_materialized_seq = next_materialized_seq.max(record.commit_seq);
-                next_pending_delta_sum = next_pending;
-                acc.applied_since_snapshot = acc.applied_since_snapshot.saturating_add(1);
-            }
-        }
-        if acc.projector_error.is_none() {
-            acc.pending_delta_sum = next_pending_delta_sum;
-            acc.pending_delta_sum_cache_valid = true;
-        }
-        if next_last_applied != acc.last_applied_order_key {
-            acc.value = next_value;
-            acc.exposure_limit_cached =
-                ((acc.value as i128 * (10_000i128 - acc.exposure_margin_bps as i128)) / 10_000)
-                    .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-            acc.exposure_limit_cache_valid = true;
-            acc.last_applied_order_key = next_last_applied;
-            acc.materialized_seq = next_materialized_seq;
-            changed = true;
-        }
-        if acc.applied_since_snapshot >= def.snapshot_every {
-            acc.deltas = acc
-                .deltas
-                .iter()
-                .filter(|(order_key, _)| **order_key > acc.last_applied_order_key)
-                .map(|(order_key, record)| (*order_key, record.clone()))
-                .collect();
-            acc.applied_since_snapshot = 0;
-            changed = true;
-        }
-        if let Some(window_commits) = def.dedupe_retain_commits
-            && !acc.dedupe.is_empty()
-        {
-            let min_commit = state.visible_head_seq.saturating_sub(window_commits);
-            let has_stale_dedupe = acc
-                .dedupe
-                .iter()
-                .any(|(_, rec)| rec.commit_seq < min_commit);
-            if has_stale_dedupe {
-                let before = acc.dedupe.len();
-                acc.dedupe = acc
-                    .dedupe
-                    .iter()
-                    .filter(|(_, rec)| rec.commit_seq >= min_commit)
-                    .map(|(key, rec)| (key.clone(), rec.clone()))
-                    .collect();
-                if acc.dedupe.len() != before {
-                    changed = true;
-                }
-            }
-        }
-        if let Some(ttl_commits) = def.exposure_ttl_commits
-            && !acc.open_exposures.is_empty()
-        {
-            let min_open_seq = state.visible_head_seq.saturating_sub(ttl_commits);
-            let mut removed_total = 0i64;
-            let mut expired_found = false;
-            for (_, rec) in &acc.open_exposures {
-                if rec.opened_at_seq < min_open_seq {
-                    removed_total = removed_total.saturating_add(rec.amount);
-                    expired_found = true;
-                }
-            }
-            if expired_found {
-                let before = acc.open_exposures.len();
-                let next_open_exposures = acc
-                    .open_exposures
-                    .iter()
-                    .filter_map(|(id, rec)| {
-                        if rec.opened_at_seq < min_open_seq {
-                            None
-                        } else {
-                            Some((id.clone(), rec.clone()))
-                        }
-                    })
-                    .collect();
-                if acc.total_exposure < removed_total {
-                    acc.exposure_rebuild_required = true;
-                } else {
-                    acc.total_exposure -= removed_total;
-                }
-                acc.open_exposures = next_open_exposures;
-                if acc.open_exposures.len() != before {
-                    changed = true;
-                }
-            }
-        }
-        if acc.exposure_rebuild_required {
-            let mut rebuilt_exposure = 0i64;
-            for (_, rec) in &acc.open_exposures {
-                let Some(next) = rebuilt_exposure.checked_add(rec.amount) else {
-                    acc.projector_error =
-                        Some("accumulator exposure overflow during rebuild".into());
-                    break;
-                };
-                rebuilt_exposure = next;
-            }
-            if acc.projector_error.is_none() {
-                if rebuilt_exposure != acc.total_exposure {
-                    acc.total_exposure = rebuilt_exposure;
-                    changed = true;
-                }
-                acc.exposure_rebuild_required = false;
-            }
-        }
-        if acc.projector_error != previous_error {
-            changed = true;
-        }
     }
     Ok(changed)
 }

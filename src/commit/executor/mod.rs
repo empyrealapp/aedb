@@ -491,9 +491,7 @@ impl CommitExecutor {
     }
 
     fn catalog_requires_post_apply_refresh(catalog: &Catalog) -> bool {
-        !catalog.async_indexes.is_empty()
-            || !catalog.kv_projections.is_empty()
-            || !catalog.accumulators.is_empty()
+        !catalog.async_indexes.is_empty() || !catalog.kv_projections.is_empty()
     }
 
     pub fn new(wal_dir: &Path) -> Result<Self, AedbError> {

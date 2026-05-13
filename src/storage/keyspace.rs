@@ -114,129 +114,11 @@ pub struct AsyncProjectionData {
     pub materialized_seq: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccumulatorDedupeRecord {
-    pub order_key: u64,
-    pub delta: i64,
-    pub commit_seq: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OpenExposureRecord {
-    pub amount: i64,
-    pub opened_at_seq: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccumulatorDeltaRecord {
-    pub order_key: u64,
-    pub delta: i64,
-    pub commit_seq: u64,
-    pub dedupe_key: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccumulatorAppendResult {
-    Applied,
-    DuplicateNoop,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct AccumulatorData {
-    pub value: i64,
-    pub last_applied_order_key: u64,
-    pub latest_order_key: u64,
-    pub materialized_seq: u64,
-    pub latest_seq: u64,
-    #[serde(default)]
-    pub pending_delta_sum: i128,
-    #[serde(default)]
-    pub pending_delta_sum_cache_valid: bool,
-    #[serde(default)]
-    pub applied_since_snapshot: u64,
-    #[serde(default)]
-    pub projector_error: Option<String>,
-    #[serde(default = "default_exposure_margin_bps")]
-    pub exposure_margin_bps: u32,
-    #[serde(default)]
-    pub exposure_limit_cached: i64,
-    #[serde(default)]
-    pub exposure_limit_cache_valid: bool,
-    #[serde(default)]
-    pub total_exposure: i64,
-    #[serde(default)]
-    pub exposure_rejections: u64,
-    #[serde(default)]
-    pub dedupe: OrdMap<String, AccumulatorDedupeRecord>,
-    #[serde(default)]
-    pub deltas: OrdMap<u64, AccumulatorDeltaRecord>,
-    #[serde(default)]
-    pub open_exposures: HashMap<String, OpenExposureRecord>,
-    #[serde(default = "default_exposure_rebuild_required")]
-    pub exposure_rebuild_required: bool,
-}
-
-fn default_exposure_rebuild_required() -> bool {
-    true
-}
-
-fn default_exposure_margin_bps() -> u32 {
-    1_000
-}
-
-fn compute_exposure_limit(value: i64, exposure_margin_bps: u32) -> i64 {
-    let allowed_ratio_bps = 10_000i128 - exposure_margin_bps as i128;
-    ((value as i128 * allowed_ratio_bps) / 10_000).clamp(i64::MIN as i128, i64::MAX as i128) as i64
-}
-
-fn unapplied_delta_sum(accumulator: &AccumulatorData) -> Result<i128, crate::error::AedbError> {
-    if accumulator.pending_delta_sum_cache_valid {
-        return Ok(accumulator.pending_delta_sum);
-    }
-    let mut pending = 0i128;
-    for (_, delta) in accumulator.deltas.range((
-        std::ops::Bound::Excluded(accumulator.last_applied_order_key),
-        std::ops::Bound::Unbounded,
-    )) {
-        pending = pending
-            .checked_add(delta.delta as i128)
-            .ok_or(crate::error::AedbError::Overflow)?;
-    }
-    Ok(pending)
-}
-
-fn effective_accumulator_value(
-    accumulator: &AccumulatorData,
-) -> Result<i64, crate::error::AedbError> {
-    if let Some(err) = &accumulator.projector_error {
-        return Err(crate::error::AedbError::Validation(format!(
-            "accumulator projector unhealthy: {err}"
-        )));
-    }
-    let pending = unapplied_delta_sum(accumulator)?;
-    let combined = (accumulator.value as i128)
-        .checked_add(pending)
-        .ok_or(crate::error::AedbError::Overflow)?;
-    i64::try_from(combined).map_err(|_| crate::error::AedbError::Overflow)
-}
-
-fn refresh_exposure_limit_cache(
-    accumulator: &mut AccumulatorData,
-) -> Result<(), crate::error::AedbError> {
-    let effective_value = effective_accumulator_value(accumulator)?;
-    accumulator.exposure_limit_cached =
-        compute_exposure_limit(effective_value, accumulator.exposure_margin_bps);
-    accumulator.exposure_limit_cache_valid = true;
-    Ok(())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Namespace {
     pub id: NamespaceId,
     pub tables: HashMap<String, TableData>,
     pub kv: KvData,
-    #[serde(default)]
-    pub accumulators: HashMap<String, AccumulatorData>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1358,7 +1240,6 @@ impl Keyspace {
                 id: namespace_id,
                 tables: HashMap::new(),
                 kv: KvData::default(),
-                accumulators: HashMap::new(),
             })
     }
 
@@ -1716,337 +1597,6 @@ impl Keyspace {
         &mut self
             .namespace_mut(NamespaceId::project_scope(project_id, scope_id))
             .kv
-    }
-
-    pub fn accumulator(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Option<&AccumulatorData> {
-        self.namespace(&NamespaceId::project_scope(project_id, scope_id))
-            .and_then(|ns| ns.accumulators.get(accumulator_name))
-    }
-
-    pub fn accumulator_mut(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> &mut AccumulatorData {
-        self.namespace_mut(NamespaceId::project_scope(project_id, scope_id))
-            .accumulators
-            .entry(accumulator_name.to_string())
-            .or_default()
-    }
-
-    fn accumulator_mut_existing(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Result<&mut AccumulatorData, crate::error::AedbError> {
-        self.namespace_mut(NamespaceId::project_scope(project_id, scope_id))
-            .accumulators
-            .get_mut(accumulator_name)
-            .ok_or_else(|| {
-                crate::error::AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })
-    }
-
-    pub fn create_accumulator(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposure_margin_bps: u32,
-    ) {
-        let acc = self.accumulator_mut(project_id, scope_id, accumulator_name);
-        acc.exposure_margin_bps = exposure_margin_bps;
-        acc.exposure_limit_cached = compute_exposure_limit(acc.value, exposure_margin_bps);
-        acc.exposure_limit_cache_valid = true;
-    }
-
-    pub fn drop_accumulator(&mut self, project_id: &str, scope_id: &str, accumulator_name: &str) {
-        let freed = {
-            let namespace = self.namespace_mut(NamespaceId::project_scope(project_id, scope_id));
-            namespace
-                .accumulators
-                .remove(accumulator_name)
-                .as_ref()
-                .map(accumulator_data_mem_cost)
-                .unwrap_or(0)
-        };
-        self.mem_bytes = self.mem_bytes.saturating_sub(freed);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn append_accumulator_delta(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        delta: i64,
-        dedupe_key: &str,
-        order_key: u64,
-        commit_seq: u64,
-    ) -> Result<AccumulatorAppendResult, crate::error::AedbError> {
-        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
-        if let Some(existing) = accumulator.dedupe.get(dedupe_key) {
-            if existing.order_key == order_key && existing.delta == delta {
-                return Ok(AccumulatorAppendResult::DuplicateNoop);
-            }
-            return Err(crate::error::AedbError::Validation(format!(
-                "dedupe key already used with different payload: {dedupe_key}"
-            )));
-        }
-        if order_key <= accumulator.latest_order_key {
-            return Err(crate::error::AedbError::Validation(format!(
-                "order key must be strictly increasing (latest={}, got={order_key})",
-                accumulator.latest_order_key
-            )));
-        }
-        let next_pending_delta_sum = accumulator
-            .pending_delta_sum
-            .checked_add(delta as i128)
-            .ok_or(crate::error::AedbError::Overflow)?;
-        let next_effective_i128 = (accumulator.value as i128)
-            .checked_add(next_pending_delta_sum)
-            .ok_or(crate::error::AedbError::Overflow)?;
-        let next_exposure_limit = if accumulator.projector_error.is_none() {
-            i64::try_from(next_effective_i128)
-                .ok()
-                .map(|next_effective| {
-                    compute_exposure_limit(next_effective, accumulator.exposure_margin_bps)
-                })
-        } else {
-            None
-        };
-        accumulator.latest_order_key = order_key;
-        accumulator.latest_seq = commit_seq;
-        accumulator.pending_delta_sum = next_pending_delta_sum;
-        accumulator.pending_delta_sum_cache_valid = true;
-        if let Some(next_exposure_limit) = next_exposure_limit {
-            accumulator.exposure_limit_cached = next_exposure_limit;
-            accumulator.exposure_limit_cache_valid = true;
-        } else {
-            accumulator.exposure_limit_cache_valid = false;
-        }
-        accumulator.deltas.insert(
-            order_key,
-            AccumulatorDeltaRecord {
-                order_key,
-                delta,
-                commit_seq,
-                dedupe_key: dedupe_key.to_string(),
-            },
-        );
-        accumulator.dedupe.insert(
-            dedupe_key.to_string(),
-            AccumulatorDedupeRecord {
-                order_key,
-                delta,
-                commit_seq,
-            },
-        );
-        self.mem_bytes = self
-            .mem_bytes
-            .saturating_add(ACCUMULATOR_DELTA_COST)
-            .saturating_add(accumulator_dedupe_cost(dedupe_key.len()));
-        Ok(AccumulatorAppendResult::Applied)
-    }
-
-    pub fn expose_accumulator(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        amount: i64,
-        exposure_id: &str,
-        commit_seq: u64,
-    ) -> Result<(), crate::error::AedbError> {
-        if amount <= 0 {
-            return Err(crate::error::AedbError::Validation(
-                "exposure amount must be > 0".into(),
-            ));
-        }
-        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
-        if !accumulator.exposure_limit_cache_valid || !accumulator.pending_delta_sum_cache_valid {
-            refresh_exposure_limit_cache(accumulator)?;
-        } else if let Some(err) = &accumulator.projector_error {
-            return Err(crate::error::AedbError::Validation(format!(
-                "accumulator projector unhealthy: {err}"
-            )));
-        }
-        if let Some(existing) = accumulator.open_exposures.get(exposure_id) {
-            if existing.amount == amount {
-                return Ok(());
-            }
-            return Err(crate::error::AedbError::Validation(format!(
-                "exposure id already exists with different amount: {exposure_id}"
-            )));
-        }
-        let Some(new_total) = accumulator.total_exposure.checked_add(amount) else {
-            accumulator.exposure_rejections = accumulator.exposure_rejections.saturating_add(1);
-            return Err(crate::error::AedbError::Overflow);
-        };
-        let max_exposure_allowed = accumulator.exposure_limit_cached;
-        if new_total > max_exposure_allowed {
-            accumulator.exposure_rejections = accumulator.exposure_rejections.saturating_add(1);
-            return Err(crate::error::AedbError::Validation(format!(
-                "exposure margin exceeded: requested_total={new_total}, allowed={max_exposure_allowed}"
-            )));
-        }
-        accumulator.total_exposure = new_total;
-        accumulator.exposure_rebuild_required = false;
-        accumulator.open_exposures.insert(
-            exposure_id.to_string(),
-            OpenExposureRecord {
-                amount,
-                opened_at_seq: commit_seq,
-            },
-        );
-        self.mem_bytes = self
-            .mem_bytes
-            .saturating_add(accumulator_exposure_cost(exposure_id.len()));
-        Ok(())
-    }
-
-    pub fn expose_accumulator_batch(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposures: &[(i64, String)],
-        commit_seq: u64,
-    ) -> Result<(), crate::error::AedbError> {
-        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
-        if !accumulator.exposure_limit_cache_valid || !accumulator.pending_delta_sum_cache_valid {
-            refresh_exposure_limit_cache(accumulator)?;
-        } else if let Some(err) = &accumulator.projector_error {
-            return Err(crate::error::AedbError::Validation(format!(
-                "accumulator projector unhealthy: {err}"
-            )));
-        }
-        let max_exposure_allowed = accumulator.exposure_limit_cached;
-        let mut running_total = accumulator.total_exposure;
-        let mut pending_inserts: Vec<(String, OpenExposureRecord)> = Vec::new();
-        let mut seen_batch: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-
-        for (amount, exposure_id) in exposures {
-            if *amount <= 0 {
-                return Err(crate::error::AedbError::Validation(
-                    "exposure amount must be > 0".into(),
-                ));
-            }
-
-            if let Some(existing) = accumulator.open_exposures.get(exposure_id.as_str()) {
-                if existing.amount != *amount {
-                    return Err(crate::error::AedbError::Validation(format!(
-                        "exposure id already exists with different amount: {exposure_id}"
-                    )));
-                }
-                continue;
-            }
-
-            if let Some(seen_amount) = seen_batch.get(exposure_id.as_str()) {
-                if *seen_amount != *amount {
-                    return Err(crate::error::AedbError::Validation(format!(
-                        "duplicate exposure id with different amount in batch: {exposure_id}"
-                    )));
-                }
-                continue;
-            }
-
-            let Some(next_total) = running_total.checked_add(*amount) else {
-                accumulator.exposure_rejections = accumulator.exposure_rejections.saturating_add(1);
-                return Err(crate::error::AedbError::Overflow);
-            };
-            if next_total > max_exposure_allowed {
-                accumulator.exposure_rejections = accumulator.exposure_rejections.saturating_add(1);
-                return Err(crate::error::AedbError::Validation(format!(
-                    "exposure margin exceeded: requested_total={next_total}, allowed={max_exposure_allowed}"
-                )));
-            }
-            running_total = next_total;
-            seen_batch.insert(exposure_id.clone(), *amount);
-            pending_inserts.push((
-                exposure_id.clone(),
-                OpenExposureRecord {
-                    amount: *amount,
-                    opened_at_seq: commit_seq,
-                },
-            ));
-        }
-
-        accumulator.total_exposure = running_total;
-        accumulator.exposure_rebuild_required = false;
-        let mut added: usize = 0;
-        for (exposure_id, record) in pending_inserts {
-            added = added.saturating_add(accumulator_exposure_cost(exposure_id.len()));
-            accumulator.open_exposures.insert(exposure_id, record);
-        }
-        self.mem_bytes = self.mem_bytes.saturating_add(added);
-        Ok(())
-    }
-
-    pub fn release_accumulator_exposure(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposure_id: &str,
-    ) -> Result<(), crate::error::AedbError> {
-        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
-        let Some(record) = accumulator.open_exposures.get(exposure_id) else {
-            return Err(crate::error::AedbError::Validation(format!(
-                "release requested for unknown exposure id: {exposure_id}"
-            )));
-        };
-        if accumulator.total_exposure < record.amount {
-            return Err(crate::error::AedbError::Underflow);
-        }
-        let record_amount = record.amount;
-        accumulator.open_exposures.remove(exposure_id);
-        accumulator.total_exposure -= record_amount;
-        accumulator.exposure_rebuild_required = false;
-        self.mem_bytes = self
-            .mem_bytes
-            .saturating_sub(accumulator_exposure_cost(exposure_id.len()));
-        Ok(())
-    }
-
-    pub fn rebuild_total_exposure(
-        &mut self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Result<(), crate::error::AedbError> {
-        let accumulator = self.accumulator_mut_existing(project_id, scope_id, accumulator_name)?;
-        let mut total = 0i64;
-        for (_, rec) in &accumulator.open_exposures {
-            total = total
-                .checked_add(rec.amount)
-                .ok_or(crate::error::AedbError::Overflow)?;
-        }
-        accumulator.total_exposure = total;
-        accumulator.exposure_rebuild_required = false;
-        Ok(())
-    }
-
-    pub fn accumulator_effective_value(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Result<Option<i64>, crate::error::AedbError> {
-        let Some(accumulator) = self.accumulator(project_id, scope_id, accumulator_name) else {
-            return Ok(None);
-        };
-        effective_accumulator_value(accumulator).map(Some)
     }
 
     pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
@@ -3232,29 +2782,6 @@ impl KeyspaceSnapshot {
         Ok(total)
     }
 
-    pub fn accumulator(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Option<&AccumulatorData> {
-        self.namespaces
-            .get(&NamespaceId::project_scope(project_id, scope_id))
-            .and_then(|ns| ns.accumulators.get(accumulator_name))
-    }
-
-    pub fn accumulator_effective_value(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Result<Option<i64>, crate::error::AedbError> {
-        let Some(accumulator) = self.accumulator(project_id, scope_id, accumulator_name) else {
-            return Ok(None);
-        };
-        effective_accumulator_value(accumulator).map(Some)
-    }
-
     pub fn async_index(
         &self,
         project_id: &str,
@@ -3425,16 +2952,6 @@ pub(crate) fn kv_segment_meta_cost(meta: &KvSegmentMeta) -> usize {
         .saturating_add(96)
 }
 
-pub(crate) fn accumulator_dedupe_cost(key_len: usize) -> usize {
-    key_len.saturating_add(32)
-}
-
-pub(crate) const ACCUMULATOR_DELTA_COST: usize = 80;
-
-pub(crate) fn accumulator_exposure_cost(key_len: usize) -> usize {
-    key_len.saturating_add(24)
-}
-
 pub(crate) fn table_data_mem_cost(t: &TableData) -> usize {
     t.rows.values().map(row_mem_cost).sum::<usize>()
 }
@@ -3466,32 +2983,12 @@ pub(crate) fn projection_data_mem_cost(p: &AsyncProjectionData) -> usize {
     p.rows.values().map(projection_row_mem_cost).sum()
 }
 
-pub(crate) fn accumulator_data_mem_cost(acc: &AccumulatorData) -> usize {
-    acc.dedupe
-        .iter()
-        .map(|(k, _)| accumulator_dedupe_cost(k.len()))
-        .sum::<usize>()
-        .saturating_add(acc.deltas.len().saturating_mul(ACCUMULATOR_DELTA_COST))
-        .saturating_add(
-            acc.open_exposures
-                .iter()
-                .map(|(k, _)| accumulator_exposure_cost(k.len()))
-                .sum::<usize>(),
-        )
-}
-
 pub(crate) fn namespace_mem_cost(ns: &Namespace) -> usize {
     ns.tables
         .values()
         .map(table_data_mem_cost)
         .sum::<usize>()
         .saturating_add(kv_data_mem_cost(&ns.kv))
-        .saturating_add(
-            ns.accumulators
-                .values()
-                .map(accumulator_data_mem_cost)
-                .sum(),
-        )
 }
 
 fn estimate_value_bytes(v: &Value) -> usize {
@@ -3510,11 +3007,10 @@ fn estimate_value_bytes(v: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Keyspace, KvData, KvEntry, NamespaceId, OpenExposureRecord, SmallKvEntry,
-        collect_hot_kv_segment_entries, compact_kv_key, first_segment_position_for_start,
-        get_sorted_segment_for_key, hot_kv_resident_cost, kv_entry_cost,
-        persistent_value_ref_resident_cost, scan_kv_entries, segment_starts_after_end,
-        segments_are_sorted_non_overlapping, small_kv_entry_cost,
+        Keyspace, KvData, KvEntry, NamespaceId, SmallKvEntry, collect_hot_kv_segment_entries,
+        compact_kv_key, first_segment_position_for_start, get_sorted_segment_for_key,
+        hot_kv_resident_cost, kv_entry_cost, persistent_value_ref_resident_cost, scan_kv_entries,
+        segment_starts_after_end, segments_are_sorted_non_overlapping, small_kv_entry_cost,
     };
     use crate::catalog::types::{Row, Value};
     use crate::commit::validation::KvIntegerMissingPolicy;
@@ -4400,54 +3896,7 @@ mod tests {
     }
 
     #[test]
-    fn accumulator_release_underflow_does_not_drop_open_exposure() {
-        let mut ks = Keyspace::default();
-        ks.create_accumulator("p", "app", "house", 1_000);
-        let acc = ks.accumulator_mut("p", "app", "house");
-        acc.total_exposure = 5;
-        acc.open_exposures.insert(
-            "hand-1".into(),
-            OpenExposureRecord {
-                amount: 10,
-                opened_at_seq: 1,
-            },
-        );
-
-        let err = ks
-            .release_accumulator_exposure("p", "app", "house", "hand-1")
-            .expect_err("corrupt exposure totals must fail");
-        assert!(matches!(err, AedbError::Underflow));
-
-        let acc = ks.accumulator("p", "app", "house").expect("accumulator");
-        assert_eq!(acc.total_exposure, 5);
-        assert!(acc.open_exposures.contains_key("hand-1"));
-    }
-
-    #[test]
-    fn accumulator_append_rejects_pending_sum_overflow() {
-        let mut ks = Keyspace::default();
-        ks.create_accumulator("p", "app", "house", 1_000);
-        let acc = ks.accumulator_mut("p", "app", "house");
-        acc.latest_order_key = 7;
-        acc.latest_seq = 9;
-        acc.pending_delta_sum = i128::MAX;
-        acc.pending_delta_sum_cache_valid = true;
-
-        let err = ks
-            .append_accumulator_delta("p", "app", "house", 1, "tx-1", 8, 1)
-            .expect_err("pending sum overflow must not saturate");
-        assert!(matches!(err, AedbError::Overflow));
-
-        let acc = ks.accumulator("p", "app", "house").expect("accumulator");
-        assert_eq!(acc.latest_order_key, 7);
-        assert_eq!(acc.latest_seq, 9);
-        assert_eq!(acc.pending_delta_sum, i128::MAX);
-        assert!(acc.deltas.is_empty());
-        assert!(acc.dedupe.is_empty());
-    }
-
-    #[test]
-    fn kv_add_i64_bounded_enforces_min_value_without_accumulator() {
+    fn kv_add_i64_bounded_enforces_min_value() {
         let mut ks = Keyspace::default();
         ks.kv_add_i64_bounded(
             "p",
@@ -4559,40 +4008,6 @@ mod tests {
         for i in 0..5_u64 {
             ks.kv_del("p", "app", format!("key:{i}").as_bytes(), 60);
         }
-        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
-
-        // Accumulator: deltas + dedupe.
-        ks.create_accumulator("p", "app", "house", 1_000);
-        for i in 0..20_u64 {
-            ks.append_accumulator_delta(
-                "p",
-                "app",
-                "house",
-                10,
-                &format!("dedupe-{i}"),
-                i + 1,
-                i + 1,
-            )
-            .expect("append");
-        }
-        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
-
-        // Exposures.
-        for i in 0..5_u64 {
-            ks.expose_accumulator("p", "app", "house", 5, &format!("hand-{i}"), 100 + i)
-                .expect("expose");
-        }
-        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
-
-        // Release some.
-        for i in 0..3_u64 {
-            ks.release_accumulator_exposure("p", "app", "house", &format!("hand-{i}"))
-                .expect("release");
-        }
-        assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
-
-        // Drops.
-        ks.drop_accumulator("p", "app", "house");
         assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
 
         ks.drop_table("p", "app", "users");

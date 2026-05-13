@@ -76,30 +76,6 @@ fn validate_assertion(
         )));
     }
     match assertion {
-        ReadAssertion::AccumulatorAvailableAtLeast {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | ReadAssertion::AccumulatorExposureWithinMargin {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        } => {
-            let exists = catalog.accumulators.contains_key(&(
-                namespace_key(project_id, scope_id),
-                accumulator_name.clone(),
-            ));
-            if exists {
-                Ok(())
-            } else {
-                Err(AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                )))
-            }
-        }
         ReadAssertion::KeyEquals { .. }
         | ReadAssertion::KeyCompare { .. }
         | ReadAssertion::KeyExists { .. }
@@ -238,58 +214,6 @@ fn evaluate_assertion(
         )));
     }
     match assertion {
-        ReadAssertion::AccumulatorAvailableAtLeast {
-            project_id,
-            scope_id,
-            accumulator_name,
-            min_amount,
-        } => {
-            let Some(acc) = keyspace.accumulator(project_id, scope_id, accumulator_name) else {
-                return Ok(Some(AssertionActual::Missing));
-            };
-            let effective_value = keyspace
-                .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-                .ok_or_else(|| {
-                    AedbError::Validation("accumulator disappeared during assertion".into())
-                })?;
-            let available = effective_value.saturating_sub(acc.total_exposure);
-            if available >= *min_amount {
-                Ok(None)
-            } else {
-                Ok(Some(AssertionActual::Value(Value::Integer(available))))
-            }
-        }
-        ReadAssertion::AccumulatorExposureWithinMargin {
-            project_id,
-            scope_id,
-            accumulator_name,
-            additional_exposure,
-        } => {
-            if *additional_exposure <= 0 {
-                return Err(AedbError::Validation(
-                    "AccumulatorExposureWithinMargin additional_exposure must be > 0".into(),
-                ));
-            }
-            let Some(acc) = keyspace.accumulator(project_id, scope_id, accumulator_name) else {
-                return Ok(Some(AssertionActual::Missing));
-            };
-            let effective_value = keyspace
-                .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-                .ok_or_else(|| {
-                    AedbError::Validation("accumulator disappeared during assertion".into())
-                })?;
-            let allowed_ratio_bps = 10_000i128 - acc.exposure_margin_bps as i128;
-            let allowed_total = ((effective_value as i128 * allowed_ratio_bps) / 10_000)
-                .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-            let projected = acc.total_exposure.saturating_add(*additional_exposure);
-            if projected <= allowed_total {
-                Ok(None)
-            } else {
-                Ok(Some(AssertionActual::Value(Value::Integer(
-                    acc.total_exposure,
-                ))))
-            }
-        }
         ReadAssertion::KeyEquals {
             project_id,
             scope_id,
@@ -659,11 +583,8 @@ fn sum_rows_for_column<'a>(
             for (scanned, row) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
                 if let Some(budget) = read_bytes.as_deref_mut() {
-                    let touched_bytes = row
-                        .values
-                        .get(column_idx)
-                        .map(value_byte_size)
-                        .unwrap_or(0);
+                    let touched_bytes =
+                        row.values.get(column_idx).map(value_byte_size).unwrap_or(0);
                     budget.charge(touched_bytes)?;
                 }
                 if !match_filter(row, schema, filter)? {
@@ -696,11 +617,8 @@ fn sum_rows_for_column<'a>(
             for (scanned, row) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
                 if let Some(budget) = read_bytes.as_deref_mut() {
-                    let touched_bytes = row
-                        .values
-                        .get(column_idx)
-                        .map(value_byte_size)
-                        .unwrap_or(0);
+                    let touched_bytes =
+                        row.values.get(column_idx).map(value_byte_size).unwrap_or(0);
                     budget.charge(touched_bytes)?;
                 }
                 if !match_filter(row, schema, filter)? {
@@ -717,11 +635,8 @@ fn sum_rows_for_column<'a>(
             for (scanned, row) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
                 if let Some(budget) = read_bytes.as_deref_mut() {
-                    let touched_bytes = row
-                        .values
-                        .get(column_idx)
-                        .map(value_byte_size)
-                        .unwrap_or(0);
+                    let touched_bytes =
+                        row.values.get(column_idx).map(value_byte_size).unwrap_or(0);
                     budget.charge(touched_bytes)?;
                 }
                 if !match_filter(row, schema, filter)? {

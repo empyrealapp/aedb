@@ -22,9 +22,7 @@ use crate::query::operators::{compile_expr, eval_compiled_expr_public};
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::index::extract_index_key_encoded;
-use crate::storage::keyspace::{
-    AccumulatorAppendResult, Keyspace, NamespaceId, SecondaryIndex, SecondaryIndexStore,
-};
+use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndex, SecondaryIndexStore};
 use primitive_types::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,7 +36,15 @@ pub fn apply_mutation(
     scan_budget: Option<usize>,
     caller: Option<&CallerContext>,
 ) -> Result<(), AedbError> {
-    apply_mutation_with_read_budget(catalog, keyspace, mutation, commit_seq, scan_budget, caller, None)
+    apply_mutation_with_read_budget(
+        catalog,
+        keyspace,
+        mutation,
+        commit_seq,
+        scan_budget,
+        caller,
+        None,
+    )
 }
 
 /// Same as [`apply_mutation`], but also charges scanned bytes against an
@@ -412,28 +418,6 @@ pub fn apply_mutation_with_read_budget(
                     scope_id,
                 } => {
                     keyspace.drop_table(&project_id, &scope_id, crate::catalog::KV_INDEX_TABLE);
-                }
-                crate::catalog::DdlOperation::CreateAccumulator {
-                    project_id,
-                    scope_id,
-                    accumulator_name,
-                    exposure_margin_bps,
-                    ..
-                } => {
-                    keyspace.create_accumulator(
-                        &project_id,
-                        &scope_id,
-                        &accumulator_name,
-                        exposure_margin_bps,
-                    );
-                }
-                crate::catalog::DdlOperation::DropAccumulator {
-                    project_id,
-                    scope_id,
-                    accumulator_name,
-                    ..
-                } => {
-                    keyspace.drop_accumulator(&project_id, &scope_id, &accumulator_name);
                 }
                 crate::catalog::DdlOperation::GrantPermission {
                     caller_id,
@@ -847,76 +831,13 @@ pub fn apply_mutation_with_read_budget(
                 commit_seq,
             )?;
         }
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            delta,
-            dedupe_key,
-            order_key,
-            release_exposure_id,
-        } => {
-            let append_result = keyspace.append_accumulator_delta(
-                &project_id,
-                &scope_id,
-                &accumulator_name,
-                delta,
-                &dedupe_key,
-                order_key,
-                commit_seq,
-            )?;
-            if let Some(exposure_id) = release_exposure_id
-                && matches!(append_result, AccumulatorAppendResult::Applied)
-            {
-                keyspace.release_accumulator_exposure(
-                    &project_id,
-                    &scope_id,
-                    &accumulator_name,
-                    &exposure_id,
-                )?;
-            }
-        }
-        Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            amount,
-            exposure_id,
-        } => {
-            keyspace.expose_accumulator(
-                &project_id,
-                &scope_id,
-                &accumulator_name,
-                amount,
-                &exposure_id,
-                commit_seq,
-            )?;
-        }
-        Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-        } => {
-            keyspace.expose_accumulator_batch(
-                &project_id,
-                &scope_id,
-                &accumulator_name,
-                &exposures,
-                commit_seq,
-            )?;
-        }
-        Mutation::ReleaseAccumulatorExposure {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposure_id,
-        } => {
-            keyspace.release_accumulator_exposure(
-                &project_id,
-                &scope_id,
-                &accumulator_name,
-                &exposure_id,
+        Mutation::PostflightCheck { assertions } => {
+            crate::commit::assertions::evaluate_assertions_with_read_budget(
+                catalog,
+                keyspace,
+                &assertions,
+                scan_budget.unwrap_or(usize::MAX),
+                read_bytes,
             )?;
         }
         Mutation::EmitEvent {
@@ -1279,6 +1200,7 @@ pub fn apply_mutation_trusted_if_eligible(
             }
             Some(result)
         }
+        Mutation::PostflightCheck { .. } => None,
         Mutation::Upsert {
             project_id,
             scope_id,

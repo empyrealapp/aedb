@@ -74,7 +74,7 @@ pub struct ReadSet {
 /// with a [`ReadSet`] cheaply.
 ///
 /// Mutations whose effect is broad (predicate updates, DDL, internal
-/// accumulator/event-outbox bookkeeping, order-book state) are reported
+/// event-outbox bookkeeping, order-book state) are reported
 /// conservatively as a `TableRange` / `KvRange` over the full table or
 /// scope. Callers must therefore treat `WriteKey` as a *superset* of the
 /// actually written keys — intersection may be false-positive but never
@@ -106,7 +106,7 @@ pub enum WriteKey {
         end: ReadBound<Vec<u8>>,
     },
     /// Conservative catch-all: any read in this (project, scope) intersects.
-    /// Emitted for DDL, accumulators, event outbox, order-book state.
+    /// Emitted for DDL, event outbox, order-book state.
     ScopeAll {
         project_id: String,
         scope_id: String,
@@ -285,12 +285,7 @@ fn read_range_intersects_write_key(read: &ReadRange, write: &WriteKey) -> bool {
                 start: wstart,
                 end: wend,
             },
-        ) => {
-            rp == wp
-                && rs == ws
-                && rt == wt
-                && ranges_overlap_pk(rstart, rend, wstart, wend)
-        }
+        ) => rp == wp && rs == ws && rt == wt && ranges_overlap_pk(rstart, rend, wstart, wend),
         (
             ReadRange::KvRange {
                 project_id: rp,
@@ -317,11 +312,7 @@ fn read_range_intersects_write_key(read: &ReadRange, write: &WriteKey) -> bool {
                 start: wstart,
                 end: wend,
             },
-        ) => {
-            rp == wp
-                && rs == ws
-                && ranges_overlap_bytes(rstart, rend, wstart, wend)
-        }
+        ) => rp == wp && rs == ws && ranges_overlap_bytes(rstart, rend, wstart, wend),
         (
             ReadRange::TableRange {
                 project_id: rp,
@@ -362,11 +353,7 @@ fn pk_in_range(
     }
 }
 
-fn bytes_in_range(
-    point: &[u8],
-    start: &ReadBound<Vec<u8>>,
-    end: &ReadBound<Vec<u8>>,
-) -> bool {
+fn bytes_in_range(point: &[u8], start: &ReadBound<Vec<u8>>, end: &ReadBound<Vec<u8>>) -> bool {
     let lo_ok = match start {
         ReadBound::Unbounded => true,
         ReadBound::Included(v) => v.as_slice() <= point,
@@ -433,20 +420,15 @@ fn ranges_overlap_bytes(
     lo_le_hi(a_start, b_end) && lo_le_hi(b_start, a_end)
 }
 
+/// Commit-time predicates evaluated against the working state before an
+/// envelope's mutations are applied.
+///
+/// Preflight can use the same shapes to produce helpful early feedback, but
+/// these assertions are the authoritative concurrency boundary. Pair them with
+/// atomic numeric mutations when a business invariant must survive contention,
+/// for example "this balance is still above the debit amount".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReadAssertion {
-    AccumulatorAvailableAtLeast {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        min_amount: i64,
-    },
-    AccumulatorExposureWithinMargin {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        additional_exposure: i64,
-    },
     KeyEquals {
         project_id: String,
         scope_id: String,
@@ -529,6 +511,9 @@ pub enum AssertionActual {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteIntent {
+    /// Ordered mutations for one atomic envelope. `Mutation::PostflightCheck`
+    /// can appear after atomic updates to validate the transaction-local
+    /// post-update state before the envelope is published.
     pub mutations: Vec<Mutation>,
 }
 
@@ -562,7 +547,13 @@ pub struct TransactionEnvelope {
     pub idempotency_key: Option<IdempotencyKey>,
     #[serde(default)]
     pub write_class: WriteClass,
+    /// Authoritative checks evaluated immediately before `write_intent`.
+    /// Use these with atomic updates for invariants that cannot rely on the
+    /// advisory preflight snapshot alone.
     pub assertions: Vec<ReadAssertion>,
+    /// Versions/ranges observed during preflight or planning. This guards
+    /// against TOCTOU by rejecting envelopes whose planned reads went stale
+    /// before commit.
     pub read_set: ReadSet,
     pub write_intent: WriteIntent,
     pub base_seq: u64,
@@ -595,6 +586,9 @@ impl TransactionEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreflightPlan {
+    /// Advisory result from the snapshot inspected during preflight.
+    /// A valid plan can still be rejected at commit if its read set or
+    /// assertions no longer match current state.
     pub valid: bool,
     pub read_set: ReadSet,
     pub write_intent: WriteIntent,
