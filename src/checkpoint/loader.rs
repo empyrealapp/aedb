@@ -6,6 +6,7 @@ use crate::storage::keyspace::Keyspace;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -37,10 +38,10 @@ pub fn load_checkpoint_with_key(
     AedbError,
 > {
     let bytes = fs::read(path)?;
-    let compressed = if bytes.starts_with(b"AEDBENC1") {
+    let compressed: Cow<'_, [u8]> = if bytes.starts_with(b"AEDBENC1") {
         let key = encryption_key
             .ok_or_else(|| AedbError::Validation("checkpoint requires key".into()))?;
-        decrypt_checkpoint_payload(&bytes, key)?
+        Cow::Owned(decrypt_checkpoint_payload(&bytes, key)?)
     } else {
         if bytes.len() < 32 {
             return Err(AedbError::Decode("checkpoint too small".into()));
@@ -50,9 +51,9 @@ pub fn load_checkpoint_with_key(
         if actual.as_slice() != trailer_hash {
             return Err(AedbError::Validation("checkpoint hash mismatch".into()));
         }
-        compressed.to_vec()
+        Cow::Borrowed(compressed)
     };
-    let decompressed = zstd::stream::decode_all(compressed.as_slice())
+    let decompressed = zstd::stream::decode_all(compressed.as_ref())
         .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
     let data: CheckpointData =
         rmp_serde::from_slice(&decompressed).map_err(|e| AedbError::Decode(e.to_string()))?;
@@ -91,9 +92,9 @@ fn decrypt_checkpoint_payload(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, A
 #[cfg(test)]
 mod tests {
     use super::{load_checkpoint, load_checkpoint_with_key};
-    use crate::catalog::Catalog;
     use crate::catalog::schema::ColumnDef;
     use crate::catalog::types::{ColumnType, Row, Value};
+    use crate::catalog::Catalog;
     use crate::checkpoint::writer::{write_checkpoint, write_checkpoint_with_key};
     use crate::storage::keyspace::Keyspace;
     use tempfile::tempdir;

@@ -1,7 +1,7 @@
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
-use aedb::commit::tx::{TransactionEnvelope, WriteClass};
-use aedb::commit::validation::Mutation;
+use aedb::commit::tx::{ReadAssertion, TransactionEnvelope, WriteClass};
+use aedb::commit::validation::{CompareOp, Mutation};
 use aedb::error::AedbError;
 use aedb::permission::{CallerContext, Permission};
 use aedb::preflight::PreflightResult;
@@ -172,5 +172,32 @@ async fn integration_preflight_plan_rejects_stale_kv_assertion() {
     assert!(
         matches!(err, AedbError::Conflict(ref msg) if msg.contains("read set conflict")),
         "expected read set conflict, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn integration_postflight_check_does_not_enter_preflight_read_set() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    db.create_project("kv").await.expect("project");
+    db.kv_set("kv", "app", b"balance".to_vec(), u256_be(1).to_vec())
+        .await
+        .expect("seed balance");
+
+    let plan = db
+        .preflight_plan(Mutation::PostflightCheck {
+            assertions: vec![ReadAssertion::KeyCompare {
+                project_id: "kv".into(),
+                scope_id: "app".into(),
+                key: b"balance".to_vec(),
+                op: CompareOp::Gte,
+                threshold: u256_be(0).to_vec(),
+            }],
+        })
+        .await;
+    assert!(plan.valid);
+    assert!(
+        plan.read_set.points.is_empty() && plan.read_set.ranges.is_empty(),
+        "postflight checks are evaluated after atomic updates, not as preflight read locks"
     );
 }

@@ -71,7 +71,7 @@ KV value-size and index-count sweeps were within noise — fsync dominates every
 
 ## Root cause
 
-`Keyspace::estimate_memory_bytes()` at `src/storage/keyspace.rs:1614` walks every row, KV entry, projection, and accumulator entry — **O(N)**.
+`Keyspace::estimate_memory_bytes()` at `src/storage/keyspace.rs:1614` walked every row, KV entry, and projection entry — **O(N)**.
 
 It was being called unconditionally on every commit at `src/commit/executor/internals.rs:1645` to enforce `max_memory_estimate_bytes` before WAL append. (A second post-apply check at line 1844 was already rate-limited to 250 ms; the pre-WAL one wasn't.)
 
@@ -82,7 +82,7 @@ Verified by math: 500k × ~37 ms commit, fsync = 5 ms, remaining ~32 ms = the O(
 Replaced the O(N) walk with an O(1) running counter.
 
 - Added `mem_bytes: usize` field to `Keyspace` and `KeyspaceSnapshot` (with `#[serde(default)]`)
-- Cost helpers: `row_mem_cost`, `kv_entry_cost`, `accumulator_dedupe_cost`, `accumulator_exposure_cost`, `ACCUMULATOR_DELTA_COST`, `table_data_mem_cost`, `kv_data_mem_cost`, `projection_data_mem_cost`, `accumulator_data_mem_cost`, `namespace_mem_cost`
+- Cost helpers: `row_mem_cost`, `kv_entry_cost`, `table_data_mem_cost`, `kv_data_mem_cost`, `projection_data_mem_cost`, `namespace_mem_cost`
 - `estimate_memory_bytes()` now returns `self.mem_bytes`
 - `recompute_memory_bytes_full()` keeps the old O(N) logic for parity tests + post-load reseed
 - `refresh_mem_bytes()` reseeds the counter from a full walk (used after constructing from external data)
@@ -92,9 +92,8 @@ Mutation sites updated to maintain delta:
 - `upsert_row`, `upsert_row_by_encoded_pk` — replace path tracks old vs new cost
 - `delete_row`, `delete_row_by_encoded`
 - `kv_set`, `kv_del`
-- `append_accumulator_delta`, `expose_accumulator`, `expose_accumulator_batch`, `release_accumulator_exposure`
 - `insert_async_projection`, `remove_async_projection`, `take_async_projection`
-- `drop_table`, `drop_scope`, `drop_project`, `drop_accumulator`
+- `drop_table`, `drop_scope`, `drop_project`
 - `insert_namespace`
 - `merge_parallel_namespace_result` in `src/commit/executor/internals.rs:2338` — tracks delta inline
 - New `insert_namespace_unchecked` for the parallel runtime's throwaway local keyspace (avoids re-walking the whole base namespace per task)

@@ -29,7 +29,7 @@ use crate::backup::{
     sha256_file_hex, verify_backup_files, write_backup_archive, write_backup_manifest,
 };
 use crate::catalog::namespace_key;
-use crate::catalog::schema::{AccumulatorValueType, AsyncIndexDef, IndexDef, TableSchema};
+use crate::catalog::schema::{AsyncIndexDef, IndexDef, TableSchema};
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
 use crate::checkpoint::loader::load_checkpoint_with_key;
@@ -733,26 +733,6 @@ pub struct TableInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccumulatorLag {
-    pub latest_order_key: u64,
-    pub last_applied_order_key: u64,
-    pub lag_orders: u64,
-    pub latest_seq: u64,
-    pub materialized_seq: u64,
-    pub lag_commits: u64,
-    pub unapplied_deltas: usize,
-    pub projector_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccumulatorExposureMetrics {
-    pub total_exposure: i64,
-    pub available: i64,
-    pub rejection_count: u64,
-    pub open_exposure_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventOutboxRecord {
     pub commit_seq: u64,
     pub ts_micros: u64,
@@ -847,24 +827,6 @@ pub enum LifecycleEvent {
         project_id: String,
         scope_id: String,
         table_name: String,
-        seq: u64,
-    },
-    AccumulatorDeltaAppended {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        delta: i64,
-        dedupe_key: String,
-        order_key: u64,
-        release_exposure_id: Option<String>,
-        seq: u64,
-    },
-    AccumulatorExposureReserved {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        amount: i64,
-        exposure_id: String,
         seq: u64,
     },
     AppEventEmitted {
@@ -3897,406 +3859,6 @@ impl AedbInstance {
             .counter_read_sharded(project_id, scope_id, key, shard_count)
     }
 
-    pub async fn create_accumulator(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        dedupe_retain_commits: Option<u64>,
-        snapshot_every: u64,
-    ) -> Result<CommitResult, AedbError> {
-        self.create_accumulator_with_options(
-            project_id,
-            scope_id,
-            accumulator_name,
-            dedupe_retain_commits,
-            snapshot_every,
-            1_000,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_accumulator_with_options(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        dedupe_retain_commits: Option<u64>,
-        snapshot_every: u64,
-        exposure_margin_bps: u32,
-        exposure_ttl_commits: Option<u64>,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit(Mutation::Ddl(DdlOperation::CreateAccumulator {
-            project_id: project_id.to_string(),
-            scope_id: scope_id.to_string(),
-            accumulator_name: accumulator_name.to_string(),
-            if_not_exists: false,
-            value_type: AccumulatorValueType::BigInt,
-            dedupe_retain_commits,
-            snapshot_every,
-            exposure_margin_bps,
-            exposure_ttl_commits,
-        }))
-        .await
-    }
-
-    pub async fn create_accumulator_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        dedupe_retain_commits: Option<u64>,
-        snapshot_every: u64,
-    ) -> Result<CommitResult, AedbError> {
-        self.create_accumulator_with_options_as(
-            caller,
-            project_id,
-            scope_id,
-            accumulator_name,
-            dedupe_retain_commits,
-            snapshot_every,
-            1_000,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_accumulator_with_options_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        dedupe_retain_commits: Option<u64>,
-        snapshot_every: u64,
-        exposure_margin_bps: u32,
-        exposure_ttl_commits: Option<u64>,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit_as(
-            caller,
-            Mutation::Ddl(DdlOperation::CreateAccumulator {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                if_not_exists: false,
-                value_type: AccumulatorValueType::BigInt,
-                dedupe_retain_commits,
-                snapshot_every,
-                exposure_margin_bps,
-                exposure_ttl_commits,
-            }),
-        )
-        .await
-    }
-
-    pub async fn drop_accumulator(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit(Mutation::Ddl(DdlOperation::DropAccumulator {
-            project_id: project_id.to_string(),
-            scope_id: scope_id.to_string(),
-            accumulator_name: accumulator_name.to_string(),
-            if_exists: true,
-        }))
-        .await
-    }
-
-    pub async fn drop_accumulator_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit_as(
-            caller,
-            Mutation::Ddl(DdlOperation::DropAccumulator {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                if_exists: true,
-            }),
-        )
-        .await
-    }
-
-    pub async fn accumulate(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        delta: i64,
-        dedupe_key: String,
-        order_key: u64,
-    ) -> Result<CommitResult, AedbError> {
-        self.accumulate_with_release(
-            project_id,
-            scope_id,
-            accumulator_name,
-            delta,
-            dedupe_key,
-            order_key,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn accumulate_with_release(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        delta: i64,
-        dedupe_key: String,
-        order_key: u64,
-        release_exposure_id: Option<String>,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit(Mutation::Accumulate {
-            project_id: project_id.to_string(),
-            scope_id: scope_id.to_string(),
-            accumulator_name: accumulator_name.to_string(),
-            delta,
-            dedupe_key,
-            order_key,
-            release_exposure_id,
-        })
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn accumulate_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        delta: i64,
-        dedupe_key: String,
-        order_key: u64,
-    ) -> Result<CommitResult, AedbError> {
-        self.accumulate_with_release_as(
-            caller,
-            project_id,
-            scope_id,
-            accumulator_name,
-            delta,
-            dedupe_key,
-            order_key,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn accumulate_with_release_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        delta: i64,
-        dedupe_key: String,
-        order_key: u64,
-        release_exposure_id: Option<String>,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit_as(
-            caller,
-            Mutation::Accumulate {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                delta,
-                dedupe_key,
-                order_key,
-                release_exposure_id,
-            },
-        )
-        .await
-    }
-
-    pub async fn expose_accumulator(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        amount: i64,
-        exposure_id: String,
-    ) -> Result<CommitResult, AedbError> {
-        if amount <= 0 {
-            return Err(AedbError::Validation("exposure amount must be > 0".into()));
-        }
-        if exposure_id.trim().is_empty() {
-            return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-        }
-        // EXPOSE is a hot-path primitive; prevalidated submit skips prestage mutation checks.
-        self.commit_prevalidated_internal(
-            "expose_accumulator",
-            Mutation::ExposeAccumulator {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                amount,
-                exposure_id,
-            },
-        )
-        .await
-    }
-
-    pub async fn expose_accumulator_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        amount: i64,
-        exposure_id: String,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit_as(
-            caller,
-            Mutation::ExposeAccumulator {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                amount,
-                exposure_id,
-            },
-        )
-        .await
-    }
-
-    pub async fn expose_accumulator_with_preflight(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        amount: i64,
-        exposure_id: String,
-    ) -> Result<CommitResult, AedbError> {
-        self.commit_with_preflight(Mutation::ExposeAccumulator {
-            project_id: project_id.to_string(),
-            scope_id: scope_id.to_string(),
-            accumulator_name: accumulator_name.to_string(),
-            amount,
-            exposure_id,
-        })
-        .await
-    }
-
-    pub async fn expose_accumulator_many_atomic(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposures: Vec<(i64, String)>,
-    ) -> Result<CommitResult, AedbError> {
-        if exposures.is_empty() {
-            return Err(AedbError::Validation(
-                "expose_accumulator_many_atomic requires at least one exposure".into(),
-            ));
-        }
-        for (amount, exposure_id) in &exposures {
-            if *amount <= 0 {
-                return Err(AedbError::Validation("exposure amount must be > 0".into()));
-            }
-            if exposure_id.trim().is_empty() {
-                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-            }
-        }
-        self.commit_prevalidated_internal(
-            "expose_accumulator_many_atomic",
-            Mutation::ExposeAccumulatorBatch {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                exposures,
-            },
-        )
-        .await
-    }
-
-    pub async fn expose_accumulator_many_atomic_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposures: Vec<(i64, String)>,
-    ) -> Result<CommitResult, AedbError> {
-        if exposures.is_empty() {
-            return Err(AedbError::Validation(
-                "expose_accumulator_many_atomic_as requires at least one exposure".into(),
-            ));
-        }
-        for (amount, exposure_id) in &exposures {
-            if *amount <= 0 {
-                return Err(AedbError::Validation("exposure amount must be > 0".into()));
-            }
-            if exposure_id.trim().is_empty() {
-                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-            }
-        }
-        self.commit_as(
-            caller,
-            Mutation::ExposeAccumulatorBatch {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                exposures,
-            },
-        )
-        .await
-    }
-
-    pub async fn release_accumulator_exposure(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposure_id: String,
-    ) -> Result<CommitResult, AedbError> {
-        if exposure_id.trim().is_empty() {
-            return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-        }
-        self.commit(Mutation::ReleaseAccumulatorExposure {
-            project_id: project_id.to_string(),
-            scope_id: scope_id.to_string(),
-            accumulator_name: accumulator_name.to_string(),
-            exposure_id,
-        })
-        .await
-    }
-
-    pub async fn release_accumulator_exposure_as(
-        &self,
-        caller: CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        exposure_id: String,
-    ) -> Result<CommitResult, AedbError> {
-        if exposure_id.trim().is_empty() {
-            return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-        }
-        self.commit_as(
-            caller,
-            Mutation::ReleaseAccumulatorExposure {
-                project_id: project_id.to_string(),
-                scope_id: scope_id.to_string(),
-                accumulator_name: accumulator_name.to_string(),
-                exposure_id,
-            },
-        )
-        .await
-    }
-
     pub async fn emit_event(
         &self,
         project_id: &str,
@@ -4335,448 +3897,6 @@ impl AedbInstance {
             },
         )
         .await
-    }
-
-    pub async fn accumulator_value(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        if self.require_authenticated_calls {
-            return Err(AedbError::PermissionDenied(
-                "authenticated caller required in secure mode".into(),
-            ));
-        }
-        let lease = self.acquire_snapshot(consistency).await?;
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        Ok(acc.value)
-    }
-
-    pub async fn accumulator_value_as(
-        &self,
-        caller: &CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        ensure_external_caller_allowed(caller)?;
-        let lease = self.acquire_snapshot(consistency).await?;
-        if !lease.view.catalog.has_kv_read_permission(
-            &caller.caller_id,
-            project_id,
-            scope_id,
-            accumulator_name.as_bytes(),
-        ) {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for accumulator",
-                caller.caller_id
-            )));
-        }
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        Ok(acc.value)
-    }
-
-    pub async fn accumulator_value_strong(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        if self.require_authenticated_calls {
-            return Err(AedbError::PermissionDenied(
-                "authenticated caller required in secure mode".into(),
-            ));
-        }
-        let lease = self.acquire_snapshot(consistency).await?;
-        lease
-            .view
-            .keyspace
-            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })
-    }
-
-    pub async fn accumulator_value_strong_as(
-        &self,
-        caller: &CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        ensure_external_caller_allowed(caller)?;
-        let lease = self.acquire_snapshot(consistency).await?;
-        if !lease.view.catalog.has_kv_read_permission(
-            &caller.caller_id,
-            project_id,
-            scope_id,
-            accumulator_name.as_bytes(),
-        ) {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for accumulator",
-                caller.caller_id
-            )));
-        }
-        lease
-            .view
-            .keyspace
-            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })
-    }
-
-    pub async fn accumulator_lag(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<AccumulatorLag, AedbError> {
-        if self.require_authenticated_calls {
-            return Err(AedbError::PermissionDenied(
-                "authenticated caller required in secure mode".into(),
-            ));
-        }
-        let lease = self.acquire_snapshot(consistency).await?;
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        let lag_orders = acc
-            .latest_order_key
-            .saturating_sub(acc.last_applied_order_key);
-        let lag_commits = acc.latest_seq.saturating_sub(acc.materialized_seq);
-        let unapplied_deltas = acc
-            .deltas
-            .range((
-                Bound::Excluded(acc.last_applied_order_key),
-                Bound::Unbounded,
-            ))
-            .count();
-        Ok(AccumulatorLag {
-            latest_order_key: acc.latest_order_key,
-            last_applied_order_key: acc.last_applied_order_key,
-            lag_orders,
-            latest_seq: acc.latest_seq,
-            materialized_seq: acc.materialized_seq,
-            lag_commits,
-            unapplied_deltas,
-            projector_error: acc.projector_error.clone(),
-        })
-    }
-
-    pub async fn accumulator_lag_as(
-        &self,
-        caller: &CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<AccumulatorLag, AedbError> {
-        ensure_external_caller_allowed(caller)?;
-        let lease = self.acquire_snapshot(consistency).await?;
-        if !lease.view.catalog.has_kv_read_permission(
-            &caller.caller_id,
-            project_id,
-            scope_id,
-            accumulator_name.as_bytes(),
-        ) {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for accumulator",
-                caller.caller_id
-            )));
-        }
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        let lag_orders = acc
-            .latest_order_key
-            .saturating_sub(acc.last_applied_order_key);
-        let lag_commits = acc.latest_seq.saturating_sub(acc.materialized_seq);
-        let unapplied_deltas = acc
-            .deltas
-            .range((
-                Bound::Excluded(acc.last_applied_order_key),
-                Bound::Unbounded,
-            ))
-            .count();
-        Ok(AccumulatorLag {
-            latest_order_key: acc.latest_order_key,
-            last_applied_order_key: acc.last_applied_order_key,
-            lag_orders,
-            latest_seq: acc.latest_seq,
-            materialized_seq: acc.materialized_seq,
-            lag_commits,
-            unapplied_deltas,
-            projector_error: acc.projector_error.clone(),
-        })
-    }
-
-    pub async fn accumulator_exposure(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        if self.require_authenticated_calls {
-            return Err(AedbError::PermissionDenied(
-                "authenticated caller required in secure mode".into(),
-            ));
-        }
-        let lease = self.acquire_snapshot(consistency).await?;
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        Ok(acc.total_exposure)
-    }
-
-    pub async fn accumulator_exposure_as(
-        &self,
-        caller: &CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        ensure_external_caller_allowed(caller)?;
-        let lease = self.acquire_snapshot(consistency).await?;
-        if !lease.view.catalog.has_kv_read_permission(
-            &caller.caller_id,
-            project_id,
-            scope_id,
-            accumulator_name.as_bytes(),
-        ) {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for accumulator",
-                caller.caller_id
-            )));
-        }
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        Ok(acc.total_exposure)
-    }
-
-    pub async fn accumulator_available(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        if self.require_authenticated_calls {
-            return Err(AedbError::PermissionDenied(
-                "authenticated caller required in secure mode".into(),
-            ));
-        }
-        let lease = self.acquire_snapshot(consistency).await?;
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        let effective = lease
-            .view
-            .keyspace
-            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })?;
-        effective
-            .checked_sub(acc.total_exposure)
-            .ok_or(AedbError::Overflow)
-    }
-
-    pub async fn accumulator_available_as(
-        &self,
-        caller: &CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<i64, AedbError> {
-        ensure_external_caller_allowed(caller)?;
-        let lease = self.acquire_snapshot(consistency).await?;
-        if !lease.view.catalog.has_kv_read_permission(
-            &caller.caller_id,
-            project_id,
-            scope_id,
-            accumulator_name.as_bytes(),
-        ) {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for accumulator",
-                caller.caller_id
-            )));
-        }
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        let effective = lease
-            .view
-            .keyspace
-            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })?;
-        effective
-            .checked_sub(acc.total_exposure)
-            .ok_or(AedbError::Overflow)
-    }
-
-    pub async fn accumulator_exposure_metrics(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<AccumulatorExposureMetrics, AedbError> {
-        if self.require_authenticated_calls {
-            return Err(AedbError::PermissionDenied(
-                "authenticated caller required in secure mode".into(),
-            ));
-        }
-        let lease = self.acquire_snapshot(consistency).await?;
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        let effective = lease
-            .view
-            .keyspace
-            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })?;
-        let available = effective
-            .checked_sub(acc.total_exposure)
-            .ok_or(AedbError::Overflow)?;
-        Ok(AccumulatorExposureMetrics {
-            total_exposure: acc.total_exposure,
-            available,
-            rejection_count: acc.exposure_rejections,
-            open_exposure_count: acc.open_exposures.len(),
-        })
-    }
-
-    pub async fn accumulator_exposure_metrics_as(
-        &self,
-        caller: &CallerContext,
-        project_id: &str,
-        scope_id: &str,
-        accumulator_name: &str,
-        consistency: ConsistencyMode,
-    ) -> Result<AccumulatorExposureMetrics, AedbError> {
-        ensure_external_caller_allowed(caller)?;
-        let lease = self.acquire_snapshot(consistency).await?;
-        if !lease.view.catalog.has_kv_read_permission(
-            &caller.caller_id,
-            project_id,
-            scope_id,
-            accumulator_name.as_bytes(),
-        ) {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for accumulator",
-                caller.caller_id
-            )));
-        }
-        let Some(acc) = lease
-            .view
-            .keyspace
-            .accumulator(project_id, scope_id, accumulator_name)
-        else {
-            return Err(AedbError::Validation(format!(
-                "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-            )));
-        };
-        let effective = lease
-            .view
-            .keyspace
-            .accumulator_effective_value(project_id, scope_id, accumulator_name)?
-            .ok_or_else(|| {
-                AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                ))
-            })?;
-        let available = effective
-            .checked_sub(acc.total_exposure)
-            .ok_or(AedbError::Overflow)?;
-        Ok(AccumulatorExposureMetrics {
-            total_exposure: acc.total_exposure,
-            available,
-            rejection_count: acc.exposure_rejections,
-            open_exposure_count: acc.open_exposures.len(),
-        })
     }
 
     pub async fn read_event_stream(
@@ -9024,54 +8144,69 @@ impl AedbInstance {
         // Hot backup: pin a consistent read view without blocking the write path.
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let snapshot_seq = lease.view.seq;
+        let keyspace = Arc::clone(&lease.view.keyspace);
+        let catalog = Arc::clone(&lease.view.catalog);
         let idempotency = self.executor.idempotency_snapshot().await;
-        let checkpoint = write_checkpoint_with_key(
-            lease.view.keyspace.as_ref(),
-            lease.view.catalog.as_ref(),
-            snapshot_seq,
-            backup_dir,
-            self._config.checkpoint_key(),
-            self._config.checkpoint_key_id.clone(),
-            idempotency,
-            self._config.checkpoint_compression_level,
-        )?;
+        drop(lease);
 
-        let mut wal_segments = Vec::new();
-        let mut file_sha256 = BTreeMap::new();
-        file_sha256.insert(
-            checkpoint.filename.clone(),
-            sha256_file_hex(&backup_dir.join(&checkpoint.filename))?,
-        );
+        let backup_dir = backup_dir.to_path_buf();
+        let source_dir = self.dir.clone();
+        let checkpoint_key = self._config.checkpoint_key().copied();
+        let checkpoint_key_id = self._config.checkpoint_key_id.clone();
+        let compression_level = self._config.checkpoint_compression_level;
+        let manifest_hmac_key = self._config.hmac_key().map(|key| key.to_vec());
 
-        for segment in read_segments_for_checkpoint(&self.dir, snapshot_seq)? {
-            let src = self.dir.join(&segment.filename);
-            let rel = format!("wal_tail/{}", segment.filename);
-            let dst = backup_dir.join(&rel);
-            copy_file_prefix(&src, &dst, segment.size_bytes)?;
-            wal_segments.push(segment.filename);
-            file_sha256.insert(rel, sha256_file_hex(&dst)?);
-        }
+        tokio::task::spawn_blocking(move || -> Result<BackupManifest, AedbError> {
+            let checkpoint = write_checkpoint_with_key(
+                keyspace.as_ref(),
+                catalog.as_ref(),
+                snapshot_seq,
+                &backup_dir,
+                checkpoint_key.as_ref(),
+                checkpoint_key_id,
+                idempotency,
+                compression_level,
+            )?;
 
-        wal_segments.sort_by_key(|name| segment_seq_from_name(name).unwrap_or(0));
-        let created_at_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        let manifest = BackupManifest {
-            backup_id: format!("bk_{}_{}", created_at_micros, snapshot_seq),
-            backup_type: "full".into(),
-            parent_backup_id: None,
-            from_seq: None,
-            created_at_micros,
-            aedb_version: env!("CARGO_PKG_VERSION").to_string(),
-            checkpoint_seq: snapshot_seq,
-            wal_head_seq: snapshot_seq,
-            checkpoint_file: checkpoint.filename,
-            wal_segments,
-            file_sha256,
-        };
-        write_backup_manifest(backup_dir, &manifest, self._config.hmac_key())?;
-        Ok(manifest)
+            let mut wal_segments = Vec::new();
+            let mut file_sha256 = BTreeMap::new();
+            file_sha256.insert(
+                checkpoint.filename.clone(),
+                sha256_file_hex(&backup_dir.join(&checkpoint.filename))?,
+            );
+
+            for segment in read_segments_for_checkpoint(&source_dir, snapshot_seq)? {
+                let src = source_dir.join(&segment.filename);
+                let rel = format!("wal_tail/{}", segment.filename);
+                let dst = backup_dir.join(&rel);
+                copy_file_prefix(&src, &dst, segment.size_bytes)?;
+                wal_segments.push(segment.filename);
+                file_sha256.insert(rel, sha256_file_hex(&dst)?);
+            }
+
+            wal_segments.sort_by_key(|name| segment_seq_from_name(name).unwrap_or(0));
+            let created_at_micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64;
+            let manifest = BackupManifest {
+                backup_id: format!("bk_{}_{}", created_at_micros, snapshot_seq),
+                backup_type: "full".into(),
+                parent_backup_id: None,
+                from_seq: None,
+                created_at_micros,
+                aedb_version: env!("CARGO_PKG_VERSION").to_string(),
+                checkpoint_seq: snapshot_seq,
+                wal_head_seq: snapshot_seq,
+                checkpoint_file: checkpoint.filename,
+                wal_segments,
+                file_sha256,
+            };
+            write_backup_manifest(&backup_dir, &manifest, manifest_hmac_key.as_deref())?;
+            Ok(manifest)
+        })
+        .await
+        .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?
     }
 
     /// Creates a full backup and packs it into a single archive file.
@@ -9083,7 +8218,14 @@ impl AedbInstance {
     ) -> Result<BackupManifest, AedbError> {
         let temp = tempfile::tempdir()?;
         let manifest = self.backup_full(temp.path()).await?;
-        write_backup_archive(temp.path(), backup_file, self._config.checkpoint_key())?;
+        let temp_path = temp.path().to_path_buf();
+        let backup_file = backup_file.to_path_buf();
+        let checkpoint_key = self._config.checkpoint_key().copied();
+        tokio::task::spawn_blocking(move || {
+            write_backup_archive(&temp_path, &backup_file, checkpoint_key.as_ref())
+        })
+        .await
+        .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))??;
         Ok(manifest)
     }
 

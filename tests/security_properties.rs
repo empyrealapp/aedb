@@ -7,7 +7,7 @@ use aedb::commit::tx::{
     WriteIntent,
 };
 use aedb::commit::validation::{
-    KvU64MissingPolicy, KvU64OverflowPolicy, KvU64UnderflowPolicy, Mutation,
+    CompareOp, KvU64MissingPolicy, KvU64OverflowPolicy, KvU64UnderflowPolicy, Mutation,
 };
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
@@ -357,6 +357,77 @@ async fn security_multi_key_atomic_update_reverts_all_on_failure() {
     assert_eq!(decode_u64(&to.value), 7);
 }
 
+#[tokio::test]
+async fn security_postflight_check_reverts_prior_atomic_updates() {
+    let dir = tempdir().expect("temp dir");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"balance".to_vec(), u64_be(5).to_vec())
+        .await
+        .expect("seed balance");
+    db.kv_set("p", "app", b"ledger".to_vec(), u64_be(7).to_vec())
+        .await
+        .expect("seed ledger");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![
+                    Mutation::KvAddU64Ex {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"ledger".to_vec(),
+                        amount_be: u64_be(1),
+                        on_missing: KvU64MissingPolicy::Reject,
+                        on_overflow: KvU64OverflowPolicy::Reject,
+                    },
+                    Mutation::KvSubU64Ex {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: b"balance".to_vec(),
+                        amount_be: u64_be(5),
+                        on_missing: KvU64MissingPolicy::Reject,
+                        on_underflow: KvU64UnderflowPolicy::Reject,
+                    },
+                    Mutation::PostflightCheck {
+                        assertions: vec![ReadAssertion::KeyCompare {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            key: b"balance".to_vec(),
+                            op: CompareOp::Gt,
+                            threshold: u64_be(0).to_vec(),
+                        }],
+                    },
+                ],
+            },
+            base_seq: db
+                .snapshot_probe(ConsistencyMode::AtLatest)
+                .await
+                .expect("probe"),
+        })
+        .await
+        .expect_err("postflight check must abort the whole transaction");
+    assert!(matches!(err, AedbError::AssertionFailed { .. }));
+
+    let balance = db
+        .kv_get_no_auth("p", "app", b"balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("read balance")
+        .expect("balance key");
+    let ledger = db
+        .kv_get_no_auth("p", "app", b"ledger", ConsistencyMode::AtLatest)
+        .await
+        .expect("read ledger")
+        .expect("ledger key");
+    assert_eq!(decode_u64(&balance.value), 5);
+    assert_eq!(decode_u64(&ledger.value), 7);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_parallel_atomic_adds_do_not_lose_updates() {
     let dir = tempdir().expect("temp dir");
@@ -393,6 +464,75 @@ async fn security_parallel_atomic_adds_do_not_lose_updates() {
         .expect("read counter")
         .expect("counter key");
     assert_eq!(decode_u64(&counter.value), 64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn security_hot_key_atomic_postflight_does_not_use_stale_precondition() {
+    let dir = tempdir().expect("temp dir");
+    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"balance".to_vec(), u64_be(32).to_vec())
+        .await
+        .expect("seed balance");
+
+    let mut tasks = Vec::new();
+    for _ in 0..64 {
+        let db = Arc::clone(&db);
+        tasks.push(tokio::spawn(async move {
+            db.commit_envelope(TransactionEnvelope {
+                caller: None,
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: Vec::new(),
+                read_set: ReadSet::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![
+                        Mutation::KvSubU64Ex {
+                            project_id: "p".into(),
+                            scope_id: "app".into(),
+                            key: b"balance".to_vec(),
+                            amount_be: u64_be(1),
+                            on_missing: KvU64MissingPolicy::Reject,
+                            on_underflow: KvU64UnderflowPolicy::NoOp,
+                        },
+                        Mutation::PostflightCheck {
+                            assertions: vec![ReadAssertion::KeyCompare {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                key: b"balance".to_vec(),
+                                op: CompareOp::Gt,
+                                threshold: u64_be(0).to_vec(),
+                            }],
+                        },
+                    ],
+                },
+                base_seq: db
+                    .snapshot_probe(ConsistencyMode::AtLatest)
+                    .await
+                    .expect("probe"),
+            })
+            .await
+        }));
+    }
+
+    let mut applied = 0usize;
+    let mut rejected = 0usize;
+    for task in tasks {
+        match task.await.expect("hot-key debit task") {
+            Ok(_) => applied += 1,
+            Err(AedbError::AssertionFailed { .. }) => rejected += 1,
+            Err(err) => panic!("unexpected hot-key debit error: {err:?}"),
+        }
+    }
+    assert_eq!(applied, 31);
+    assert_eq!(rejected, 33);
+
+    let balance = db
+        .kv_get_no_auth("p", "app", b"balance", ConsistencyMode::AtLatest)
+        .await
+        .expect("read balance")
+        .expect("balance key");
+    assert_eq!(decode_u64(&balance.value), 1);
 }
 
 #[tokio::test]

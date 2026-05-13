@@ -116,74 +116,64 @@ Native U256 KV mutation variants are available for strict/soft decrement and bou
 - Namespace hierarchy: `project -> scope -> table`
 - Typed relational tables for structured data
 - KV APIs for point lookups, prefix/range scans, and counters
-- Native accumulators for high-ingest, exactly-once additive state
+- Atomic KV/table integer updates with commit-time read assertions
 
-Accumulator example:
+Casino-style hot balance updates should use native atomic mutations plus assertions,
+not a separate accumulator subsystem. This keeps the safety check in the same commit
+envelope while allowing non-conflicting atomic updates to stay parallelizable.
+
+Atomic update safety has four layers:
+
+- `preflight` / `preflight_plan` can reject obviously invalid updates before enqueueing, such as a decrement that would underflow the snapshot it inspected.
+- `ReadAssertion`s in a `TransactionEnvelope` are authoritative pre-apply commit-time checks. They are evaluated against the working state for the commit epoch before the write intent applies.
+- `Mutation::PostflightCheck` evaluates `ReadAssertion`s after prior mutations in the same write intent have applied to the transaction-local trial state. Use this for hot-key atomic updates when the invariant is about the post-update value; it does not add a pre-apply read dependency that would serialize every writer on the same key.
+- Atomic mutation variants such as `KvSubU64Ex`, `KvSubU256Ex`, `KvAddI64Bounded`, and `TableDecU256` apply the numeric update without requiring callers to perform a separate read-modify-write. If the mutation itself cannot be applied, it returns a structured error and the envelope rolls back.
+
+Use `commit_with_preflight` for simple single-mutation UX checks. Use an explicit
+`TransactionEnvelope` with `Mutation::PostflightCheck` when the business invariant
+depends on the value after an atomic update, for example "balance must remain
+above the reserve after this debit".
 
 ```rust
-db.create_accumulator("casino", "app", "house_balance", Some(86_400), 10_000)
-    .await?;
+use aedb::commit::tx::{ReadAssertion, ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
+use aedb::commit::validation::{
+    CompareOp, KvU64MissingPolicy, KvU64UnderflowPolicy, Mutation,
+};
+use aedb::query::plan::ConsistencyMode;
 
-db.accumulate(
-    "casino",
-    "app",
-    "house_balance",
-    -125,               // delta
-    "settle_tx_123".into(), // dedupe key
-    42,                 // order key
-)
+let balance_key = b"house/balance".to_vec();
+let base_seq = db.snapshot_probe(ConsistencyMode::AtLatest).await?;
+
+db.commit_envelope(TransactionEnvelope {
+    caller: None,
+    idempotency_key: None,
+    write_class: WriteClass::Standard,
+    assertions: Vec::new(),
+    read_set: ReadSet::default(),
+    write_intent: WriteIntent {
+        mutations: vec![
+            Mutation::KvSubU64Ex {
+                project_id: "casino".into(),
+                scope_id: "app".into(),
+                key: balance_key.clone(),
+                amount_be: u64::to_be_bytes(500),
+                on_missing: KvU64MissingPolicy::Reject,
+                on_underflow: KvU64UnderflowPolicy::Reject,
+            },
+            Mutation::PostflightCheck {
+                assertions: vec![ReadAssertion::KeyCompare {
+                    project_id: "casino".into(),
+                    scope_id: "app".into(),
+                    key: balance_key,
+                    op: CompareOp::Gte,
+                    threshold: u64::to_be_bytes(10_000).to_vec(),
+                }],
+            },
+        ],
+    },
+    base_seq,
+})
 .await?;
-
-let projected = db
-    .accumulator_value("casino", "app", "house_balance", ConsistencyMode::AtLatest)
-    .await?;
-let strong = db
-    .accumulator_value_strong("casino", "app", "house_balance", ConsistencyMode::AtLatest)
-    .await?;
-let lag = db
-    .accumulator_lag("casino", "app", "house_balance", ConsistencyMode::AtLatest)
-    .await?;
-
-// Safety model:
-// - accumulator_value(...) is the projected/materialized value and may lag.
-// - accumulator_value_strong(...), accumulator_available(...), exposure assertions,
-//   and expose_accumulator(...) evaluate against the effective value
-//   (materialized value + unapplied deltas in the same snapshot).
-// Use the strong/effective APIs for credit, reserve, and risk decisions.
-
-// Optional circuit-breaker controls (basis points + orphan TTL in commit units)
-db.create_accumulator_with_options(
-    "casino",
-    "app",
-    "house_balance_cb",
-    Some(86_400),
-    10_000,
-    1_000, // 10% exposure margin
-    Some(20_000),
-)
-.await?;
-
-db.expose_accumulator("casino", "app", "house_balance_cb", 500, "hand-42".into())
-    .await?;
-db.accumulate_with_release(
-    "casino",
-    "app",
-    "house_balance_cb",
-    -120,
-    "settle_hand_42".into(),
-    43,
-    Some("hand-42".into()),
-)
-.await?;
-let exposure = db
-    .accumulator_exposure("casino", "app", "house_balance_cb", ConsistencyMode::AtLatest)
-    .await?;
-let available = db
-    .accumulator_available("casino", "app", "house_balance_cb", ConsistencyMode::AtLatest)
-    .await?;
-let exposure_metrics = db
-    .accumulator_exposure_metrics("casino", "app", "house_balance_cb", ConsistencyMode::AtLatest)
-    .await?;
 
 // Tier-2 event stream + processor checkpoint primitives
 db.emit_event(
@@ -203,42 +193,6 @@ db.ack_reactive_processor_checkpoint("points_processor", page.next_commit_seq.un
 let processor_lag = db
     .reactive_processor_lag("points_processor", ConsistencyMode::AtLatest)
     .await?;
-```
-
-Recommended hand lifecycle (high-throughput):
-
-```rust
-// 1) Reserve max loss at deal time (fast circuit breaker)
-db.expose_accumulator("casino", "app", "house_balance_cb", max_payout, hand_id.clone())
-    .await?;
-
-// 2) Apply actual outcome and release full reservation at settle time
-db.accumulate_with_release(
-    "casino",
-    "app",
-    "house_balance_cb",
-    actual_result,
-    hand_id.clone(), // dedupe key
-    settle_seq,
-    Some(hand_id),   // release exposure id
-)
-.await?;
-```
-
-For bursty deal traffic, use atomic batch reserve:
-
-```rust
-db.expose_accumulator_many_atomic(
-    "casino",
-    "app",
-    "house_balance_cb",
-    vec![
-        (500, "hand-101".to_string()),
-        (750, "hand-102".to_string()),
-        (300, "hand-103".to_string()),
-    ],
-)
-.await?;
 ```
 
 For event processors, prefer watermark-batched checkpoint ACKs to reduce write load:
@@ -349,11 +303,8 @@ When handler retries are exhausted, AEDB writes failed events to the durable
 `_system.app.reactive_processor_dead_letters` table and advances checkpoint so
 poison batches do not stall ingestion.
 
-Secure mode/authenticated flows can use `create_accumulator_as`, `accumulate_as`,
-`accumulator_value_as`, `accumulator_value_strong_as`, `accumulator_lag_as`,
-`expose_accumulator_as`, `accumulate_with_release_as`, `accumulator_exposure_as`,
-`accumulator_available_as`, `accumulator_exposure_metrics_as`,
-`expose_accumulator_many_atomic_as`, and `ack_reactive_processor_checkpoint_batched_as`.
+Secure mode/authenticated flows can use `commit_as`, `commit_envelope_as`,
+`commit_as_with_preflight`, and `ack_reactive_processor_checkpoint_batched_as`.
 
 Arcana-oriented engine interface primitives (effect batches, keyed-state helpers,
 processor pull/commit/context) are also exposed under `aedb::engine_interface`
@@ -400,9 +351,11 @@ println!("snapshot seq = {}", result.snapshot_seq);
 
 ### Preflight and commits
 
-- `preflight` and `preflight_plan` are advisory
-- state may change before commit
-- use `commit_with_preflight` / `commit_as_with_preflight` for lowest TOCTOU risk
+- `preflight` and `preflight_plan` are advisory; state may change before commit
+- `commit_with_preflight` / `commit_as_with_preflight` include the preflight read set in the commit envelope, which catches stale reads before writes apply
+- `ReadAssertion`s are commit-time checks for invariants that must hold under concurrency
+- `Mutation::PostflightCheck` is a commit-time post-apply check for atomic updates; failed checks abort and roll back the whole envelope before publish
+- atomic integer updates should encode their own underflow/overflow/missing-key policy and return structured errors rather than relying on fallbacks
 - use `commit_with_finality(..., CommitFinality::Visible)` for low-latency user ack
 - use `CommitFinality::Durable` for flows that must wait for WAL durability
 

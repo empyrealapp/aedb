@@ -210,9 +210,19 @@ In Arcana effect processor:
 - stop pre-reading and calculating next numeric values in shadow maps for common u256 ops
 - emit `KvAddU256Ex`/`KvSubU256Ex`/`KvMaxU256`/`KvMinU256` directly
 
-## 3) Keep accumulators for hot shared keys
-For house-balance style contention keys, keep accumulator mutations as primary path.
-For isolated per-user keys, numeric KV mutations provide low-overhead direct updates.
+## 3) Use atomic updates for hot shared keys
+For house-balance style contention keys, use atomic KV/table integer mutations plus commit-time assertions.
+Do not route this through accumulators; the accumulator subsystem was removed in favor of one general atomic update path.
+
+Preflight is only the UX/early-rejection layer. It can say "this debit would
+fail on the snapshot I just read", and `commit_with_preflight` carries that
+snapshot's read set into the commit envelope to catch stale planning. For hot
+keys, prefer an atomic mutation followed by `Mutation::PostflightCheck`: the
+update applies to the transaction-local trial state, then the postflight
+assertion validates the resulting value. A failed postflight check or mutation
+underflow/overflow rejects and rolls back the whole envelope before publish, but
+the postflight check does not add a pre-apply read dependency that forces all
+writers of the same key through stale CAS-style sequencing.
 
 ## Acceptance tests (AEDB)
 - `action_envelope_applied_once`: single envelope applies all writes atomically.

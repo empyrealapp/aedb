@@ -1,8 +1,7 @@
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{SYSTEM_PROJECT_ID, namespace_key};
 use crate::commit::tx::{
-    AssertionActual, ReadAssertion, ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope,
-    WriteClass, WriteIntent,
+    ReadAssertion, ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
 };
 use crate::commit::validation::Mutation;
 use crate::error::AedbError;
@@ -25,34 +24,10 @@ pub struct EffectBatch {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum EffectPrecondition {
-    RequireAvailable {
-        accumulator: String,
-        min_amount: i64,
-    },
-    RequireExposureOk {
-        accumulator: String,
-        amount: i64,
-    },
-}
+pub enum EffectPrecondition {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EffectOperation {
-    Accumulate {
-        accumulator: String,
-        delta: i64,
-        dedupe_id: String,
-        order_key: u64,
-    },
-    Expose {
-        accumulator: String,
-        amount: i64,
-        dedupe_id: String,
-    },
-    ReleaseExposure {
-        accumulator: String,
-        dedupe_id: String,
-    },
     Write {
         keyed_state: String,
         key: Value,
@@ -124,69 +99,12 @@ impl AedbInstance {
         batch: EffectBatch,
     ) -> Result<EffectBatchCommitResult, AedbError> {
         let preflight_lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
-        let assertions: Vec<ReadAssertion> = batch
-            .preconditions
-            .iter()
-            .map(|precondition| match precondition {
-                EffectPrecondition::RequireAvailable {
-                    accumulator,
-                    min_amount,
-                } => ReadAssertion::AccumulatorAvailableAtLeast {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    accumulator_name: accumulator.clone(),
-                    min_amount: *min_amount,
-                },
-                EffectPrecondition::RequireExposureOk {
-                    accumulator,
-                    amount,
-                } => ReadAssertion::AccumulatorExposureWithinMargin {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    accumulator_name: accumulator.clone(),
-                    additional_exposure: *amount,
-                },
-            })
-            .collect();
+        let assertions: Vec<ReadAssertion> = Vec::new();
 
         let mut mutations = Vec::with_capacity(batch.effects.len() + batch.events.len());
         let mut keyed_state_pk_index_cache: HashMap<String, usize> = HashMap::new();
         for effect in batch.effects {
             match effect {
-                EffectOperation::Accumulate {
-                    accumulator,
-                    delta,
-                    dedupe_id,
-                    order_key,
-                } => mutations.push(Mutation::Accumulate {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    accumulator_name: accumulator,
-                    delta,
-                    dedupe_key: dedupe_id,
-                    order_key,
-                    release_exposure_id: None,
-                }),
-                EffectOperation::Expose {
-                    accumulator,
-                    amount,
-                    dedupe_id,
-                } => mutations.push(Mutation::ExposeAccumulator {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    accumulator_name: accumulator,
-                    amount,
-                    exposure_id: dedupe_id,
-                }),
-                EffectOperation::ReleaseExposure {
-                    accumulator,
-                    dedupe_id,
-                } => mutations.push(Mutation::ReleaseAccumulatorExposure {
-                    project_id: project_id.to_string(),
-                    scope_id: scope_id.to_string(),
-                    accumulator_name: accumulator,
-                    exposure_id: dedupe_id,
-                }),
                 EffectOperation::Write {
                     keyed_state,
                     key,
@@ -288,17 +206,11 @@ impl AedbInstance {
                 index,
                 assertion,
                 actual,
-            }) => {
-                if let Some(rejected) = batch_rejected_from_assertion(&assertion, &actual) {
-                    Ok(EffectBatchCommitResult::Rejected(rejected))
-                } else {
-                    Err(AedbError::AssertionFailed {
-                        index,
-                        assertion,
-                        actual,
-                    })
-                }
-            }
+            }) => Err(AedbError::AssertionFailed {
+                index,
+                assertion,
+                actual,
+            }),
             Err(err) => Err(err),
         }
     }
@@ -791,50 +703,6 @@ impl AedbInstance {
     }
 }
 
-fn batch_rejected_from_assertion(
-    assertion: &ReadAssertion,
-    actual: &AssertionActual,
-) -> Option<BatchRejected> {
-    match assertion {
-        ReadAssertion::AccumulatorAvailableAtLeast {
-            accumulator_name,
-            min_amount,
-            ..
-        } => Some(BatchRejected {
-            error_code: "available_below_min",
-            failed_precondition: format!(
-                "RequireAvailable({}, min={})",
-                accumulator_name, min_amount
-            ),
-            actual_value: assertion_actual_i64(actual),
-        }),
-        ReadAssertion::AccumulatorExposureWithinMargin {
-            accumulator_name,
-            additional_exposure,
-            ..
-        } => Some(BatchRejected {
-            error_code: "exposure_margin_exceeded",
-            failed_precondition: format!(
-                "RequireExposureOk({}, amount={})",
-                accumulator_name, additional_exposure
-            ),
-            actual_value: assertion_actual_i64(actual),
-        }),
-        _ => None,
-    }
-}
-
-fn assertion_actual_i64(actual: &AssertionActual) -> i64 {
-    match actual {
-        AssertionActual::Value(Value::Integer(v)) => *v,
-        AssertionActual::Value(Value::Timestamp(v)) => *v,
-        AssertionActual::Value(Value::U64(v)) => (*v).min(i64::MAX as u64) as i64,
-        AssertionActual::Version(v) | AssertionActual::Count(v) => (*v).min(i64::MAX as u64) as i64,
-        AssertionActual::Bool(v) => i64::from(*v),
-        AssertionActual::Missing | AssertionActual::Bytes(_) | AssertionActual::Value(_) => 0,
-    }
-}
-
 impl<'a> ProcessorContext<'a> {
     pub async fn pull(&mut self, max_count: usize) -> Result<Vec<EventOutboxRecord>, AedbError> {
         let batch = self
@@ -926,48 +794,6 @@ impl<'a> ProcessorContext<'a> {
                 ConsistencyMode::AtLatest,
             )
             .await
-    }
-
-    pub fn accumulate(&mut self, accumulator: &str, delta: i64, dedupe_id: String, order_key: u64) {
-        self.pending.push(Mutation::Accumulate {
-            project_id: self.project_id.clone(),
-            scope_id: self.scope_id.clone(),
-            accumulator_name: accumulator.to_string(),
-            delta,
-            dedupe_key: dedupe_id,
-            order_key,
-            release_exposure_id: None,
-        });
-    }
-
-    pub async fn value(&self, accumulator: &str) -> Result<i64, AedbError> {
-        self.db
-            .accumulator_value(
-                &self.project_id,
-                &self.scope_id,
-                accumulator,
-                ConsistencyMode::AtLatest,
-            )
-            .await
-    }
-
-    pub fn expose(&mut self, accumulator: &str, amount: i64, dedupe_id: String) {
-        self.pending.push(Mutation::ExposeAccumulator {
-            project_id: self.project_id.clone(),
-            scope_id: self.scope_id.clone(),
-            accumulator_name: accumulator.to_string(),
-            amount,
-            exposure_id: dedupe_id,
-        });
-    }
-
-    pub fn release_exposure(&mut self, accumulator: &str, dedupe_id: String) {
-        self.pending.push(Mutation::ReleaseAccumulatorExposure {
-            project_id: self.project_id.clone(),
-            scope_id: self.scope_id.clone(),
-            accumulator_name: accumulator.to_string(),
-            exposure_id: dedupe_id,
-        });
     }
 
     pub fn emit(&mut self, event_name: &str, event_key: String, data_json: String) {

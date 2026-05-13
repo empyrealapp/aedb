@@ -177,7 +177,7 @@ async fn main() {
         println!(
             "  (>1 = redundant caches, OrdMap node overhead, version_store, secondary indexes,"
         );
-        println!("   accumulator deltas, async projections, allocator fragmentation, etc.)");
+        println!("   async projections, allocator fragmentation, etc.)");
     }
     if seed > 0 {
         let counter_per = counter / seed as usize;

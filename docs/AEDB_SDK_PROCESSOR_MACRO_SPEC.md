@@ -39,32 +39,21 @@ Reads and writes are typed by state/event type.
 - `first() -> Option<T>`
 - `rank(key) -> Option<usize>`
 
-### AccumulatorHandle API
-- `value()`
-- `value_strong()`
-- `available()`
-- `exposure()`
-- `lag()`
-
 ## Effect batch builder
 WASM game logic should return one `EffectBatch`:
-- `require_available(accumulator, min_amount)`
-- `require_exposure_ok(accumulator, amount)`
-- `accumulate(accumulator, delta).dedupe(id)`
-- `expose(accumulator, amount, dedupe_id)`
-- `release_exposure(accumulator, dedupe_id)`
+- atomic KV/table integer mutations for balances and counters
+- read assertions for non-negative, capacity, and compare-and-update checks
 - `put<T: State>(&T)`
 - `delete<T: State>(key)`
 - `emit<E: Event>(&E)`
 
-## Accumulator boundary
+## Atomic update boundary
 AEDB should expose primitive building blocks only:
-- positive/negative `accumulate`
-- availability and exposure reads
-- preconditions that reject insufficient balance/capacity
+- atomic numeric add/sub/max/min mutations
+- commit-time read assertions that reject insufficient balance/capacity
 
 AEDB should **not** encode app withdrawal policy semantics (for example `withdraw_delay` or `request_withdraw` workflow).  
-Application logic (Arcana) should implement delayed withdrawals by scheduling a later effect batch with `require_available + accumulate(negative_delta)`.
+Application logic (Arcana) should implement delayed withdrawals by scheduling a later effect batch with read assertions plus an atomic negative update.
 
 ## Processor macro
 `#[processor(...)]` defines typed event consumers with generated registration + invocation wiring.
@@ -76,14 +65,12 @@ Expected options:
 - `batch_size` (optional, defaulted)
 - `owns` (writable state types)
 - `reads` (read-only state types)
-- `reads_accumulators` (read-only accumulator names)
 
 `ProcessorCtx<E>` should provide:
 - `events()`
 - `state<T>()` for owned types
 - `read_state<T>()` for read-only types
-- `accumulate(name, key, delta, dedupe_id)`
-- `accumulator_value(name, key)`
+- atomic numeric update helpers
 - `commit()` (atomic writes + checkpoint advance)
 
 ## Error model
@@ -92,7 +79,6 @@ Expected options:
 
 ## Startup flow
 At startup, register:
-- accumulators
 - state schemas
 - event schemas
 - processors

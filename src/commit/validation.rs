@@ -218,18 +218,25 @@ pub enum Mutation {
         scope_id: String,
         key: Vec<u8>,
     },
+    /// Atomic big-endian U256 add using the current KV value as input.
+    /// Overflow/missing-key behavior is fixed for this legacy form; prefer
+    /// `KvAddU256Ex` when callers need explicit policy.
     KvIncU256 {
         project_id: String,
         scope_id: String,
         key: Vec<u8>,
         amount_be: [u8; 32],
     },
+    /// Atomic big-endian U256 subtract. The storage engine performs the
+    /// read-modify-write inside the commit path, so callers do not need to
+    /// serialize on a userland read. Underflow rejects the envelope.
     KvDecU256 {
         project_id: String,
         scope_id: String,
         key: Vec<u8>,
         amount_be: [u8; 32],
     },
+    /// Atomic U256 add with explicit missing-key and overflow policy.
     KvAddU256Ex {
         project_id: String,
         scope_id: String,
@@ -238,6 +245,10 @@ pub enum Mutation {
         on_missing: KvU256MissingPolicy,
         on_overflow: KvU256OverflowPolicy,
     },
+    /// Atomic U256 subtract with explicit missing-key and underflow policy.
+    /// Pair with `PostflightCheck` when a higher-level invariant must be
+    /// checked against the post-update value without adding a pre-apply read
+    /// dependency on the hot key.
     KvSubU256Ex {
         project_id: String,
         scope_id: String,
@@ -292,6 +303,9 @@ pub enum Mutation {
         on_missing: KvIntegerMissingPolicy,
         on_underflow: KvIntegerUnderflowPolicy,
     },
+    /// Atomic signed add with optional lower/upper bounds. This is useful for
+    /// balances that can be represented as i64 and need a "do not cross this
+    /// floor" check without a separate accumulator.
     KvAddI64Bounded {
         project_id: String,
         scope_id: String,
@@ -333,34 +347,12 @@ pub enum Mutation {
         operand_be: [u8; 8],
         expected_seq: Option<u64>,
     },
-    Accumulate {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        delta: i64,
-        dedupe_key: String,
-        order_key: u64,
-        #[serde(default)]
-        release_exposure_id: Option<String>,
-    },
-    ExposeAccumulator {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        amount: i64,
-        exposure_id: String,
-    },
-    ExposeAccumulatorBatch {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        exposures: Vec<(i64, String)>,
-    },
-    ReleaseAccumulatorExposure {
-        project_id: String,
-        scope_id: String,
-        accumulator_name: String,
-        exposure_id: String,
+    /// Evaluates assertions against the transaction-local state produced by
+    /// prior mutations in this write intent. Use this after atomic updates
+    /// when the invariant depends on the post-update value and should not
+    /// create a pre-apply read dependency that serializes a hot key.
+    PostflightCheck {
+        assertions: Vec<crate::commit::tx::ReadAssertion>,
     },
     EmitEvent {
         project_id: String,
@@ -377,6 +369,9 @@ pub enum Mutation {
         column: String,
         amount_be: [u8; 32],
     },
+    /// Atomic U256 decrement of a table cell. The row and column are resolved
+    /// inside commit; underflow rejects the envelope and no partial writes are
+    /// published.
     TableDecU256 {
         project_id: String,
         scope_id: String,
@@ -495,8 +490,8 @@ impl Mutation {
     /// Predicate-driven mutations (e.g. `DeleteWhere`, `UpdateWhere`)
     /// and batch inserts without resolved primary keys return a
     /// conservative `TableRange` over the full table. Mutations that
-    /// touch catalog or internal scope state (DDL, accumulators,
-    /// event outbox, order-book bookkeeping) return `ScopeAll` over
+    /// touch catalog or internal scope state (DDL, event outbox,
+    /// order-book bookkeeping) return `ScopeAll` over
     /// the affected (project, scope).
     pub fn write_keys(&self) -> Vec<crate::commit::tx::WriteKey> {
         use crate::commit::tx::{ReadBound, WriteKey};
@@ -694,27 +689,8 @@ impl Mutation {
                 scope_id: scope_id.clone(),
                 key: key.clone(),
             }],
-            Mutation::Accumulate {
-                project_id,
-                scope_id,
-                ..
-            }
-            | Mutation::ExposeAccumulator {
-                project_id,
-                scope_id,
-                ..
-            }
-            | Mutation::ExposeAccumulatorBatch {
-                project_id,
-                scope_id,
-                ..
-            }
-            | Mutation::ReleaseAccumulatorExposure {
-                project_id,
-                scope_id,
-                ..
-            }
-            | Mutation::EmitEvent {
+            Mutation::PostflightCheck { .. } => Vec::new(),
+            Mutation::EmitEvent {
                 project_id,
                 scope_id,
                 ..
@@ -829,6 +805,7 @@ pub fn validate_kv_sizes_early(mutation: &Mutation, config: &AedbConfig) -> Resu
                 )));
             }
         }
+        Mutation::PostflightCheck { .. } => {}
         // Other mutation types have different size constraints validated elsewhere
         _ => {}
     }
@@ -1222,110 +1199,8 @@ pub fn validate_mutation_with_config(
             }
             Ok(())
         }
-        Mutation::Accumulate {
-            project_id,
-            scope_id,
-            accumulator_name,
-            dedupe_key,
-            release_exposure_id,
-            ..
-        } => {
-            validate_identifier_like(accumulator_name, "accumulator_name")?;
-            if dedupe_key.trim().is_empty() {
-                return Err(AedbError::Validation("dedupe_key cannot be empty".into()));
-            }
-            if let Some(exposure_id) = release_exposure_id
-                && exposure_id.trim().is_empty()
-            {
-                return Err(AedbError::Validation(
-                    "release_exposure_id cannot be empty".into(),
-                ));
-            }
-            let ns = namespace_key(project_id, scope_id);
-            if !catalog
-                .accumulators
-                .contains_key(&(ns, accumulator_name.to_string()))
-            {
-                return Err(AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                )));
-            }
-            Ok(())
-        }
-        Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            amount,
-            exposure_id,
-        } => {
-            validate_identifier_like(accumulator_name, "accumulator_name")?;
-            if *amount <= 0 {
-                return Err(AedbError::Validation("exposure amount must be > 0".into()));
-            }
-            if exposure_id.trim().is_empty() {
-                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-            }
-            let ns = namespace_key(project_id, scope_id);
-            if !catalog
-                .accumulators
-                .contains_key(&(ns, accumulator_name.to_string()))
-            {
-                return Err(AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                )));
-            }
-            Ok(())
-        }
-        Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposures,
-        } => {
-            validate_identifier_like(accumulator_name, "accumulator_name")?;
-            if exposures.is_empty() {
-                return Err(AedbError::Validation("exposures cannot be empty".into()));
-            }
-            for (amount, exposure_id) in exposures {
-                if *amount <= 0 {
-                    return Err(AedbError::Validation("exposure amount must be > 0".into()));
-                }
-                if exposure_id.trim().is_empty() {
-                    return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-                }
-            }
-            let ns = namespace_key(project_id, scope_id);
-            if !catalog
-                .accumulators
-                .contains_key(&(ns, accumulator_name.to_string()))
-            {
-                return Err(AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                )));
-            }
-            Ok(())
-        }
-        Mutation::ReleaseAccumulatorExposure {
-            project_id,
-            scope_id,
-            accumulator_name,
-            exposure_id,
-        } => {
-            validate_identifier_like(accumulator_name, "accumulator_name")?;
-            if exposure_id.trim().is_empty() {
-                return Err(AedbError::Validation("exposure_id cannot be empty".into()));
-            }
-            let ns = namespace_key(project_id, scope_id);
-            if !catalog
-                .accumulators
-                .contains_key(&(ns, accumulator_name.to_string()))
-            {
-                return Err(AedbError::Validation(format!(
-                    "accumulator does not exist: {project_id}.{scope_id}.{accumulator_name}"
-                )));
-            }
-            Ok(())
+        Mutation::PostflightCheck { assertions } => {
+            crate::commit::assertions::validate_assertions(catalog, assertions)
         }
         Mutation::EmitEvent {
             project_id,
@@ -1708,6 +1583,9 @@ pub fn validate_permissions(
             "OrderBookMatch is system-only".into(),
         ));
     }
+    if matches!(mutation, Mutation::PostflightCheck { .. }) {
+        return Ok(());
+    }
     let is_admin = catalog.has_permission(&caller.caller_id, &Permission::GlobalAdmin);
     match mutation {
         Mutation::OrderBookNew { request, .. } => {
@@ -1873,34 +1751,12 @@ fn kv_write_target(mutation: &Mutation) -> Option<(&str, &str, &[u8])> {
             key,
             ..
         } => Some((project_id.as_str(), scope_id.as_str(), key.as_slice())),
-        Mutation::Accumulate {
+        Mutation::EmitEvent {
             project_id,
             scope_id,
-            accumulator_name,
+            topic,
             ..
-        }
-        | Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            accumulator_name,
-            ..
-        }
-        | Mutation::EmitEvent {
-            project_id,
-            scope_id,
-            topic: accumulator_name,
-            ..
-        } => Some((
-            project_id.as_str(),
-            scope_id.as_str(),
-            accumulator_name.as_bytes(),
-        )),
+        } => Some((project_id.as_str(), scope_id.as_str(), topic.as_bytes())),
         Mutation::OrderBookNew {
             project_id,
             scope_id,
@@ -2080,8 +1936,6 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             | DdlOperation::DropIndex { project_id, .. }
             | DdlOperation::CreateAsyncIndex { project_id, .. }
             | DdlOperation::DropAsyncIndex { project_id, .. }
-            | DdlOperation::CreateAccumulator { project_id, .. }
-            | DdlOperation::DropAccumulator { project_id, .. }
             | DdlOperation::EnableKvProjection { project_id, .. }
             | DdlOperation::DisableKvProjection { project_id, .. }
             | DdlOperation::SetReadPolicy { project_id, .. }
@@ -2194,26 +2048,6 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             scope_id,
             ..
         }
-        | Mutation::Accumulate {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ExposeAccumulator {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ExposeAccumulatorBatch {
-            project_id,
-            scope_id,
-            ..
-        }
-        | Mutation::ReleaseAccumulatorExposure {
-            project_id,
-            scope_id,
-            ..
-        }
         | Mutation::EmitEvent {
             project_id,
             scope_id,
@@ -2273,6 +2107,7 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             scope_id: Some(scope_id.clone()),
             prefix: None,
         }),
+        Mutation::PostflightCheck { .. } => Ok(Permission::GlobalAdmin),
     }
 }
 
