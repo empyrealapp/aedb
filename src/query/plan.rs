@@ -94,6 +94,7 @@ pub struct Query {
     pub predicate: Option<Expr>,
     pub order_by: Vec<(String, Order)>,
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
     pub group_by: Vec<String>,
     pub aggregates: Vec<Aggregate>,
     pub having: Option<Expr>,
@@ -174,6 +175,7 @@ impl Query {
             predicate: None,
             order_by: Vec::new(),
             limit: None,
+            offset: None,
             group_by: vec![],
             aggregates: Vec::new(),
             having: None,
@@ -254,6 +256,11 @@ impl Query {
 
     pub fn limit(mut self, n: usize) -> Self {
         self.limit = Some(n);
+        self
+    }
+
+    pub fn offset(mut self, n: usize) -> Self {
+        self.offset = Some(n);
         self
     }
 

@@ -1286,6 +1286,113 @@ fn uppercase_hex_cursor_is_accepted() {
 }
 
 #[test]
+fn limit_offset_scan_stops_after_requested_window() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"]).from("users").limit(5).offset(10),
+    )
+    .expect("offset page");
+
+    let ids = result
+        .rows
+        .iter()
+        .map(|row| row.values[0].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            Value::Integer(10),
+            Value::Integer(11),
+            Value::Integer(12),
+            Value::Integer(13),
+            Value::Integer(14),
+        ]
+    );
+    assert!(result.truncated);
+    assert!(result.cursor.is_none());
+    assert_eq!(result.rows_examined, 16);
+}
+
+#[test]
+fn limit_offset_uses_index_candidate_window() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .where_(col("age").eq(lit(20)))
+            .limit(1)
+            .offset(1),
+    )
+    .expect("indexed offset page");
+
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(52));
+    assert_eq!(result.rows_examined, 2);
+}
+
+#[test]
+fn offset_requires_limit_and_cannot_mix_with_cursor() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let err = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"]).from("users").offset(1),
+    )
+    .expect_err("offset without limit");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+
+    let first = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .order_by("id", Order::Asc)
+            .limit(5),
+        &QueryOptions::default(),
+        42,
+        10_000,
+        None,
+    )
+    .expect("first page");
+    let options = QueryOptions {
+        cursor: first.cursor,
+        ..QueryOptions::default()
+    };
+    let err = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .order_by("id", Order::Asc)
+            .limit(5)
+            .offset(5),
+        &options,
+        42,
+        10_000,
+        None,
+    )
+    .expect_err("cursor with offset");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+}
+
+#[test]
 fn validate_query_rejects_too_many_order_by_columns() {
     let schema = validation_schema_with_columns(33);
     let mut query = Query::select(&["*"]).from("wide");

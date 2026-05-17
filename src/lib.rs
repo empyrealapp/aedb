@@ -9263,6 +9263,7 @@ impl ReadTx<'_> {
             predicate: query.predicate.clone(),
             order_by: Vec::new(),
             limit: None,
+            offset: None,
             group_by: Vec::new(),
             aggregates: vec![crate::query::plan::Aggregate::Count],
             having: None,
@@ -9290,18 +9291,13 @@ impl ReadTx<'_> {
                 });
             }
             let mut full_query = query.clone();
-            full_query.limit = Some(requested_rows);
+            full_query.limit = Some(page_size.max(1));
+            full_query.offset = Some(offset);
             let full = self
                 .query_with_options(project_id, scope_id, full_query, QueryOptions::default())
                 .await?;
-            let rows = full
-                .rows
-                .into_iter()
-                .skip(offset)
-                .take(page_size.max(1))
-                .collect::<Vec<_>>();
             return Ok(ListPageResult {
-                rows,
+                rows: full.rows,
                 total_count,
                 next_cursor: None,
                 snapshot_seq: full.snapshot_seq,

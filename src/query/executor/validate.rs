@@ -7,6 +7,11 @@ use crate::query::plan::{
 };
 
 pub(super) fn validate_query(schema: &TableSchema, query: &Query) -> Result<(), QueryError> {
+    if query.offset.unwrap_or(0) > 0 && query.limit.is_none() {
+        return Err(QueryError::InvalidQuery {
+            reason: "OFFSET requires LIMIT".into(),
+        });
+    }
     if query.order_by.len() > MAX_ORDER_BY_COLUMNS {
         return Err(QueryError::InvalidQuery {
             reason: format!(
