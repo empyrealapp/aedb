@@ -383,86 +383,76 @@ fn execute_query_with_options_capturing_signed(
     let effective_page_size = page_size.min(max_scan_rows);
 
     let estimated_rows: usize;
-    let row_source: Box<dyn Iterator<Item = Row> + Send> =
-        if let Some(async_index) = &options.async_index {
-            let projection = snapshot
-                .async_index(project_id, scope_id, &query.table, async_index)
-                .ok_or_else(|| QueryError::InvalidQuery {
-                    reason: "async index not found".into(),
-                })?;
-            materialized_seq = Some(projection.materialized_seq);
-            estimated_rows = projection.rows.len();
-            // Async-index projections expose their own materialized_seq; fall
-            // back to recording a coarse table range for the underlying table
-            // so writes invalidate subscribers.
-            if let Some(collector) = read_set.as_deref_mut() {
-                collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
-            }
-            let rows: Vec<Row> = projection.rows.values().cloned().collect();
-            Box::new(rows.into_iter())
-        } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
-            let candidate_limit = if cursor_state.is_none()
-                && query.order_by.is_empty()
-                && query.aggregates.is_empty()
-                && query.having.is_none()
-            {
-                Some(effective_page_size.saturating_add(1))
-            } else {
-                None
-            };
-            let indexed_pks = indexed_pks_for_predicate_limited(
-                catalog,
-                project_id,
-                scope_id,
-                &query.table,
-                table,
-                predicate,
-                candidate_limit,
-            )?
-            .map(|result| result.pks);
-            match indexed_pks {
-                Some(pks) => {
-                    if let Some(collector) = read_set.as_deref_mut() {
-                        collector.record_touched_pks(
-                            snapshot,
-                            schema,
-                            project_id,
-                            scope_id,
-                            &query.table,
-                            &pks,
-                        );
-                    }
-                    estimated_rows = pks.len();
-                    let rows: Vec<Row> = pks
-                        .into_iter()
-                        .filter_map(|pk| table.rows.get(&pk).cloned())
-                        .collect();
-                    Box::new(rows.into_iter())
-                }
-                None => {
-                    if let Some(collector) = read_set.as_deref_mut() {
-                        collector.record_full_table_scan(
-                            snapshot,
-                            project_id,
-                            scope_id,
-                            &query.table,
-                        );
-                    }
-                    estimated_rows = table.rows.len();
-                    let rows: Vec<Row> = table.rows.values().cloned().collect();
-                    Box::new(rows.into_iter())
-                }
-            }
+    let row_source: Box<dyn Iterator<Item = Row> + Send + '_> = if let Some(async_index) =
+        &options.async_index
+    {
+        let projection = snapshot
+            .async_index(project_id, scope_id, &query.table, async_index)
+            .ok_or_else(|| QueryError::InvalidQuery {
+                reason: "async index not found".into(),
+            })?;
+        materialized_seq = Some(projection.materialized_seq);
+        estimated_rows = projection.rows.len();
+        // Async-index projections expose their own materialized_seq; fall
+        // back to recording a coarse table range for the underlying table
+        // so writes invalidate subscribers.
+        if let Some(collector) = read_set.as_deref_mut() {
+            collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
+        }
+        Box::new(projection.rows.values().cloned())
+    } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
+        let candidate_limit = if cursor_state.is_none()
+            && query.order_by.is_empty()
+            && query.aggregates.is_empty()
+            && query.having.is_none()
+        {
+            Some(effective_page_size.saturating_add(1))
         } else {
-            if let Some(collector) = read_set.as_deref_mut() {
-                collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
-            }
-            let rows: Vec<Row> = table
-                .map(|t| t.rows.values().cloned().collect())
-                .unwrap_or_default();
-            estimated_rows = rows.len();
-            Box::new(rows.into_iter())
+            None
         };
+        let indexed_pks = indexed_pks_for_predicate_limited(
+            catalog,
+            project_id,
+            scope_id,
+            &query.table,
+            table,
+            predicate,
+            candidate_limit,
+        )?
+        .map(|result| result.pks);
+        match indexed_pks {
+            Some(pks) => {
+                if let Some(collector) = read_set.as_deref_mut() {
+                    collector.record_touched_pks(
+                        snapshot,
+                        schema,
+                        project_id,
+                        scope_id,
+                        &query.table,
+                        &pks,
+                    );
+                }
+                estimated_rows = pks.len();
+                Box::new(
+                    pks.into_iter()
+                        .filter_map(move |pk| table.rows.get(&pk).cloned()),
+                )
+            }
+            None => {
+                if let Some(collector) = read_set.as_deref_mut() {
+                    collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
+                }
+                estimated_rows = table.rows.len();
+                Box::new(table.rows.values().cloned())
+            }
+        }
+    } else {
+        if let Some(collector) = read_set.as_deref_mut() {
+            collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
+        }
+        estimated_rows = table.map_or(0, |t| t.rows.len());
+        Box::new(table.into_iter().flat_map(|t| t.rows.values().cloned()))
+    };
 
     if estimated_rows > max_scan_rows
         && query_requires_full_evaluation(&query, cursor_state.is_some())
@@ -480,7 +470,7 @@ fn execute_query_with_options_capturing_signed(
         query.predicate.is_some(),
     )?;
 
-    let mut root: Box<dyn Operator + Send> = Box::new(ScanOperator::new(row_source));
+    let mut root: Box<dyn Operator + Send + '_> = Box::new(ScanOperator::new(row_source));
     let mut selected_indices: Option<Vec<usize>> = None;
     let mut row_columns = columns.clone();
     for stage in &physical_plan.stages {

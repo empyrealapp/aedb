@@ -17,6 +17,7 @@ const PAGE_FRAME_HEADER_BYTES: usize = 48;
 const MIN_PAGE_BYTES: usize = 256;
 const MAX_PAGE_BYTES: usize = 16 * 1024 * 1024;
 const PAGE_STORE_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+const PAGE_STORE_ZERO_BUFFER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PageId(pub u64);
@@ -121,15 +122,15 @@ impl PagedStore {
             let page_id = PageId(self.page_count.load(Ordering::Acquire));
             let blake3_hash = page_hash(page_id, payload);
 
-            let mut frame = vec![0u8; PAGE_FRAME_HEADER_BYTES + self.page_size];
-            frame[0..8].copy_from_slice(&page_id.0.to_le_bytes());
-            frame[8..12].copy_from_slice(&page_len.to_le_bytes());
-            frame[16..48].copy_from_slice(&blake3_hash);
-            frame[PAGE_FRAME_HEADER_BYTES..PAGE_FRAME_HEADER_BYTES + payload.len()]
-                .copy_from_slice(payload);
+            let mut header = [0u8; PAGE_FRAME_HEADER_BYTES];
+            header[0..8].copy_from_slice(&page_id.0.to_le_bytes());
+            header[8..12].copy_from_slice(&page_len.to_le_bytes());
+            header[16..48].copy_from_slice(&blake3_hash);
 
             file.seek(SeekFrom::End(0))?;
-            file.write_all(&frame)?;
+            file.write_all(&header)?;
+            file.write_all(payload)?;
+            write_zero_padding(&mut *file, self.page_size.saturating_sub(payload.len()))?;
             file.flush()?;
             let next_page_count =
                 page_id
@@ -170,29 +171,29 @@ impl PagedStore {
         {
             let mut file = self.file.lock();
             let mut next_page_id = self.page_count.load(Ordering::Acquire);
-            let mut frame = vec![0u8; PAGE_FRAME_HEADER_BYTES + self.page_size];
             let write_buf_capacity = PAGE_STORE_WRITE_BUFFER_BYTES
-                .max(frame.len())
-                .min(frame.len().saturating_mul(payloads.len()));
+                .min(
+                    PAGE_FRAME_HEADER_BYTES
+                        .saturating_add(self.page_size)
+                        .saturating_mul(payloads.len()),
+                )
+                .max(PAGE_FRAME_HEADER_BYTES);
             let mut write_buf = Vec::with_capacity(write_buf_capacity);
-            let mut previous_payload_len = 0usize;
             file.seek(SeekFrom::End(0))?;
             for (payload, page_len) in payloads.iter().zip(page_lens.into_iter()) {
                 let page_id = PageId(next_page_id);
                 let blake3_hash = page_hash(page_id, payload);
-                frame[0..8].copy_from_slice(&page_id.0.to_le_bytes());
-                frame[8..12].copy_from_slice(&page_len.to_le_bytes());
-                frame[12..16].fill(0);
-                frame[16..48].copy_from_slice(&blake3_hash);
-                frame[PAGE_FRAME_HEADER_BYTES..PAGE_FRAME_HEADER_BYTES + payload.len()]
-                    .copy_from_slice(payload);
-                if payload.len() < previous_payload_len {
-                    frame[PAGE_FRAME_HEADER_BYTES + payload.len()
-                        ..PAGE_FRAME_HEADER_BYTES + previous_payload_len]
-                        .fill(0);
-                }
-                append_frame_to_writer(&mut *file, &mut write_buf, &frame)?;
-                previous_payload_len = payload.len();
+                let mut header = [0u8; PAGE_FRAME_HEADER_BYTES];
+                header[0..8].copy_from_slice(&page_id.0.to_le_bytes());
+                header[8..12].copy_from_slice(&page_len.to_le_bytes());
+                header[16..48].copy_from_slice(&blake3_hash);
+                append_bytes_to_writer(&mut *file, &mut write_buf, &header)?;
+                append_bytes_to_writer(&mut *file, &mut write_buf, payload)?;
+                append_zero_padding_to_writer(
+                    &mut *file,
+                    &mut write_buf,
+                    self.page_size.saturating_sub(payload.len()),
+                )?;
                 refs.push(PageRef {
                     page_id,
                     len: page_len,
@@ -262,51 +263,44 @@ impl PagedStore {
             });
         }
         let frame_offset = frame_offset(page_ref.page_id, self.page_stride)?;
-        let frame_read_len = PAGE_FRAME_HEADER_BYTES
-            .checked_add(expected_len)
-            .ok_or_else(|| AedbError::IntegrityError {
-                message: "page frame read length overflow".into(),
-            })?;
-        let mut frame_prefix = vec![0u8; frame_read_len];
-        read_exact_at(&self.read_file, &mut frame_prefix, frame_offset)?;
+        let mut header = [0u8; PAGE_FRAME_HEADER_BYTES];
+        read_exact_at(&self.read_file, &mut header, frame_offset)?;
         let stored_page_id =
-            {
-                let header = &frame_prefix[..PAGE_FRAME_HEADER_BYTES];
-                u64::from_le_bytes(header[0..8].try_into().map_err(|_| {
-                    AedbError::IntegrityError {
+            u64::from_le_bytes(
+                header[0..8]
+                    .try_into()
+                    .map_err(|_| AedbError::IntegrityError {
                         message: "invalid page id header".into(),
-                    }
-                })?)
-            };
+                    })?,
+            );
         if stored_page_id != page_ref.page_id.0 {
             return Err(AedbError::IntegrityError {
                 message: "page id header mismatch".into(),
             });
         }
-        let stored_len =
-            {
-                let header = &frame_prefix[..PAGE_FRAME_HEADER_BYTES];
-                u32::from_le_bytes(header[8..12].try_into().map_err(|_| {
-                    AedbError::IntegrityError {
-                        message: "invalid page length header".into(),
-                    }
-                })?)
-            };
+        let stored_len = u32::from_le_bytes(header[8..12].try_into().map_err(|_| {
+            AedbError::IntegrityError {
+                message: "invalid page length header".into(),
+            }
+        })?);
         if stored_len != page_ref.len || stored_len as usize > self.page_size {
             return Err(AedbError::IntegrityError {
                 message: "page length header mismatch".into(),
             });
         }
         let mut stored_hash = [0u8; 32];
-        stored_hash.copy_from_slice(&frame_prefix[16..48]);
+        stored_hash.copy_from_slice(&header[16..48]);
         if stored_hash != page_ref.blake3_hash {
             return Err(AedbError::IntegrityError {
                 message: "page hash header mismatch".into(),
             });
         }
-        frame_prefix.copy_within(PAGE_FRAME_HEADER_BYTES..frame_read_len, 0);
-        frame_prefix.truncate(expected_len);
-        let payload = frame_prefix;
+        let mut payload = vec![0u8; expected_len];
+        read_exact_at(
+            &self.read_file,
+            &mut payload,
+            frame_offset + PAGE_FRAME_HEADER_BYTES as u64,
+        )?;
         if page_hash(page_ref.page_id, &payload) != page_ref.blake3_hash {
             return Err(AedbError::IntegrityError {
                 message: "page payload hash mismatch".into(),
@@ -413,20 +407,34 @@ fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> Result<(),
 #[cfg(not(any(unix, windows)))]
 compile_error!("PagedStore requires positional file reads for concurrent cold read safety");
 
-fn append_frame_to_writer<W: Write>(
+fn append_bytes_to_writer<W: Write>(
     writer: &mut W,
     write_buf: &mut Vec<u8>,
-    frame: &[u8],
+    bytes: &[u8],
 ) -> Result<(), AedbError> {
-    if frame.len() > PAGE_STORE_WRITE_BUFFER_BYTES {
+    if bytes.len() > PAGE_STORE_WRITE_BUFFER_BYTES {
         flush_write_buffer(writer, write_buf)?;
-        writer.write_all(frame)?;
+        writer.write_all(bytes)?;
         return Ok(());
     }
-    if write_buf.len() + frame.len() > PAGE_STORE_WRITE_BUFFER_BYTES {
+    if write_buf.len() + bytes.len() > PAGE_STORE_WRITE_BUFFER_BYTES {
         flush_write_buffer(writer, write_buf)?;
     }
-    write_buf.extend_from_slice(frame);
+    write_buf.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_zero_padding_to_writer<W: Write>(
+    writer: &mut W,
+    write_buf: &mut Vec<u8>,
+    mut byte_count: usize,
+) -> Result<(), AedbError> {
+    let zeros = [0u8; PAGE_STORE_ZERO_BUFFER_BYTES];
+    while byte_count > 0 {
+        let write_count = byte_count.min(zeros.len());
+        append_bytes_to_writer(writer, write_buf, &zeros[..write_count])?;
+        byte_count -= write_count;
+    }
     Ok(())
 }
 
@@ -434,6 +442,16 @@ fn flush_write_buffer<W: Write>(writer: &mut W, write_buf: &mut Vec<u8>) -> Resu
     if !write_buf.is_empty() {
         writer.write_all(write_buf)?;
         write_buf.clear();
+    }
+    Ok(())
+}
+
+fn write_zero_padding<W: Write>(writer: &mut W, mut byte_count: usize) -> Result<(), AedbError> {
+    let zeros = [0u8; PAGE_STORE_ZERO_BUFFER_BYTES];
+    while byte_count > 0 {
+        let write_count = byte_count.min(zeros.len());
+        writer.write_all(&zeros[..write_count])?;
+        byte_count -= write_count;
     }
     Ok(())
 }

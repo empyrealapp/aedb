@@ -3227,6 +3227,8 @@ fn merge_parallel_namespace_result(
     };
     let mut added: usize = 0;
     let mut removed: usize = 0;
+    let use_point_lookup_cache =
+        keyspace.primary_index_backend == crate::config::PrimaryIndexBackend::ArtExperimental;
     let dest = keyspace.namespace_mut(ns_id.clone());
     let mut table_names: Vec<_> = targets.tables.iter().cloned().collect();
     table_names.sort();
@@ -3261,8 +3263,10 @@ fn merge_parallel_namespace_result(
                 Some(row) => {
                     added = added.saturating_add(row_mem_cost(row));
                     dest_table.rows.insert(row_key.clone(), row.clone());
-                    dest_table.row_cache.insert(row_key.clone(), row.clone());
-                    dest_table.pk_hash.insert(row_key.clone(), ());
+                    if use_point_lookup_cache {
+                        dest_table.row_cache.insert(row_key.clone(), row.clone());
+                        dest_table.pk_hash.insert(row_key.clone(), ());
+                    }
                 }
                 None => {
                     dest_table.rows.remove(row_key);
@@ -3274,9 +3278,11 @@ fn merge_parallel_namespace_result(
             match source_table.and_then(|table| table.row_versions.get(row_key)) {
                 Some(version) => {
                     dest_table.row_versions.insert(row_key.clone(), *version);
-                    dest_table
-                        .row_versions_cache
-                        .insert(row_key.clone(), *version);
+                    if use_point_lookup_cache {
+                        dest_table
+                            .row_versions_cache
+                            .insert(row_key.clone(), *version);
+                    }
                 }
                 None => {
                     dest_table.row_versions.remove(row_key);

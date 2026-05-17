@@ -53,10 +53,10 @@ pub fn load_checkpoint_with_key(
         }
         Cow::Borrowed(compressed)
     };
-    let decompressed = zstd::stream::decode_all(compressed.as_ref())
+    let mut decoder = zstd::stream::Decoder::new(compressed.as_ref())
         .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
     let data: CheckpointData =
-        rmp_serde::from_slice(&decompressed).map_err(|e| AedbError::Decode(e.to_string()))?;
+        rmp_serde::from_read(&mut decoder).map_err(|e| AedbError::Decode(e.to_string()))?;
     let mut keyspace = Keyspace {
         primary_index_backend: data.keyspace.primary_index_backend,
         value_store: None,
@@ -92,9 +92,9 @@ fn decrypt_checkpoint_payload(bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, A
 #[cfg(test)]
 mod tests {
     use super::{load_checkpoint, load_checkpoint_with_key};
+    use crate::catalog::Catalog;
     use crate::catalog::schema::ColumnDef;
     use crate::catalog::types::{ColumnType, Row, Value};
-    use crate::catalog::Catalog;
     use crate::checkpoint::writer::{write_checkpoint, write_checkpoint_with_key};
     use crate::storage::keyspace::Keyspace;
     use tempfile::tempdir;

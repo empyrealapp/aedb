@@ -366,10 +366,10 @@ fn sha256_prefix_hex(path: &Path, bytes_to_hash: u64) -> Result<String, AedbErro
     use sha2::{Digest, Sha256};
 
     let mut file = File::open(path)?;
-    let mut reader = std::io::BufReader::new(&mut file);
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, &mut file);
     let mut hasher = Sha256::new();
     let mut remaining_size_bytes = bytes_to_hash;
-    let mut buffer = [0u8; 16 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     while remaining_size_bytes > 0 {
         let read_size_bytes =
             usize::try_from(remaining_size_bytes.min(buffer.len() as u64)).unwrap_or(buffer.len());
@@ -386,7 +386,17 @@ fn sha256_prefix_hex(path: &Path, bytes_to_hash: u64) -> Result<String, AedbErro
             "segment shorter than expected".into(),
         ));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex_string(hasher.finalize().as_slice()))
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]

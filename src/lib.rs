@@ -82,13 +82,13 @@ use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 use hmac::{Hmac, Mac};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::File;
 use std::future::Future;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -8147,7 +8147,6 @@ impl AedbInstance {
         let keyspace = Arc::clone(&lease.view.keyspace);
         let catalog = Arc::clone(&lease.view.catalog);
         let idempotency = self.executor.idempotency_snapshot().await;
-        drop(lease);
 
         let backup_dir = backup_dir.to_path_buf();
         let source_dir = self.dir.clone();
@@ -8170,18 +8169,15 @@ impl AedbInstance {
 
             let mut wal_segments = Vec::new();
             let mut file_sha256 = BTreeMap::new();
-            file_sha256.insert(
-                checkpoint.filename.clone(),
-                sha256_file_hex(&backup_dir.join(&checkpoint.filename))?,
-            );
+            file_sha256.insert(checkpoint.filename.clone(), checkpoint.sha256_hex.clone());
 
             for segment in read_segments_for_checkpoint(&source_dir, snapshot_seq)? {
                 let src = source_dir.join(&segment.filename);
                 let rel = format!("wal_tail/{}", segment.filename);
                 let dst = backup_dir.join(&rel);
-                copy_file_prefix(&src, &dst, segment.size_bytes)?;
+                let hash = copy_file_prefix_sha256_hex(&src, &dst, segment.size_bytes)?;
                 wal_segments.push(segment.filename);
-                file_sha256.insert(rel, sha256_file_hex(&dst)?);
+                file_sha256.insert(rel, hash);
             }
 
             wal_segments.sort_by_key(|name| segment_seq_from_name(name).unwrap_or(0));
@@ -8259,9 +8255,9 @@ impl AedbInstance {
             }
             let rel = format!("wal_tail/{}", segment.filename);
             let dst = backup_dir.join(&rel);
-            copy_file_prefix(&src, &dst, segment.size_bytes)?;
+            let hash = copy_file_prefix_sha256_hex(&src, &dst, segment.size_bytes)?;
             wal_segments.push(segment.filename);
-            file_sha256.insert(rel, sha256_file_hex(&dst)?);
+            file_sha256.insert(rel, hash);
         }
 
         wal_segments.sort_by_key(|name| segment_seq_from_name(name).unwrap_or(0));
