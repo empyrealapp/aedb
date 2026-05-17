@@ -12,6 +12,8 @@ use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use tracing::warn;
 
+const WAL_REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
+
 #[allow(clippy::too_many_arguments)]
 pub fn replay_segments(
     segments: &[PathBuf],
@@ -45,7 +47,7 @@ pub fn replay_segments(
         if replay_size_bytes <= SEGMENT_HEADER_SIZE as u64 {
             continue;
         }
-        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let mut reader = BufReader::with_capacity(WAL_REPLAY_BUFFER_BYTES, file);
         let mut header = [0u8; SEGMENT_HEADER_SIZE];
         reader.read_exact(&mut header)?;
         let payload_size_bytes = replay_size_bytes.saturating_sub(SEGMENT_HEADER_SIZE as u64);
@@ -59,7 +61,7 @@ pub fn replay_segments(
                     if let Some(to_seq) = to_seq_inclusive
                         && frame.commit_seq > to_seq
                     {
-                        continue;
+                        return Ok(max_seq);
                     }
                     if frame.commit_seq <= last_applied_seq {
                         return Err(AedbError::Validation(

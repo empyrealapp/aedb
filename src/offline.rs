@@ -425,7 +425,7 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                     ns_id
                 ));
             }
-            if table_data.rows.len() != table_data.pk_hash.len() {
+            if !table_data.pk_hash.is_empty() && table_data.rows.len() != table_data.pk_hash.len() {
                 violations.push(format!(
                     "pk_hash cardinality mismatch in namespace={:?} table={table_name}",
                     ns_id

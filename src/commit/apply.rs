@@ -96,8 +96,9 @@ pub fn apply_mutation_with_read_budget(
             for row in rows {
                 let primary_key =
                     extract_primary_key_from_row_with_indices(&row, &schema, &primary_key_indices)?;
+                let encoded_pk = EncodedKey::from_values(&primary_key);
                 if keyspace
-                    .get_row(&project_id, &scope_id, &table_name, &primary_key)
+                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)
                     .is_some()
                 {
                     return Err(AedbError::DuplicatePK {
@@ -105,7 +106,7 @@ pub fn apply_mutation_with_read_budget(
                         key: format!("{primary_key:?}"),
                     });
                 }
-                apply_upsert_once_with_schema(
+                apply_upsert_once_with_schema_and_old_row(
                     catalog,
                     keyspace,
                     &schema,
@@ -113,6 +114,8 @@ pub fn apply_mutation_with_read_budget(
                     &scope_id,
                     &table_name,
                     primary_key,
+                    encoded_pk,
+                    None,
                     row,
                     commit_seq,
                 )?;
@@ -154,7 +157,11 @@ pub fn apply_mutation_with_read_budget(
             for row in rows {
                 let primary_key =
                     extract_primary_key_from_row_with_indices(&row, &schema, &primary_key_indices)?;
-                apply_upsert_once_with_schema(
+                let encoded_pk = EncodedKey::from_values(&primary_key);
+                let old_row = keyspace
+                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)
+                    .cloned();
+                apply_upsert_once_with_schema_and_old_row(
                     catalog,
                     keyspace,
                     &schema,
@@ -162,6 +169,8 @@ pub fn apply_mutation_with_read_budget(
                     &scope_id,
                     &table_name,
                     primary_key,
+                    encoded_pk,
+                    old_row,
                     row,
                     commit_seq,
                 )?;
@@ -1173,8 +1182,9 @@ pub fn apply_mutation_trusted_if_eligible(
                         break;
                     }
                 };
+                let encoded_pk = EncodedKey::from_values(&primary_key);
                 if keyspace
-                    .get_row(&project_id, &scope_id, &table_name, &primary_key)
+                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)
                     .is_some()
                 {
                     result = Err(AedbError::DuplicatePK {
@@ -1183,7 +1193,7 @@ pub fn apply_mutation_trusted_if_eligible(
                     });
                     break;
                 }
-                if let Err(err) = apply_upsert_once_with_schema(
+                if let Err(err) = apply_upsert_once_with_schema_and_old_row(
                     catalog,
                     keyspace,
                     &schema,
@@ -1191,6 +1201,8 @@ pub fn apply_mutation_trusted_if_eligible(
                     &scope_id,
                     &table_name,
                     primary_key,
+                    encoded_pk,
+                    None,
                     row,
                     commit_seq,
                 ) {
@@ -1254,13 +1266,16 @@ pub fn apply_mutation_trusted_if_eligible(
                         break;
                     }
                 };
-                if let Err(err) = apply_upsert_trusted_fast(
+                let encoded_pk = EncodedKey::from_values(&primary_key);
+                if let Err(err) = apply_upsert_trusted_fast_with_schema(
                     catalog,
                     keyspace,
+                    &schema,
                     &project_id,
                     &scope_id,
                     &table_name,
                     primary_key,
+                    encoded_pk,
                     row,
                     commit_seq,
                 ) {
@@ -1951,14 +1966,42 @@ fn apply_upsert_trusted_fast(
             "trusted fast path is not eligible for this table".into(),
         ));
     }
-    let old_row = keyspace
-        .get_row(project_id, scope_id, table_name, &primary_key)
-        .cloned();
-    keyspace.upsert_row(
+    let encoded_pk = EncodedKey::from_values(&primary_key);
+    apply_upsert_trusted_fast_with_schema(
+        catalog,
+        keyspace,
+        &schema,
         project_id,
         scope_id,
         table_name,
-        primary_key.clone(),
+        primary_key,
+        encoded_pk,
+        row,
+        commit_seq,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_upsert_trusted_fast_with_schema(
+    catalog: &mut Catalog,
+    keyspace: &mut Keyspace,
+    schema: &TableSchema,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: Vec<Value>,
+    encoded_pk: EncodedKey,
+    row: Row,
+    commit_seq: u64,
+) -> Result<(), AedbError> {
+    let old_row = keyspace
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
+        .cloned();
+    keyspace.upsert_row_by_encoded_pk(
+        project_id,
+        scope_id,
+        table_name,
+        encoded_pk,
         row.clone(),
         commit_seq,
     );
@@ -2021,8 +2064,9 @@ fn apply_insert_once(
     row: Row,
     commit_seq: u64,
 ) -> Result<(), AedbError> {
+    let encoded_pk = EncodedKey::from_values(&primary_key);
     if keyspace
-        .get_row(project_id, scope_id, table_name, &primary_key)
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
         .is_some()
     {
         return Err(AedbError::DuplicatePK {
@@ -2036,7 +2080,7 @@ fn apply_insert_once(
         .get(&(ns, table_name.to_string()))
         .ok_or_else(|| AedbError::Validation("table missing".into()))?
         .clone();
-    apply_upsert_once_with_schema(
+    apply_upsert_once_with_schema_and_old_row(
         catalog,
         keyspace,
         &schema,
@@ -2044,6 +2088,8 @@ fn apply_insert_once(
         scope_id,
         table_name,
         primary_key,
+        encoded_pk,
+        None,
         row,
         commit_seq,
     )

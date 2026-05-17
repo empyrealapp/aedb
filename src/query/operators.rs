@@ -170,16 +170,16 @@ pub trait Operator {
     }
 }
 
-pub struct ScanOperator {
-    rows: Box<dyn Iterator<Item = Row> + Send>,
+pub struct ScanOperator<'a> {
+    rows: Box<dyn Iterator<Item = Row> + Send + 'a>,
     examined: usize,
 }
 
-impl ScanOperator {
+impl<'a> ScanOperator<'a> {
     pub fn new<I>(rows: I) -> Self
     where
         I: IntoIterator<Item = Row>,
-        I::IntoIter: Iterator<Item = Row> + Send + 'static,
+        I::IntoIter: Iterator<Item = Row> + Send + 'a,
     {
         Self {
             rows: Box::new(rows.into_iter()),
@@ -188,7 +188,7 @@ impl ScanOperator {
     }
 }
 
-impl Operator for ScanOperator {
+impl Operator for ScanOperator<'_> {
     fn next(&mut self) -> Option<Row> {
         let row = self.rows.next()?;
         self.examined += 1;
@@ -213,18 +213,18 @@ impl Operator for ScanOperator {
     }
 }
 
-pub struct FilterOperator {
-    child: Box<dyn Operator + Send>,
+pub struct FilterOperator<'a> {
+    child: Box<dyn Operator + Send + 'a>,
     predicate: CompiledExpr,
 }
 
-impl FilterOperator {
-    pub fn new(child: Box<dyn Operator + Send>, predicate: CompiledExpr) -> Self {
+impl<'a> FilterOperator<'a> {
+    pub fn new(child: Box<dyn Operator + Send + 'a>, predicate: CompiledExpr) -> Self {
         Self { child, predicate }
     }
 }
 
-impl Operator for FilterOperator {
+impl Operator for FilterOperator<'_> {
     fn next(&mut self) -> Option<Row> {
         loop {
             let row = self.child.next()?;
@@ -363,18 +363,18 @@ fn compile_expr_uncached(
     }
 }
 
-pub struct ProjectOperator {
-    child: Box<dyn Operator + Send>,
+pub struct ProjectOperator<'a> {
+    child: Box<dyn Operator + Send + 'a>,
     selected: Vec<usize>,
 }
 
-impl ProjectOperator {
-    pub fn new(child: Box<dyn Operator + Send>, selected: Vec<usize>) -> Self {
+impl<'a> ProjectOperator<'a> {
+    pub fn new(child: Box<dyn Operator + Send + 'a>, selected: Vec<usize>) -> Self {
         Self { child, selected }
     }
 }
 
-impl Operator for ProjectOperator {
+impl Operator for ProjectOperator<'_> {
     fn next(&mut self) -> Option<Row> {
         let row = self.child.next()?;
         let values = self
@@ -416,12 +416,12 @@ pub struct SortOperator {
 }
 
 impl SortOperator {
-    pub fn new(child: Box<dyn Operator + Send>, order_by: Vec<(usize, Order)>) -> Self {
+    pub fn new(child: Box<dyn Operator + Send + '_>, order_by: Vec<(usize, Order)>) -> Self {
         Self::new_with_limit(child, order_by, None)
     }
 
     pub fn new_with_limit(
-        mut child: Box<dyn Operator + Send>,
+        mut child: Box<dyn Operator + Send + '_>,
         order_by: Vec<(usize, Order)>,
         limit: Option<usize>,
     ) -> Self {
@@ -643,13 +643,13 @@ impl Operator for SortOperator {
     }
 }
 
-pub struct LimitOperator {
-    child: Box<dyn Operator + Send>,
+pub struct LimitOperator<'a> {
+    child: Box<dyn Operator + Send + 'a>,
     remaining: usize,
 }
 
-impl LimitOperator {
-    pub fn new(child: Box<dyn Operator + Send>, limit: usize) -> Self {
+impl<'a> LimitOperator<'a> {
+    pub fn new(child: Box<dyn Operator + Send + 'a>, limit: usize) -> Self {
         Self {
             child,
             remaining: limit,
@@ -657,7 +657,7 @@ impl LimitOperator {
     }
 }
 
-impl Operator for LimitOperator {
+impl Operator for LimitOperator<'_> {
     fn next(&mut self) -> Option<Row> {
         if self.remaining == 0 {
             return None;
@@ -779,7 +779,7 @@ impl AggregateState {
 
 impl AggregateOperator {
     pub fn new(
-        mut child: Box<dyn Operator + Send>,
+        mut child: Box<dyn Operator + Send + '_>,
         aggregates: Vec<Aggregate>,
         group_by_idx: Vec<usize>,
         aggregate_col_idx: Vec<Option<usize>>,

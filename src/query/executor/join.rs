@@ -26,6 +26,16 @@ pub(super) fn execute_join_query(
     cursor_state: Option<CursorToken>,
     cursor_signing_key: Option<&[u8; 32]>,
 ) -> Result<QueryResult, QueryError> {
+    if query.offset.unwrap_or(0) > 0 && query.limit.is_none() {
+        return Err(QueryError::InvalidQuery {
+            reason: "OFFSET requires LIMIT".into(),
+        });
+    }
+    if cursor_state.is_some() && query.offset.unwrap_or(0) > 0 {
+        return Err(QueryError::InvalidQuery {
+            reason: "OFFSET cannot be combined with cursor pagination".into(),
+        });
+    }
     let (base_ns_project, base_ns_scope, base_table) =
         resolve_table_ref(project_id, scope_id, &query.table);
     let base_schema = catalog
@@ -335,6 +345,13 @@ pub(super) fn execute_join_query(
             .unwrap_or(max_scan_rows.min(100))
     });
     let effective_page_size = page_size.min(max_scan_rows);
+    let row_offset_count = query.offset.unwrap_or(0);
+    if row_offset_count.saturating_add(effective_page_size) > max_scan_rows {
+        return Err(QueryError::ScanBoundExceeded {
+            estimated_rows: row_offset_count.saturating_add(effective_page_size) as u64,
+            max_scan_rows: max_scan_rows as u64,
+        });
+    }
     let sort_indices: Vec<(usize, crate::query::plan::Order)> = if !query.order_by.is_empty() {
         query
             .order_by
@@ -346,10 +363,15 @@ pub(super) fn execute_join_query(
     };
     let pk_indices: Vec<usize> = (0..columns.len()).collect();
     let mut sliced = Vec::new();
+    let mut skipped = 0usize;
     for row in rows {
         if let Some(cursor) = &cursor_state
             && !row_after_cursor(&row, cursor, &sort_indices, &pk_indices)
         {
+            continue;
+        }
+        if skipped < row_offset_count {
+            skipped += 1;
             continue;
         }
         sliced.push(row);
@@ -391,7 +413,7 @@ pub(super) fn execute_join_query(
         cursor_state.as_ref().and_then(|c| c.remaining_limit),
         returned_rows,
     );
-    let cursor = if has_more {
+    let cursor = if has_more && row_offset_count == 0 {
         let last_row = cursor_last_row.ok_or_else(|| QueryError::InvalidQuery {
             reason: "invalid cursor state".into(),
         })?;
@@ -413,7 +435,7 @@ pub(super) fn execute_join_query(
     Ok(QueryResult {
         rows_examined,
         rows: sliced,
-        truncated: cursor.is_some(),
+        truncated: has_more,
         cursor,
         snapshot_seq,
         materialized_seq: None,

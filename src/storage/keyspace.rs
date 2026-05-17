@@ -640,6 +640,25 @@ fn scan_kv_entries(
         return Ok(merged.into_iter().take(limit).collect());
     }
 
+    if kv.small_entries.is_empty() {
+        let mut out = Vec::with_capacity(limit.min(64));
+        for (key, entry) in kv.entries.range((start, end)).take(limit) {
+            out.push((key.clone(), materialize_kv_entry(entry, value_store)?));
+        }
+        return Ok(out);
+    }
+    if kv.entries.is_empty() {
+        let small_start = bound_to_compact_key(start);
+        let small_end = bound_to_compact_key(end);
+        let out = kv
+            .small_entries
+            .range((small_start, small_end))
+            .take(limit)
+            .map(|(key, entry)| (key.as_slice().to_vec(), entry.materialize()))
+            .collect();
+        return Ok(out);
+    }
+
     let small_start = bound_to_compact_key(start.clone());
     let small_end = bound_to_compact_key(end.clone());
     let mut small = kv.small_entries.range((small_start, small_end)).peekable();
@@ -1217,6 +1236,8 @@ impl Keyspace {
     }
 
     fn rebuild_point_lookup_caches(&mut self) {
+        let use_point_lookup_cache =
+            self.primary_index_backend == PrimaryIndexBackend::ArtExperimental;
         let namespace_ids: Vec<NamespaceId> = self.namespaces.keys().cloned().collect();
         for namespace_id in namespace_ids {
             let Some(namespace) = self.namespaces_mut().get_mut(&namespace_id) else {
@@ -1227,8 +1248,15 @@ impl Keyspace {
                 let Some(table) = namespace.tables.get_mut(&table_name) else {
                     continue;
                 };
-                table.row_cache = table.rows.clone().into_iter().collect();
-                table.row_versions_cache = table.row_versions.clone().into_iter().collect();
+                if use_point_lookup_cache {
+                    table.pk_hash = table.rows.keys().map(|pk| (pk.clone(), ())).collect();
+                    table.row_cache = table.rows.clone().into_iter().collect();
+                    table.row_versions_cache = table.row_versions.clone().into_iter().collect();
+                } else {
+                    table.pk_hash.clear();
+                    table.row_cache.clear();
+                    table.row_versions_cache.clear();
+                }
             }
         }
     }
@@ -1360,8 +1388,8 @@ impl Keyspace {
                 table.rows.insert(encoded_pk.clone(), row);
             }
             table.row_versions.insert(encoded_pk.clone(), commit_seq);
-            table.pk_hash.insert(encoded_pk.clone(), ());
             if use_cache {
+                table.pk_hash.insert(encoded_pk.clone(), ());
                 table.row_versions_cache.insert(encoded_pk, commit_seq);
             }
             old_cost

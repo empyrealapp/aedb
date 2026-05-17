@@ -1,8 +1,10 @@
 use crate::error::AedbError;
 use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+
+const WAL_SCAN_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub fn scan_segments(data_dir: &Path) -> Result<Vec<PathBuf>, AedbError> {
     let mut segments: Vec<(u64, PathBuf)> = fs::read_dir(data_dir)?
@@ -20,7 +22,7 @@ pub fn scan_segments(data_dir: &Path) -> Result<Vec<PathBuf>, AedbError> {
 pub fn verify_hash_chain(paths: &[PathBuf]) -> Result<(), AedbError> {
     let mut prev_hash = [0u8; 32];
     for path in paths {
-        let mut file = fs::File::open(path)?;
+        let mut file = BufReader::with_capacity(WAL_SCAN_BUFFER_BYTES, fs::File::open(path)?);
         let mut header = [0u8; SEGMENT_HEADER_SIZE];
         file.read_exact(&mut header)?;
         let parsed = SegmentHeader::from_bytes(&header)
@@ -31,7 +33,7 @@ pub fn verify_hash_chain(paths: &[PathBuf]) -> Result<(), AedbError> {
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&header);
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; WAL_SCAN_BUFFER_BYTES];
         loop {
             let n = file.read(&mut buffer)?;
             if n == 0 {
@@ -101,7 +103,7 @@ pub fn validated_hash_chain_prefix_len_from_checkpoint(
             break;
         }
 
-        let mut file = match fs::File::open(path) {
+        let file = match fs::File::open(path) {
             Ok(f) => f,
             Err(e) => {
                 if strict {
@@ -110,6 +112,7 @@ pub fn validated_hash_chain_prefix_len_from_checkpoint(
                 break;
             }
         };
+        let mut file = BufReader::with_capacity(WAL_SCAN_BUFFER_BYTES, file);
         let mut header = [0u8; SEGMENT_HEADER_SIZE];
         if let Err(e) = file.read_exact(&mut header) {
             if strict {
@@ -137,7 +140,7 @@ pub fn validated_hash_chain_prefix_len_from_checkpoint(
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&header);
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; WAL_SCAN_BUFFER_BYTES];
         loop {
             match file.read(&mut buffer) {
                 Ok(0) => break,

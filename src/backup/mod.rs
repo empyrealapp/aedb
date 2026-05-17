@@ -23,6 +23,7 @@ const MAX_BACKUP_ARCHIVE_PATH_BYTES: u32 = 4_096;
 const MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const BACKUP_ARCHIVE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+const BACKUP_ARCHIVE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupManifest {
@@ -119,7 +120,7 @@ pub fn write_backup_archive(
     let salt = *Uuid::new_v4().as_bytes();
 
     let archive_file = fs::File::create(archive_path)?;
-    let mut writer = BufWriter::new(archive_file);
+    let mut writer = BufWriter::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, archive_file);
     writer.write_all(BACKUP_ARCHIVE_MAGIC)?;
     writer.write_all(&[archive_flags])?;
     writer.write_all(&salt)?;
@@ -170,7 +171,10 @@ pub fn extract_backup_archive(
     }
     fs::create_dir_all(dir)?;
 
-    let mut reader = BufReader::new(fs::File::open(archive_path)?);
+    let mut reader = BufReader::with_capacity(
+        BACKUP_ARCHIVE_IO_BUFFER_BYTES,
+        fs::File::open(archive_path)?,
+    );
     let mut magic = [0u8; 8];
     reader.read_exact(&mut magic)?;
     if &magic != BACKUP_ARCHIVE_MAGIC {
@@ -229,9 +233,9 @@ pub fn extract_backup_archive(
 
 pub fn sha256_file_hex(path: &Path) -> Result<String, AedbError> {
     let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, file);
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 16 * 1024];
+    let mut buf = vec![0u8; BACKUP_ARCHIVE_IO_BUFFER_BYTES];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -263,17 +267,6 @@ fn write_file_atomic_synced(dir: &Path, filename: &str, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-fn write_output_file_synced(path: &Path, bytes: &[u8]) -> Result<(), AedbError> {
-    let mut file = fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    Ok(())
-}
-
 fn write_legacy_archive_file<W: Write>(
     writer: &mut W,
     rel: &str,
@@ -283,9 +276,10 @@ fn write_legacy_archive_file<W: Write>(
     encryption_key: Option<&[u8; 32]>,
 ) -> Result<(), AedbError> {
     validate_archive_path_len(rel)?;
-    let raw = fs::read(resolved)?;
-    let compressed = zstd::stream::encode_all(raw.as_slice(), 3)
-        .map_err(|e| AedbError::Encode(e.to_string()))?;
+    let file = fs::File::open(resolved)?;
+    let reader = BufReader::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, file);
+    let compressed =
+        zstd::stream::encode_all(reader, 3).map_err(|e| AedbError::Encode(e.to_string()))?;
 
     let payload = if let Some(key) = encryption_key {
         let nonce = derive_archive_nonce(salt, entry_index, rel);
@@ -318,7 +312,8 @@ fn write_chunked_archive_file<W: Write>(
     writer.write_all(rel.as_bytes())?;
     write_u64(writer, file_len)?;
 
-    let mut reader = BufReader::new(fs::File::open(resolved)?);
+    let mut reader =
+        BufReader::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, fs::File::open(resolved)?);
     let mut buf = vec![0u8; BACKUP_ARCHIVE_CHUNK_BYTES];
     let mut chunk_index = 0u64;
     loop {
@@ -388,11 +383,22 @@ fn extract_legacy_archive_file<R: Read>(
         payload
     };
 
-    let bytes = zstd::stream::decode_all(compressed.as_slice())
-        .map_err(|e| AedbError::Decode(e.to_string()))?;
-
     let out = resolve_backup_output_path(dir, rel)?;
-    write_output_file_synced(&out, &bytes)?;
+    write_compressed_payload_file_synced(&out, compressed.as_slice())?;
+    Ok(())
+}
+
+fn write_compressed_payload_file_synced(path: &Path, compressed: &[u8]) -> Result<(), AedbError> {
+    let mut decoder =
+        zstd::stream::Decoder::new(compressed).map_err(|e| AedbError::Decode(e.to_string()))?;
+    let mut file =
+        BufWriter::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, fs::File::create(path)?);
+    std::io::copy(&mut decoder, &mut file)?;
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
     Ok(())
 }
 
@@ -407,7 +413,8 @@ fn extract_chunked_archive_file<R: Read>(
 ) -> Result<(), AedbError> {
     let file_len = read_u64(reader)?;
     let out = resolve_backup_output_path(dir, rel)?;
-    let mut file = BufWriter::new(fs::File::create(&out)?);
+    let mut file =
+        BufWriter::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, fs::File::create(&out)?);
     let mut remaining = file_len;
     let mut chunk_index = 0u64;
     while remaining > 0 {
@@ -439,8 +446,7 @@ fn extract_chunked_archive_file<R: Read>(
             payload
         };
 
-        let bytes = decode_archive_chunk(&compressed, raw_len)?;
-        file.write_all(&bytes)?;
+        write_archive_chunk(&compressed, raw_len, &mut file)?;
         remaining -= raw_len as u64;
         chunk_index = chunk_index.saturating_add(1);
     }
@@ -463,20 +469,22 @@ fn read_archive_payload<R: Read>(reader: &mut R) -> Result<Vec<u8>, AedbError> {
     Ok(payload)
 }
 
-fn decode_archive_chunk(compressed: &[u8], expected_len: usize) -> Result<Vec<u8>, AedbError> {
+fn write_archive_chunk<W: Write>(
+    compressed: &[u8],
+    expected_len: usize,
+    writer: &mut W,
+) -> Result<(), AedbError> {
     let decoder =
         zstd::stream::Decoder::new(compressed).map_err(|e| AedbError::Decode(e.to_string()))?;
     let mut limited = decoder.take(expected_len as u64 + 1);
-    let mut bytes = Vec::with_capacity(expected_len);
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|e| AedbError::Decode(e.to_string()))?;
-    if bytes.len() != expected_len {
+    let written =
+        std::io::copy(&mut limited, writer).map_err(|e| AedbError::Decode(e.to_string()))?;
+    if written != expected_len as u64 {
         return Err(AedbError::Decode(
             "chunked backup archive decoded length mismatch".into(),
         ));
     }
-    Ok(bytes)
+    Ok(())
 }
 
 fn validate_archive_path_len(rel: &str) -> Result<(), AedbError> {
@@ -789,9 +797,11 @@ fn read_u64<R: Read>(reader: &mut R) -> Result<u64, AedbError> {
 }
 
 fn hex_string(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        out.push_str(&format!("{b:02x}"));
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
     }
     out
 }

@@ -97,8 +97,7 @@ impl PersistentValueStore {
         &self,
         values: &[Vec<u8>],
     ) -> Result<Vec<PersistentValueRef>, AedbError> {
-        let value_slices: Vec<&[u8]> = values.iter().map(Vec::as_slice).collect();
-        self.append_many_cold_slices(&value_slices)
+        self.append_many_vecs_with_cache_policy(values, false)
     }
 
     pub fn append_many_hot_slices(
@@ -118,6 +117,56 @@ impl PersistentValueStore {
     fn append_many_slices_with_cache_policy(
         &self,
         values: &[&[u8]],
+        populate_hot_cache: bool,
+    ) -> Result<Vec<PersistentValueRef>, AedbError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (refs, next_file_len) = {
+            let mut file = self.file.lock();
+            let append_start_offset = file.seek(SeekFrom::End(0))?;
+            let write_buf_capacity = VALUE_STORE_WRITE_BUFFER_BYTES.min(
+                values
+                    .iter()
+                    .fold(0usize, |total, value| total.saturating_add(value.len())),
+            );
+            let mut write_buf = Vec::with_capacity(write_buf_capacity);
+            let mut refs = Vec::with_capacity(values.len());
+            let mut value_offset = append_start_offset;
+            for value in values {
+                let value_byte_count = value.len() as u64;
+                refs.push(PersistentValueRef {
+                    offset: value_offset,
+                    len: value_byte_count,
+                    blake3_hash: *blake3::hash(value).as_bytes(),
+                });
+                append_value_to_writer(&mut *file, &mut write_buf, value)?;
+                value_offset = value_offset.checked_add(value_byte_count).ok_or_else(|| {
+                    AedbError::IntegrityError {
+                        message: "persistent value store append offset overflows".into(),
+                    }
+                })?;
+            }
+            flush_write_buffer(&mut *file, &mut write_buf)?;
+            file.flush()?;
+            (refs, value_offset)
+        };
+
+        self.len.store(next_file_len, Ordering::Release);
+        if populate_hot_cache && self.hot_cache_capacity_bytes > 0 {
+            let mut hot_cache = self.hot_cache.lock();
+            for (value_ref, value) in refs.iter().zip(values.iter()) {
+                hot_cache.insert(value_ref.clone(), value);
+            }
+        }
+        self.dirty.store(true, Ordering::Release);
+        Ok(refs)
+    }
+
+    fn append_many_vecs_with_cache_policy(
+        &self,
+        values: &[Vec<u8>],
         populate_hot_cache: bool,
     ) -> Result<Vec<PersistentValueRef>, AedbError> {
         if values.is_empty() {

@@ -1529,7 +1529,7 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
     if size_bytes <= SEGMENT_HEADER_SIZE as u64 {
         return Ok(None);
     }
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut reader = BufReader::with_capacity(WAL_SEQUENTIAL_READ_BUFFER_BYTES, file);
     let mut header = [0u8; SEGMENT_HEADER_SIZE];
     reader.read_exact(&mut header)?;
     let payload_size_bytes = size_bytes.saturating_sub(SEGMENT_HEADER_SIZE as u64);
@@ -1557,21 +1557,37 @@ pub(crate) fn scan_segment_seq_range(path: &Path) -> Result<Option<(u64, u64)>, 
     Ok(Some((min_seq, max_seq)))
 }
 
-pub(crate) fn copy_file_prefix(src: &Path, dst: &Path, size_bytes: u64) -> Result<(), AedbError> {
+pub(crate) fn copy_file_prefix_sha256_hex(
+    src: &Path,
+    dst: &Path,
+    size_bytes: u64,
+) -> Result<String, AedbError> {
     let mut reader = File::open(src)?;
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent)?;
     }
     let mut writer = File::create(dst)?;
-    std::io::copy(
-        &mut std::io::Read::by_ref(&mut reader).take(size_bytes),
-        &mut writer,
-    )?;
+    let mut hasher = Sha256::new();
+    let mut remaining = size_bytes;
+    let mut buf = vec![0u8; WAL_SEQUENTIAL_READ_BUFFER_BYTES];
+    while remaining > 0 {
+        let to_read = buf.len().min(remaining as usize);
+        let n = reader.read(&mut buf[..to_read])?;
+        if n == 0 {
+            return Err(AedbError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "backup source file shorter than manifest segment size",
+            )));
+        }
+        writer.write_all(&buf[..n])?;
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
     writer.sync_all()?;
     if let Some(parent) = dst.parent() {
         File::open(parent)?.sync_all()?;
     }
-    Ok(())
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub(crate) fn validate_backup_chain(chain: &[(PathBuf, BackupManifest)]) -> Result<(), AedbError> {
@@ -1660,6 +1676,8 @@ pub(crate) fn validate_backup_chain_compatibility(
     Ok(())
 }
 
+const WAL_SEQUENTIAL_READ_BUFFER_BYTES: usize = 1024 * 1024;
+
 pub(crate) fn resolve_target_seq_for_time(
     chain: &[(PathBuf, BackupManifest)],
     target_time_micros: u64,
@@ -1690,7 +1708,7 @@ pub(crate) fn resolve_target_seq_for_time(
             if file.metadata()?.len() <= SEGMENT_HEADER_SIZE as u64 {
                 continue;
             }
-            let mut reader = BufReader::with_capacity(64 * 1024, file);
+            let mut reader = BufReader::with_capacity(WAL_SEQUENTIAL_READ_BUFFER_BYTES, file);
             let mut header = [0u8; SEGMENT_HEADER_SIZE];
             reader.read_exact(&mut header)?;
             let mut frame_reader = FrameReader::new(reader);
@@ -1783,7 +1801,7 @@ pub(crate) fn verify_hash_chain_batch(
 
         let mut hasher = blake3::Hasher::new();
         hasher.update(&header);
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; WAL_SEQUENTIAL_READ_BUFFER_BYTES];
         loop {
             let n = file.read(&mut buffer)?;
             if n == 0 {
