@@ -1583,8 +1583,11 @@ pub fn validate_permissions(
             "OrderBookMatch is system-only".into(),
         ));
     }
-    if matches!(mutation, Mutation::PostflightCheck { .. }) {
-        return Ok(());
+    if let Mutation::PostflightCheck { assertions } = mutation {
+        if caller.is_internal_system() {
+            return Ok(());
+        }
+        return validate_assertion_permissions(catalog, caller, assertions);
     }
     let is_admin = catalog.has_permission(&caller.caller_id, &Permission::GlobalAdmin);
     match mutation {
@@ -2211,6 +2214,103 @@ fn can_administer_permission(catalog: &Catalog, caller_id: &str, permission: &Pe
             ) || catalog.is_owner_of_project(caller_id, project_id)
                 || catalog.has_delegable_grant(caller_id, permission)
         }
+    }
+}
+
+pub(crate) fn validate_assertion_permissions(
+    catalog: &Catalog,
+    caller: &CallerContext,
+    assertions: &[crate::commit::tx::ReadAssertion],
+) -> Result<(), AedbError> {
+    for assertion in assertions {
+        validate_assertion_permission(catalog, caller, assertion)?;
+    }
+    Ok(())
+}
+
+fn validate_assertion_permission(
+    catalog: &Catalog,
+    caller: &CallerContext,
+    assertion: &crate::commit::tx::ReadAssertion,
+) -> Result<(), AedbError> {
+    use crate::commit::tx::ReadAssertion;
+
+    match assertion {
+        ReadAssertion::KeyEquals {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | ReadAssertion::KeyCompare {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | ReadAssertion::KeyExists {
+            project_id,
+            scope_id,
+            key,
+            ..
+        }
+        | ReadAssertion::KeyVersion {
+            project_id,
+            scope_id,
+            key,
+            ..
+        } => {
+            if catalog.has_kv_read_permission(&caller.caller_id, project_id, scope_id, key) {
+                Ok(())
+            } else {
+                Err(AedbError::PermissionDenied("permission denied".into()))
+            }
+        }
+        ReadAssertion::RowVersion {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | ReadAssertion::RowExists {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | ReadAssertion::RowColumnCompare {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | ReadAssertion::CountCompare {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | ReadAssertion::SumCompare {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        } => {
+            let required = Permission::TableRead {
+                project_id: project_id.clone(),
+                scope_id: scope_id.clone(),
+                table_name: table_name.clone(),
+            };
+            if catalog.has_permission(&caller.caller_id, &required) {
+                Ok(())
+            } else {
+                Err(AedbError::PermissionDenied("permission denied".into()))
+            }
+        }
+        ReadAssertion::All(assertions) | ReadAssertion::Any(assertions) => {
+            validate_assertion_permissions(catalog, caller, assertions)
+        }
+        ReadAssertion::Not(assertion) => validate_assertion_permission(catalog, caller, assertion),
     }
 }
 

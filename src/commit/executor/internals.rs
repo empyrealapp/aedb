@@ -406,6 +406,15 @@ pub(super) fn pre_stage_validate(
     }
     if !envelope.assertions.is_empty() {
         validate_assertions(&catalog, &envelope.assertions)?;
+        if let Some(caller) = envelope.caller.as_ref()
+            && !caller.is_internal_system()
+        {
+            crate::commit::validation::validate_assertion_permissions(
+                &catalog,
+                caller,
+                &envelope.assertions,
+            )?;
+        }
     }
     let caller = envelope.caller.as_ref();
     let mut staged_catalog: Option<Catalog> = None;

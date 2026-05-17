@@ -3495,6 +3495,202 @@ async fn kv_no_auth_apis_in_secure_mode_return_structured_error() {
 }
 
 #[tokio::test]
+async fn postflight_assertions_require_read_permission_in_secure_mode() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([8u8; 32]), dir.path())
+        .expect("open secure");
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        system,
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"secret".to_vec(),
+            value: b"not-for-mallory".to_vec(),
+        },
+    )
+    .await
+    .expect("seed secret");
+
+    let err = db
+        .commit_as(
+            CallerContext::new("mallory"),
+            Mutation::PostflightCheck {
+                assertions: vec![ReadAssertion::KeyCompare {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"secret".to_vec(),
+                    op: crate::commit::validation::CompareOp::Eq,
+                    threshold: b"guess".to_vec(),
+                }],
+            },
+        )
+        .await
+        .expect_err("postflight assertion without read permission must fail before evaluation");
+    assert!(matches!(err, AedbError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn envelope_assertions_require_read_permission_in_secure_mode() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([12u8; 32]), dir.path())
+        .expect("open secure");
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        system,
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"secret".to_vec(),
+            value: b"not-for-mallory".to_vec(),
+        },
+    )
+    .await
+    .expect("seed secret");
+
+    let err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: Some(CallerContext::new("mallory")),
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::KeyCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret".to_vec(),
+                op: crate::commit::validation::CompareOp::Eq,
+                threshold: b"guess".to_vec(),
+            }],
+            read_set: crate::commit::tx::ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: Vec::new(),
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("envelope assertion without read permission must fail before evaluation");
+    assert!(matches!(err, AedbError::PermissionDenied(_)));
+}
+
+#[tokio::test]
+async fn async_index_query_requires_table_read_permission() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([10u8; 32]), dir.path())
+        .expect("open secure");
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateScope {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            owner_id: None,
+            if_not_exists: true,
+        }),
+    )
+    .await
+    .expect("create scope");
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateTable {
+            owner_id: None,
+            if_not_exists: false,
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+        }),
+    )
+    .await
+    .expect("create table");
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateAsyncIndex {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "users".into(),
+            index_name: "users_view".into(),
+            if_not_exists: false,
+            projected_columns: vec!["id".into(), "name".into()],
+        }),
+    )
+    .await
+    .expect("create async index");
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::GrantPermission {
+            caller_id: "alice".into(),
+            permission: Permission::IndexRead {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "users".into(),
+                index_name: "users_view".into(),
+            },
+            actor_id: Some("system".into()),
+            delegable: false,
+        }),
+    )
+    .await
+    .expect("grant index read");
+
+    let err = db
+        .query_with_options_as(
+            Some(&CallerContext::new("alice")),
+            "p",
+            "app",
+            Query::select(&["*"]).from("users"),
+            QueryOptions {
+                async_index: Some("users_view".into()),
+                allow_full_scan: true,
+                ..QueryOptions::default()
+            },
+        )
+        .await
+        .expect_err("index read alone must not disclose async projection rows");
+    assert!(matches!(err, QueryError::PermissionDenied { .. }));
+}
+
+#[tokio::test]
 async fn event_stream_and_processor_lag_as_require_explicit_permissions() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open_production(AedbConfig::production([3u8; 32]), dir.path())
