@@ -198,25 +198,30 @@ pub(crate) fn authorize_and_bind_query_for_caller(
             });
         }
     }
-    let required = if let Some(index_name) = &options.async_index {
-        Permission::IndexRead {
-            project_id: base_project_id.clone(),
-            scope_id: base_scope_id.clone(),
-            table_name: base_table_name.clone(),
-            index_name: index_name.clone(),
-        }
-    } else {
-        Permission::TableRead {
-            project_id: base_project_id.clone(),
-            scope_id: base_scope_id.clone(),
-            table_name: base_table_name.clone(),
-        }
+    let table_read = Permission::TableRead {
+        project_id: base_project_id.clone(),
+        scope_id: base_scope_id.clone(),
+        table_name: base_table_name.clone(),
     };
-    if !catalog.has_permission(&caller.caller_id, &required) {
+    if !catalog.has_permission(&caller.caller_id, &table_read) {
         return Err(QueryError::PermissionDenied {
             permission: "permission denied".into(),
             scope: String::new(),
         });
+    }
+    if let Some(index_name) = &options.async_index {
+        let index_read = Permission::IndexRead {
+            project_id: base_project_id.clone(),
+            scope_id: base_scope_id.clone(),
+            table_name: base_table_name.clone(),
+            index_name: index_name.clone(),
+        };
+        if !catalog.has_permission(&caller.caller_id, &index_read) {
+            return Err(QueryError::PermissionDenied {
+                permission: "permission denied".into(),
+                scope: String::new(),
+            });
+        }
     }
     for join in &query.joins {
         let (join_project_id, join_scope_id, join_table_name) =
