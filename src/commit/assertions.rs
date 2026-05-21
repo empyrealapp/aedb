@@ -220,7 +220,7 @@ fn evaluate_assertion(
             key,
             expected,
         } => {
-            let current = keyspace.kv_get(project_id, scope_id, key);
+            let current = keyspace.try_kv_get(project_id, scope_id, key)?;
             if let Some(entry) = current.as_ref()
                 && let Some(budget) = read_bytes.as_deref_mut()
             {
@@ -242,7 +242,7 @@ fn evaluate_assertion(
             op,
             threshold,
         } => {
-            let Some(current) = keyspace.kv_get(project_id, scope_id, key) else {
+            let Some(current) = keyspace.try_kv_get(project_id, scope_id, key)? else {
                 return Ok(Some(AssertionActual::Missing));
             };
             if let Some(budget) = read_bytes.as_deref_mut() {
@@ -260,7 +260,7 @@ fn evaluate_assertion(
             key,
             expected,
         } => {
-            let exists = keyspace.kv_get(project_id, scope_id, key).is_some();
+            let exists = keyspace.try_kv_get(project_id, scope_id, key)?.is_some();
             if exists == *expected {
                 Ok(None)
             } else {
@@ -273,7 +273,7 @@ fn evaluate_assertion(
             key,
             expected_seq,
         } => {
-            let version = keyspace.kv_version(project_id, scope_id, key);
+            let version = keyspace.try_kv_version(project_id, scope_id, key)?;
             if version == *expected_seq {
                 Ok(None)
             } else {
@@ -443,7 +443,7 @@ fn evaluate_assertion(
                 assertion,
                 depth + 1,
                 max_scan_rows,
-                read_bytes.as_deref_mut(),
+                read_bytes,
             )? {
                 None => Ok(Some(AssertionActual::Bool(true))),
                 Some(_) => Ok(None),

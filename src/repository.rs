@@ -174,7 +174,7 @@ impl<'a> RepositoryContext<'a> {
             }
             None => {
                 self.db
-                    .query_with_options(&self.project_id, &self.scope_id, query, options)
+                    .query_no_auth(&self.project_id, &self.scope_id, query, options)
                     .await
             }
         }

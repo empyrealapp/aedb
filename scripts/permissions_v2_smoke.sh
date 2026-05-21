@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "[permissions-v2] formatting"
+cargo fmt --check
+
 echo "[permissions-v2] cargo check"
 cargo check
 

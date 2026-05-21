@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::schema::IndexType;
 use aedb::catalog::types::{ColumnType, Row, Value};

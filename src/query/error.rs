@@ -1,6 +1,80 @@
 use crate::error::AedbError;
 use std::fmt;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryErrorCode {
+    TableNotFound,
+    ColumnNotFound,
+    TypeMismatch,
+    ScanBoundExceeded,
+    InvalidQuery,
+    PermissionDenied,
+    SeqNotYetVisible,
+    SeqGarbageCollected,
+    CursorExpired,
+    InvalidCursor,
+    SnapshotExpired,
+    SnapshotLimitReached,
+    InternalError,
+}
+
+/// Broad caller-action class for [`QueryError`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryErrorClass {
+    /// The query can be retried after backoff or snapshot renewal.
+    Retryable,
+    /// The caller identity lacks the required read permission.
+    Permission,
+    /// The query, cursor, schema reference, or requested snapshot is invalid.
+    Validation,
+    /// The requested scan exceeds configured limits.
+    Unavailable,
+    /// Internal storage/query failure. Surface for operator investigation.
+    Integrity,
+}
+
+impl QueryErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QueryErrorCode::TableNotFound => "table_not_found",
+            QueryErrorCode::ColumnNotFound => "column_not_found",
+            QueryErrorCode::TypeMismatch => "type_mismatch",
+            QueryErrorCode::ScanBoundExceeded => "scan_bound_exceeded",
+            QueryErrorCode::InvalidQuery => "invalid_query",
+            QueryErrorCode::PermissionDenied => "permission_denied",
+            QueryErrorCode::SeqNotYetVisible => "seq_not_yet_visible",
+            QueryErrorCode::SeqGarbageCollected => "seq_garbage_collected",
+            QueryErrorCode::CursorExpired => "cursor_expired",
+            QueryErrorCode::InvalidCursor => "invalid_cursor",
+            QueryErrorCode::SnapshotExpired => "snapshot_expired",
+            QueryErrorCode::SnapshotLimitReached => "snapshot_limit_reached",
+            QueryErrorCode::InternalError => "internal_error",
+        }
+    }
+
+    pub fn class(self) -> QueryErrorClass {
+        match self {
+            QueryErrorCode::SeqNotYetVisible
+            | QueryErrorCode::CursorExpired
+            | QueryErrorCode::SnapshotExpired
+            | QueryErrorCode::SnapshotLimitReached => QueryErrorClass::Retryable,
+            QueryErrorCode::PermissionDenied => QueryErrorClass::Permission,
+            QueryErrorCode::ScanBoundExceeded => QueryErrorClass::Unavailable,
+            QueryErrorCode::InternalError => QueryErrorClass::Integrity,
+            QueryErrorCode::TableNotFound
+            | QueryErrorCode::ColumnNotFound
+            | QueryErrorCode::TypeMismatch
+            | QueryErrorCode::InvalidQuery
+            | QueryErrorCode::SeqGarbageCollected
+            | QueryErrorCode::InvalidCursor => QueryErrorClass::Validation,
+        }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self.class(), QueryErrorClass::Retryable)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryError {
     TableNotFound {
@@ -83,8 +157,8 @@ impl fmt::Display for QueryError {
                 "scan bound exceeded: estimated_rows={estimated_rows}, max_scan_rows={max_scan_rows}"
             ),
             QueryError::InvalidQuery { reason } => write!(f, "invalid query: {reason}"),
-            QueryError::PermissionDenied { permission, scope } => {
-                write!(f, "permission denied: {permission} (scope={scope})")
+            QueryError::PermissionDenied { .. } => {
+                write!(f, "permission denied: permission denied")
             }
             QueryError::SeqNotYetVisible { requested, current } => write!(
                 f,
@@ -113,6 +187,36 @@ impl std::error::Error for QueryError {}
 impl QueryError {
     pub fn is_table_not_found(&self) -> bool {
         matches!(self, QueryError::TableNotFound { .. })
+    }
+
+    pub fn code(&self) -> QueryErrorCode {
+        match self {
+            QueryError::TableNotFound { .. } => QueryErrorCode::TableNotFound,
+            QueryError::ColumnNotFound { .. } => QueryErrorCode::ColumnNotFound,
+            QueryError::TypeMismatch { .. } => QueryErrorCode::TypeMismatch,
+            QueryError::ScanBoundExceeded { .. } => QueryErrorCode::ScanBoundExceeded,
+            QueryError::InvalidQuery { .. } => QueryErrorCode::InvalidQuery,
+            QueryError::PermissionDenied { .. } => QueryErrorCode::PermissionDenied,
+            QueryError::SeqNotYetVisible { .. } => QueryErrorCode::SeqNotYetVisible,
+            QueryError::SeqGarbageCollected { .. } => QueryErrorCode::SeqGarbageCollected,
+            QueryError::CursorExpired { .. } => QueryErrorCode::CursorExpired,
+            QueryError::InvalidCursor => QueryErrorCode::InvalidCursor,
+            QueryError::SnapshotExpired => QueryErrorCode::SnapshotExpired,
+            QueryError::SnapshotLimitReached => QueryErrorCode::SnapshotLimitReached,
+            QueryError::InternalError(_) => QueryErrorCode::InternalError,
+        }
+    }
+
+    pub fn code_str(&self) -> &'static str {
+        self.code().as_str()
+    }
+
+    pub fn class(&self) -> QueryErrorClass {
+        self.code().class()
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.code().is_retryable()
     }
 }
 
@@ -217,7 +321,7 @@ impl From<AedbError> for QueryError {
 mod tests {
     use crate::error::{AedbError, ResourceType};
 
-    use super::QueryError;
+    use super::{QueryError, QueryErrorClass, QueryErrorCode};
 
     #[test]
     fn query_error_display_is_human_readable() {
@@ -242,5 +346,54 @@ mod tests {
             }
         );
         assert!(err.is_table_not_found());
+        assert_eq!(err.code(), QueryErrorCode::TableNotFound);
+        assert_eq!(err.code_str(), "table_not_found");
+        assert_eq!(err.class(), QueryErrorClass::Validation);
+    }
+
+    #[test]
+    fn query_error_code_strings_are_stable() {
+        let expected = [
+            (QueryErrorCode::TableNotFound, "table_not_found"),
+            (QueryErrorCode::ColumnNotFound, "column_not_found"),
+            (QueryErrorCode::TypeMismatch, "type_mismatch"),
+            (QueryErrorCode::ScanBoundExceeded, "scan_bound_exceeded"),
+            (QueryErrorCode::InvalidQuery, "invalid_query"),
+            (QueryErrorCode::PermissionDenied, "permission_denied"),
+            (QueryErrorCode::SeqNotYetVisible, "seq_not_yet_visible"),
+            (QueryErrorCode::SeqGarbageCollected, "seq_garbage_collected"),
+            (QueryErrorCode::CursorExpired, "cursor_expired"),
+            (QueryErrorCode::InvalidCursor, "invalid_cursor"),
+            (QueryErrorCode::SnapshotExpired, "snapshot_expired"),
+            (
+                QueryErrorCode::SnapshotLimitReached,
+                "snapshot_limit_reached",
+            ),
+            (QueryErrorCode::InternalError, "internal_error"),
+        ];
+        for (code, stable) in expected {
+            assert_eq!(code.as_str(), stable);
+        }
+    }
+
+    #[test]
+    fn query_error_code_classes_describe_caller_behavior() {
+        assert_eq!(
+            QueryErrorCode::SnapshotExpired.class(),
+            QueryErrorClass::Retryable
+        );
+        assert_eq!(
+            QueryErrorCode::PermissionDenied.class(),
+            QueryErrorClass::Permission
+        );
+        assert_eq!(
+            QueryErrorCode::ScanBoundExceeded.class(),
+            QueryErrorClass::Unavailable
+        );
+        assert_eq!(
+            QueryErrorCode::InternalError.class(),
+            QueryErrorClass::Integrity
+        );
+        assert!(QueryErrorCode::CursorExpired.is_retryable());
     }
 }

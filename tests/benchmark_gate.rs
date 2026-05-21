@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::backup::{extract_backup_archive, sha256_file_hex, write_backup_archive};
 use aedb::catalog::DdlOperation;

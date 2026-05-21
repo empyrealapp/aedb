@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::backup::{
     load_backup_manifest, sha256_file_hex, verify_backup_files, write_backup_manifest,

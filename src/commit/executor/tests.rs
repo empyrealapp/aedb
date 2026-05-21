@@ -3393,6 +3393,136 @@ async fn settlements_unique_and_fk_constraints_compose() {
 }
 
 #[tokio::test]
+async fn non_pk_foreign_key_fails_closed_when_runtime_unique_index_missing() {
+    let dir = tempdir().expect("temp");
+    let exec = CommitExecutor::new(dir.path()).expect("executor");
+
+    exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
+        owner_id: None,
+        if_not_exists: true,
+        project_id: "fkidx".into(),
+    }))
+    .await
+    .expect("project");
+    exec.submit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "fkidx".into(),
+        scope_id: "app".into(),
+        table_name: "parents".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "email".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("parents");
+    exec.submit(Mutation::Ddl(DdlOperation::AlterTable {
+        project_id: "fkidx".into(),
+        scope_id: "app".into(),
+        table_name: "parents".into(),
+        alteration: TableAlteration::AddConstraint(Constraint::Unique {
+            name: "uq_parent_email".into(),
+            columns: vec!["email".into()],
+        }),
+    }))
+    .await
+    .expect("unique parent email");
+    exec.submit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "fkidx".into(),
+        scope_id: "app".into(),
+        table_name: "children".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "parent_email".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("children");
+    exec.submit(Mutation::Ddl(DdlOperation::AlterTable {
+        project_id: "fkidx".into(),
+        scope_id: "app".into(),
+        table_name: "children".into(),
+        alteration: TableAlteration::AddForeignKey(ForeignKey {
+            name: "fk_parent_email".into(),
+            columns: vec!["parent_email".into()],
+            references_project_id: "fkidx".into(),
+            references_scope_id: "app".into(),
+            references_table: "parents".into(),
+            references_columns: vec!["email".into()],
+            on_delete: ForeignKeyAction::Restrict,
+            on_update: ForeignKeyAction::Restrict,
+        }),
+    }))
+    .await
+    .expect("fk");
+    exec.submit(Mutation::Upsert {
+        project_id: "fkidx".into(),
+        scope_id: "app".into(),
+        table_name: "parents".into(),
+        primary_key: vec![Value::Text("p1".into())],
+        row: Row {
+            values: vec![
+                Value::Text("p1".into()),
+                Value::Text("p@example.com".into()),
+            ],
+        },
+    })
+    .await
+    .expect("parent");
+
+    {
+        let mut state = exec.state.lock().await;
+        let table = state
+            .keyspace
+            .namespace_mut(NamespaceId::project_scope("fkidx", "app"))
+            .tables
+            .get_mut("parents")
+            .expect("parents table");
+        table.indexes.remove("uq_parent_email");
+    }
+
+    let err = exec
+        .submit(Mutation::Upsert {
+            project_id: "fkidx".into(),
+            scope_id: "app".into(),
+            table_name: "children".into(),
+            primary_key: vec![Value::Text("c1".into())],
+            row: Row {
+                values: vec![
+                    Value::Text("c1".into()),
+                    Value::Text("p@example.com".into()),
+                ],
+            },
+        })
+        .await
+        .expect_err("missing runtime FK index must fail closed");
+    assert!(
+        matches!(err, AedbError::IntegrityError { message } if message.contains("missing runtime unique index"))
+    );
+}
+
+#[tokio::test]
 async fn rejects_when_commit_queue_bytes_exceeded() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {

@@ -132,7 +132,7 @@ async fn cmd_scan_table(args: &[String]) -> Result<(), String> {
         db.query_with_options_as(Some(&caller), &project_id, &scope_id, query, options)
             .await
     } else {
-        db.query_with_options(&project_id, &scope_id, query, options)
+        db.query_no_auth(&project_id, &scope_id, query, options)
             .await
     }
     .map_err(|e| e.to_string())?;

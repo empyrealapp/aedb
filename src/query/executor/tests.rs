@@ -781,7 +781,7 @@ fn bounded_scan_is_enforced_when_full_scan_not_allowed() {
         &QueryOptions::default(),
         1,
         10_000,
-    None,
+        None,
     )
     .expect_err("should reject full scan");
     assert!(matches!(err, QueryError::InvalidQuery { .. }));
@@ -818,7 +818,7 @@ fn non_join_page_size_is_capped_by_max_scan_rows() {
         &QueryOptions::default(),
         9,
         10,
-    None,
+        None,
     )
     .expect("bounded page");
     assert_eq!(result.rows.len(), 10);
@@ -842,7 +842,7 @@ fn aggregate_limit_does_not_bypass_scan_bound() {
         &QueryOptions::default(),
         7,
         10,
-    None,
+        None,
     )
     .expect_err("aggregate should still honor scan bound");
     assert!(matches!(err, QueryError::ScanBoundExceeded { .. }));
@@ -864,7 +864,7 @@ fn cursor_does_not_bypass_scan_bound() {
         &QueryOptions::default(),
         9,
         100,
-    None,
+        None,
     )
     .expect("first page");
     let err = execute_query_with_options(
@@ -882,7 +882,7 @@ fn cursor_does_not_bypass_scan_bound() {
         },
         9,
         10,
-    None,
+        None,
     )
     .expect_err("cursor path should still honor scan bound");
     assert!(matches!(err, QueryError::ScanBoundExceeded { .. }));
@@ -937,7 +937,7 @@ fn join_scan_bound_uses_cardinality_aware_estimate_when_right_side_is_primary_ke
         &QueryOptions::default(),
         1,
         1_000,
-    None,
+        None,
     )
     .expect("primary-key join should stay within scan bound");
     assert_eq!(result.rows.len(), 10);
@@ -980,7 +980,7 @@ fn cursor_pagination_returns_stable_pages() {
             &options,
             42,
             10_000,
-        None,
+            None,
         )
         .expect("page");
         all.extend(page.rows.clone());
@@ -1096,7 +1096,7 @@ fn join_on_right_primary_key_uses_bounded_probe_path() {
         &QueryOptions::default(),
         1,
         100,
-    None,
+        None,
     )
     .expect("pk join should respect bounded probe path");
     assert_eq!(result.rows.len(), 50);
@@ -1234,7 +1234,7 @@ fn invalid_cursor_is_rejected() {
         &options,
         42,
         10_000,
-    None,
+        None,
     )
     .expect_err("invalid cursor should fail");
     assert!(matches!(err, QueryError::InvalidQuery { .. }));
@@ -1256,7 +1256,7 @@ fn uppercase_hex_cursor_is_accepted() {
         &QueryOptions::default(),
         42,
         10_000,
-    None,
+        None,
     )
     .expect("first page");
     let cursor = first
@@ -1279,7 +1279,7 @@ fn uppercase_hex_cursor_is_accepted() {
         &options,
         42,
         10_000,
-    None,
+        None,
     )
     .expect("uppercase cursor should decode");
     assert_eq!(second.rows.len(), 10);
@@ -1438,7 +1438,7 @@ fn cursor_snapshot_mismatch_is_rejected() {
         &QueryOptions::default(),
         42,
         10_000,
-    None,
+        None,
     )
     .expect("first page");
     let options = QueryOptions {
@@ -1457,7 +1457,7 @@ fn cursor_snapshot_mismatch_is_rejected() {
         &options,
         43,
         10_000,
-    None,
+        None,
     )
     .expect_err("snapshot mismatch");
     assert!(matches!(err, QueryError::InvalidQuery { .. }));
@@ -1513,7 +1513,7 @@ fn join_query_supports_cursor_pagination() {
         &QueryOptions::default(),
         7,
         10_000,
-    None,
+        None,
     )
     .expect("first page");
     assert_eq!(first.rows.len(), 5);
@@ -1537,7 +1537,7 @@ fn join_query_supports_cursor_pagination() {
         &options,
         7,
         10_000,
-    None,
+        None,
     )
     .expect("join cursor page");
     assert_eq!(second.rows.len(), 5);
@@ -1679,7 +1679,7 @@ fn descending_cursor_pagination_is_stable() {
             &options,
             55,
             10_000,
-        None,
+            None,
         )
         .expect("page");
         all.extend(page.rows.clone());
@@ -1778,7 +1778,9 @@ fn split_recommended_set_on_full_consumption() {
         &catalog,
         "A",
         "app",
-        Query::select(&["*"]).from("users").aggregate(Aggregate::Count),
+        Query::select(&["*"])
+            .from("users")
+            .aggregate(Aggregate::Count),
         &QueryOptions {
             allow_full_scan: true,
             ..QueryOptions::default()
@@ -1836,16 +1838,28 @@ fn cursor_remaining_limit_is_threaded_across_pages() {
     let decoded = super::cursor::decode_cursor(&encoded, None).expect("decode");
     assert_eq!(decoded.remaining_limit, Some(10));
 
-    assert_eq!(super::compute_remaining_limit_after_page(Some(10), None, 3), Some(7));
-    assert_eq!(super::compute_remaining_limit_after_page(Some(10), Some(7), 3), Some(4));
-    assert_eq!(super::compute_remaining_limit_after_page(None, None, 5), None);
-    assert_eq!(super::compute_remaining_limit_after_page(Some(2), None, 5), Some(0));
+    assert_eq!(
+        super::compute_remaining_limit_after_page(Some(10), None, 3),
+        Some(7)
+    );
+    assert_eq!(
+        super::compute_remaining_limit_after_page(Some(10), Some(7), 3),
+        Some(4)
+    );
+    assert_eq!(
+        super::compute_remaining_limit_after_page(None, None, 5),
+        None
+    );
+    assert_eq!(
+        super::compute_remaining_limit_after_page(Some(2), None, 5),
+        Some(0)
+    );
 }
 
 #[test]
 fn read_set_captures_primary_key_point_lookup() {
-    use super::execute_query_with_options_capturing;
     use super::ReadSetCollector;
+    use super::execute_query_with_options_capturing;
     use crate::commit::tx::ReadKey;
 
     let (keyspace, catalog) = setup();
@@ -1875,7 +1889,13 @@ fn read_set_captures_primary_key_point_lookup() {
     assert_eq!(read_set.points.len(), 1, "expected one point entry");
     assert!(read_set.ranges.is_empty(), "no ranges for PK lookup");
     let entry = &read_set.points[0];
-    let ReadKey::TableRow { project_id, scope_id, table_name, primary_key } = &entry.key else {
+    let ReadKey::TableRow {
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+    } = &entry.key
+    else {
         panic!("expected TableRow read key");
     };
     assert_eq!(project_id, "A");
@@ -1886,8 +1906,8 @@ fn read_set_captures_primary_key_point_lookup() {
 
 #[test]
 fn read_set_captures_indexed_range_as_touched_pks() {
-    use super::execute_query_with_options_capturing;
     use super::ReadSetCollector;
+    use super::execute_query_with_options_capturing;
 
     let (keyspace, catalog) = setup();
     let snapshot = keyspace.snapshot();
@@ -1923,8 +1943,8 @@ fn read_set_captures_indexed_range_as_touched_pks() {
 
 #[test]
 fn read_set_captures_full_table_scan_as_range() {
-    use super::execute_query_with_options_capturing;
     use super::ReadSetCollector;
+    use super::execute_query_with_options_capturing;
     use crate::commit::tx::ReadRange;
 
     let (keyspace, catalog) = setup();
@@ -1948,7 +1968,11 @@ fn read_set_captures_full_table_scan_as_range() {
     .expect("query");
 
     let read_set = collector.into_inner();
-    assert_eq!(read_set.ranges.len(), 1, "full scan should record one coarse range");
+    assert_eq!(
+        read_set.ranges.len(),
+        1,
+        "full scan should record one coarse range"
+    );
     let ReadRange::TableRange { table_name, .. } = &read_set.ranges[0].range else {
         panic!("expected TableRange");
     };

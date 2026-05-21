@@ -1,14 +1,17 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
+use aedb::catalog::schema::{ColumnDef, IndexType};
+use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::tx::{IdempotencyKey, ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::Mutation;
-use aedb::config::AedbConfig;
+use aedb::config::{AedbConfig, StorageMode};
 use aedb::error::AedbError;
 use aedb::offline;
 use aedb::order_book::{
     ExecInstruction, OrderRequest, OrderSide, OrderType, SelfTradePrevention, TimeInForce,
 };
-use aedb::query::plan::ConsistencyMode;
+use aedb::query::plan::{ConsistencyMode, Query};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 use tempfile::tempdir;
@@ -76,6 +79,146 @@ proptest! {
                 .await
                 .expect("kv read");
             prop_assert!(entry.is_none());
+            Ok(())
+        });
+        outcome?;
+    }
+
+    #[test]
+    fn prop_mixed_table_kv_envelope_is_atomic_when_late_mutation_fails(
+        suffix in prop::collection::vec(any::<u8>(), 4..16),
+        table_id in 1i64..10_000,
+        table_amount in 1i64..1_000_000,
+        kv_value in prop::collection::vec(any::<u8>(), 1..64),
+    ) {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome: Result<(), TestCaseError> = rt.block_on(async move {
+            let dir = tempdir().expect("temp dir");
+            let config = AedbConfig {
+                storage_mode: StorageMode::DiskBacked,
+                ..AedbConfig::default()
+            };
+            let db = AedbInstance::open(config, dir.path()).expect("open");
+            db.create_project("p").await.expect("project");
+            db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+                owner_id: None,
+                if_not_exists: false,
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "ledger".into(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "owner".into(),
+                        col_type: ColumnType::Text,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "amount".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                ],
+                primary_key: vec!["id".into()],
+            }))
+            .await
+            .expect("table");
+            db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "ledger".into(),
+                index_name: "by_owner".into(),
+                if_not_exists: false,
+                columns: vec!["owner".into()],
+                index_type: IndexType::BTree,
+                partial_filter: None,
+            }))
+            .await
+            .expect("index");
+
+            let mut kv_key = b"mixed-atomic:".to_vec();
+            kv_key.extend_from_slice(&suffix);
+            let err = db
+                .commit_envelope(TransactionEnvelope {
+                    caller: None,
+                    idempotency_key: None,
+                    write_class: WriteClass::Standard,
+                    assertions: Vec::new(),
+                    read_set: ReadSet::default(),
+                    write_intent: WriteIntent {
+                        mutations: vec![
+                            Mutation::KvSet {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                key: kv_key.clone(),
+                                value: kv_value,
+                            },
+                            Mutation::Upsert {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                table_name: "ledger".into(),
+                                primary_key: vec![Value::Integer(table_id)],
+                                row: Row::from_values(vec![
+                                    Value::Integer(table_id),
+                                    Value::Text("alice".into()),
+                                    Value::Integer(table_amount),
+                                ]),
+                            },
+                            Mutation::KvDecU256 {
+                                project_id: "p".into(),
+                                scope_id: "app".into(),
+                                key: b"missing-counter".to_vec(),
+                                amount_be: one_u256(),
+                            },
+                        ],
+                    },
+                    base_seq: 0,
+                })
+                .await
+                .expect_err("late failure should abort mixed envelope");
+            prop_assert!(matches!(err, AedbError::Underflow | AedbError::Validation(_)));
+
+            let kv = db
+                .kv_get_no_auth("p", "app", &kv_key, ConsistencyMode::AtLatest)
+                .await
+                .expect("kv read");
+            prop_assert!(kv.is_none());
+
+            let by_pk = db
+                .query(
+                    "p",
+                    "app",
+                    Query::select(&["id", "owner", "amount"])
+                        .from("ledger")
+                        .where_(aedb::query::plan::Expr::Eq("id".into(), Value::Integer(table_id)))
+                        .limit(1),
+                )
+                .await
+                .expect("query table by pk");
+            prop_assert!(by_pk.rows.is_empty());
+
+            let by_index = db
+                .query(
+                    "p",
+                    "app",
+                    Query::select(&["id", "owner", "amount"])
+                        .from("ledger")
+                        .where_(aedb::query::plan::Expr::Eq(
+                            "owner".into(),
+                            Value::Text("alice".into()),
+                        ))
+                        .limit(10),
+                )
+                .await
+                .expect("query table by index");
+            prop_assert!(by_index.rows.is_empty());
             Ok(())
         });
         outcome?;

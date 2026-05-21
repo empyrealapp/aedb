@@ -226,12 +226,7 @@ pub fn extract_index_key(
             .ok_or_else(|| AedbError::Validation(format!("indexed column not found: {col}")))?;
         // Treat missing slots as Null so index migrations against rows written
         // under an older schema (shorter `row.values`) succeed instead of panicking.
-        out.push(
-            row.values
-                .get(column_index)
-                .cloned()
-                .unwrap_or(Value::Null),
-        );
+        out.push(row.values.get(column_index).cloned().unwrap_or(Value::Null));
     }
     Ok(out)
 }

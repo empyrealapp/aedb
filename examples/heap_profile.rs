@@ -14,7 +14,7 @@ use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
 use aedb::config::AedbConfig;
-use aedb::query::plan::{Query, col, lit};
+use aedb::query::plan::{Query, QueryOptions, col, lit};
 use tempfile::tempdir;
 
 #[global_allocator]
@@ -115,13 +115,14 @@ async fn main() {
 
         if i % 1_000 == 0 {
             let _ = db
-                .query(
+                .query_no_auth(
                     PROJECT,
                     SCOPE,
                     Query::select(&["id", "name"])
                         .from(TABLE)
                         .where_(col("id").eq(lit(pk)))
                         .limit(1),
+                    QueryOptions::default(),
                 )
                 .await
                 .expect("point query");
