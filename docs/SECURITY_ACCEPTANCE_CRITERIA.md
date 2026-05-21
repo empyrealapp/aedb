@@ -1,6 +1,6 @@
 # Security Acceptance Criteria
 
-This document defines the minimum acceptance gates before claiming production readiness for high-integrity financial workloads.
+This document defines repo-local acceptance gates for high-integrity workloads. Passing these gates is evidence about the tested code paths; it is not evidence of independent audit, penetration testing, key management quality, or restore readiness in a deployed environment.
 
 ## Mandatory CI Gates
 
@@ -50,9 +50,9 @@ All mandatory scenarios must satisfy:
 - Deterministic replay/integrity checks pass in strict crash and strict restore suites.
 - No authorization boundary bypass in secure mode test suites.
 
-## External Validation (Required Outside This Repo)
+## External Validation Required For Stronger Claims
 
-The following are required before financial-grade claims:
+The following are required before using security-audited, penetration-tested, financial-grade, or equivalent production-readiness claims:
 
 - Independent code audit with focus on commit atomicity, authorization checks, and recovery path.
 - Penetration testing of the embedding/API boundary in the host application.

@@ -11,12 +11,12 @@ Primary API entry point: `AedbInstance`.
 
 ## Why AEDB
 
-AEDB is designed for local-first and service-side state where you want predictable durability and recovery behavior without running an external database process.
+AEDB is designed for local-first and service-side state where you want explicit durability and recovery controls without running an external database process.
 
 Use AEDB when you want:
 
 - in-process storage with explicit durability controls
-- deterministic crash recovery from checkpoint + WAL replay
+- checkpoint + WAL replay with crash/recovery coverage in the repo test suite
 - table + KV data models in one engine
 - operational APIs for checkpoint, backup, restore, and diagnostics
 
@@ -379,8 +379,12 @@ AEDB supports permission-aware APIs via `CallerContext` and `Permission`.
 
 Security/operations docs:
 
+- `docs/PRODUCTION_READINESS.md`
 - `docs/SECURITY_ACCEPTANCE_CRITERIA.md`
 - `docs/SECURITY_OPERATIONS_RUNBOOK.md`
+- `docs/AUTHORIZATION_MODEL.md`
+- `docs/COMMIT_SEQUENCING.md`
+- `docs/PERSISTENCE_COMPATIBILITY.md`
 - `docs/AEDB_SDK_PROCESSOR_MACRO_SPEC.md`
 - `docs/AEDB_MIGRATION_SYSTEM.md`
 
