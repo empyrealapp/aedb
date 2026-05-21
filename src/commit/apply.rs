@@ -2008,7 +2008,7 @@ fn apply_upsert_trusted_fast_with_schema(
     maintain_secondary_indexes(
         catalog,
         keyspace,
-        &schema,
+        schema,
         project_id,
         scope_id,
         table_name,

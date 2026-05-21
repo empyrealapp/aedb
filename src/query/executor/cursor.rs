@@ -112,10 +112,9 @@ pub(super) fn decode_cursor(
     let mut decoded_bytes = Vec::with_capacity(encoded_size_bytes / 2);
     let encoded_bytes = encoded.as_bytes();
     for byte_offset in (0..encoded_bytes.len()).step_by(2) {
-        let hi = decode_hex_nibble(encoded_bytes[byte_offset])
-            .ok_or(QueryError::InvalidCursor)?;
-        let lo = decode_hex_nibble(encoded_bytes[byte_offset + 1])
-            .ok_or(QueryError::InvalidCursor)?;
+        let hi = decode_hex_nibble(encoded_bytes[byte_offset]).ok_or(QueryError::InvalidCursor)?;
+        let lo =
+            decode_hex_nibble(encoded_bytes[byte_offset + 1]).ok_or(QueryError::InvalidCursor)?;
         decoded_bytes.push((hi << 4) | lo);
     }
     let payload_slice: &[u8] = if let Some(key) = signing_key {
@@ -124,10 +123,10 @@ pub(super) fn decode_cursor(
         }
         let split_at = decoded_bytes.len() - HMAC_TAG_LEN;
         let (payload, tag) = decoded_bytes.split_at(split_at);
-        let mut mac =
-            HmacSha256::new_from_slice(key).map_err(|_| QueryError::InvalidCursor)?;
+        let mut mac = HmacSha256::new_from_slice(key).map_err(|_| QueryError::InvalidCursor)?;
         mac.update(payload);
-        mac.verify_slice(tag).map_err(|_| QueryError::InvalidCursor)?;
+        mac.verify_slice(tag)
+            .map_err(|_| QueryError::InvalidCursor)?;
         payload
     } else {
         &decoded_bytes

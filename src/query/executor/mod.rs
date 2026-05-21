@@ -467,7 +467,7 @@ fn execute_query_with_options_capturing_signed(
             }
         }
     } else {
-        if let Some(collector) = read_set.as_deref_mut() {
+        if let Some(collector) = read_set {
             collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
         }
         estimated_rows = table.map_or(0, |t| t.rows.len());

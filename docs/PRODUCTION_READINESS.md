@@ -16,7 +16,7 @@ Passing everything here is necessary before production rollout. It is not suffic
 
 ## Mandatory Repo Gates
 
-Run the full repo-local production gate:
+Run the full repo-local production gate before production rollout:
 
 ```bash
 ./scripts/production_readiness_gate.sh
@@ -24,6 +24,9 @@ Run the full repo-local production gate:
 
 That gate currently enforces:
 
+- `cargo fmt --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `./scripts/supply_chain_gate.sh`
 - `cargo test --test query_integration -- --test-threads=1`
 - `cargo test --test stress arcana_l1_balance_conservation_under_load -- --test-threads=1`
 - `./scripts/security_gate.sh`
@@ -38,6 +41,38 @@ The security gate includes:
 
 See [SECURITY_ACCEPTANCE_CRITERIA.md](SECURITY_ACCEPTANCE_CRITERIA.md) for the detailed list.
 
+## Local Quality Commands
+
+Use the explicit gates below instead of `cargo test --workspace --all-targets`. The all-targets test command enters benchmark binaries, so it is not the default correctness gate.
+
+Fast correctness gate:
+
+```bash
+./scripts/correctness_gate.sh
+```
+
+Ignored long-running correctness and recovery tests:
+
+```bash
+./scripts/security_gate.sh
+```
+
+Benchmarks and benchmark threshold targets:
+
+```bash
+./scripts/benchmark_gate.sh
+```
+
+Dependency and supply-chain review:
+
+```bash
+./scripts/supply_chain_gate.sh
+```
+
+The supply-chain gate uses `cargo deny check` to track advisories, yanked crates, licenses, duplicate versions, wildcard dependencies, banned crates, and unknown registries or git sources. Runtime dependency additions must be justified in PRs, including why the dependency belongs in the runtime graph instead of dev-only tooling.
+
+Clippy treats warnings as errors. `clippy::too_many_arguments` is not globally allowed: production-facing boundaries should keep argument lists small when a coherent typed options struct exists. Local allowances are acceptable only with a rationale when the function is an internal storage/query boundary where explicit snapshot, caller, namespace, limit, cursor, or durability state makes correctness review clearer than hiding those values in an unrelated bag.
+
 ## Release Checklist
 
 - Production config uses `open_secure(...)` or `open_production(...)`.
@@ -46,6 +81,7 @@ See [SECURITY_ACCEPTANCE_CRITERIA.md](SECURITY_ACCEPTANCE_CRITERIA.md) for the d
 - Backup chain restore checks pass on a clean directory.
 - Offline invariant checks pass on a restored dataset.
 - Operational metrics are captured for baseline commit latency, queue depth, and durable-head lag.
+- Runtime dependency additions have PR rationale covering license, advisory status, duplicate versions, and why the crate is not dev-only.
 
 ## External Requirements
 

@@ -22,6 +22,10 @@ pub(crate) fn ensure_stable_order_from_catalog(
     query
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Query execution is an internal boundary that keeps caller, snapshot, limit, and cursor state explicit instead of hiding storage-critical context in a loosely related options bag."
+)]
 pub(crate) fn execute_query_against_view(
     view: &SnapshotReadView,
     project_id: &str,

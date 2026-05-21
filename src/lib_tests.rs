@@ -2773,7 +2773,9 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
             write_class: WriteClass::Standard,
             assertions: Vec::new(),
             read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: WriteIntent { mutations: too_many },
+            write_intent: WriteIntent {
+                mutations: too_many,
+            },
             base_seq: 0,
         })
         .await
@@ -2802,7 +2804,9 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
         write_class: WriteClass::Standard,
         assertions: Vec::new(),
         read_set: crate::commit::tx::ReadSet::default(),
-        write_intent: WriteIntent { mutations: ok_batch },
+        write_intent: WriteIntent {
+            mutations: ok_batch,
+        },
         base_seq: 0,
     })
     .await
@@ -2849,8 +2853,7 @@ async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
     match err {
         AedbError::Validation(msg) => {
             assert!(
-                msg.contains("max_read_assertions_per_envelope")
-                    && msg.contains("assertions=3"),
+                msg.contains("max_read_assertions_per_envelope") && msg.contains("assertions=3"),
                 "informative limit message expected, got: {msg}"
             );
         }
@@ -12402,8 +12405,10 @@ async fn subscribe_commits_delivers_delta_after_commit() {
 
 #[tokio::test]
 async fn subscribe_commits_lagged_subscriber_can_resume() {
-    let mut config = AedbConfig::default();
-    config.commit_broadcast_capacity = 2;
+    let config = AedbConfig {
+        commit_broadcast_capacity: 2,
+        ..AedbConfig::default()
+    };
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(config, dir.path()).expect("open");
 
