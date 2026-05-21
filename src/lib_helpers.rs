@@ -22,39 +22,43 @@ pub(crate) fn ensure_stable_order_from_catalog(
     query
 }
 
+pub(crate) struct QueryExecutionContext<'a> {
+    pub view: &'a SnapshotReadView,
+    pub project_id: &'a str,
+    pub scope_id: &'a str,
+    pub options: &'a QueryOptions,
+    pub caller: Option<&'a CallerContext>,
+    pub max_scan_rows: usize,
+    pub cursor_signing_key: Option<&'a [u8; 32]>,
+}
+
 pub(crate) fn execute_query_against_view(
-    view: &SnapshotReadView,
-    project_id: &str,
-    scope_id: &str,
+    ctx: QueryExecutionContext<'_>,
     mut query: Query,
-    options: &QueryOptions,
-    caller: Option<&CallerContext>,
-    max_scan_rows: usize,
-    cursor_signing_key: Option<&[u8; 32]>,
 ) -> Result<QueryResult, QueryError> {
-    let snapshot = &view.keyspace;
-    let catalog = &view.catalog;
-    let seq = view.seq;
+    let snapshot = &ctx.view.keyspace;
+    let catalog = &ctx.view.catalog;
+    let seq = ctx.view.seq;
 
     query = authorize_and_bind_query_for_caller(
-        project_id,
-        scope_id,
+        ctx.project_id,
+        ctx.scope_id,
         query,
-        options,
-        caller,
+        ctx.options,
+        ctx.caller,
         catalog.as_ref(),
     )?;
 
     execute_query_with_options(
         snapshot.as_ref(),
         catalog.as_ref(),
-        project_id,
-        scope_id,
+        ctx.project_id,
+        ctx.scope_id,
         query,
-        options,
+        ctx.options,
         seq,
-        max_scan_rows,
-        cursor_signing_key,
+        ctx.max_scan_rows,
+        ctx.cursor_signing_key,
     )
 }
 
