@@ -2487,11 +2487,21 @@ impl Keyspace {
     }
 
     pub fn kv_version(&self, project_id: &str, scope_id: &str, key: &[u8]) -> u64 {
+        self.try_kv_version(project_id, scope_id, key)
+            .expect("KV segment read failed")
+    }
+
+    pub fn try_kv_version(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: &[u8],
+    ) -> Result<u64, crate::error::AedbError> {
         let Some(namespace) = self.namespace(&NamespaceId::project_scope(project_id, scope_id))
         else {
-            return 0;
+            return Ok(0);
         };
-        namespace
+        let version = namespace
             .kv
             .entries
             .get(key)
@@ -2504,12 +2514,12 @@ impl Keyspace {
                     .map(|entry| entry.version)
             })
             .or_else(|| namespace.kv.segment_tombstones.get(key).copied())
-            .or_else(|| {
+            .map(Ok)
+            .unwrap_or_else(|| {
                 self.try_kv_segment_get(&namespace.kv, key)
-                    .expect("KV segment read failed")
-                    .map(|entry| entry.version)
-            })
-            .unwrap_or(0)
+                    .map(|entry| entry.map(|entry| entry.version).unwrap_or(0))
+            })?;
+        Ok(version)
     }
 
     pub fn max_kv_version_in_range(
@@ -2519,11 +2529,22 @@ impl Keyspace {
         start: Bound<Vec<u8>>,
         end: Bound<Vec<u8>>,
     ) -> u64 {
+        self.try_max_kv_version_in_range(project_id, scope_id, start, end)
+            .expect("KV segment scan failed")
+    }
+
+    pub fn try_max_kv_version_in_range(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Result<u64, crate::error::AedbError> {
         let Some(kv) = self
             .namespace(&NamespaceId::project_scope(project_id, scope_id))
             .map(|ns| &ns.kv)
         else {
-            return 0;
+            return Ok(0);
         };
         let visible_max = scan_kv_entries(
             kv,
@@ -2533,8 +2554,7 @@ impl Keyspace {
             self.value_store.as_deref(),
             self.kv_segment_store.as_deref(),
             true,
-        )
-        .expect("KV segment scan failed")
+        )?
         .into_iter()
         .map(|(_, entry)| entry.version)
         .max()
@@ -2545,7 +2565,7 @@ impl Keyspace {
             .map(|(_, version)| *version)
             .max()
             .unwrap_or(0);
-        visible_max.max(tombstone_max)
+        Ok(visible_max.max(tombstone_max))
     }
 
     pub fn kv_structural_version(&self, project_id: &str, scope_id: &str) -> u64 {

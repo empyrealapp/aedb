@@ -153,7 +153,7 @@ fn apply_keyspace_only_mutation(
         } => Some((|| {
             if let Some(expected_seq) = expected_seq {
                 let actual = keyspace
-                    .kv_get(project_id, scope_id, key)
+                    .try_kv_get(project_id, scope_id, key)?
                     .map(|entry| entry.version)
                     .unwrap_or(0);
                 if actual != *expected_seq {
@@ -298,7 +298,7 @@ fn apply_keyspace_only_mutation(
         } => Some((|| {
             if let Some(expected_seq) = expected_seq {
                 let actual = keyspace
-                    .kv_get(project_id, scope_id, key)
+                    .try_kv_get(project_id, scope_id, key)?
                     .map(|entry| entry.version)
                     .unwrap_or(0);
                 if actual != *expected_seq {
@@ -5168,12 +5168,12 @@ pub(super) fn revalidate_read_set_for_keyspace(
                 start,
                 end,
             } => (
-                keyspace.max_kv_version_in_range(
+                keyspace.try_max_kv_version_in_range(
                     project_id,
                     scope_id,
                     bytes_bound_to_vec(start),
                     bytes_bound_to_vec(end),
-                ),
+                )?,
                 keyspace.kv_structural_version(project_id, scope_id),
             ),
         };
@@ -5666,7 +5666,7 @@ fn apply_kv_projection_delta(
             key,
             ..
         } if namespace_key(p, s) == namespace => {
-            if let Some(entry) = state.keyspace.kv_get(project_id, scope_id, key) {
+            if let Some(entry) = state.keyspace.try_kv_get(project_id, scope_id, key)? {
                 upsert_kv_projection_row(
                     state,
                     project_id,

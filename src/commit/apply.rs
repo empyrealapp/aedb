@@ -656,7 +656,7 @@ pub fn apply_mutation_with_read_budget(
         } => {
             if let Some(expected_seq) = expected_seq {
                 let actual = keyspace
-                    .kv_get(&project_id, &scope_id, &key)
+                    .try_kv_get(&project_id, &scope_id, &key)?
                     .map(|entry| entry.version)
                     .unwrap_or(0);
                 if actual != expected_seq {
@@ -815,7 +815,7 @@ pub fn apply_mutation_with_read_budget(
         } => {
             if let Some(expected_seq) = expected_seq {
                 let actual = keyspace
-                    .kv_get(&project_id, &scope_id, &key)
+                    .try_kv_get(&project_id, &scope_id, &key)?
                     .map(|entry| entry.version)
                     .unwrap_or(0);
                 if actual != expected_seq {
@@ -2559,10 +2559,9 @@ fn validate_foreign_keys(
                 });
             }
         } else {
-            // For non-PK unique references, prefer the unique hash index.
             let ref_ns = namespace_key(&fk.references_project_id, &fk.references_scope_id);
             let lookup_key = EncodedKey::from_values(&values);
-            let maybe_index_name = catalog
+            let index_name = catalog
                 .indexes
                 .iter()
                 .find(|((idx_ns, idx_table, _), idx_def)| {
@@ -2574,17 +2573,13 @@ fn validate_foreign_keys(
                             crate::catalog::schema::IndexType::UniqueHash
                         )
                 })
-                .map(|((_, _, idx_name), _)| idx_name.clone());
-            if let Some(index_name) = maybe_index_name
-                && let Some(ref_table) =
-                    keyspace.table_by_namespace_key(&ref_ns, &fk.references_table)
-                && let Some(index) = ref_table.indexes.get(&index_name)
-                && index.unique_existing(&lookup_key).is_some()
-            {
-                continue;
-            }
-
-            // Fallback path if runtime index is not present yet.
+                .map(|((_, _, idx_name), _)| idx_name.clone())
+                .ok_or_else(|| AedbError::IntegrityError {
+                    message: format!(
+                        "non-primary-key foreign key {} references {} without a unique runtime index",
+                        fk.name, fk.references_table
+                    ),
+                })?;
             let ref_table = keyspace
                 .table_by_namespace_key(&ref_ns, &fk.references_table)
                 .ok_or_else(|| AedbError::NotFound {
@@ -2594,22 +2589,16 @@ fn validate_foreign_keys(
                         fk.references_project_id, fk.references_scope_id, fk.references_table
                     ),
                 })?;
-            let matched = ref_table.rows.iter().any(|(_pk, r)| {
-                let mut same = true;
-                for (i, ref_col) in fk.references_columns.iter().enumerate() {
-                    let Some(reference_column_index) =
-                        ref_schema.columns.iter().position(|c| c.name == *ref_col)
-                    else {
-                        return false;
-                    };
-                    if r.values.get(reference_column_index) != values.get(i) {
-                        same = false;
-                        break;
-                    }
-                }
-                same
-            });
-            if !matched {
+            let index = ref_table
+                .indexes
+                .get(&index_name)
+                .ok_or_else(|| AedbError::IntegrityError {
+                    message: format!(
+                        "missing runtime unique index {index_name} for non-primary-key foreign key {}",
+                        fk.name
+                    ),
+                })?;
+            if index.unique_existing(&lookup_key).is_none() {
                 return Err(AedbError::ForeignKeyViolation {
                     fk_name: fk.name.clone(),
                     table: schema.table_name.clone(),
@@ -2617,6 +2606,7 @@ fn validate_foreign_keys(
                     ref_key: format!("{values:?}"),
                 });
             }
+            continue;
         }
     }
     Ok(())
