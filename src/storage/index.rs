@@ -224,7 +224,14 @@ pub fn extract_index_key(
             .iter()
             .position(|c| c.name == *col)
             .ok_or_else(|| AedbError::Validation(format!("indexed column not found: {col}")))?;
-        out.push(row.values[column_index].clone());
+        // Treat missing slots as Null so index migrations against rows written
+        // under an older schema (shorter `row.values`) succeed instead of panicking.
+        out.push(
+            row.values
+                .get(column_index)
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
     }
     Ok(out)
 }
@@ -311,5 +318,49 @@ mod tests {
         assert_eq!(key, vec![Value::Integer(42)]);
         let encoded = extract_index_key_encoded(&row, &schema, &["age".into()]).expect("encoded");
         assert_eq!(encoded, EncodedKey::from_values(&[Value::Integer(42)]));
+    }
+
+    #[test]
+    fn extract_index_key_pads_short_rows_with_null() {
+        // Schema declares three columns but the row was written under an older
+        // schema with only the first value. Index extraction must not panic on
+        // the missing slot — it should substitute Null so migrations against
+        // legacy rows can complete.
+        let schema = TableSchema {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "t".into(),
+            owner_id: None,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: true,
+                },
+                ColumnDef {
+                    name: "tag".into(),
+                    col_type: ColumnType::Text,
+                    nullable: true,
+                },
+            ],
+            primary_key: vec!["id".into()],
+            constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let short_row = Row::from_values(vec![Value::Integer(1)]);
+        let key =
+            extract_index_key(&short_row, &schema, &["age".into(), "tag".into()]).expect("extract");
+        assert_eq!(key, vec![Value::Null, Value::Null]);
+        let encoded = extract_index_key_encoded(&short_row, &schema, &["age".into(), "tag".into()])
+            .expect("encoded");
+        assert_eq!(
+            encoded,
+            EncodedKey::from_values(&[Value::Null, Value::Null])
+        );
     }
 }
