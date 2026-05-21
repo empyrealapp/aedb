@@ -1448,29 +1448,11 @@ async fn strict_restore_rejects_older_backup_version() {
     let dir = tempdir().expect("data dir");
     let backup_dir = tempdir().expect("backup dir");
     let config = AedbConfig::production([7u8; 32]);
-    let db = AedbInstance::open_secure(config.clone(), dir.path()).expect("open secure");
-    let system = CallerContext::system_internal();
-    db.commit_as(
-        system.clone(),
-        Mutation::Ddl(DdlOperation::CreateProject {
-            owner_id: None,
-            if_not_exists: true,
-            project_id: "arcana".into(),
-        }),
-    )
-    .await
-    .expect("create project");
-    db.commit_as(
-        system,
-        Mutation::Ddl(DdlOperation::CreateScope {
-            owner_id: None,
-            if_not_exists: true,
-            project_id: "arcana".into(),
-            scope_id: "app".into(),
-        }),
-    )
-    .await
-    .expect("create scope");
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("arcana").await.expect("create project");
+    db.create_scope("arcana", "app")
+        .await
+        .expect("create scope");
     db.backup_full(backup_dir.path())
         .await
         .expect("backup full");
@@ -1498,38 +1480,17 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
     let backup_dir = tempdir().expect("backup dir");
     let restore_dir = tempdir().expect("restore dir");
     let config = AedbConfig::production([8u8; 32]);
-    let db = AedbInstance::open_secure(config.clone(), dir.path()).expect("open secure");
-    let system = CallerContext::system_internal();
-    db.commit_as(
-        system.clone(),
-        Mutation::Ddl(DdlOperation::CreateProject {
-            owner_id: None,
-            if_not_exists: true,
-            project_id: "arcana".into(),
-        }),
-    )
-    .await
-    .expect("create project");
-    db.commit_as(
-        system.clone(),
-        Mutation::Ddl(DdlOperation::CreateScope {
-            owner_id: None,
-            if_not_exists: true,
-            project_id: "arcana".into(),
-            scope_id: "app".into(),
-        }),
-    )
-    .await
-    .expect("create scope");
-    db.commit_as(
-        system,
-        Mutation::KvSet {
-            project_id: "arcana".into(),
-            scope_id: "app".into(),
-            key: b"k".to_vec(),
-            value: b"v".to_vec(),
-        },
-    )
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("arcana").await.expect("create project");
+    db.create_scope("arcana", "app")
+        .await
+        .expect("create scope");
+    db.commit(Mutation::KvSet {
+        project_id: "arcana".into(),
+        scope_id: "app".into(),
+        key: b"k".to_vec(),
+        value: b"v".to_vec(),
+    })
     .await
     .expect("write kv");
     db.backup_full(backup_dir.path())

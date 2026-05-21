@@ -157,12 +157,8 @@ impl fmt::Display for QueryError {
                 "scan bound exceeded: estimated_rows={estimated_rows}, max_scan_rows={max_scan_rows}"
             ),
             QueryError::InvalidQuery { reason } => write!(f, "invalid query: {reason}"),
-            QueryError::PermissionDenied { permission, scope } => {
-                if scope.is_empty() {
-                    write!(f, "permission denied: {permission}")
-                } else {
-                    write!(f, "permission denied: {permission} (scope={scope})")
-                }
+            QueryError::PermissionDenied { .. } => {
+                write!(f, "permission denied: permission denied")
             }
             QueryError::SeqNotYetVisible { requested, current } => write!(
                 f,

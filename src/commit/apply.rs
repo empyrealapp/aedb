@@ -2589,7 +2589,7 @@ fn validate_foreign_keys(
                         fk.references_project_id, fk.references_scope_id, fk.references_table
                     ),
                 })?;
-            let index = ref_table
+            let reference_unique_index = ref_table
                 .indexes
                 .get(&index_name)
                 .ok_or_else(|| AedbError::IntegrityError {
@@ -2598,7 +2598,10 @@ fn validate_foreign_keys(
                         fk.name
                     ),
                 })?;
-            if index.unique_existing(&lookup_key).is_none() {
+            if reference_unique_index
+                .unique_existing(&lookup_key)
+                .is_none()
+            {
                 return Err(AedbError::ForeignKeyViolation {
                     fk_name: fk.name.clone(),
                     table: schema.table_name.clone(),

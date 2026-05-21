@@ -110,10 +110,7 @@ impl AedbInstance {
                 .catalog
                 .has_permission(&caller.caller_id, &required)
             {
-                return Err(AedbError::PermissionDenied(format!(
-                    "caller={} missing table read permission for system event stream",
-                    caller.caller_id
-                )));
+                return Err(AedbError::PermissionDenied("permission denied".into()));
             }
         }
         let Some(table) = lease.view.keyspace.table(
@@ -476,10 +473,7 @@ impl AedbInstance {
                 .catalog
                 .has_permission(&caller.caller_id, &required)
             {
-                return Err(AedbError::PermissionDenied(format!(
-                    "caller={} missing table read permission for reactive processor checkpoints",
-                    caller.caller_id
-                )));
+                return Err(AedbError::PermissionDenied("permission denied".into()));
             }
         }
         let mut checkpoint_seq = 0u64;

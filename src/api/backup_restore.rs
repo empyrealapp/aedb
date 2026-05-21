@@ -62,13 +62,31 @@ impl AedbInstance {
             let mut file_sha256 = BTreeMap::new();
             file_sha256.insert(checkpoint.filename.clone(), checkpoint.sha256_hex.clone());
 
-            for segment in read_segments_for_checkpoint(&source_dir, snapshot_seq)? {
+            let mut segments = read_segments_for_checkpoint(&source_dir, snapshot_seq)?;
+            for segment in segments.clone() {
                 let src = source_dir.join(&segment.filename);
                 let rel = format!("wal_tail/{}", segment.filename);
                 let dst = backup_dir.join(&rel);
-                let hash = copy_file_prefix_sha256_hex(&src, &dst, segment.size_bytes)?;
+                let hash = match copy_file_prefix_sha256_hex(&src, &dst, segment.size_bytes) {
+                    Ok(hash) => hash,
+                    Err(AedbError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                        segments = read_segments_for_checkpoint(&source_dir, snapshot_seq)?;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 wal_segments.push(segment.filename);
                 file_sha256.insert(rel, hash);
+            }
+            if wal_segments.is_empty() {
+                for segment in segments {
+                    let src = source_dir.join(&segment.filename);
+                    let rel = format!("wal_tail/{}", segment.filename);
+                    let dst = backup_dir.join(&rel);
+                    let hash = copy_file_prefix_sha256_hex(&src, &dst, segment.size_bytes)?;
+                    wal_segments.push(segment.filename);
+                    file_sha256.insert(rel, hash);
+                }
             }
 
             wal_segments.sort_by_key(|name| segment_seq_from_name(name).unwrap_or(0));
