@@ -37,6 +37,19 @@ pub fn preflight_with_config(
     mutation: &Mutation,
     config: &AedbConfig,
 ) -> PreflightResult {
+    macro_rules! kv_get {
+        ($project_id:expr, $scope_id:expr, $key:expr) => {
+            match snapshot.try_kv_get($project_id, $scope_id, $key) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return PreflightResult::Err {
+                        reason: e.to_string(),
+                    };
+                }
+            }
+        };
+    }
+
     if let Err(e) = validate_mutation_with_config(catalog, mutation, config) {
         return PreflightResult::Err {
             reason: e.to_string(),
@@ -136,7 +149,7 @@ pub fn preflight_with_config(
             key,
             amount_be,
         } => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match kv_get!(project_id, scope_id, key) {
                 Some(entry) => match decode_u256(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -157,7 +170,7 @@ pub fn preflight_with_config(
             key,
             amount_be,
         } => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match kv_get!(project_id, scope_id, key) {
                 Some(entry) => match decode_u256(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -180,7 +193,7 @@ pub fn preflight_with_config(
             on_missing,
             on_overflow,
         } => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match kv_get!(project_id, scope_id, key) {
                 Some(entry) => match decode_u256(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -215,7 +228,7 @@ pub fn preflight_with_config(
             on_missing,
             on_underflow,
         } => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match kv_get!(project_id, scope_id, key) {
                 Some(entry) => match decode_u256(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -254,7 +267,7 @@ pub fn preflight_with_config(
             on_missing,
             ..
         } => {
-            if snapshot.kv_get(project_id, scope_id, key).is_none()
+            if kv_get!(project_id, scope_id, key).is_none()
                 && matches!(on_missing, KvU256MissingPolicy::Reject)
             {
                 return PreflightResult::Err {
@@ -272,7 +285,7 @@ pub fn preflight_with_config(
             operand_be,
             expected_seq,
         } => {
-            let current_entry = snapshot.kv_get(project_id, scope_id, key);
+            let current_entry = kv_get!(project_id, scope_id, key);
             let current_version = current_entry
                 .as_ref()
                 .map(|entry| entry.version)
@@ -326,7 +339,7 @@ pub fn preflight_with_config(
             on_missing,
             on_overflow,
         } => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match kv_get!(project_id, scope_id, key) {
                 Some(entry) => match decode_u64(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -361,7 +374,7 @@ pub fn preflight_with_config(
             on_missing,
             on_underflow,
         } => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match kv_get!(project_id, scope_id, key) {
                 Some(entry) => match decode_u64(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -413,7 +426,7 @@ pub fn preflight_with_config(
         } => {
             let shard = counter_shard_index(*shard_hint, *shard_count);
             let shard_key = counter_shard_storage_key(key, shard);
-            let current = match snapshot.kv_get(project_id, scope_id, &shard_key) {
+            let current = match kv_get!(project_id, scope_id, &shard_key) {
                 Some(entry) => match decode_u64(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -442,7 +455,7 @@ pub fn preflight_with_config(
             on_missing,
             ..
         } => {
-            if snapshot.kv_get(project_id, scope_id, key).is_none()
+            if kv_get!(project_id, scope_id, key).is_none()
                 && matches!(on_missing, KvU64MissingPolicy::Reject)
             {
                 return PreflightResult::Err {
@@ -460,7 +473,7 @@ pub fn preflight_with_config(
             operand_be,
             expected_seq,
         } => {
-            let current_entry = snapshot.kv_get(project_id, scope_id, key);
+            let current_entry = kv_get!(project_id, scope_id, key);
             let current_version = current_entry
                 .as_ref()
                 .map(|entry| entry.version)
@@ -590,6 +603,11 @@ pub fn preflight_plan_with_config(
     config: &AedbConfig,
 ) -> PreflightPlan {
     let mut errors = Vec::new();
+    macro_rules! kv_version {
+        ($project_id:expr, $scope_id:expr, $key:expr) => {
+            snapshot_kv_version_for_key(snapshot, $project_id, $scope_id, $key, &mut errors)
+        };
+    }
     if let Err(e) = validate_mutation_with_config(catalog, mutation, config) {
         errors.push(e.to_string());
     }
@@ -744,10 +762,7 @@ pub fn preflight_plan_with_config(
             scope_id,
             key,
         } => {
-            let version = snapshot
-                .kv_get(project_id, scope_id, key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -772,10 +787,7 @@ pub fn preflight_plan_with_config(
             ..
         } => {
             if expected_seq.is_some() || matches!(op, KvU256MutatorOp::Sub) {
-                let version = snapshot
-                    .kv_get(project_id, scope_id, key)
-                    .map(|e| e.version)
-                    .unwrap_or(0);
+                let version = kv_version!(project_id, scope_id, key);
                 read_set.points.push(ReadSetEntry {
                     key: ReadKey::KvKey {
                         project_id: project_id.clone(),
@@ -799,10 +811,7 @@ pub fn preflight_plan_with_config(
             on_underflow: KvU256UnderflowPolicy::Reject,
             ..
         } => {
-            let version = snapshot
-                .kv_get(project_id, scope_id, key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -822,10 +831,7 @@ pub fn preflight_plan_with_config(
             on_underflow: KvU64UnderflowPolicy::Reject,
             ..
         } => {
-            let version = snapshot
-                .kv_get(project_id, scope_id, key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -845,10 +851,7 @@ pub fn preflight_plan_with_config(
             ..
         } => {
             if expected_seq.is_some() || matches!(op, KvU64MutatorOp::Sub) {
-                let version = snapshot
-                    .kv_get(project_id, scope_id, key)
-                    .map(|e| e.version)
-                    .unwrap_or(0);
+                let version = kv_version!(project_id, scope_id, key);
                 read_set.points.push(ReadSetEntry {
                     key: ReadKey::KvKey {
                         project_id: project_id.clone(),
@@ -866,10 +869,7 @@ pub fn preflight_plan_with_config(
             on_underflow: KvIntegerUnderflowPolicy::Reject,
             ..
         } => {
-            let version = snapshot
-                .kv_get(project_id, scope_id, key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -927,10 +927,7 @@ pub fn preflight_plan_with_config(
             scope_id,
             request,
         } => {
-            let version = snapshot
-                .kv_get(project_id, scope_id, request.instrument.as_bytes())
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, request.instrument.as_bytes());
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -963,10 +960,7 @@ pub fn preflight_plan_with_config(
         } => {
             let mut key = format!("ob:{instrument}:ord:").into_bytes();
             key.extend_from_slice(&order_id.to_be_bytes());
-            let version = snapshot
-                .kv_get(project_id, scope_id, &key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, &key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -992,8 +986,13 @@ pub fn preflight_plan_with_config(
             let start = ReadBound::Included(prefix.clone());
             let mut end = prefix.clone();
             end.push(0xff);
-            let max_version =
-                snapshot_max_kv_version_for_prefix(snapshot, project_id, scope_id, &prefix);
+            let max_version = snapshot_max_kv_version_for_prefix(
+                snapshot,
+                project_id,
+                scope_id,
+                &prefix,
+                &mut errors,
+            );
             let structural_version = snapshot_kv_structural_version(snapshot, project_id, scope_id);
             read_set.ranges.push(ReadRangeEntry {
                 range: ReadRange::KvRange {
@@ -1018,10 +1017,7 @@ pub fn preflight_plan_with_config(
             table_id,
         } => {
             let key = crate::order_book::key_order_book_table_spec(table_id);
-            let version = snapshot
-                .kv_get(project_id, scope_id, &key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, &key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -1044,10 +1040,7 @@ pub fn preflight_plan_with_config(
             ..
         } => {
             let key = crate::order_book::key_instrument_config(instrument);
-            let version = snapshot
-                .kv_get(project_id, scope_id, &key)
-                .map(|e| e.version)
-                .unwrap_or(0);
+            let version = kv_version!(project_id, scope_id, &key);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::KvKey {
                     project_id: project_id.clone(),
@@ -1090,7 +1083,14 @@ fn preflight_kv_sub_int_ex(
 ) -> PreflightResult {
     match amount {
         KvIntegerAmount::U64(amount_be) => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match match snapshot.try_kv_get(project_id, scope_id, key) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return PreflightResult::Err {
+                        reason: e.to_string(),
+                    };
+                }
+            } {
                 Some(entry) => match decode_u64(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -1116,7 +1116,14 @@ fn preflight_kv_sub_int_ex(
             PreflightResult::Ok { affected_rows: 1 }
         }
         KvIntegerAmount::U256(amount_be) => {
-            let current = match snapshot.kv_get(project_id, scope_id, key) {
+            let current = match match snapshot.try_kv_get(project_id, scope_id, key) {
+                Ok(entry) => entry,
+                Err(e) => {
+                    return PreflightResult::Err {
+                        reason: e.to_string(),
+                    };
+                }
+            } {
                 Some(entry) => match decode_u256(&entry.value) {
                     Ok(value) => value,
                     Err(reason) => return PreflightResult::Err { reason },
@@ -1197,19 +1204,35 @@ fn snapshot_max_kv_version_for_prefix(
     project_id: &str,
     scope_id: &str,
     prefix: &[u8],
+    errors: &mut Vec<String>,
 ) -> u64 {
-    let ns = crate::storage::keyspace::NamespaceId::project_scope(project_id, scope_id);
-    let Some(namespace) = snapshot.namespaces.get(&ns) else {
-        return 0;
-    };
-    namespace
-        .kv
-        .entries
-        .iter()
-        .filter(|(k, _)| k.starts_with(prefix))
-        .map(|(_, v)| v.version)
-        .max()
-        .unwrap_or(0)
+    match snapshot.try_kv_scan_prefix(project_id, scope_id, prefix, usize::MAX) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|(_, entry)| entry.version)
+            .max()
+            .unwrap_or(0),
+        Err(e) => {
+            errors.push(e.to_string());
+            0
+        }
+    }
+}
+
+fn snapshot_kv_version_for_key(
+    snapshot: &KeyspaceSnapshot,
+    project_id: &str,
+    scope_id: &str,
+    key: &[u8],
+    errors: &mut Vec<String>,
+) -> u64 {
+    match snapshot.try_kv_get(project_id, scope_id, key) {
+        Ok(entry) => entry.map(|entry| entry.version).unwrap_or(0),
+        Err(e) => {
+            errors.push(e.to_string());
+            0
+        }
+    }
 }
 
 fn snapshot_kv_structural_version(

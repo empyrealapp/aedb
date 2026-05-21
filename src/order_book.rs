@@ -1190,12 +1190,12 @@ pub fn apply_order_book_mass_cancel(
     price_range_ticks: Option<(i64, i64)>,
     commit_seq: u64,
 ) -> Result<(), AedbError> {
-    let orders = keyspace.kv_scan_prefix(
+    let orders = keyspace.try_kv_scan_prefix(
         project_id,
         scope_id,
         &all_orders_prefix(instrument),
         MASS_CANCEL_SCAN_LIMIT.saturating_add(1),
-    );
+    )?;
     if orders.len() > MASS_CANCEL_SCAN_LIMIT {
         return Err(AedbError::Validation(
             "mass cancel scan limit exceeded".into(),

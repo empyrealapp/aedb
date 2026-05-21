@@ -830,12 +830,12 @@ pub(in crate::commit::executor) fn revalidate_read_set_for_keyspace(
                 start,
                 end,
             } => (
-                keyspace.max_kv_version_in_range(
+                keyspace.try_max_kv_version_in_range(
                     project_id,
                     scope_id,
                     bytes_bound_to_vec(start),
                     bytes_bound_to_vec(end),
-                ),
+                )?,
                 keyspace.kv_structural_version(project_id, scope_id),
             ),
         };

@@ -441,6 +441,178 @@ async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
     reopened.shutdown().await.expect("shutdown reopened");
 }
 
+fn corrupt_file_byte(path: &Path, at: usize) {
+    let mut bytes = fs::read(path).expect("read file to corrupt");
+    assert!(bytes.len() > at, "file too small to corrupt at offset {at}");
+    bytes[at] ^= 0x5a;
+    fs::write(path, bytes).expect("rewrite corrupted file");
+}
+
+fn first_kv_segment_path(dir: &Path) -> PathBuf {
+    fs::read_dir(dir.join("kv_segments"))
+        .expect("segment dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "aedbkv"))
+        .expect("kv segment file")
+}
+
+#[tokio::test]
+async fn disk_backed_spilled_value_corruption_fails_closed_for_reads_and_commit_guards() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 0,
+        persistent_value_hot_cache_bytes: 0,
+        max_kv_value_bytes: 256 * 1024,
+        max_transaction_bytes: 512 * 1024,
+        ..AedbConfig::default()
+    };
+    let value = vec![7u8; 128 * 1024];
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set("p", "app", b"blob".to_vec(), value)
+        .await
+        .expect("set spilled value");
+
+    corrupt_file_byte(&dir.path().join("values.aedbdat"), 16);
+
+    let err = db
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect_err("point lookup must return a structured corruption error");
+    assert!(
+        matches!(err, QueryError::InternalError(message) if message.contains("persistent value hash mismatch"))
+    );
+
+    let preflight = db
+        .preflight(Mutation::KvMutateU64 {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"blob".to_vec(),
+            op: crate::commit::validation::KvU64MutatorOp::Set,
+            operand_be: 1u64.to_be_bytes(),
+            expected_seq: Some(1),
+        })
+        .await;
+    assert!(
+        matches!(preflight, crate::preflight::PreflightResult::Err { reason } if reason.contains("persistent value hash mismatch"))
+    );
+
+    let commit_err = db
+        .commit_envelope(TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::KeyEquals {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"blob".to_vec(),
+                expected: b"anything".to_vec(),
+            }],
+            read_set: Default::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "app".into(),
+                    key: b"after-corruption".to_vec(),
+                    value: b"blocked".to_vec(),
+                }],
+            },
+            base_seq: 0,
+        })
+        .await
+        .expect_err("commit assertion must return corruption error");
+    assert!(
+        matches!(commit_err, AedbError::IntegrityError { ref message } if message.contains("persistent value hash mismatch")),
+        "unexpected commit error: {commit_err:?}"
+    );
+
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let recovered = reopened
+        .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
+        .await
+        .expect("WAL recovery should not panic")
+        .expect("WAL should recover the committed value");
+    assert_eq!(recovered.value.len(), 128 * 1024);
+    reopened.shutdown().await.expect("shutdown reopened");
+}
+
+#[tokio::test]
+async fn disk_backed_kv_segment_corruption_fails_closed_for_point_prefix_and_secure_reads() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        persistent_value_inline_threshold_bytes: 1024,
+        persistent_value_hot_cache_bytes: 0,
+        kv_segment_block_cache_bytes: 0,
+        max_memory_estimate_bytes: 10 * 1024,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.kv_set_many_atomic(
+        "p",
+        "app",
+        (0..512u16)
+            .map(|i| (format!("seg:{i:03}").into_bytes(), vec![i as u8; 16]))
+            .collect(),
+    )
+    .await
+    .expect("seed segment values");
+
+    let caller = CallerContext::new("alice");
+    db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
+        actor_id: None,
+        delegable: false,
+        caller_id: "alice".into(),
+        permission: Permission::KvRead {
+            project_id: "p".into(),
+            scope_id: Some("app".into()),
+            prefix: Some(b"seg:".to_vec()),
+        },
+    }))
+    .await
+    .expect("grant read");
+
+    corrupt_file_byte(&first_kv_segment_path(dir.path()), 16);
+
+    let point_err = db
+        .kv_get_no_auth("p", "app", b"seg:000", ConsistencyMode::AtLatest)
+        .await
+        .expect_err("point lookup must fail on corrupt segment");
+    assert!(
+        matches!(point_err, QueryError::InternalError(message) if message.contains("KV segment"))
+    );
+
+    let prefix_err = db
+        .kv_scan_prefix_no_auth("p", "app", b"seg:", 10, ConsistencyMode::AtLatest)
+        .await
+        .expect_err("prefix scan must fail on corrupt segment");
+    assert!(
+        matches!(prefix_err, QueryError::InternalError(message) if message.contains("KV segment"))
+    );
+
+    let secure_err = db
+        .kv_scan_prefix(
+            "p",
+            "app",
+            b"seg:",
+            10,
+            None,
+            ConsistencyMode::AtLatest,
+            &caller,
+        )
+        .await
+        .expect_err("secure scan must not disclose partial rows after corruption");
+    assert!(
+        matches!(secure_err, QueryError::InternalError(message) if message.contains("KV segment"))
+    );
+}
+
 #[tokio::test]
 async fn production_profile_spills_all_kv_payloads_by_default() {
     let dir = tempdir().expect("temp");
