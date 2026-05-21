@@ -2903,8 +2903,8 @@ impl AedbInstance {
         let catalog = &lease.view.catalog;
         if !catalog.has_kv_read_permission(&caller.caller_id, project_id, scope_id, key) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         let execute_started = Instant::now();
@@ -3118,8 +3118,8 @@ impl AedbInstance {
                 Some(prefixes) => prefixes,
                 None => {
                     return Err(QueryError::PermissionDenied {
-                        permission: format!("KvRead({project_id}.{scope_id})"),
-                        scope: caller.caller_id.clone(),
+                        permission: "permission denied".into(),
+                        scope: String::new(),
                     });
                 }
             };
@@ -3240,8 +3240,8 @@ impl AedbInstance {
                 Some(prefixes) => prefixes,
                 None => {
                     return Err(QueryError::PermissionDenied {
-                        permission: format!("KvRead({project_id}.{scope_id})"),
-                        scope: caller.caller_id.clone(),
+                        permission: "permission denied".into(),
+                        scope: String::new(),
                     });
                 }
             };
@@ -3335,8 +3335,8 @@ impl AedbInstance {
         );
         if !project_read {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.*)"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         let snapshot = &lease.view.keyspace;
@@ -3848,10 +3848,7 @@ impl AedbInstance {
             .catalog
             .has_kv_read_permission(&caller.caller_id, project_id, scope_id, key)
         {
-            return Err(AedbError::PermissionDenied(format!(
-                "caller={} missing kv read permission for counter",
-                caller.caller_id
-            )));
+            return Err(AedbError::PermissionDenied("permission denied".into()));
         }
         lease
             .view
@@ -3968,10 +3965,7 @@ impl AedbInstance {
                 .catalog
                 .has_permission(&caller.caller_id, &required)
             {
-                return Err(AedbError::PermissionDenied(format!(
-                    "caller={} missing table read permission for system event stream",
-                    caller.caller_id
-                )));
+                return Err(AedbError::PermissionDenied("permission denied".into()));
             }
         }
         let Some(table) = lease.view.keyspace.table(
@@ -4334,10 +4328,7 @@ impl AedbInstance {
                 .catalog
                 .has_permission(&caller.caller_id, &required)
             {
-                return Err(AedbError::PermissionDenied(format!(
-                    "caller={} missing table read permission for reactive processor checkpoints",
-                    caller.caller_id
-                )));
+                return Err(AedbError::PermissionDenied("permission denied".into()));
             }
         }
         let mut checkpoint_seq = 0u64;
@@ -6899,8 +6890,8 @@ impl AedbInstance {
             prefix.as_bytes(),
         ) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         read_top_n(
@@ -6936,8 +6927,8 @@ impl AedbInstance {
             prefix.as_bytes(),
         ) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         let order = read_order_status(
@@ -6955,8 +6946,8 @@ impl AedbInstance {
                 .has_permission(&caller.caller_id, &Permission::GlobalAdmin);
             if !admin && order.owner != caller.caller_id {
                 return Err(QueryError::PermissionDenied {
-                    permission: "order_status(owner match)".into(),
-                    scope: caller.caller_id.clone(),
+                    permission: "permission denied".into(),
+                    scope: String::new(),
                 });
             }
         }
@@ -6985,8 +6976,8 @@ impl AedbInstance {
             prefix.as_bytes(),
         ) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         let admin = lease
@@ -6995,8 +6986,8 @@ impl AedbInstance {
             .has_permission(&caller.caller_id, &Permission::GlobalAdmin);
         if !admin && owner != caller.caller_id {
             return Err(QueryError::PermissionDenied {
-                permission: "open_orders(owner match)".into(),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         read_open_orders(
@@ -7031,8 +7022,8 @@ impl AedbInstance {
             prefix.as_bytes(),
         ) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         read_recent_trades(
@@ -7066,8 +7057,8 @@ impl AedbInstance {
             prefix.as_bytes(),
         ) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         read_spread(
@@ -7101,8 +7092,8 @@ impl AedbInstance {
             prefix.as_bytes(),
         ) {
             return Err(QueryError::PermissionDenied {
-                permission: format!("KvRead({project_id}.{scope_id})"),
-                scope: caller.caller_id.clone(),
+                permission: "permission denied".into(),
+                scope: String::new(),
             });
         }
         read_last_execution_report(&lease.view.keyspace, project_id, scope_id, instrument)
@@ -8138,6 +8129,11 @@ impl AedbInstance {
     }
 
     pub async fn backup_full(&self, backup_dir: &Path) -> Result<BackupManifest, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
         create_private_dir_all(backup_dir)?;
         create_private_dir_all(&backup_dir.join("wal_tail"))?;
 
@@ -8230,6 +8226,11 @@ impl AedbInstance {
         backup_dir: &Path,
         parent_backup_dir: &Path,
     ) -> Result<BackupManifest, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "authenticated caller required in secure mode".into(),
+            ));
+        }
         create_private_dir_all(backup_dir)?;
         create_private_dir_all(&backup_dir.join("wal_tail"))?;
         let parent = load_backup_manifest(parent_backup_dir, self._config.hmac_key())?;

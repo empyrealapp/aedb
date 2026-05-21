@@ -50,6 +50,25 @@ All mandatory scenarios must satisfy:
 - Deterministic replay/integrity checks pass in strict crash and strict restore suites.
 - No authorization boundary bypass in secure mode test suites.
 
+## Secure-Mode API Boundary
+
+Secure mode is fail-closed at the public API boundary. Public methods that omit caller context must reject in secure mode unless they are pure local lifecycle/configuration operations that cannot read or mutate protected AEDB data.
+
+Current unauthenticated read escape hatches are intentionally limited to non-secure deployments:
+
+- `query_no_auth`
+- `kv_get_no_auth`
+- `kv_get_many_no_auth`
+- `kv_scan_prefix_no_auth`
+
+The synchronous bridge may expose wrappers with the same names; they inherit the same secure-mode denial from `AedbInstance`.
+
+Public methods with anonymous read behavior but without a `_no_auth` suffix, including `query`, `query_with_options`, `query_with_read_set`, `read_event_stream`, `reactive_processor_lag`, migration runners, and backup writers, must also reject in secure mode until a caller-bearing/admin-authorized API exists.
+
+Methods containing `unchecked` are crate-private implementation details only. They must not be exported as public API, and secure-mode coverage must fail if they become reachable without an authenticated caller.
+
+Permission-denied diagnostics are part of the security boundary. They may identify that access was denied, but must not disclose protected project names, scope names, table names, keys, predicate details, row contents, or assertion actual values. Use generic `"permission denied"` messages for authorization failures; detailed resource identifiers belong in trusted audit logs, not user-facing errors.
+
 ## External Validation (Required Outside This Repo)
 
 The following are required before financial-grade claims:

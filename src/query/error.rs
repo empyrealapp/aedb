@@ -84,7 +84,11 @@ impl fmt::Display for QueryError {
             ),
             QueryError::InvalidQuery { reason } => write!(f, "invalid query: {reason}"),
             QueryError::PermissionDenied { permission, scope } => {
-                write!(f, "permission denied: {permission} (scope={scope})")
+                if scope.is_empty() {
+                    write!(f, "permission denied: {permission}")
+                } else {
+                    write!(f, "permission denied: {permission} (scope={scope})")
+                }
             }
             QueryError::SeqNotYetVisible { requested, current } => write!(
                 f,
