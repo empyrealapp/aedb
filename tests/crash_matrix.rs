@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::backup::sha256_file_hex;
 use aedb::catalog::DdlOperation;

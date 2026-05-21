@@ -21,11 +21,11 @@ async fn setup_policy_db(max_scan_rows: usize) -> TestDb {
         ..AedbConfig::default()
     });
     let db = &fixture.db;
-    create_project_scope(&db, PROJECT, SCOPE).await;
-    create_table(&db, PROJECT, SCOPE, "docs", id_owner_amount_columns()).await;
-    create_owner_index(&db, PROJECT, SCOPE, "docs").await;
+    create_project_scope(db, PROJECT, SCOPE).await;
+    create_table(db, PROJECT, SCOPE, "docs", id_owner_amount_columns()).await;
+    create_owner_index(db, PROJECT, SCOPE, "docs").await;
     create_async_index(
-        &db,
+        db,
         PROJECT,
         SCOPE,
         "docs",
@@ -34,7 +34,7 @@ async fn setup_policy_db(max_scan_rows: usize) -> TestDb {
     )
     .await;
     seed_owned_rows(
-        &db,
+        db,
         PROJECT,
         SCOPE,
         "docs",
@@ -48,9 +48,9 @@ async fn setup_policy_db(max_scan_rows: usize) -> TestDb {
         ],
     )
     .await;
-    set_owner_read_policy(&db, PROJECT, SCOPE, "docs").await;
-    grant_table_read(&db, "alice", PROJECT, SCOPE, "docs").await;
-    grant_index_read(&db, "alice", PROJECT, SCOPE, "docs", "docs_projection").await;
+    set_owner_read_policy(db, PROJECT, SCOPE, "docs").await;
+    grant_table_read(db, "alice", PROJECT, SCOPE, "docs").await;
+    grant_index_read(db, "alice", PROJECT, SCOPE, "docs", "docs_projection").await;
     fixture
 }
 

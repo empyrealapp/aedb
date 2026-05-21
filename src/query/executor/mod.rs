@@ -477,7 +477,7 @@ fn execute_query_with_options_capturing_signed(
                     )
                 }
                 None => {
-                    if let Some(collector) = read_set.as_deref_mut() {
+                    if let Some(collector) = read_set {
                         collector.record_full_table_scan(
                             snapshot,
                             &exec_project_id,
@@ -490,7 +490,7 @@ fn execute_query_with_options_capturing_signed(
                 }
             }
         } else {
-            if let Some(collector) = read_set.as_deref_mut() {
+            if let Some(collector) = read_set {
                 collector.record_full_table_scan(
                     snapshot,
                     &exec_project_id,

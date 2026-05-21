@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::{ColumnDef, IndexType};
@@ -96,8 +97,10 @@ proptest! {
             .expect("runtime");
         let outcome: Result<(), TestCaseError> = rt.block_on(async move {
             let dir = tempdir().expect("temp dir");
-            let mut config = AedbConfig::default();
-            config.storage_mode = StorageMode::DiskBacked;
+            let config = AedbConfig {
+                storage_mode: StorageMode::DiskBacked,
+                ..AedbConfig::default()
+            };
             let db = AedbInstance::open(config, dir.path()).expect("open");
             db.create_project("p").await.expect("project");
             db.commit(Mutation::Ddl(DdlOperation::CreateTable {

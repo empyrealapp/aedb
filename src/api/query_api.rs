@@ -286,7 +286,7 @@ impl AedbInstance {
             }
         }
         query.limit = Some(page_size.max(1));
-        self.query_with_options(
+        self.query_no_auth(
             project_id,
             scope_id,
             query,
@@ -412,7 +412,7 @@ impl AedbInstance {
             .explain_query(project_id, scope_id, query.clone(), options.clone())
             .await?;
         let result = self
-            .query_with_options(project_id, scope_id, query, options)
+            .query_no_auth(project_id, scope_id, query, options)
             .await?;
         Ok(QueryWithDiagnosticsResult {
             result,
@@ -634,7 +634,7 @@ impl AedbInstance {
     ) -> Result<QueryResult, QueryError> {
         let (query, mut options) = adapter.execute_read_only(project_id, scope_id, sql)?;
         options.consistency = consistency;
-        self.query_with_options(project_id, scope_id, query, options)
+        self.query_no_auth(project_id, scope_id, query, options)
             .await
     }
 

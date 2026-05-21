@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;

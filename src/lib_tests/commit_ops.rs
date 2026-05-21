@@ -1514,8 +1514,10 @@ async fn subscribe_commits_delivers_delta_after_commit() {
 
 #[tokio::test]
 async fn subscribe_commits_lagged_subscriber_can_resume() {
-    let mut config = AedbConfig::default();
-    config.commit_broadcast_capacity = 2;
+    let config = AedbConfig {
+        commit_broadcast_capacity: 2,
+        ..AedbConfig::default()
+    };
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(config, dir.path()).expect("open");
 

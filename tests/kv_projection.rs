@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::KV_INDEX_TABLE;
 use aedb::catalog::types::Value;

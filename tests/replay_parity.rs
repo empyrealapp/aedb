@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 mod common;
 
 use aedb::AedbInstance;

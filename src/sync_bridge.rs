@@ -106,7 +106,11 @@ impl AedbSync {
         scope_id: &str,
         query: Query,
     ) -> Result<QueryResult, QueryError> {
-        block_on_aedb(&self.rt, self.inner.query(project_id, scope_id, query))
+        block_on_aedb(
+            &self.rt,
+            self.inner
+                .query_no_auth(project_id, scope_id, query, QueryOptions::default()),
+        )
     }
 
     pub fn query_no_auth(
@@ -133,7 +137,7 @@ impl AedbSync {
         block_on_aedb(
             &self.rt,
             self.inner
-                .query_with_options(project_id, scope_id, query, options),
+                .query_no_auth(project_id, scope_id, query, options),
         )
     }
 

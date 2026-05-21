@@ -8,6 +8,7 @@ pub mod engine_interface;
 pub mod error;
 mod lib_helpers;
 #[cfg(test)]
+#[allow(deprecated)]
 mod lib_tests;
 pub mod manifest;
 pub mod migration;
