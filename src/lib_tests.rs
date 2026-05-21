@@ -1678,6 +1678,429 @@ async fn grant_and_revoke_authorization_matrix_is_enforced() {
     ));
 }
 
+#[derive(Clone, Copy)]
+enum AuthzMatrixCase {
+    TableRead,
+    TableWrite,
+    KvRead,
+    KvWrite,
+    AsyncIndexRead,
+    EventStreamRead,
+    ProcessorLagRead,
+}
+
+impl AuthzMatrixCase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::TableRead => "table read",
+            Self::TableWrite => "table write",
+            Self::KvRead => "kv read",
+            Self::KvWrite => "kv write",
+            Self::AsyncIndexRead => "async index read",
+            Self::EventStreamRead => "event stream read",
+            Self::ProcessorLagRead => "processor lag read",
+        }
+    }
+
+    fn direct_permissions(self) -> Vec<Permission> {
+        match self {
+            Self::TableRead => vec![Permission::TableRead {
+                project_id: "p".into(),
+                scope_id: "s1".into(),
+                table_name: "events".into(),
+            }],
+            Self::TableWrite => vec![Permission::TableWrite {
+                project_id: "p".into(),
+                scope_id: "s1".into(),
+                table_name: "events".into(),
+            }],
+            Self::KvRead => vec![Permission::KvRead {
+                project_id: "p".into(),
+                scope_id: Some("s1".into()),
+                prefix: Some(b"acct:".to_vec()),
+            }],
+            Self::KvWrite => vec![Permission::KvWrite {
+                project_id: "p".into(),
+                scope_id: Some("s1".into()),
+                prefix: Some(b"acct:".to_vec()),
+            }],
+            Self::AsyncIndexRead => vec![
+                Permission::TableRead {
+                    project_id: "p".into(),
+                    scope_id: "s1".into(),
+                    table_name: "events".into(),
+                },
+                Permission::IndexRead {
+                    project_id: "p".into(),
+                    scope_id: "s1".into(),
+                    table_name: "events".into(),
+                    index_name: "events_view".into(),
+                },
+            ],
+            Self::EventStreamRead => vec![Permission::TableRead {
+                project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+                scope_id: crate::SYSTEM_SCOPE_ID.into(),
+                table_name: crate::EVENT_OUTBOX_TABLE.into(),
+            }],
+            Self::ProcessorLagRead => vec![Permission::TableRead {
+                project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+                scope_id: crate::SYSTEM_SCOPE_ID.into(),
+                table_name: crate::REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.into(),
+            }],
+        }
+    }
+}
+
+async fn setup_authz_matrix_db(db: &AedbInstance) {
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            project_id: "p".into(),
+            owner_id: Some("project_owner".into()),
+            if_not_exists: true,
+        }),
+    )
+    .await
+    .expect("project");
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::CreateScope {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+            owner_id: Some("scope_owner".into()),
+            if_not_exists: true,
+        }),
+    )
+    .await
+    .expect("scope");
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::CreateTable {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+            table_name: "events".into(),
+            owner_id: Some("table_owner".into()),
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "amount".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+        }),
+    )
+    .await
+    .expect("table");
+    for mutation in [
+        Mutation::Ddl(DdlOperation::CreateAsyncIndex {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+            table_name: "events".into(),
+            index_name: "events_view".into(),
+            if_not_exists: false,
+            projected_columns: vec!["id".into(), "amount".into()],
+        }),
+        Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+            table_name: "events".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![Value::Integer(1), Value::Integer(10)]),
+        },
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+            key: b"acct:1".to_vec(),
+            value: b"10".to_vec(),
+        },
+        Mutation::EmitEvent {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+            topic: "payments".into(),
+            event_key: "evt-1".into(),
+            payload_json: "{\"amount\":10}".into(),
+        },
+    ] {
+        db.commit_as(CallerContext::system_internal(), mutation)
+            .await
+            .expect("seed matrix mutation");
+    }
+}
+
+async fn grant_matrix_permissions(
+    db: &AedbInstance,
+    caller_id: &str,
+    permissions: Vec<Permission>,
+) {
+    for permission in permissions {
+        db.commit_as(
+            CallerContext::system_internal(),
+            Mutation::Ddl(DdlOperation::GrantPermission {
+                caller_id: caller_id.into(),
+                permission,
+                actor_id: Some(SYSTEM_CALLER_ID.into()),
+                delegable: false,
+            }),
+        )
+        .await
+        .expect("grant matrix permission");
+    }
+}
+
+async fn revoke_matrix_permissions(
+    db: &AedbInstance,
+    caller_id: &str,
+    permissions: Vec<Permission>,
+) {
+    for permission in permissions {
+        db.commit_as(
+            CallerContext::system_internal(),
+            Mutation::Ddl(DdlOperation::RevokePermission {
+                caller_id: caller_id.into(),
+                permission,
+                actor_id: Some(SYSTEM_CALLER_ID.into()),
+            }),
+        )
+        .await
+        .expect("revoke matrix permission");
+    }
+}
+
+async fn assert_matrix_access(db: &AedbInstance, case: AuthzMatrixCase, caller_id: &str) {
+    let caller = CallerContext::new(caller_id);
+    match case {
+        AuthzMatrixCase::TableRead => {
+            db.query_with_options_as(
+                Some(&caller),
+                "p",
+                "s1",
+                Query::select(&["id"]).from("events").limit(1),
+                QueryOptions::default(),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+        AuthzMatrixCase::TableWrite => {
+            db.commit_as(
+                caller,
+                Mutation::Upsert {
+                    project_id: "p".into(),
+                    scope_id: "s1".into(),
+                    table_name: "events".into(),
+                    primary_key: vec![Value::Integer(20)],
+                    row: Row::from_values(vec![Value::Integer(20), Value::Integer(20)]),
+                },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+        AuthzMatrixCase::KvRead => {
+            db.kv_get("p", "s1", b"acct:1", ConsistencyMode::AtLatest, &caller)
+                .await
+                .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+        AuthzMatrixCase::KvWrite => {
+            db.commit_as(
+                caller,
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "s1".into(),
+                    key: b"acct:2".to_vec(),
+                    value: b"20".to_vec(),
+                },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+        AuthzMatrixCase::AsyncIndexRead => {
+            db.query_with_options_as(
+                Some(&caller),
+                "p",
+                "s1",
+                Query::select(&["id"]).from("events").limit(1),
+                QueryOptions {
+                    async_index: Some("events_view".into()),
+                    allow_full_scan: true,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+        AuthzMatrixCase::EventStreamRead => {
+            db.read_event_stream_as(&caller, None, 0, 10, ConsistencyMode::AtLatest)
+                .await
+                .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+        AuthzMatrixCase::ProcessorLagRead => {
+            db.reactive_processor_lag_as(&caller, "matrix_processor", ConsistencyMode::AtLatest)
+                .await
+                .unwrap_or_else(|err| panic!("{} should allow {caller_id}: {err:?}", case.name()));
+        }
+    }
+}
+
+async fn assert_matrix_denied(db: &AedbInstance, case: AuthzMatrixCase, caller_id: &str) {
+    let caller = CallerContext::new(caller_id);
+    let denied = match case {
+        AuthzMatrixCase::TableRead => db
+            .query_with_options_as(
+                Some(&caller),
+                "p",
+                "s1",
+                Query::select(&["id"]).from("events").limit(1),
+                QueryOptions::default(),
+            )
+            .await
+            .is_err(),
+        AuthzMatrixCase::TableWrite => db
+            .commit_as(
+                caller,
+                Mutation::Upsert {
+                    project_id: "p".into(),
+                    scope_id: "s1".into(),
+                    table_name: "events".into(),
+                    primary_key: vec![Value::Integer(99)],
+                    row: Row::from_values(vec![Value::Integer(99), Value::Integer(99)]),
+                },
+            )
+            .await
+            .is_err(),
+        AuthzMatrixCase::KvRead => db
+            .kv_get("p", "s1", b"acct:1", ConsistencyMode::AtLatest, &caller)
+            .await
+            .is_err(),
+        AuthzMatrixCase::KvWrite => db
+            .commit_as(
+                caller,
+                Mutation::KvSet {
+                    project_id: "p".into(),
+                    scope_id: "s1".into(),
+                    key: b"acct:denied".to_vec(),
+                    value: b"x".to_vec(),
+                },
+            )
+            .await
+            .is_err(),
+        AuthzMatrixCase::AsyncIndexRead => db
+            .query_with_options_as(
+                Some(&caller),
+                "p",
+                "s1",
+                Query::select(&["id"]).from("events").limit(1),
+                QueryOptions {
+                    async_index: Some("events_view".into()),
+                    allow_full_scan: true,
+                    ..QueryOptions::default()
+                },
+            )
+            .await
+            .is_err(),
+        AuthzMatrixCase::EventStreamRead => db
+            .read_event_stream_as(&caller, None, 0, 10, ConsistencyMode::AtLatest)
+            .await
+            .is_err(),
+        AuthzMatrixCase::ProcessorLagRead => db
+            .reactive_processor_lag_as(&caller, "matrix_processor", ConsistencyMode::AtLatest)
+            .await
+            .is_err(),
+    };
+    assert!(denied, "{} should deny {caller_id}", case.name());
+}
+
+#[tokio::test]
+async fn authorization_matrix_helper_covers_core_resource_access() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([14u8; 32]), dir.path())
+        .expect("open");
+    setup_authz_matrix_db(&db).await;
+
+    db.commit_as(
+        CallerContext::system_internal(),
+        Mutation::Ddl(DdlOperation::GrantPermission {
+            caller_id: "global_admin".into(),
+            permission: Permission::GlobalAdmin,
+            actor_id: Some(SYSTEM_CALLER_ID.into()),
+            delegable: false,
+        }),
+    )
+    .await
+    .expect("grant global admin");
+    grant_matrix_permissions(
+        &db,
+        "project_admin",
+        vec![Permission::ProjectAdmin {
+            project_id: "p".into(),
+        }],
+    )
+    .await;
+    grant_matrix_permissions(
+        &db,
+        "scope_admin",
+        vec![Permission::ScopeAdmin {
+            project_id: "p".into(),
+            scope_id: "s1".into(),
+        }],
+    )
+    .await;
+
+    let project_cases = [
+        AuthzMatrixCase::TableRead,
+        AuthzMatrixCase::TableWrite,
+        AuthzMatrixCase::KvRead,
+        AuthzMatrixCase::KvWrite,
+        AuthzMatrixCase::AsyncIndexRead,
+    ];
+    for case in project_cases {
+        grant_matrix_permissions(&db, "direct", case.direct_permissions()).await;
+        assert_matrix_access(&db, case, "direct").await;
+        revoke_matrix_permissions(&db, "direct", case.direct_permissions()).await;
+        assert_matrix_denied(&db, case, "direct").await;
+
+        assert_matrix_access(&db, case, "project_admin").await;
+        assert_matrix_access(&db, case, "scope_admin").await;
+        assert_matrix_access(&db, case, "global_admin").await;
+    }
+
+    db.commit_as(
+        CallerContext::new("table_owner"),
+        Mutation::Ddl(DdlOperation::GrantPermission {
+            caller_id: "owned_table_reader".into(),
+            permission: Permission::TableRead {
+                project_id: "p".into(),
+                scope_id: "s1".into(),
+                table_name: "events".into(),
+            },
+            actor_id: None,
+            delegable: false,
+        }),
+    )
+    .await
+    .expect("table owner can grant table read");
+    assert_matrix_access(&db, AuthzMatrixCase::TableRead, "owned_table_reader").await;
+
+    for case in [
+        AuthzMatrixCase::EventStreamRead,
+        AuthzMatrixCase::ProcessorLagRead,
+    ] {
+        grant_matrix_permissions(&db, "direct_system_reader", case.direct_permissions()).await;
+        assert_matrix_access(&db, case, "direct_system_reader").await;
+        revoke_matrix_permissions(&db, "direct_system_reader", case.direct_permissions()).await;
+        assert_matrix_denied(&db, case, "direct_system_reader").await;
+        assert_matrix_access(&db, case, "global_admin").await;
+    }
+
+    assert_matrix_denied(&db, AuthzMatrixCase::TableRead, "missing").await;
+    assert_matrix_denied(&db, AuthzMatrixCase::KvRead, "missing").await;
+}
+
 #[tokio::test]
 async fn kv_scan_all_scopes_requires_project_wide_read() {
     let dir = tempdir().expect("temp");
@@ -2773,7 +3196,9 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
             write_class: WriteClass::Standard,
             assertions: Vec::new(),
             read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: WriteIntent { mutations: too_many },
+            write_intent: WriteIntent {
+                mutations: too_many,
+            },
             base_seq: 0,
         })
         .await
@@ -2802,7 +3227,9 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
         write_class: WriteClass::Standard,
         assertions: Vec::new(),
         read_set: crate::commit::tx::ReadSet::default(),
-        write_intent: WriteIntent { mutations: ok_batch },
+        write_intent: WriteIntent {
+            mutations: ok_batch,
+        },
         base_seq: 0,
     })
     .await
@@ -2849,8 +3276,7 @@ async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
     match err {
         AedbError::Validation(msg) => {
             assert!(
-                msg.contains("max_read_assertions_per_envelope")
-                    && msg.contains("assertions=3"),
+                msg.contains("max_read_assertions_per_envelope") && msg.contains("assertions=3"),
                 "informative limit message expected, got: {msg}"
             );
         }
@@ -3495,6 +3921,283 @@ async fn kv_no_auth_apis_in_secure_mode_return_structured_error() {
 }
 
 #[tokio::test]
+async fn secure_mode_rejects_all_public_no_auth_read_escape_hatches() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([16u8; 32]), dir.path())
+        .expect("open secure");
+
+    let cases = [
+        db.query(
+            "secret_project",
+            "app",
+            Query::select(&["*"]).from("secret_table").limit(1),
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("query should deny"),
+        db.query_with_options(
+            "secret_project",
+            "app",
+            Query::select(&["*"]).from("secret_table").limit(1),
+            QueryOptions::default(),
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("query_with_options should deny"),
+        db.query_with_read_set(
+            "secret_project",
+            "app",
+            Query::select(&["*"]).from("secret_table").limit(1),
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("query_with_read_set should deny"),
+        db.query_no_auth(
+            "secret_project",
+            "app",
+            Query::select(&["*"]).from("secret_table").limit(1),
+            QueryOptions::default(),
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("query_no_auth should deny"),
+        db.kv_get_no_auth(
+            "secret_project",
+            "app",
+            b"secret-key",
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("kv_get_no_auth should deny"),
+        db.kv_get_many_no_auth(
+            "secret_project",
+            "app",
+            &[b"secret-key".to_vec()],
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("kv_get_many_no_auth should deny"),
+        db.kv_scan_prefix_no_auth(
+            "secret_project",
+            "app",
+            b"secret-prefix",
+            10,
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .err()
+        .map(|err| err.to_string())
+        .expect("kv_scan_prefix_no_auth should deny"),
+    ];
+
+    for rendered in cases {
+        assert!(rendered.contains("permission denied"));
+        assert!(!rendered.contains("secret_project"));
+        assert!(!rendered.contains("secret_table"));
+        assert!(!rendered.contains("secret-key"));
+        assert!(!rendered.contains("secret-prefix"));
+    }
+
+    assert!(matches!(
+        db.read_event_stream(None, 0, 1, ConsistencyMode::AtLatest)
+            .await
+            .expect_err("anonymous event stream should deny"),
+        AedbError::PermissionDenied(_)
+    ));
+    assert!(matches!(
+        db.reactive_processor_lag("secret_processor", ConsistencyMode::AtLatest)
+            .await
+            .expect_err("anonymous processor lag should deny"),
+        AedbError::PermissionDenied(_)
+    ));
+    let backup_dir = tempdir().expect("backup temp");
+    assert!(matches!(
+        db.backup_full(backup_dir.path())
+            .await
+            .expect_err("anonymous backup should deny"),
+        AedbError::PermissionDenied(_)
+    ));
+    let incremental_backup_dir = tempdir().expect("incremental backup temp");
+    let parent_backup_dir = tempdir().expect("parent backup temp");
+    assert!(matches!(
+        db.backup_incremental(incremental_backup_dir.path(), parent_backup_dir.path())
+            .await
+            .expect_err("anonymous incremental backup should deny"),
+        AedbError::PermissionDenied(_)
+    ));
+    let backup_file_dir = tempdir().expect("backup file temp");
+    let backup_file = backup_file_dir.path().join("backup.aedbarc");
+    assert!(matches!(
+        db.backup_full_to_file(&backup_file)
+            .await
+            .expect_err("anonymous backup file should deny"),
+        AedbError::PermissionDenied(_)
+    ));
+    assert!(matches!(
+        db.apply_migration(crate::migration::Migration {
+            version: 1,
+            name: "secret migration".into(),
+            project_id: "secret_project".into(),
+            scope_id: "app".into(),
+            mutations: Vec::new(),
+            down_mutations: None,
+        })
+        .await
+        .expect_err("anonymous migration should deny"),
+        AedbError::PermissionDenied(_)
+    ));
+}
+
+#[test]
+fn public_no_auth_and_unchecked_surface_is_intentional() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut exposed = Vec::new();
+    for rel in ["src/lib.rs", "src/sync_bridge.rs"] {
+        let source = fs::read_to_string(root.join(rel)).expect("read source");
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("pub ")
+                && (trimmed.contains("_no_auth") || trimmed.contains("unchecked"))
+            {
+                exposed.push(format!("{rel}:{trimmed}"));
+            }
+        }
+    }
+    exposed.sort();
+    assert_eq!(
+        exposed,
+        vec![
+            "src/lib.rs:pub async fn kv_get_many_no_auth(".to_string(),
+            "src/lib.rs:pub async fn kv_get_no_auth(".to_string(),
+            "src/lib.rs:pub async fn kv_scan_prefix_no_auth(".to_string(),
+            "src/lib.rs:pub async fn query_no_auth(".to_string(),
+            "src/sync_bridge.rs:pub fn query_no_auth(".to_string(),
+        ],
+        "public no_auth/unchecked API surface changed; update secure-mode tests and docs intentionally"
+    );
+}
+
+#[tokio::test]
+async fn permission_denied_message_snapshots_do_not_disclose_protected_data() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([17u8; 32]), dir.path())
+        .expect("open");
+    setup_secure_assertion_denial_fixture(&db).await;
+
+    let commit_denied = db
+        .commit_as(
+            CallerContext::new("mallory"),
+            Mutation::Upsert {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                primary_key: vec![Value::Integer(777)],
+                row: Row::from_values(vec![Value::Integer(777), Value::Integer(42)]),
+            },
+        )
+        .await
+        .expect_err("table write should deny")
+        .to_string();
+    let query_denied = db
+        .query_with_options_as(
+            Some(&CallerContext::new("mallory")),
+            "p",
+            "app",
+            Query::select(&["amount"])
+                .from("secret_rows")
+                .where_(Expr::Eq("amount".into(), Value::Integer(42))),
+            QueryOptions::default(),
+        )
+        .await
+        .expect_err("query should deny")
+        .to_string();
+    let kv_denied = db
+        .kv_get(
+            "p",
+            "app",
+            b"secret:key",
+            ConsistencyMode::AtLatest,
+            &CallerContext::new("mallory"),
+        )
+        .await
+        .expect_err("kv should deny")
+        .to_string();
+    let event_denied = db
+        .read_event_stream_as(
+            &CallerContext::new("mallory"),
+            None,
+            0,
+            1,
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect_err("event stream should deny")
+        .to_string();
+    let processor_denied = db
+        .reactive_processor_lag_as(
+            &CallerContext::new("mallory"),
+            "secret_processor",
+            ConsistencyMode::AtLatest,
+        )
+        .await
+        .expect_err("processor lag should deny")
+        .to_string();
+
+    let snapshots = [
+        (
+            "commit",
+            commit_denied.as_str(),
+            "permission denied: permission denied",
+        ),
+        (
+            "query",
+            query_denied.as_str(),
+            "permission denied: permission denied",
+        ),
+        (
+            "kv",
+            kv_denied.as_str(),
+            "permission denied: permission denied",
+        ),
+        (
+            "event",
+            event_denied.as_str(),
+            "permission denied: permission denied",
+        ),
+        (
+            "processor",
+            processor_denied.as_str(),
+            "permission denied: permission denied",
+        ),
+    ];
+    for (label, rendered, expected) in snapshots {
+        assert_eq!(rendered, expected, "{label} denial snapshot changed");
+        for forbidden in [
+            "secret_rows",
+            "secret:key",
+            "secret_processor",
+            "amount",
+            "777",
+            "42",
+            "mallory",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{label} denial leaked {forbidden}: {rendered}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn postflight_assertions_require_read_permission_in_secure_mode() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open_production(AedbConfig::production([8u8; 32]), dir.path())
@@ -3589,6 +4292,253 @@ async fn envelope_assertions_require_read_permission_in_secure_mode() {
         .await
         .expect_err("envelope assertion without read permission must fail before evaluation");
     assert!(matches!(err, AedbError::PermissionDenied(_)));
+}
+
+async fn setup_secure_assertion_denial_fixture(db: &AedbInstance) {
+    let system = CallerContext::system_internal();
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateProject {
+            owner_id: None,
+            if_not_exists: true,
+            project_id: "p".into(),
+        }),
+    )
+    .await
+    .expect("create project");
+    db.commit_as(
+        system.clone(),
+        Mutation::Ddl(DdlOperation::CreateTable {
+            owner_id: None,
+            if_not_exists: false,
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "secret_rows".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "amount".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+        }),
+    )
+    .await
+    .expect("create secret table");
+    for mutation in [
+        Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"secret:key".to_vec(),
+            value: b"secret-value".to_vec(),
+        },
+        Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "secret_rows".into(),
+            primary_key: vec![Value::Integer(1)],
+            row: Row::from_values(vec![Value::Integer(1), Value::Integer(42)]),
+        },
+        Mutation::Ddl(DdlOperation::GrantPermission {
+            caller_id: "writer".into(),
+            permission: Permission::KvWrite {
+                project_id: "p".into(),
+                scope_id: Some("app".into()),
+                prefix: Some(b"public:".to_vec()),
+            },
+            actor_id: Some(SYSTEM_CALLER_ID.into()),
+            delegable: false,
+        }),
+    ] {
+        db.commit_as(system.clone(), mutation)
+            .await
+            .expect("seed assertion denial fixture");
+    }
+}
+
+fn assertion_denial_cases() -> Vec<(&'static str, ReadAssertion)> {
+    vec![
+        (
+            "key equals",
+            ReadAssertion::KeyEquals {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret:key".to_vec(),
+                expected: b"wrong".to_vec(),
+            },
+        ),
+        (
+            "key compare",
+            ReadAssertion::KeyCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret:key".to_vec(),
+                op: crate::commit::validation::CompareOp::Eq,
+                threshold: b"wrong".to_vec(),
+            },
+        ),
+        (
+            "key exists",
+            ReadAssertion::KeyExists {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret:key".to_vec(),
+                expected: false,
+            },
+        ),
+        (
+            "key version",
+            ReadAssertion::KeyVersion {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret:key".to_vec(),
+                expected_seq: 999,
+            },
+        ),
+        (
+            "row version",
+            ReadAssertion::RowVersion {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                primary_key: vec![Value::Integer(1)],
+                expected_seq: 999,
+            },
+        ),
+        (
+            "row exists",
+            ReadAssertion::RowExists {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                primary_key: vec![Value::Integer(1)],
+                expected: false,
+            },
+        ),
+        (
+            "row column compare",
+            ReadAssertion::RowColumnCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                primary_key: vec![Value::Integer(1)],
+                column: "amount".into(),
+                op: crate::commit::validation::CompareOp::Eq,
+                threshold: Value::Integer(0),
+            },
+        ),
+        (
+            "count compare",
+            ReadAssertion::CountCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                filter: Some(Expr::Eq("amount".into(), Value::Integer(42))),
+                op: crate::commit::validation::CompareOp::Eq,
+                threshold: 0,
+            },
+        ),
+        (
+            "sum compare",
+            ReadAssertion::SumCompare {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                column: "amount".into(),
+                filter: Some(Expr::Eq("id".into(), Value::Integer(1))),
+                op: crate::commit::validation::CompareOp::Eq,
+                threshold: Value::Integer(0),
+            },
+        ),
+        (
+            "nested all",
+            ReadAssertion::All(vec![ReadAssertion::KeyExists {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret:key".to_vec(),
+                expected: false,
+            }]),
+        ),
+        (
+            "nested any",
+            ReadAssertion::Any(vec![ReadAssertion::RowExists {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                table_name: "secret_rows".into(),
+                primary_key: vec![Value::Integer(1)],
+                expected: false,
+            }]),
+        ),
+        (
+            "nested not",
+            ReadAssertion::Not(Box::new(ReadAssertion::KeyEquals {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: b"secret:key".to_vec(),
+                expected: b"secret-value".to_vec(),
+            })),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn secure_mode_denies_every_read_assertion_variant_before_evaluation() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_production(AedbConfig::production([15u8; 32]), dir.path())
+        .expect("open");
+    setup_secure_assertion_denial_fixture(&db).await;
+
+    for (label, assertion) in assertion_denial_cases() {
+        let result = db
+            .commit_envelope(TransactionEnvelope {
+                caller: Some(CallerContext::new("writer")),
+                idempotency_key: None,
+                write_class: WriteClass::Standard,
+                assertions: vec![assertion],
+                read_set: crate::commit::tx::ReadSet::default(),
+                write_intent: WriteIntent {
+                    mutations: vec![Mutation::KvSet {
+                        project_id: "p".into(),
+                        scope_id: "app".into(),
+                        key: format!("public:{label}").into_bytes(),
+                        value: b"ok".to_vec(),
+                    }],
+                },
+                base_seq: 0,
+            })
+            .await;
+        let err = match result {
+            Ok(ok) => panic!(
+                "{label} assertion unexpectedly committed at seq {}",
+                ok.commit_seq
+            ),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, AedbError::PermissionDenied(_)),
+            "{label} should be denied before assertion evaluation, got {err:?}"
+        );
+        let rendered = err.to_string();
+        for forbidden in [
+            "secret_rows",
+            "secret:key",
+            "secret-value",
+            "amount",
+            "42",
+            "public:",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{label} permission denial leaked {forbidden}: {rendered}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -10199,10 +11149,8 @@ async fn strict_restore_rejects_older_backup_version() {
     let dir = tempdir().expect("data dir");
     let backup_dir = tempdir().expect("backup dir");
     let config = AedbConfig::production([7u8; 32]);
-    let db = AedbInstance::open_secure(config.clone(), dir.path()).expect("open secure");
-    let system = CallerContext::system_internal();
-    db.commit_as(
-        system.clone(),
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.commit(
         Mutation::Ddl(DdlOperation::CreateProject {
             owner_id: None,
             if_not_exists: true,
@@ -10211,8 +11159,7 @@ async fn strict_restore_rejects_older_backup_version() {
     )
     .await
     .expect("create project");
-    db.commit_as(
-        system,
+    db.commit(
         Mutation::Ddl(DdlOperation::CreateScope {
             owner_id: None,
             if_not_exists: true,
@@ -10249,10 +11196,8 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
     let backup_dir = tempdir().expect("backup dir");
     let restore_dir = tempdir().expect("restore dir");
     let config = AedbConfig::production([8u8; 32]);
-    let db = AedbInstance::open_secure(config.clone(), dir.path()).expect("open secure");
-    let system = CallerContext::system_internal();
-    db.commit_as(
-        system.clone(),
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.commit(
         Mutation::Ddl(DdlOperation::CreateProject {
             owner_id: None,
             if_not_exists: true,
@@ -10261,8 +11206,7 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
     )
     .await
     .expect("create project");
-    db.commit_as(
-        system.clone(),
+    db.commit(
         Mutation::Ddl(DdlOperation::CreateScope {
             owner_id: None,
             if_not_exists: true,
@@ -10272,8 +11216,7 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
     )
     .await
     .expect("create scope");
-    db.commit_as(
-        system,
+    db.commit(
         Mutation::KvSet {
             project_id: "arcana".into(),
             scope_id: "app".into(),
