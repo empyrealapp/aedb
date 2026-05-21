@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+echo "[security-gate] formatting"
+cargo fmt --check
+
 echo "[security-gate] unit/library"
 cargo test --lib
 

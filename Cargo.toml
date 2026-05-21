@@ -55,9 +55,9 @@ proptest = "1"
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio = { version = "1", features = ["test-util", "macros"] }
-rand = "0.8"
+rand = "0.8.6"
 dhat = "0.3"
-pprof = { version = "0.13", features = ["flamegraph"] }
+pprof = { version = "0.15", features = ["flamegraph"] }
 
 [[bench]]
 name = "perf"

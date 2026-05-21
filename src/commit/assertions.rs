@@ -443,7 +443,7 @@ fn evaluate_assertion(
                 assertion,
                 depth + 1,
                 max_scan_rows,
-                read_bytes.as_deref_mut(),
+                read_bytes,
             )? {
                 None => Ok(Some(AssertionActual::Bool(true))),
                 Some(_) => Ok(None),

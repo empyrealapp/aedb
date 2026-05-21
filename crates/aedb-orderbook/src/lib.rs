@@ -160,6 +160,10 @@ fn decode_u256_bytes_to_u64(bytes: &[u8]) -> Result<u64, AedbError> {
     Ok(u64::from_be_bytes(out))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Benchmark/simulation request construction mirrors the order-entry API fields explicitly so test traffic is easy to audit."
+)]
 fn request(
     instrument: &str,
     owner: &str,
@@ -731,7 +735,7 @@ async fn run_hft_simulation_impl(
                 });
                 pending_orders += 1;
                 if pending_orders >= orders_per_commit {
-                    if let Err(other) = flush_pending_orders(
+                    flush_pending_orders(
                         db_clone.as_ref(),
                         &mut pending_mutations,
                         &mut pending_orders,
@@ -745,10 +749,7 @@ async fn run_hft_simulation_impl(
                         &mut max_commit_seq,
                         &mut max_finality_gap,
                     )
-                    .await
-                    {
-                        return Err(other);
-                    }
+                    .await?;
                 }
 
                 if cfg.lifecycle_every_ops > 0 && op % cfg.lifecycle_every_ops == 0 {
@@ -801,7 +802,7 @@ async fn run_hft_simulation_impl(
                     }
                 }
             }
-            if let Err(other) = flush_pending_orders(
+            flush_pending_orders(
                 db_clone.as_ref(),
                 &mut pending_mutations,
                 &mut pending_orders,
@@ -815,11 +816,8 @@ async fn run_hft_simulation_impl(
                 &mut max_commit_seq,
                 &mut max_finality_gap,
             )
-            .await
-            {
-                return Err(other);
-            }
-            Ok((
+            .await?;
+            Ok::<_, AedbError>((
                 accepted,
                 rejected,
                 lifecycle_attempted,
@@ -962,6 +960,10 @@ fn summarize_latency(sorted_latencies_us: &[u64]) -> LatencyStats {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "This simulation helper mutates several independent counters and latency collectors in one commit flush; grouping them would obscure which metrics are updated."
+)]
 async fn flush_pending_orders(
     db: &AedbInstance,
     pending_mutations: &mut Vec<Mutation>,
