@@ -1,6 +1,6 @@
 # Security Acceptance Criteria
 
-This document defines the minimum acceptance gates before claiming production readiness for high-integrity financial workloads.
+This document defines repo-local acceptance gates for high-integrity workloads. Passing these gates is evidence about the tested code paths; it is not evidence of independent audit, penetration testing, key management quality, or restore readiness in a deployed environment.
 
 ## Mandatory CI Gates
 
@@ -69,9 +69,9 @@ Methods containing `unchecked` are crate-private implementation details only. Th
 
 Permission-denied diagnostics are part of the security boundary. They may identify that access was denied, but must not disclose protected project names, scope names, table names, keys, predicate details, row contents, or assertion actual values. Use generic `"permission denied"` messages for authorization failures; detailed resource identifiers belong in trusted audit logs, not user-facing errors.
 
-## External Validation (Required Outside This Repo)
+## External Validation Required For Stronger Claims
 
-The following are required before financial-grade claims:
+The following are required before using security-audited, penetration-tested, financial-grade, or equivalent production-readiness claims:
 
 - Independent code audit with focus on commit atomicity, authorization checks, and recovery path.
 - Penetration testing of the embedding/API boundary in the host application.
