@@ -134,15 +134,22 @@ pub(crate) fn explain_access_path_for_query(
         });
     }
 
-    let table_key = (namespace_key(project_id, scope_id), query.table.clone());
+    let (exec_project_id, exec_scope_id, exec_table_name) =
+        join::resolve_table_ref(project_id, scope_id, &query.table);
+    let mut query = query.clone();
+    query.table = exec_table_name;
+    let table_key = (
+        namespace_key(&exec_project_id, &exec_scope_id),
+        query.table.clone(),
+    );
     let schema = catalog
         .tables
         .get(&table_key)
         .ok_or_else(|| QueryError::TableNotFound {
-            project_id: project_id.to_string(),
+            project_id: exec_project_id.clone(),
             table: query.table.clone(),
         })?;
-    let table = snapshot.table(project_id, scope_id, &query.table);
+    let table = snapshot.table(&exec_project_id, &exec_scope_id, &query.table);
 
     if let Some(predicate) = query.predicate.as_ref() {
         if query.limit != Some(0)
@@ -164,8 +171,8 @@ pub(crate) fn explain_access_path_for_query(
         if let Some(table) = table
             && let Some(indexed) = indexed_pks_for_predicate_with_trace(
                 catalog,
-                project_id,
-                scope_id,
+                &exec_project_id,
+                &exec_scope_id,
                 &query.table,
                 table,
                 predicate,
@@ -354,22 +361,29 @@ fn execute_query_with_options_capturing_signed(
         );
     }
 
-    let table_key = (namespace_key(project_id, scope_id), query.table.clone());
+    let (exec_project_id, exec_scope_id, exec_table_name) =
+        join::resolve_table_ref(project_id, scope_id, &query.table);
+    let mut query = query;
+    query.table = exec_table_name;
+    let table_key = (
+        namespace_key(&exec_project_id, &exec_scope_id),
+        query.table.clone(),
+    );
     let schema = catalog
         .tables
         .get(&table_key)
         .ok_or_else(|| QueryError::TableNotFound {
-            project_id: project_id.to_string(),
+            project_id: exec_project_id.clone(),
             table: query.table.clone(),
         })?;
-    let table = snapshot.table(project_id, scope_id, &query.table);
+    let table = snapshot.table(&exec_project_id, &exec_scope_id, &query.table);
     let mut materialized_seq = None;
     if let Some(result) = try_primary_key_point_query(
         snapshot,
         schema,
         table,
-        project_id,
-        scope_id,
+        &exec_project_id,
+        &exec_scope_id,
         &query,
         &cursor_state,
         snapshot_seq,
@@ -403,76 +417,90 @@ fn execute_query_with_options_capturing_signed(
     }
 
     let estimated_rows: usize;
-    let row_source: Box<dyn Iterator<Item = Row> + Send + '_> = if let Some(async_index) =
-        &options.async_index
-    {
-        let projection = snapshot
-            .async_index(project_id, scope_id, &query.table, async_index)
-            .ok_or_else(|| QueryError::InvalidQuery {
-                reason: "async index not found".into(),
-            })?;
-        materialized_seq = Some(projection.materialized_seq);
-        estimated_rows = projection.rows.len();
-        // Async-index projections expose their own materialized_seq; fall
-        // back to recording a coarse table range for the underlying table
-        // so writes invalidate subscribers.
-        if let Some(collector) = read_set.as_deref_mut() {
-            collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
-        }
-        Box::new(projection.rows.values().cloned())
-    } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
-        let candidate_limit = if cursor_state.is_none()
-            && query.order_by.is_empty()
-            && query.aggregates.is_empty()
-            && query.having.is_none()
-        {
-            Some(page_window)
+    let row_source: Box<dyn Iterator<Item = Row> + Send + '_> =
+        if let Some(async_index) = &options.async_index {
+            let projection = snapshot
+                .async_index(&exec_project_id, &exec_scope_id, &query.table, async_index)
+                .ok_or_else(|| QueryError::InvalidQuery {
+                    reason: "async index not found".into(),
+                })?;
+            materialized_seq = Some(projection.materialized_seq);
+            estimated_rows = projection.rows.len();
+            // Async-index projections expose their own materialized_seq; fall
+            // back to recording a coarse table range for the underlying table
+            // so writes invalidate subscribers.
+            if let Some(collector) = read_set.as_deref_mut() {
+                collector.record_full_table_scan(
+                    snapshot,
+                    &exec_project_id,
+                    &exec_scope_id,
+                    &query.table,
+                );
+            }
+            Box::new(projection.rows.values().cloned())
+        } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
+            let candidate_limit = if cursor_state.is_none()
+                && query.order_by.is_empty()
+                && query.aggregates.is_empty()
+                && query.having.is_none()
+            {
+                Some(page_window)
+            } else {
+                None
+            };
+            let indexed_pks = indexed_pks_for_predicate_limited(
+                catalog,
+                &exec_project_id,
+                &exec_scope_id,
+                &query.table,
+                table,
+                predicate,
+                candidate_limit,
+            )?
+            .map(|result| result.pks);
+            match indexed_pks {
+                Some(pks) => {
+                    if let Some(collector) = read_set.as_deref_mut() {
+                        collector.record_touched_pks(
+                            snapshot,
+                            schema,
+                            &exec_project_id,
+                            &exec_scope_id,
+                            &query.table,
+                            &pks,
+                        );
+                    }
+                    estimated_rows = pks.len();
+                    Box::new(
+                        pks.into_iter()
+                            .filter_map(move |pk| table.rows.get(&pk).cloned()),
+                    )
+                }
+                None => {
+                    if let Some(collector) = read_set.as_deref_mut() {
+                        collector.record_full_table_scan(
+                            snapshot,
+                            &exec_project_id,
+                            &exec_scope_id,
+                            &query.table,
+                        );
+                    }
+                    estimated_rows = table.rows.len();
+                    Box::new(table.rows.values().cloned())
+                }
+            }
         } else {
-            None
+            if let Some(collector) = read_set.as_deref_mut() {
+                collector.record_full_table_scan(
+                    snapshot,
+                    &exec_project_id,
+                    &exec_scope_id,
+                    &query.table,
+                );
+            }
+            estimated_rows = table.map_or(0, |t| t.rows.len());
+            Box::new(table.into_iter().flat_map(|t| t.rows.values().cloned()))
         };
-        let indexed_pks = indexed_pks_for_predicate_limited(
-            catalog,
-            project_id,
-            scope_id,
-            &query.table,
-            table,
-            predicate,
-            candidate_limit,
-        )?
-        .map(|result| result.pks);
-        match indexed_pks {
-            Some(pks) => {
-                if let Some(collector) = read_set.as_deref_mut() {
-                    collector.record_touched_pks(
-                        snapshot,
-                        schema,
-                        project_id,
-                        scope_id,
-                        &query.table,
-                        &pks,
-                    );
-                }
-                estimated_rows = pks.len();
-                Box::new(
-                    pks.into_iter()
-                        .filter_map(move |pk| table.rows.get(&pk).cloned()),
-                )
-            }
-            None => {
-                if let Some(collector) = read_set.as_deref_mut() {
-                    collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
-                }
-                estimated_rows = table.rows.len();
-                Box::new(table.rows.values().cloned())
-            }
-        }
-    } else {
-        if let Some(collector) = read_set.as_deref_mut() {
-            collector.record_full_table_scan(snapshot, project_id, scope_id, &query.table);
-        }
-        estimated_rows = table.map_or(0, |t| t.rows.len());
-        Box::new(table.into_iter().flat_map(|t| t.rows.values().cloned()))
-    };
 
     if estimated_rows > max_scan_rows
         && query_requires_full_evaluation(&query, cursor_state.is_some())
