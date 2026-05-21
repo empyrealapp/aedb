@@ -58,6 +58,31 @@ pub enum AedbErrorCode {
     AssertionFailed,
 }
 
+/// Broad caller-action class for [`AedbError`].
+///
+/// Match on [`AedbError::code`] for stable machine-readable detail, then use
+/// this class to choose the caller response without parsing error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AedbErrorClass {
+    /// Transient capacity or timing failure. Retrying with backoff is expected.
+    Retryable,
+    /// Optimistic concurrency or assertion failure. Refresh the read state and
+    /// retry only if the business operation is still valid.
+    Conflict,
+    /// Caller is not authenticated or lacks permission. Do not retry until the
+    /// caller identity or grants change.
+    Permission,
+    /// Request shape, schema, type, arithmetic, or missing resource problem.
+    /// Fix the request before retrying.
+    Validation,
+    /// Durability, recovery, decode, or integrity failure. Treat as operator
+    /// action required before continuing writes.
+    Integrity,
+    /// Service or subsystem is not currently available. Retry after readiness
+    /// or the competing operation changes.
+    Unavailable,
+}
+
 impl AedbErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -97,6 +122,50 @@ impl AedbErrorCode {
             AedbErrorCode::SnapshotExpired => "snapshot_expired",
             AedbErrorCode::AssertionFailed => "assertion_failed",
         }
+    }
+
+    pub fn class(self) -> AedbErrorClass {
+        match self {
+            AedbErrorCode::QueueFull
+            | AedbErrorCode::Timeout
+            | AedbErrorCode::PartitionLockTimeout
+            | AedbErrorCode::EpochApplyTimeout
+            | AedbErrorCode::ParallelApplyCancelled
+            | AedbErrorCode::ParallelApplyWorkerPanicked
+            | AedbErrorCode::SnapshotExpired => AedbErrorClass::Retryable,
+            AedbErrorCode::Conflict | AedbErrorCode::AssertionFailed => AedbErrorClass::Conflict,
+            AedbErrorCode::PermissionDenied => AedbErrorClass::Permission,
+            AedbErrorCode::Io
+            | AedbErrorCode::Encode
+            | AedbErrorCode::Decode
+            | AedbErrorCode::IntegrityError => AedbErrorClass::Integrity,
+            AedbErrorCode::Unavailable | AedbErrorCode::CheckpointInProgress => {
+                AedbErrorClass::Unavailable
+            }
+            AedbErrorCode::Validation
+            | AedbErrorCode::InvalidConfig
+            | AedbErrorCode::ProjectAlreadyExists
+            | AedbErrorCode::ScopeAlreadyExists
+            | AedbErrorCode::TableAlreadyExists
+            | AedbErrorCode::IndexAlreadyExists
+            | AedbErrorCode::ProjectNotFound
+            | AedbErrorCode::ScopeNotFound
+            | AedbErrorCode::TableNotFound
+            | AedbErrorCode::IndexNotFound
+            | AedbErrorCode::DuplicatePrimaryKey
+            | AedbErrorCode::UniqueViolation
+            | AedbErrorCode::ForeignKeyViolation
+            | AedbErrorCode::CheckConstraintFailed
+            | AedbErrorCode::NotNullViolation
+            | AedbErrorCode::TypeMismatch
+            | AedbErrorCode::UnknownColumn
+            | AedbErrorCode::Underflow
+            | AedbErrorCode::Overflow => AedbErrorClass::Validation,
+        }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(self.class(), AedbErrorClass::Retryable)
     }
 }
 
@@ -236,23 +305,80 @@ impl AedbError {
     pub fn code_str(&self) -> &'static str {
         self.code().as_str()
     }
+
+    pub fn class(&self) -> AedbErrorClass {
+        self.code().class()
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.code().is_retryable()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AedbError, AedbErrorCode, ResourceType};
+    use super::{AedbError, AedbErrorClass, AedbErrorCode, ResourceType};
 
     #[test]
     fn error_code_strings_are_stable() {
-        assert_eq!(AedbErrorCode::TableNotFound.as_str(), "table_not_found");
-        assert_eq!(
-            AedbErrorCode::IndexAlreadyExists.as_str(),
-            "index_already_exists"
-        );
-        assert_eq!(
-            AedbErrorCode::PermissionDenied.as_str(),
-            "permission_denied"
-        );
+        let expected = [
+            (AedbErrorCode::Io, "io"),
+            (AedbErrorCode::Encode, "encode"),
+            (AedbErrorCode::Decode, "decode"),
+            (AedbErrorCode::Validation, "validation"),
+            (AedbErrorCode::InvalidConfig, "invalid_config"),
+            (AedbErrorCode::IntegrityError, "integrity_error"),
+            (AedbErrorCode::Unavailable, "unavailable"),
+            (
+                AedbErrorCode::CheckpointInProgress,
+                "checkpoint_in_progress",
+            ),
+            (
+                AedbErrorCode::ProjectAlreadyExists,
+                "project_already_exists",
+            ),
+            (AedbErrorCode::ScopeAlreadyExists, "scope_already_exists"),
+            (AedbErrorCode::TableAlreadyExists, "table_already_exists"),
+            (AedbErrorCode::IndexAlreadyExists, "index_already_exists"),
+            (AedbErrorCode::ProjectNotFound, "project_not_found"),
+            (AedbErrorCode::ScopeNotFound, "scope_not_found"),
+            (AedbErrorCode::TableNotFound, "table_not_found"),
+            (AedbErrorCode::IndexNotFound, "index_not_found"),
+            (AedbErrorCode::DuplicatePrimaryKey, "duplicate_primary_key"),
+            (AedbErrorCode::UniqueViolation, "unique_violation"),
+            (AedbErrorCode::ForeignKeyViolation, "foreign_key_violation"),
+            (
+                AedbErrorCode::CheckConstraintFailed,
+                "check_constraint_failed",
+            ),
+            (AedbErrorCode::NotNullViolation, "not_null_violation"),
+            (AedbErrorCode::TypeMismatch, "type_mismatch"),
+            (AedbErrorCode::UnknownColumn, "unknown_column"),
+            (AedbErrorCode::Conflict, "conflict"),
+            (AedbErrorCode::Underflow, "underflow"),
+            (AedbErrorCode::Overflow, "overflow"),
+            (AedbErrorCode::QueueFull, "queue_full"),
+            (AedbErrorCode::PermissionDenied, "permission_denied"),
+            (AedbErrorCode::Timeout, "timeout"),
+            (
+                AedbErrorCode::PartitionLockTimeout,
+                "partition_lock_timeout",
+            ),
+            (AedbErrorCode::EpochApplyTimeout, "epoch_apply_timeout"),
+            (
+                AedbErrorCode::ParallelApplyCancelled,
+                "parallel_apply_cancelled",
+            ),
+            (
+                AedbErrorCode::ParallelApplyWorkerPanicked,
+                "parallel_apply_worker_panicked",
+            ),
+            (AedbErrorCode::SnapshotExpired, "snapshot_expired"),
+            (AedbErrorCode::AssertionFailed, "assertion_failed"),
+        ];
+        for (code, stable) in expected {
+            assert_eq!(code.as_str(), stable);
+        }
     }
 
     #[test]
@@ -263,5 +389,28 @@ mod tests {
         };
         assert_eq!(err.code(), AedbErrorCode::TableNotFound);
         assert_eq!(err.code_str(), "table_not_found");
+        assert_eq!(err.class(), AedbErrorClass::Validation);
+    }
+
+    #[test]
+    fn error_code_classes_describe_caller_behavior() {
+        assert_eq!(AedbErrorCode::QueueFull.class(), AedbErrorClass::Retryable);
+        assert_eq!(
+            AedbErrorCode::AssertionFailed.class(),
+            AedbErrorClass::Conflict
+        );
+        assert_eq!(
+            AedbErrorCode::PermissionDenied.class(),
+            AedbErrorClass::Permission
+        );
+        assert_eq!(
+            AedbErrorCode::IntegrityError.class(),
+            AedbErrorClass::Integrity
+        );
+        assert_eq!(
+            AedbErrorCode::Unavailable.class(),
+            AedbErrorClass::Unavailable
+        );
+        assert!(AedbErrorCode::Timeout.is_retryable());
     }
 }

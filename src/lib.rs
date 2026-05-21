@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 pub mod backup;
 pub mod catalog;
 pub mod checkpoint;
@@ -1154,18 +1156,41 @@ impl Drop for AedbInstance {
 }
 
 impl AedbInstance {
+    /// Open a production instance that requires authenticated caller APIs.
+    ///
+    /// This validates the full production profile, including HMAC-backed
+    /// manifests, strict recovery, hash-chain enforcement, and durable commits.
     pub fn open_production(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
         validate_arcana_config(&config)?;
         Self::open_internal(config, dir, true)
     }
 
+    /// Open a secure instance that requires authenticated caller APIs.
+    ///
+    /// Use this for production embedders after constructing an
+    /// [`AedbConfig::production`] config and setting a checkpoint encryption key
+    /// when checkpoints must be protected at rest.
     pub fn open_secure(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
         validate_secure_config(&config)?;
         Self::open_internal(config, dir, true)
     }
 
-    pub fn open(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
+    /// Open an unauthenticated instance.
+    ///
+    /// This mode permits anonymous APIs such as [`Self::commit_no_auth`],
+    /// [`Self::query_no_auth`], and KV `*_no_auth` reads. Prefer
+    /// [`Self::open_secure`] or [`Self::open_production`] for services that
+    /// expose AEDB through any caller boundary.
+    pub fn open_no_auth(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
         Self::open_internal(config, dir, false)
+    }
+
+    #[deprecated(
+        since = "0.1.0",
+        note = "use open_secure/open_production for authenticated mode, or open_no_auth when anonymous APIs are intentional"
+    )]
+    pub fn open(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
+        Self::open_no_auth(config, dir)
     }
 
     fn open_internal(
@@ -1331,7 +1356,19 @@ impl AedbInstance {
         })
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "use commit_as for authenticated writes, or commit_no_auth when anonymous writes are intentional"
+    )]
     pub async fn commit(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
+        self.commit_no_auth(mutation).await
+    }
+
+    /// Commit a mutation without a caller identity.
+    ///
+    /// This is unavailable for instances opened with [`Self::open_secure`] or
+    /// [`Self::open_production`]. Use [`Self::commit_as`] at caller boundaries.
+    pub async fn commit_no_auth(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
         let started = self
             .telemetry_hooks_present
             .load(Ordering::Acquire)
@@ -1896,6 +1933,10 @@ impl AedbInstance {
         Ok(())
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "use query_with_options_as for authenticated reads, or query_no_auth when anonymous reads are intentional"
+    )]
     pub async fn query(
         &self,
         project_id: &str,
@@ -1915,6 +1956,10 @@ impl AedbInstance {
     /// Run a query and capture the read-set it touched (point keys and key
     /// ranges with row versions). Used by reactive subscriptions to drive
     /// per-query invalidation. The query semantics mirror [`Self::query`].
+    #[deprecated(
+        since = "0.1.0",
+        note = "use query_with_options_capturing_as for authenticated reads; this method is anonymous"
+    )]
     pub async fn query_with_read_set(
         &self,
         project_id: &str,
@@ -2005,6 +2050,11 @@ impl AedbInstance {
             .await
     }
 
+    /// Run a query without a caller identity.
+    ///
+    /// This is unavailable for instances opened with [`Self::open_secure`] or
+    /// [`Self::open_production`]. Prefer [`Self::query_with_options_as`] in
+    /// services.
     pub async fn query_no_auth(
         &self,
         project_id: &str,
@@ -2022,6 +2072,10 @@ impl AedbInstance {
             .await
     }
 
+    #[deprecated(
+        since = "0.1.0",
+        note = "use query_with_options_as for authenticated reads, or query_no_auth when anonymous reads are intentional"
+    )]
     pub async fn query_with_options(
         &self,
         project_id: &str,

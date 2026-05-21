@@ -36,13 +36,13 @@ use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
-use aedb::query::plan::{Expr, Query};
+use aedb::query::plan::{Expr, Query, QueryOptions};
 use tempfile::tempdir;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempdir()?;
-    let db = AedbInstance::open(Default::default(), dir.path())?;
+    let db = AedbInstance::open_no_auth(Default::default(), dir.path())?;
 
     db.create_project("demo").await?;
     db.create_scope("demo", "app").await?;
@@ -81,7 +81,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .from("users")
         .where_(Expr::Eq("id".into(), Value::Integer(1)));
 
-    let result = db.query("demo", "app", query).await?;
+    let result = db
+        .query_no_auth("demo", "app", query, QueryOptions::default())
+        .await?;
     assert_eq!(result.rows.len(), 1);
 
     Ok(())
@@ -365,7 +367,7 @@ Low-latency profile example:
 use aedb::config::AedbConfig;
 
 let config = AedbConfig::low_latency([7u8; 32]);
-let db = aedb::AedbInstance::open(config, dir.path())?;
+let db = aedb::AedbInstance::open_secure(config, dir.path())?;
 ```
 
 ## Security and Permissions
@@ -379,10 +381,17 @@ AEDB supports permission-aware APIs via `CallerContext` and `Permission`.
 
 Security/operations docs:
 
+- `docs/PRODUCTION_USAGE_EXAMPLES.md`
 - `docs/SECURITY_ACCEPTANCE_CRITERIA.md`
 - `docs/SECURITY_OPERATIONS_RUNBOOK.md`
 - `docs/AEDB_SDK_PROCESSOR_MACRO_SPEC.md`
 - `docs/AEDB_MIGRATION_SYSTEM.md`
+
+Error handling:
+
+- `AedbError::code()` / `QueryError::code()` are stable machine-readable codes
+- `AedbError::class()` / `QueryError::class()` map errors to retryable, conflict, permission, validation, integrity, and unavailable caller behavior
+- use `*_str()` helpers for log/API strings; do not parse display text
 
 ## Operational APIs
 
