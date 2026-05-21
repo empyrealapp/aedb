@@ -92,238 +92,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Core Concepts
 
-### Action envelopes and typed KV numerics
-
-For single hot-path action commits (effects + metadata in one atomic envelope), use
-`AedbInstance::commit_action_envelope(...)` with `ActionEnvelopeRequest`.
-Result semantics are explicit:
-
-- `ActionCommitOutcome::Applied`
-- `ActionCommitOutcome::Duplicate` (idempotent replay, no writes applied)
-
-Native U256 KV mutation variants are available for strict/soft decrement and bounded updates:
-
-- `Mutation::KvAddU256Ex`
-- `Mutation::KvSubU256Ex`
-- `Mutation::KvMaxU256`
-- `Mutation::KvMinU256`
-
-`CommitResult` also exposes idempotency metadata:
-
-- `idempotency: IdempotencyOutcome`
-- `canonical_commit_seq`
-
 ### Data model
 
 - Namespace hierarchy: `project -> scope -> table`
 - Typed relational tables for structured data
 - KV APIs for point lookups, prefix/range scans, and counters
-- Atomic KV/table integer updates with commit-time read assertions
+- Atomic KV/table integer updates with explicit underflow/overflow behavior
+- Event stream and processor checkpoint primitives for durable derived-state workflows
 
-Casino-style hot balance updates should use native atomic mutations plus assertions,
-not a separate accumulator subsystem. This keeps the safety check in the same commit
-envelope while allowing non-conflicting atomic updates to stay parallelizable.
+Use tables when you need schema, indexes, constraints, filters, ordering, or
+joins. Use KV for point lookups, prefix/range scans, opaque payloads, and
+counters. Keep one source of truth unless an explicit projection is part of the
+design.
 
-Atomic update safety has four layers:
+### Transaction model
 
-- `preflight` / `preflight_plan` can reject obviously invalid updates before enqueueing, such as a decrement that would underflow the snapshot it inspected.
-- `ReadAssertion`s in a `TransactionEnvelope` are authoritative pre-apply commit-time checks. They are evaluated against the working state for the commit epoch before the write intent applies.
-- `Mutation::PostflightCheck` evaluates `ReadAssertion`s after prior mutations in the same write intent have applied to the transaction-local trial state. Use this for hot-key atomic updates when the invariant is about the post-update value; it does not add a pre-apply read dependency that would serialize every writer on the same key.
-- Atomic mutation variants such as `KvSubU64Ex`, `KvSubU256Ex`, `KvAddI64Bounded`, and `TableDecU256` apply the numeric update without requiring callers to perform a separate read-modify-write. If the mutation itself cannot be applied, it returns a structured error and the envelope rolls back.
+Writes are appended to the WAL and applied as ordered commit envelopes. A commit
+may include one mutation or a set of mutations that must publish atomically.
 
-Use `commit_with_preflight` for simple single-mutation UX checks. Use an explicit
-`TransactionEnvelope` with `Mutation::PostflightCheck` when the business invariant
-depends on the value after an atomic update, for example "balance must remain
-above the reserve after this debit".
+- `commit_with_preflight` / `commit_as_with_preflight` perform an advisory read
+  and include the observed read set in the commit envelope.
+- `ReadAssertion`s are commit-time checks evaluated against the working state
+  before the write intent applies.
+- `Mutation::PostflightCheck` evaluates assertions after earlier mutations in
+  the same envelope have applied to the transaction-local trial state.
+- Atomic numeric mutations encode their missing-key, underflow, and overflow
+  policy in the mutation and return structured errors on rejection.
+- `CommitFinality::Visible` waits for publication to readers; `CommitFinality::Durable`
+  waits for the durable head.
 
-```rust
-use aedb::commit::tx::{ReadAssertion, ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
-use aedb::commit::validation::{
-    CompareOp, KvU64MissingPolicy, KvU64UnderflowPolicy, Mutation,
-};
-use aedb::query::plan::ConsistencyMode;
+### Operational Features
 
-let balance_key = b"house/balance".to_vec();
-let base_seq = db.snapshot_probe(ConsistencyMode::AtLatest).await?;
+AEDB includes operational APIs for checkpointing, backup/restore, event streams,
+processor checkpoints, diagnostics, and offline invariant checks. These APIs are
+part of the storage engine surface, but application-specific processor logic
+belongs outside the core write path.
 
-db.commit_envelope(TransactionEnvelope {
-    caller: None,
-    idempotency_key: None,
-    write_class: WriteClass::Standard,
-    assertions: Vec::new(),
-    read_set: ReadSet::default(),
-    write_intent: WriteIntent {
-        mutations: vec![
-            Mutation::KvSubU64Ex {
-                project_id: "casino".into(),
-                scope_id: "app".into(),
-                key: balance_key.clone(),
-                amount_be: u64::to_be_bytes(500),
-                on_missing: KvU64MissingPolicy::Reject,
-                on_underflow: KvU64UnderflowPolicy::Reject,
-            },
-            Mutation::PostflightCheck {
-                assertions: vec![ReadAssertion::KeyCompare {
-                    project_id: "casino".into(),
-                    scope_id: "app".into(),
-                    key: balance_key,
-                    op: CompareOp::Gte,
-                    threshold: u64::to_be_bytes(10_000).to_vec(),
-                }],
-            },
-        ],
-    },
-    base_seq,
-})
-.await?;
+Detailed examples live in:
 
-// Tier-2 event stream + processor checkpoint primitives
-db.emit_event(
-    "casino",
-    "app",
-    "hand_settled",
-    "hand_42".into(),
-    r#"{"user_id":"u1","wager":100,"pnl":-120}"#.into(),
-)
-.await?;
-
-let page = db
-    .read_event_stream(Some("hand_settled"), 0, 100, ConsistencyMode::AtLatest)
-    .await?;
-db.ack_reactive_processor_checkpoint("points_processor", page.next_commit_seq.unwrap_or(0))
-    .await?;
-let processor_lag = db
-    .reactive_processor_lag("points_processor", ConsistencyMode::AtLatest)
-    .await?;
-```
-
-For event processors, prefer watermark-batched checkpoint ACKs to reduce write load:
-
-```rust
-db.ack_reactive_processor_checkpoint_batched(
-    "points_processor",
-    processed_seq,
-    100, // persist every 100 commits advanced
-)
-.await?;
-```
-
-`ack_reactive_processor_checkpoint_batched_as(...)` isolates watermark state per caller and
-only updates cache state after successful commit.
-
-Built-in processor scheduler (period + size limits):
-
-```rust
-use std::sync::Arc;
-
-let db = Arc::new(db);
-db.start_reactive_processor(
-    "points_processor",
-    aedb::ReactiveProcessorOptions {
-        caller_id: Some("processor_points".into()),
-        topic_filter: Some("hand_settled".into()),
-        run_on_interval: false,
-        max_allowed_lag_commits: Some(2_000),
-        max_allowed_stall_ms: Some(30_000),
-        max_events_per_run: 256,
-        max_bytes_per_run: 2 * 1024 * 1024,
-        max_run_duration_ms: 250,
-        run_interval_ms: 20,
-        idle_backoff_ms: 50,
-        checkpoint_watermark_commits: 64,
-        max_retries: 3,
-        retry_backoff_ms: 100,
-    },
-    move |db, events| async move {
-        // Your derived-state logic (idempotent)
-        for event in events {
-            let _ = db
-                .emit_event(
-                    "casino",
-                    "app",
-                    "points_applied",
-                    format!("points:{}", event.event_key),
-                    event.payload_json,
-                )
-                .await?;
-        }
-        Ok(())
-    },
-)
-.await?;
-
-let status = db
-    .reactive_processor_runtime_status("points_processor")
-    .await;
-
-let health = db
-    .reactive_processor_health("points_processor", ConsistencyMode::AtLatest)
-    .await?;
-
-let processors = db
-    .list_reactive_processors(ConsistencyMode::AtLatest)
-    .await?;
-
-db.stop_reactive_processor("points_processor").await?;
-```
-
-`caller_id` defines the explicit auth context for that processor runtime:
-- event stream reads run via `read_event_stream_as(...)`
-- lag/checkpoint access runs via `reactive_processor_lag_as(...)` and
-  `ack_reactive_processor_checkpoint_batched_as(...)`
-- dead-letter writes run via `commit_as(...)`
-
-In secure mode, `caller_id` is required for `start_reactive_processor(...)`.
-
-For periodic refresh jobs (e.g. weekly/all-time leaderboard snapshots), set
-`run_on_interval: true`. AEDB will invoke the processor handler on each
-`run_interval_ms` tick even when no new events are present.
-
-Lifecycle controls:
-- `pause_reactive_processor(name)` disables in registry and stops runtime.
-- `resume_reactive_processor(name)` re-enables and starts runtime using the registered handler.
-- `list_reactive_processors(consistency)` returns durable config + running state.
-- `reactive_processor_health(name, consistency)` returns lag + runtime counters/timestamps.
-- `reactive_processor_slo_status(name, consistency)` returns threshold checks and breach reasons.
-- `list_reactive_processor_slo_statuses(consistency)` returns all processor SLO states.
-- `enforce_reactive_processor_slos(consistency)` returns `Unavailable` when any enabled processor breaches SLO.
-
-Processor configs are durably persisted in a system registry table when started.
-On process restart, register the handler again and AEDB auto-resumes enabled processors:
-
-```rust
-let resumed = db
-    .register_reactive_processor_handler("points_processor", move |db, events| async move {
-        // same handler logic
-        Ok(())
-    })
-    .await?;
-assert!(resumed); // true when durable registry had enabled processor config
-```
-
-When handler retries are exhausted, AEDB writes failed events to the durable
-`_system.app.reactive_processor_dead_letters` table and advances checkpoint so
-poison batches do not stall ingestion.
-
-Secure mode/authenticated flows can use `commit_as`, `commit_envelope_as`,
-`commit_as_with_preflight`, and `ack_reactive_processor_checkpoint_batched_as`.
-
-Arcana-oriented engine interface primitives (effect batches, keyed-state helpers,
-processor pull/commit/context) are also exposed under `aedb::engine_interface`
-and as `AedbInstance` methods:
-
-- `commit_effect_batch(project_id, scope_id, EffectBatch)`
-- `keyed_state_read` / `keyed_state_read_field` / `keyed_state_write` / `keyed_state_update` / `keyed_state_delete`
-- `keyed_state_query_index` / `keyed_state_index_rank`
-- `processor_pull(event_name, processor_id, max_count)`
-- `processor_commit(processor_id, checkpoint_seq, mutations)` (atomic state + checkpoint commit)
-- `processor_context(project_id, scope_id, processor_id, source_event)` with:
-  - `pull(max_count)`
-  - `read` / `query_index`
-  - `write` / `update` / `delete`
-  - `accumulate` / `value` / `expose` / `release_exposure`
-  - `emit`
-  - `commit`
+- `docs/PRODUCTION_USAGE_EXAMPLES.md`
+- `docs/COMMIT_SEQUENCING.md`
+- `docs/AUTHORIZATION_MODEL.md`
+- `docs/PERSISTENCE_COMPATIBILITY.md`
 
 ### Consistency modes
 
@@ -383,6 +193,7 @@ Security/operations docs:
 
 - `docs/PRODUCTION_READINESS.md`
 - `docs/PRODUCTION_USAGE_EXAMPLES.md`
+- `docs/ARCHITECTURE_BOUNDARIES.md`
 - `docs/SECURITY_ACCEPTANCE_CRITERIA.md`
 - `docs/SECURITY_OPERATIONS_RUNBOOK.md`
 - `docs/AUTHORIZATION_MODEL.md`
@@ -444,19 +255,19 @@ cargo test --test crash_matrix
 cargo test --test stress
 ```
 
-Security acceptance gate (mandatory profile):
+Security acceptance gate:
 
 ```bash
 ./scripts/security_gate.sh
 ```
 
-Production readiness gate:
+Operational readiness gate:
 
 ```bash
 ./scripts/production_readiness_gate.sh
 ```
 
-Production rollout guidance:
+Operational rollout guidance:
 
 - [docs/PRODUCTION_READINESS.md](docs/PRODUCTION_READINESS.md)
 

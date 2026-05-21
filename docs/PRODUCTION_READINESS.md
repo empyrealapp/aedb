@@ -1,8 +1,8 @@
-# Production Readiness
+# Operational Readiness
 
-This document is the repo-local deployment gate for AEDB. It is intentionally practical: every local claim should map to a command, configuration value, or operational artifact that can be checked before rollout.
+This document is the repo-local deployment checklist for AEDB. It is intentionally practical: every local claim should map to a command, configuration value, or operational artifact that can be checked before rollout.
 
-Passing everything here is necessary before production rollout. It does not prove that a deployment is secure, financial-grade, or operationally ready by itself. Those claims require the external validation items at the end of this document.
+Passing everything here is a baseline for operating AEDB in a serious deployment. It does not prove that a deployment is secure, audited, or operationally mature by itself. Those claims require the external validation items at the end of this document.
 
 ## Required Runtime Profile
 
@@ -14,9 +14,9 @@ Passing everything here is necessary before production rollout. It does not prov
 - Configure a manifest HMAC key.
 - Prefer checkpoint encryption via `with_checkpoint_key([u8; 32])` for production deployments.
 
-## Mandatory Repo Gates
+## Required Repo Gates
 
-Run the full repo-local production gate before production rollout:
+Run the full repo-local operational gate before rollout:
 
 ```bash
 ./scripts/production_readiness_gate.sh
@@ -67,7 +67,7 @@ Repo tests do not prove:
 - that restore procedures meet business RTO/RPO targets;
 - that an adversary cannot exploit the embedding application around AEDB.
 
-Do not describe a deployment as security-audited, penetration-tested, financial-grade, or production-ready for high-integrity workloads until the external requirements below have evidence.
+Do not describe a deployment as independently audited, penetration-tested, or suitable for regulated/high-risk workloads until the external requirements below have evidence.
 
 ## Local Quality Commands
 
@@ -114,7 +114,7 @@ Clippy treats warnings as errors. `clippy::too_many_arguments` is not globally a
 
 ## External Requirements
 
-These are required before claiming production readiness for high-integrity workloads and cannot be satisfied by source changes in this repo alone:
+These requirements cannot be satisfied by source changes in this repo alone:
 
 - Independent code audit focused on commit atomicity, authorization, and recovery.
 - Penetration testing of the embedding and API boundary in the host application.

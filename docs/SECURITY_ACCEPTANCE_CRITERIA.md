@@ -1,6 +1,6 @@
 # Security Acceptance Criteria
 
-This document defines repo-local acceptance gates for high-integrity workloads. Passing these gates is evidence about the tested code paths; it is not evidence of independent audit, penetration testing, key management quality, or restore readiness in a deployed environment.
+This document defines repo-local security acceptance gates. Passing these gates is evidence about the tested code paths; it is not evidence of independent audit, penetration testing, key management quality, or restore readiness in a deployed environment.
 
 ## Mandatory CI Gates
 
@@ -71,7 +71,7 @@ Permission-denied diagnostics are part of the security boundary. They may identi
 
 ## External Validation Required For Stronger Claims
 
-The following are required before using security-audited, penetration-tested, financial-grade, or equivalent production-readiness claims:
+The following are required before using independently audited, penetration-tested, regulated-workload, or equivalent operational claims:
 
 - Independent code audit with focus on commit atomicity, authorization checks, and recovery path.
 - Penetration testing of the embedding/API boundary in the host application.
