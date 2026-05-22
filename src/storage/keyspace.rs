@@ -70,9 +70,6 @@ pub struct TableData {
     pub row_versions: OrdMap<EncodedKey, u64>,
     #[serde(default)]
     pub structural_version: u64,
-    pub pk_hash: HashMap<EncodedKey, ()>,
-    pub row_cache: HashMap<EncodedKey, Row>,
-    pub row_versions_cache: HashMap<EncodedKey, u64>,
     pub indexes: HashMap<String, SecondaryIndex>,
 }
 
@@ -1235,33 +1232,6 @@ impl Keyspace {
 
     pub fn set_backend(&mut self, backend: PrimaryIndexBackend) {
         self.primary_index_backend = backend;
-        self.rebuild_point_lookup_caches();
-    }
-
-    fn rebuild_point_lookup_caches(&mut self) {
-        let use_point_lookup_cache =
-            self.primary_index_backend == PrimaryIndexBackend::ArtExperimental;
-        let namespace_ids: Vec<NamespaceId> = self.namespaces.keys().cloned().collect();
-        for namespace_id in namespace_ids {
-            let Some(namespace) = self.namespaces_mut().get_mut(&namespace_id) else {
-                continue;
-            };
-            let table_names: Vec<String> = namespace.tables.keys().cloned().collect();
-            for table_name in table_names {
-                let Some(table) = namespace.tables.get_mut(&table_name) else {
-                    continue;
-                };
-                if use_point_lookup_cache {
-                    table.pk_hash = table.rows.keys().map(|pk| (pk.clone(), ())).collect();
-                    table.row_cache = table.rows.clone().into_iter().collect();
-                    table.row_versions_cache = table.row_versions.clone().into_iter().collect();
-                } else {
-                    table.pk_hash.clear();
-                    table.row_cache.clear();
-                    table.row_versions_cache.clear();
-                }
-            }
-        }
     }
 
     pub fn namespace_mut(&mut self, namespace_id: NamespaceId) -> &mut Namespace {
@@ -1376,7 +1346,6 @@ impl Keyspace {
         row: Row,
         commit_seq: u64,
     ) {
-        let use_cache = self.primary_index_backend == PrimaryIndexBackend::ArtExperimental;
         let new_cost = row_mem_cost(&row);
         let old_cost = {
             let table = self.table_mut(project_id, scope_id, table_name);
@@ -1384,17 +1353,8 @@ impl Keyspace {
             if old_cost == 0 {
                 table.structural_version = commit_seq;
             }
-            if use_cache {
-                table.rows.insert(encoded_pk.clone(), row.clone());
-                table.row_cache.insert(encoded_pk.clone(), row);
-            } else {
-                table.rows.insert(encoded_pk.clone(), row);
-            }
+            table.rows.insert(encoded_pk.clone(), row);
             table.row_versions.insert(encoded_pk.clone(), commit_seq);
-            if use_cache {
-                table.pk_hash.insert(encoded_pk.clone(), ());
-                table.row_versions_cache.insert(encoded_pk, commit_seq);
-            }
             old_cost
         };
         self.mem_bytes = self
@@ -1423,15 +1383,7 @@ impl Keyspace {
     ) -> Option<&Row> {
         self.namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.tables.get(table_name))
-            .and_then(|t| {
-                if self.primary_index_backend == PrimaryIndexBackend::ArtExperimental {
-                    t.row_cache
-                        .get(encoded_pk)
-                        .or_else(|| t.rows.get(encoded_pk))
-                } else {
-                    t.rows.get(encoded_pk)
-                }
-            })
+            .and_then(|t| t.rows.get(encoded_pk))
     }
 
     pub fn delete_row(
@@ -1460,9 +1412,6 @@ impl Keyspace {
                 .tables
                 .get_mut(table_name)?;
             table.row_versions.remove(encoded_pk);
-            table.pk_hash.remove(encoded_pk);
-            table.row_cache.remove(encoded_pk);
-            table.row_versions_cache.remove(encoded_pk);
             let removed = table.rows.remove(encoded_pk);
             if removed.is_some() {
                 table.structural_version = commit_seq;
@@ -1579,16 +1528,7 @@ impl Keyspace {
         let encoded_pk = EncodedKey::from_values(pk);
         self.namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.tables.get(table_name))
-            .and_then(|t| {
-                if self.primary_index_backend == PrimaryIndexBackend::ArtExperimental {
-                    t.row_versions_cache
-                        .get(&encoded_pk)
-                        .copied()
-                        .or_else(|| t.row_versions.get(&encoded_pk).copied())
-                } else {
-                    t.row_versions.get(&encoded_pk).copied()
-                }
-            })
+            .and_then(|t| t.row_versions.get(&encoded_pk).copied())
             .unwrap_or(0)
     }
 
@@ -3645,7 +3585,7 @@ mod tests {
     }
 
     #[test]
-    fn art_experimental_backend_uses_point_lookup_cache() {
+    fn art_experimental_backend_uses_primary_ordmap_storage() {
         let mut ks = Keyspace::with_backend(PrimaryIndexBackend::OrdMap);
         ks.upsert_row(
             "p",
