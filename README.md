@@ -24,7 +24,7 @@ Use AEDB when you want:
 
 ```toml
 [dependencies]
-aedb = "0.2.4"
+aedb = "0.2.7"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
