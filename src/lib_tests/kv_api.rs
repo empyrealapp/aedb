@@ -1432,7 +1432,7 @@ async fn batch_mutations_respect_max_batch_rows() {
 async fn memory_limit_is_enforced_before_wal_commit() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {
-        max_memory_estimate_bytes: 500,
+        max_memory_estimate_bytes: 1_000,
         ..AedbConfig::default()
     };
     let db = AedbInstance::open(config, dir.path()).expect("open");

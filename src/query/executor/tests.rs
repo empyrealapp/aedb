@@ -430,6 +430,54 @@ fn exact_index_predicate_limit_caps_candidate_materialization() {
 }
 
 #[test]
+fn non_exact_like_index_predicate_keeps_residual_filter() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let table = snapshot.table("A", "app", "users").expect("snapshot table");
+    let predicate = Expr::Like("name".into(), "u1%7%".into());
+
+    let indexed = indexed_pks_for_predicate_limited(
+        &catalog,
+        "A",
+        "app",
+        "users",
+        table,
+        &predicate,
+        Some(1),
+    )
+    .expect("index lookup")
+    .expect("indexed");
+    assert!(!indexed.predicate_exact);
+    assert!(
+        indexed.pks.len() > 1,
+        "non-exact LIKE candidates must not be capped before residual filtering"
+    );
+
+    let result = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["name"]).from("users").where_(predicate),
+        &QueryOptions {
+            allow_full_scan: false,
+            ..QueryOptions::default()
+        },
+        0,
+        10_000,
+        None,
+    )
+    .expect("like query");
+
+    assert_eq!(
+        result.rows,
+        vec![Row {
+            values: vec![Value::Text("u17".into())]
+        }]
+    );
+}
+
+#[test]
 fn primary_key_eq_uses_point_lookup_path() {
     let (keyspace, catalog) = setup();
     let snapshot = keyspace.snapshot();
@@ -708,6 +756,63 @@ fn composite_index_respects_leftmost_prefix_rule() {
     assert!(
         bad.rows_examined >= good.rows_examined,
         "non-leftmost query should not be better than leftmost"
+    );
+}
+
+#[test]
+fn simple_leftmost_eq_can_use_composite_index_without_single_column_index() {
+    let (mut keyspace, mut catalog) = setup();
+    let ns = namespace_key("A", "app");
+    catalog
+        .indexes
+        .remove(&(ns.clone(), "users".to_string(), "by_age".to_string()));
+    keyspace
+        .table_by_namespace_key_mut(&ns, "users")
+        .expect("table")
+        .indexes
+        .remove("by_age");
+    catalog
+        .create_index(
+            "A",
+            "app",
+            "users",
+            "by_age_name",
+            vec!["age".into(), "name".into()],
+            IndexType::BTree,
+            None,
+        )
+        .expect("composite index");
+    let schema = catalog
+        .tables
+        .get(&(ns.clone(), "users".to_string()))
+        .expect("schema")
+        .clone();
+    let table = keyspace
+        .table_by_namespace_key_mut(&ns, "users")
+        .expect("table");
+    let mut by_age_name = SecondaryIndex::default();
+    for (pk, row) in &table.rows {
+        let key = extract_index_key_encoded(row, &schema, &["age".into(), "name".into()])
+            .expect("composite key");
+        by_age_name.insert(key, pk.clone());
+    }
+    table.indexes.insert("by_age_name".into(), by_age_name);
+
+    let result = execute_query(
+        &keyspace.snapshot(),
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id", "name", "age"])
+            .from("users")
+            .where_(Expr::Eq("age".into(), Value::Integer(40))),
+    )
+    .expect("leftmost eq should use composite index");
+
+    assert!(!result.rows.is_empty());
+    assert!(
+        result.rows_examined < 100,
+        "leftmost eq should avoid full scan via composite index"
     );
 }
 

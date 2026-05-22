@@ -13,9 +13,17 @@ fn estimate_row_bytes(row: &Row) -> usize {
 }
 
 /// Cost contribution of one table row in `estimate_memory_bytes` accounting.
-/// Matches the original O(N) walk: row bytes + 32 per-row overhead.
+///
+/// Tables keep persistent map entries for rows and per-row versions, with
+/// structural overhead that is not represented by row payload bytes alone.
+/// The previous payload-only estimate was fast after the running-counter work,
+/// but it undercounted resident memory for table-heavy workloads.
 pub(crate) fn row_mem_cost(row: &Row) -> usize {
-    estimate_row_bytes(row).saturating_add(32)
+    const TABLE_ROW_RESIDENT_FACTOR: usize = 2;
+
+    estimate_row_bytes(row)
+        .saturating_add(32)
+        .saturating_mul(TABLE_ROW_RESIDENT_FACTOR)
 }
 
 pub(crate) fn projection_row_mem_cost(row: &Row) -> usize {
