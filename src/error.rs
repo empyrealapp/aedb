@@ -1,5 +1,112 @@
 use thiserror::Error;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryIntegrityKind {
+    ManifestWalSegmentMissing,
+    ManifestWalSegmentMissingSizeMetadata,
+    ManifestWalSegmentMissingChecksumMetadata,
+    ManifestWalSegmentChecksumMismatch,
+    ManifestWalSegmentTruncated,
+    ManifestWalSegmentSizeMismatch,
+    ManifestWalSegmentInvalidChecksumMetadata,
+}
+
+impl RecoveryIntegrityKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RecoveryIntegrityKind::ManifestWalSegmentMissing => "manifest_wal_segment_missing",
+            RecoveryIntegrityKind::ManifestWalSegmentMissingSizeMetadata => {
+                "manifest_wal_segment_missing_size_metadata"
+            }
+            RecoveryIntegrityKind::ManifestWalSegmentMissingChecksumMetadata => {
+                "manifest_wal_segment_missing_checksum_metadata"
+            }
+            RecoveryIntegrityKind::ManifestWalSegmentChecksumMismatch => {
+                "manifest_wal_segment_checksum_mismatch"
+            }
+            RecoveryIntegrityKind::ManifestWalSegmentTruncated => "manifest_wal_segment_truncated",
+            RecoveryIntegrityKind::ManifestWalSegmentSizeMismatch => {
+                "manifest_wal_segment_size_mismatch"
+            }
+            RecoveryIntegrityKind::ManifestWalSegmentInvalidChecksumMetadata => {
+                "manifest_wal_segment_invalid_checksum_metadata"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryIntegrityKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryIntegrityDiagnostic {
+    pub kind: RecoveryIntegrityKind,
+    pub segment_filename: String,
+    pub manifest_path: std::path::PathBuf,
+    pub wal_dir: std::path::PathBuf,
+    pub recovery_mode: crate::config::RecoveryMode,
+    pub durable_seq: u64,
+    pub visible_seq: u64,
+    pub active_segment_seq: u64,
+    pub segment_seq: u64,
+    pub latest_checkpoint_seq: Option<u64>,
+    pub expected_size_bytes: Option<u64>,
+    pub actual_size_bytes: Option<u64>,
+    pub expected_sha256_hex: Option<String>,
+    pub actual_sha256_hex: Option<String>,
+}
+
+impl RecoveryIntegrityDiagnostic {
+    pub fn operator_message(&self) -> &'static str {
+        match self.recovery_mode {
+            crate::config::RecoveryMode::Strict => {
+                "strict recovery stopped because the manifest and WAL files are inconsistent; local dev data may be corrupt, and persisted data requires restore/repair from a known-good backup"
+            }
+            crate::config::RecoveryMode::Permissive => {
+                "permissive recovery skipped manifest-referenced WAL data; local dev data may be corrupt, and persisted data requires restore/repair from a known-good backup before relying on it"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryIntegrityDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: segment={} manifest={} wal_dir={} mode={:?} durable_seq={} visible_seq={} active_segment_seq={} segment_seq={}",
+            self.kind,
+            self.segment_filename,
+            self.manifest_path.display(),
+            self.wal_dir.display(),
+            self.recovery_mode,
+            self.durable_seq,
+            self.visible_seq,
+            self.active_segment_seq,
+            self.segment_seq
+        )?;
+        if let Some(seq) = self.latest_checkpoint_seq {
+            write!(f, " latest_checkpoint_seq={seq}")?;
+        }
+        if let Some(size) = self.expected_size_bytes {
+            write!(f, " expected_size_bytes={size}")?;
+        }
+        if let Some(size) = self.actual_size_bytes {
+            write!(f, " actual_size_bytes={size}")?;
+        }
+        if let Some(ref sha) = self.expected_sha256_hex {
+            write!(f, " expected_sha256_hex={sha}")?;
+        }
+        if let Some(ref sha) = self.actual_sha256_hex {
+            write!(f, " actual_sha256_hex={sha}")?;
+        }
+        write!(f, "; {}", self.operator_message())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceType {
     Project,
@@ -27,6 +134,7 @@ pub enum AedbErrorCode {
     Validation,
     InvalidConfig,
     IntegrityError,
+    RecoveryIntegrity,
     Unavailable,
     CheckpointInProgress,
     ProjectAlreadyExists,
@@ -92,6 +200,7 @@ impl AedbErrorCode {
             AedbErrorCode::Validation => "validation",
             AedbErrorCode::InvalidConfig => "invalid_config",
             AedbErrorCode::IntegrityError => "integrity_error",
+            AedbErrorCode::RecoveryIntegrity => "recovery_integrity",
             AedbErrorCode::Unavailable => "unavailable",
             AedbErrorCode::CheckpointInProgress => "checkpoint_in_progress",
             AedbErrorCode::ProjectAlreadyExists => "project_already_exists",
@@ -138,7 +247,8 @@ impl AedbErrorCode {
             AedbErrorCode::Io
             | AedbErrorCode::Encode
             | AedbErrorCode::Decode
-            | AedbErrorCode::IntegrityError => AedbErrorClass::Integrity,
+            | AedbErrorCode::IntegrityError
+            | AedbErrorCode::RecoveryIntegrity => AedbErrorClass::Integrity,
             AedbErrorCode::Unavailable | AedbErrorCode::CheckpointInProgress => {
                 AedbErrorClass::Unavailable
             }
@@ -183,6 +293,10 @@ pub enum AedbError {
     InvalidConfig { message: String },
     #[error("integrity error: {message}")]
     IntegrityError { message: String },
+    #[error("recovery integrity error: {diagnostic}")]
+    RecoveryIntegrity {
+        diagnostic: Box<RecoveryIntegrityDiagnostic>,
+    },
     #[error("resource unavailable: {message}")]
     Unavailable { message: String },
     #[error("checkpoint in progress")]
@@ -266,6 +380,7 @@ impl AedbError {
             AedbError::Validation(_) => AedbErrorCode::Validation,
             AedbError::InvalidConfig { .. } => AedbErrorCode::InvalidConfig,
             AedbError::IntegrityError { .. } => AedbErrorCode::IntegrityError,
+            AedbError::RecoveryIntegrity { .. } => AedbErrorCode::RecoveryIntegrity,
             AedbError::Unavailable { .. } => AedbErrorCode::Unavailable,
             AedbError::CheckpointInProgress => AedbErrorCode::CheckpointInProgress,
             AedbError::AlreadyExists { resource_type, .. } => match resource_type {
@@ -328,6 +443,7 @@ mod tests {
             (AedbErrorCode::Validation, "validation"),
             (AedbErrorCode::InvalidConfig, "invalid_config"),
             (AedbErrorCode::IntegrityError, "integrity_error"),
+            (AedbErrorCode::RecoveryIntegrity, "recovery_integrity"),
             (AedbErrorCode::Unavailable, "unavailable"),
             (
                 AedbErrorCode::CheckpointInProgress,
