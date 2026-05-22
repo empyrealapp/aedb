@@ -231,6 +231,9 @@ impl From<AedbError> for QueryError {
             AedbError::Validation(reason) => QueryError::InvalidQuery { reason },
             AedbError::InvalidConfig { message } => QueryError::InvalidQuery { reason: message },
             AedbError::IntegrityError { message } => QueryError::InternalError(message),
+            AedbError::RecoveryIntegrity { diagnostic } => {
+                QueryError::InternalError(diagnostic.to_string())
+            }
             AedbError::Unavailable { message } => QueryError::InternalError(message),
             AedbError::CheckpointInProgress => {
                 QueryError::InternalError("checkpoint in progress".into())

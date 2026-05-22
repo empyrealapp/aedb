@@ -5,8 +5,8 @@ use crate::backup::sha256_file_hex;
 use crate::catalog::Catalog;
 use crate::checkpoint::loader::load_checkpoint_with_key;
 use crate::commit::tx::{IdempotencyKey, IdempotencyRecord};
-use crate::config::{AedbConfig, StorageMode};
-use crate::error::AedbError;
+use crate::config::{AedbConfig, RecoveryMode, StorageMode};
+use crate::error::{AedbError, RecoveryIntegrityDiagnostic, RecoveryIntegrityKind};
 use crate::manifest::atomic::load_manifest_signed_mode;
 use crate::manifest::schema::Manifest;
 use crate::recovery::replay::replay_segments;
@@ -29,6 +29,12 @@ pub struct RecoveredState {
     pub idempotency: HashMap<IdempotencyKey, IdempotencyRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryOutcome {
+    pub state: RecoveredState,
+    pub warnings: Vec<RecoveryIntegrityDiagnostic>,
+}
+
 type LoadedCheckpoint = (
     Keyspace,
     Catalog,
@@ -44,6 +50,13 @@ pub fn recover_with_config(
     data_dir: &Path,
     config: &AedbConfig,
 ) -> Result<RecoveredState, AedbError> {
+    recover_with_config_and_diagnostics(data_dir, config).map(|outcome| outcome.state)
+}
+
+pub fn recover_with_config_and_diagnostics(
+    data_dir: &Path,
+    config: &AedbConfig,
+) -> Result<RecoveryOutcome, AedbError> {
     info!("recovery: load manifest");
     let manifest =
         load_manifest_signed_mode(data_dir, config.hmac_key(), config.strict_recovery())?;
@@ -76,7 +89,7 @@ pub fn recover_with_config(
         &segments,
         seq,
         replay_to,
-        Some(&replay_limits),
+        Some(&replay_limits.limits),
         config.hash_chain_required,
         config.strict_recovery(),
         &mut keyspace,
@@ -84,11 +97,14 @@ pub fn recover_with_config(
         &mut idempotency,
     )?;
     attach_configured_value_store(&mut keyspace, config, data_dir)?;
-    Ok(RecoveredState {
-        keyspace,
-        catalog,
-        current_seq: replayed,
-        idempotency,
+    Ok(RecoveryOutcome {
+        state: RecoveredState {
+            keyspace,
+            catalog,
+            current_seq: replayed,
+            idempotency,
+        },
+        warnings: replay_limits.warnings,
     })
 }
 
@@ -130,7 +146,7 @@ pub fn recover_at_seq_with_config(
         &segments,
         seq,
         Some(effective_target),
-        Some(&replay_limits),
+        Some(&replay_limits.limits),
         config.hash_chain_required,
         config.strict_recovery(),
         &mut keyspace,
@@ -175,44 +191,58 @@ fn has_explicit_manifest(data_dir: &Path) -> bool {
     data_dir.join("manifest.json").exists() || data_dir.join("manifest.json.prev").exists()
 }
 
+#[derive(Debug, Default)]
+struct ReplaySelection {
+    limits: HashMap<PathBuf, u64>,
+    warnings: Vec<RecoveryIntegrityDiagnostic>,
+}
+
 fn segment_paths_for_replay(
     data_dir: &Path,
     manifest: &Manifest,
     explicit_manifest: bool,
     config: &AedbConfig,
-) -> Result<(Vec<PathBuf>, HashMap<PathBuf, u64>), AedbError> {
+) -> Result<(Vec<PathBuf>, ReplaySelection), AedbError> {
     if !explicit_manifest {
-        return Ok((scan_segments(data_dir)?, HashMap::new()));
+        return Ok((scan_segments(data_dir)?, ReplaySelection::default()));
     }
 
     let mut segments = manifest.segments.clone();
     segments.sort_by_key(|segment| segment.segment_seq);
     let mut segment_paths = Vec::with_capacity(segments.len());
-    let mut replay_limits = HashMap::new();
+    let mut replay_selection = ReplaySelection::default();
     let active_segment_seq = manifest.active_segment_seq;
     for segment in segments {
         let is_active_segment = segment.segment_seq == active_segment_seq;
         let path = data_dir.join(&segment.filename);
         if !path.exists() {
-            if config.strict_recovery() {
-                return Err(AedbError::Validation(format!(
-                    "manifest referenced wal segment missing: {}",
-                    segment.filename
-                )));
-            }
-            warn!(
-                filename = %segment.filename,
-                "recovery: manifest referenced wal segment missing, skipping in permissive mode"
+            let diagnostic = manifest_segment_diagnostic(
+                RecoveryIntegrityKind::ManifestWalSegmentMissing,
+                data_dir,
+                manifest,
+                &segment,
+                config.recovery_mode,
+                None,
+                None,
+                None,
             );
+            handle_manifest_segment_diagnostic(&mut replay_selection, diagnostic)?;
             continue;
         }
         let actual_size_bytes = std::fs::metadata(&path)?.len();
         if segment.size_bytes == 0 {
             if config.strict_recovery() && !is_active_segment {
-                return Err(AedbError::Validation(format!(
-                    "manifest referenced wal segment missing size metadata: {}",
-                    segment.filename
-                )));
+                let diagnostic = manifest_segment_diagnostic(
+                    RecoveryIntegrityKind::ManifestWalSegmentMissingSizeMetadata,
+                    data_dir,
+                    manifest,
+                    &segment,
+                    config.recovery_mode,
+                    Some(actual_size_bytes),
+                    None,
+                    None,
+                );
+                handle_manifest_segment_diagnostic(&mut replay_selection, diagnostic)?;
             }
             warn!(
                 filename = %segment.filename,
@@ -220,34 +250,49 @@ fn segment_paths_for_replay(
             );
         } else {
             if actual_size_bytes < segment.size_bytes {
-                if config.strict_recovery() {
-                    return Err(AedbError::Validation(format!(
-                        "manifest wal segment truncated: {}",
-                        segment.filename
-                    )));
-                }
-                warn!(
-                    filename = %segment.filename,
-                    "recovery: wal segment shorter than manifest size, skipping segment in permissive mode"
+                let diagnostic = manifest_segment_diagnostic(
+                    RecoveryIntegrityKind::ManifestWalSegmentTruncated,
+                    data_dir,
+                    manifest,
+                    &segment,
+                    config.recovery_mode,
+                    Some(actual_size_bytes),
+                    None,
+                    None,
                 );
+                handle_manifest_segment_diagnostic(&mut replay_selection, diagnostic)?;
                 continue;
             }
             if actual_size_bytes > segment.size_bytes
                 && !is_active_segment
                 && config.strict_recovery()
             {
-                return Err(AedbError::Validation(format!(
-                    "manifest wal segment size mismatch: {}",
-                    segment.filename
-                )));
+                let diagnostic = manifest_segment_diagnostic(
+                    RecoveryIntegrityKind::ManifestWalSegmentSizeMismatch,
+                    data_dir,
+                    manifest,
+                    &segment,
+                    config.recovery_mode,
+                    Some(actual_size_bytes),
+                    None,
+                    None,
+                );
+                handle_manifest_segment_diagnostic(&mut replay_selection, diagnostic)?;
             }
         }
         if segment.sha256_hex.is_empty() {
             if config.strict_recovery() && !is_active_segment {
-                return Err(AedbError::Validation(format!(
-                    "manifest referenced wal segment missing sha256 metadata: {}",
-                    segment.filename
-                )));
+                let diagnostic = manifest_segment_diagnostic(
+                    RecoveryIntegrityKind::ManifestWalSegmentMissingChecksumMetadata,
+                    data_dir,
+                    manifest,
+                    &segment,
+                    config.recovery_mode,
+                    Some(actual_size_bytes),
+                    None,
+                    None,
+                );
+                handle_manifest_segment_diagnostic(&mut replay_selection, diagnostic)?;
             }
             warn!(
                 filename = %segment.filename,
@@ -255,10 +300,17 @@ fn segment_paths_for_replay(
             );
         } else if !is_valid_sha256_hex(&segment.sha256_hex) {
             if config.strict_recovery() && !is_active_segment {
-                return Err(AedbError::Validation(format!(
-                    "manifest wal segment sha256 metadata invalid: {}",
-                    segment.filename
-                )));
+                let diagnostic = manifest_segment_diagnostic(
+                    RecoveryIntegrityKind::ManifestWalSegmentInvalidChecksumMetadata,
+                    data_dir,
+                    manifest,
+                    &segment,
+                    config.recovery_mode,
+                    Some(actual_size_bytes),
+                    None,
+                    None,
+                );
+                handle_manifest_segment_diagnostic(&mut replay_selection, diagnostic)?;
             }
             warn!(
                 filename = %segment.filename,
@@ -272,19 +324,81 @@ fn segment_paths_for_replay(
             };
             let actual = sha256_prefix_hex(&path, hash_len)?;
             if actual != segment.sha256_hex {
-                return Err(AedbError::Validation(format!(
-                    "manifest wal segment sha256 mismatch: {}",
-                    segment.filename
-                )));
+                let diagnostic = manifest_segment_diagnostic(
+                    RecoveryIntegrityKind::ManifestWalSegmentChecksumMismatch,
+                    data_dir,
+                    manifest,
+                    &segment,
+                    config.recovery_mode,
+                    Some(actual_size_bytes),
+                    None,
+                    Some(actual),
+                );
+                return Err(recovery_integrity_error(diagnostic));
             }
         }
         let replay_limit_path = path.clone();
         segment_paths.push(path);
         if segment.size_bytes > 0 {
-            replay_limits.insert(replay_limit_path, segment.size_bytes);
+            replay_selection
+                .limits
+                .insert(replay_limit_path, segment.size_bytes);
         }
     }
-    Ok((segment_paths, replay_limits))
+    Ok((segment_paths, replay_selection))
+}
+
+fn manifest_segment_diagnostic(
+    kind: RecoveryIntegrityKind,
+    data_dir: &Path,
+    manifest: &Manifest,
+    segment: &crate::manifest::schema::SegmentMeta,
+    recovery_mode: RecoveryMode,
+    actual_size_bytes: Option<u64>,
+    expected_sha256_hex: Option<String>,
+    actual_sha256_hex: Option<String>,
+) -> RecoveryIntegrityDiagnostic {
+    RecoveryIntegrityDiagnostic {
+        kind,
+        segment_filename: segment.filename.clone(),
+        manifest_path: data_dir.join("manifest.json"),
+        wal_dir: data_dir.to_path_buf(),
+        recovery_mode,
+        durable_seq: manifest.durable_seq,
+        visible_seq: manifest.visible_seq,
+        active_segment_seq: manifest.active_segment_seq,
+        segment_seq: segment.segment_seq,
+        latest_checkpoint_seq: manifest.checkpoints.iter().map(|cp| cp.seq).max(),
+        expected_size_bytes: (segment.size_bytes > 0).then_some(segment.size_bytes),
+        actual_size_bytes,
+        expected_sha256_hex: expected_sha256_hex
+            .or_else(|| (!segment.sha256_hex.is_empty()).then(|| segment.sha256_hex.clone())),
+        actual_sha256_hex,
+    }
+}
+
+fn handle_manifest_segment_diagnostic(
+    replay_selection: &mut ReplaySelection,
+    diagnostic: RecoveryIntegrityDiagnostic,
+) -> Result<(), AedbError> {
+    match diagnostic.recovery_mode {
+        RecoveryMode::Strict => Err(recovery_integrity_error(diagnostic)),
+        RecoveryMode::Permissive => {
+            warn!(
+                kind = %diagnostic.kind,
+                filename = %diagnostic.segment_filename,
+                "recovery: skipping manifest-referenced wal segment in permissive mode"
+            );
+            replay_selection.warnings.push(diagnostic);
+            Ok(())
+        }
+    }
+}
+
+fn recovery_integrity_error(diagnostic: RecoveryIntegrityDiagnostic) -> AedbError {
+    AedbError::RecoveryIntegrity {
+        diagnostic: Box::new(diagnostic),
+    }
 }
 
 fn load_latest_valid_checkpoint(
@@ -401,7 +515,7 @@ fn hex_string(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::recover_with_config;
+    use super::{recover_with_config, recover_with_config_and_diagnostics};
     use crate::catalog::schema::ColumnDef;
     use crate::catalog::types::{ColumnType, Row, Value};
     use crate::catalog::{Catalog, DdlOperation};
@@ -410,6 +524,7 @@ mod tests {
     use crate::commit::executor::CommitExecutor;
     use crate::commit::tx::WalCommitPayload;
     use crate::commit::validation::Mutation;
+    use crate::error::{AedbError, RecoveryIntegrityKind};
     use crate::manifest::atomic::write_manifest_atomic;
     use crate::manifest::schema::{Manifest, SegmentMeta};
     use crate::recovery::replay::replay_segments;
@@ -430,6 +545,36 @@ mod tests {
 
     fn strict_config() -> crate::config::AedbConfig {
         crate::config::AedbConfig::default()
+    }
+
+    fn write_test_segment(dir: &std::path::Path, filename: &str) -> u64 {
+        let path = dir.join(filename);
+        let mut file = File::create(&path).expect("segment file");
+        file.write_all(&SegmentHeader::new(1, 1, [0u8; 32]).to_bytes())
+            .expect("header");
+        file.write_all(b"frame-bytes").expect("payload");
+        file.sync_all().expect("sync");
+        std::fs::metadata(path).expect("metadata").len()
+    }
+
+    fn single_segment_manifest(
+        filename: &str,
+        active_segment_seq: u64,
+        size_bytes: u64,
+        sha256_hex: String,
+    ) -> Manifest {
+        Manifest {
+            durable_seq: 1,
+            visible_seq: 1,
+            active_segment_seq,
+            checkpoints: vec![],
+            segments: vec![SegmentMeta {
+                filename: filename.into(),
+                segment_seq: 1,
+                sha256_hex,
+                size_bytes,
+            }],
+        }
     }
 
     #[tokio::test]
@@ -928,6 +1073,10 @@ mod tests {
         .await
         .expect("project");
         let (_snapshot, _catalog, seq) = exec.snapshot_state().await;
+        let segment_filename = "segment_0000000000000001.aedbwal";
+        let segment_size = std::fs::metadata(dir.path().join(segment_filename))
+            .expect("segment metadata")
+            .len();
 
         let manifest = Manifest {
             durable_seq: seq,
@@ -935,18 +1084,115 @@ mod tests {
             active_segment_seq: 2,
             checkpoints: vec![],
             segments: vec![SegmentMeta {
-                filename: "segment_0000000000000001.aedbwal".into(),
+                filename: segment_filename.into(),
                 segment_seq: 1,
                 sha256_hex: "00".repeat(32),
-                size_bytes: 1,
+                size_bytes: segment_size,
             }],
         };
         write_manifest_atomic(&manifest, dir.path()).expect("manifest");
         let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
-        assert!(
-            err.to_string().contains("segment sha256 mismatch")
-                || err.to_string().contains("segment size mismatch")
+        match err {
+            AedbError::RecoveryIntegrity { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind,
+                    RecoveryIntegrityKind::ManifestWalSegmentChecksumMismatch
+                );
+                assert_eq!(diagnostic.segment_filename, segment_filename);
+                let json = serde_json::to_string(&diagnostic).expect("json diagnostic");
+                assert!(json.contains("manifest_wal_segment_checksum_mismatch"));
+            }
+            other => panic!("expected recovery integrity diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_recovery_reports_structured_missing_manifest_wal_segment() {
+        let dir = tempdir().expect("temp");
+        let filename = "segment_0000000000000001.aedbwal";
+        let manifest = single_segment_manifest(filename, 2, 128, "11".repeat(32));
+        write_manifest_atomic(&manifest, dir.path()).expect("manifest");
+
+        let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
+        match err {
+            AedbError::RecoveryIntegrity { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind,
+                    RecoveryIntegrityKind::ManifestWalSegmentMissing
+                );
+                assert_eq!(diagnostic.segment_filename, filename);
+                assert_eq!(diagnostic.manifest_path, dir.path().join("manifest.json"));
+                assert_eq!(diagnostic.wal_dir, dir.path());
+                assert_eq!(diagnostic.durable_seq, 1);
+                assert_eq!(diagnostic.visible_seq, 1);
+                assert_eq!(diagnostic.active_segment_seq, 2);
+                assert_eq!(diagnostic.segment_seq, 1);
+                assert!(diagnostic.operator_message().contains("restore/repair"));
+            }
+            other => panic!("expected recovery integrity diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_recovery_reports_missing_size_metadata_distinctly() {
+        let dir = tempdir().expect("temp");
+        let filename = "segment_0000000000000001.aedbwal";
+        write_test_segment(dir.path(), filename);
+        let manifest = single_segment_manifest(filename, 2, 0, "11".repeat(32));
+        write_manifest_atomic(&manifest, dir.path()).expect("manifest");
+
+        let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
+        match err {
+            AedbError::RecoveryIntegrity { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind,
+                    RecoveryIntegrityKind::ManifestWalSegmentMissingSizeMetadata
+                );
+                assert_eq!(diagnostic.segment_filename, filename);
+                assert!(diagnostic.actual_size_bytes.is_some());
+            }
+            other => panic!("expected recovery integrity diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn strict_recovery_reports_missing_checksum_metadata_distinctly() {
+        let dir = tempdir().expect("temp");
+        let filename = "segment_0000000000000001.aedbwal";
+        let segment_size_bytes = write_test_segment(dir.path(), filename);
+        let manifest = single_segment_manifest(filename, 2, segment_size_bytes, String::new());
+        write_manifest_atomic(&manifest, dir.path()).expect("manifest");
+
+        let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
+        match err {
+            AedbError::RecoveryIntegrity { diagnostic } => {
+                assert_eq!(
+                    diagnostic.kind,
+                    RecoveryIntegrityKind::ManifestWalSegmentMissingChecksumMetadata
+                );
+                assert_eq!(diagnostic.segment_filename, filename);
+                assert_eq!(diagnostic.expected_size_bytes, Some(segment_size_bytes));
+            }
+            other => panic!("expected recovery integrity diagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permissive_recovery_records_skipped_manifest_wal_segments() {
+        let dir = tempdir().expect("temp");
+        let filename = "segment_0000000000000001.aedbwal";
+        let manifest = single_segment_manifest(filename, 2, 128, "11".repeat(32));
+        write_manifest_atomic(&manifest, dir.path()).expect("manifest");
+
+        let outcome =
+            recover_with_config_and_diagnostics(dir.path(), &non_strict_config()).expect("recover");
+        assert_eq!(outcome.state.current_seq, 0);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert_eq!(
+            outcome.warnings[0].kind,
+            RecoveryIntegrityKind::ManifestWalSegmentMissing
         );
+        assert_eq!(outcome.warnings[0].segment_filename, filename);
     }
 
     #[tokio::test]
