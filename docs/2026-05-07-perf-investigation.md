@@ -145,7 +145,7 @@ Three findings:
 
 Top suspects for the 45× gap (from the dhat profile):
 
-- Redundant `row_cache: HashMap` + `row_versions_cache: HashMap` + `pk_hash: HashMap` next to the `OrdMap` source-of-truth
+- Historical redundant `row_cache: HashMap` + `row_versions_cache: HashMap` + `pk_hash: HashMap` next to the `OrdMap` source-of-truth. These caches have since been removed; re-run `examples/ram_probe.rs` to quantify the remaining gap.
 - `im::OrdMap` HAMT/btree node Arc overhead
 - `version_store` retaining historical snapshots (default `max_versions: 1024`, `min_version_age_ms: 5000`)
 - Allocator fragmentation
@@ -154,7 +154,7 @@ Top suspects for the 45× gap (from the dhat profile):
 
 ### Cheap (days)
 
-1. **Drop redundant caches** in `TableData` (`row_cache`, `row_versions_cache`, `pk_hash`). 1–2 days. Probably halves table RAM, cuts ~3 of 4 HAMT clones per commit. Re-measure read latency to confirm acceptable regression. **The dhat profile is the evidence; the bench harness is ready to verify.**
+1. **Re-measure table RAM after redundant cache removal.** `TableData` now keeps rows and row versions only in the canonical `OrdMap`s. Re-run the RSS probe and read-latency benches so the next storage decision is based on current data.
 2. **Make the counter honest.** Either multiply by an empirical structural factor or replace `max_memory_estimate_bytes` with an actual RSS-based check via `/proc/self/statm`. ~½ day. Otherwise users keep getting bitten by the 45× gap.
 3. **Tune `version_store` retention.** Default `max_versions: 1024` is generous. 64–128 is plenty for most workloads. Hours of testing, no code change.
 

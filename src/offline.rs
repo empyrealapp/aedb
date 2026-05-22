@@ -425,12 +425,6 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                     ns_id
                 ));
             }
-            if !table_data.pk_hash.is_empty() && table_data.rows.len() != table_data.pk_hash.len() {
-                violations.push(format!(
-                    "pk_hash cardinality mismatch in namespace={:?} table={table_name}",
-                    ns_id
-                ));
-            }
             let schema_key = match ns_id {
                 NamespaceId::Project(namespace) => Some((namespace.clone(), table_name.clone())),
                 NamespaceId::System | NamespaceId::Global => None,
@@ -655,16 +649,10 @@ mod tests {
             rows: OrdMap::new(),
             row_versions: OrdMap::new(),
             structural_version: 0,
-            pk_hash: ImHashMap::new(),
-            row_cache: ImHashMap::new(),
-            row_versions_cache: ImHashMap::new(),
             indexes: ImHashMap::new(),
         };
         table.rows.insert(pk.clone(), row.clone());
         table.row_versions.insert(pk.clone(), 1);
-        table.pk_hash.insert(pk.clone(), ());
-        table.row_cache.insert(pk.clone(), row);
-        table.row_versions_cache.insert(pk.clone(), 1);
         table.indexes.insert(
             "by_owner".into(),
             SecondaryIndex {

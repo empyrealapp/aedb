@@ -3239,8 +3239,6 @@ fn merge_parallel_namespace_result(
     };
     let mut added: usize = 0;
     let mut removed: usize = 0;
-    let use_point_lookup_cache =
-        keyspace.primary_index_backend == crate::config::PrimaryIndexBackend::ArtExperimental;
     let dest = keyspace.namespace_mut(ns_id.clone());
     let mut table_names: Vec<_> = targets.tables.iter().cloned().collect();
     table_names.sort();
@@ -3275,30 +3273,18 @@ fn merge_parallel_namespace_result(
                 Some(row) => {
                     added = added.saturating_add(row_mem_cost(row));
                     dest_table.rows.insert(row_key.clone(), row.clone());
-                    if use_point_lookup_cache {
-                        dest_table.row_cache.insert(row_key.clone(), row.clone());
-                        dest_table.pk_hash.insert(row_key.clone(), ());
-                    }
                 }
                 None => {
                     dest_table.rows.remove(row_key);
-                    dest_table.row_cache.remove(row_key);
-                    dest_table.pk_hash.remove(row_key);
                 }
             }
             removed = removed.saturating_add(prev_row_cost);
             match source_table.and_then(|table| table.row_versions.get(row_key)) {
                 Some(version) => {
                     dest_table.row_versions.insert(row_key.clone(), *version);
-                    if use_point_lookup_cache {
-                        dest_table
-                            .row_versions_cache
-                            .insert(row_key.clone(), *version);
-                    }
                 }
                 None => {
                     dest_table.row_versions.remove(row_key);
-                    dest_table.row_versions_cache.remove(row_key);
                 }
             }
         }
@@ -4687,9 +4673,6 @@ fn rebuild_kv_projection_rows(
     if let Some(table) = state.keyspace.table_by_namespace_key_mut(&ns, table_name) {
         table.rows.clear();
         table.row_versions.clear();
-        table.pk_hash.clear();
-        table.row_cache.clear();
-        table.row_versions_cache.clear();
         table.structural_version = materialized_seq;
     } else {
         state
