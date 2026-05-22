@@ -5,7 +5,7 @@ use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
-use aedb::query::plan::{ConsistencyMode, Order, Query, QueryOptions, col, lit};
+use aedb::query::plan::{ConsistencyMode, Expr, Order, Query, QueryOptions, col, lit};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use tempfile::tempdir;
 use tokio::runtime::Runtime;
@@ -86,6 +86,96 @@ async fn setup_db(config: AedbConfig, seed_rows: i64) -> (tempfile::TempDir, Aed
         .expect("seed kv");
     }
 
+    (dir, db)
+}
+
+async fn setup_index_predicate_db(seed_rows: i64) -> (tempfile::TempDir, AedbInstance) {
+    let (dir, db) = setup_db(AedbConfig::default(), seed_rows).await;
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: TABLE_NAME.into(),
+        index_name: "by_name".into(),
+        if_not_exists: false,
+        columns: vec!["name".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("name index");
+    for table_name in ["partial_users", "composite_users"] {
+        db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            table_name: table_name.into(),
+            owner_id: None,
+            if_not_exists: false,
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+        }))
+        .await
+        .expect("predicate table");
+    }
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: "partial_users".into(),
+        index_name: "age_25_only".into(),
+        if_not_exists: false,
+        columns: vec!["age".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: Some(Expr::Eq("age".into(), Value::Integer(25))),
+    }))
+    .await
+    .expect("partial index");
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: "composite_users".into(),
+        index_name: "by_age_name".into(),
+        if_not_exists: false,
+        columns: vec!["age".into(), "name".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("composite index");
+    for table_name in ["partial_users", "composite_users"] {
+        let mut rows = Vec::with_capacity(seed_rows as usize);
+        for id in 1..=seed_rows {
+            rows.push(Row {
+                values: vec![
+                    Value::Integer(id),
+                    Value::Text(format!("{table_name}-{id}").into()),
+                    Value::Integer(18 + (id % 50)),
+                ],
+            });
+        }
+        db.commit(Mutation::UpsertBatch {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            table_name: table_name.into(),
+            rows,
+        })
+        .await
+        .expect("seed predicate table");
+    }
     (dir, db)
 }
 
@@ -475,6 +565,119 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
     }
 }
 
+fn bench_index_predicate_shapes(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let (_dir, db) = rt.block_on(setup_index_predicate_db(2_000));
+
+    c.bench_function("index_eq_age_limit_20", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "name"])
+                            .from(TABLE_NAME)
+                            .where_(col("age").eq(lit(25_i64)))
+                            .limit(20),
+                    )
+                    .await
+                    .expect("index eq query");
+            });
+        })
+    });
+
+    c.bench_function("index_in_age_limit_20", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "name"])
+                            .from(TABLE_NAME)
+                            .where_(col("age").in_(vec![lit(25_i64), lit(26_i64), lit(27_i64)]))
+                            .limit(20),
+                    )
+                    .await
+                    .expect("index in query");
+            });
+        })
+    });
+
+    c.bench_function("index_like_name_prefix_exact_limit_20", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "name"])
+                            .from(TABLE_NAME)
+                            .where_(col("name").like(lit("user-12%")))
+                            .limit(20),
+                    )
+                    .await
+                    .expect("index like exact prefix query");
+            });
+        })
+    });
+
+    c.bench_function("index_like_name_residual_limit_20", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "name"])
+                            .from(TABLE_NAME)
+                            .where_(col("name").like(lit("user-1%7%")))
+                            .limit(20),
+                    )
+                    .await
+                    .expect("index like residual query");
+            });
+        })
+    });
+
+    c.bench_function("index_partial_age_eq_limit_20", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "name"])
+                            .from("partial_users")
+                            .where_(col("age").eq(lit(25_i64)))
+                            .limit(20),
+                    )
+                    .await
+                    .expect("partial index query");
+            });
+        })
+    });
+
+    c.bench_function("index_composite_leftmost_eq_limit_20", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let _ = db
+                    .query(
+                        PROJECT_ID,
+                        SCOPE_ID,
+                        Query::select(&["id", "name"])
+                            .from("composite_users")
+                            .where_(col("age").eq(lit(25_i64)))
+                            .limit(20),
+                    )
+                    .await
+                    .expect("composite index query");
+            });
+        })
+    });
+}
+
 fn bench_end_to_end_bootstrap(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
     c.bench_function("e2e_bootstrap_commit_and_query", |b| {
@@ -512,5 +715,10 @@ fn bench_end_to_end_bootstrap(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_aedb_hot_paths, bench_end_to_end_bootstrap);
+criterion_group!(
+    benches,
+    bench_aedb_hot_paths,
+    bench_index_predicate_shapes,
+    bench_end_to_end_bootstrap
+);
 criterion_main!(benches);

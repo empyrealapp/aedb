@@ -8,7 +8,7 @@ use aedb::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use aedb::permission::{CallerContext, Permission};
-use aedb::query::plan::{ConsistencyMode, Query, col, lit};
+use aedb::query::plan::{ConsistencyMode, Expr, Query, col, lit};
 use aedb::storage::page_store::PagedStore;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -407,6 +407,247 @@ async fn benchmark_coordinator_vs_parallel_lanes() {
         "benchmark_coordinator_vs_parallel_lanes: parallel_tps={} coordinator_tps={} (parallel_commits={} coordinator_commits={})",
         parallel_tps, coordinator_tps, parallel_count, coordinator_count
     );
+}
+
+#[tokio::test]
+#[ignore = "benchmark gate; run explicitly in CI or perf environment"]
+async fn benchmark_index_predicate_shapes() {
+    let config = AedbConfig {
+        recovery_mode: RecoveryMode::Strict,
+        ..AedbConfig::default()
+    }
+    .with_hmac_key(vec![9u8; 32]);
+    let (_dir, db) = setup(config, 2_000).await;
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: TABLE_NAME.into(),
+        index_name: "by_age".into(),
+        if_not_exists: true,
+        columns: vec!["age".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("age index");
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: TABLE_NAME.into(),
+        index_name: "by_name".into(),
+        if_not_exists: false,
+        columns: vec!["name".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("name index");
+    for table_name in ["partial_users", "composite_users"] {
+        db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+            owner_id: None,
+            if_not_exists: false,
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            table_name: table_name.into(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "name".into(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "age".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+            ],
+            primary_key: vec!["id".into()],
+        }))
+        .await
+        .expect("predicate table");
+    }
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: "partial_users".into(),
+        index_name: "age_25_only".into(),
+        if_not_exists: false,
+        columns: vec!["age".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: Some(Expr::Eq("age".into(), Value::Integer(25))),
+    }))
+    .await
+    .expect("partial index");
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: PROJECT_ID.into(),
+        scope_id: SCOPE_ID.into(),
+        table_name: "composite_users".into(),
+        index_name: "by_age_name".into(),
+        if_not_exists: false,
+        columns: vec!["age".into(), "name".into()],
+        index_type: aedb::catalog::schema::IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("composite index");
+    for table_name in ["partial_users", "composite_users"] {
+        let rows = (0..2_000)
+            .map(|i| Row {
+                values: vec![
+                    Value::Integer(i),
+                    Value::Text(format!("{table_name}-{i}").into()),
+                    Value::Integer(18 + (i % 50)),
+                ],
+            })
+            .collect();
+        db.commit(Mutation::UpsertBatch {
+            project_id: PROJECT_ID.into(),
+            scope_id: SCOPE_ID.into(),
+            table_name: table_name.into(),
+            rows,
+        })
+        .await
+        .expect("seed predicate table");
+    }
+
+    let mut eq_lat = Vec::new();
+    let mut in_lat = Vec::new();
+    let mut like_exact_lat = Vec::new();
+    let mut like_residual_lat = Vec::new();
+    let mut partial_lat = Vec::new();
+    let mut composite_lat = Vec::new();
+
+    for _ in 0..120 {
+        let t0 = Instant::now();
+        let eq = db
+            .query(
+                PROJECT_ID,
+                SCOPE_ID,
+                Query::select(&["id", "name"])
+                    .from(TABLE_NAME)
+                    .where_(col("age").eq(lit(25_i64)))
+                    .limit(20),
+            )
+            .await
+            .expect("eq index query");
+        assert!(!eq.rows.is_empty());
+        eq_lat.push(t0.elapsed().as_micros());
+
+        let t0 = Instant::now();
+        let in_rows = db
+            .query(
+                PROJECT_ID,
+                SCOPE_ID,
+                Query::select(&["id", "name"])
+                    .from(TABLE_NAME)
+                    .where_(col("age").in_(vec![lit(25_i64), lit(26_i64), lit(27_i64)]))
+                    .limit(20),
+            )
+            .await
+            .expect("in index query");
+        assert!(!in_rows.rows.is_empty());
+        in_lat.push(t0.elapsed().as_micros());
+
+        let t0 = Instant::now();
+        let like_exact = db
+            .query(
+                PROJECT_ID,
+                SCOPE_ID,
+                Query::select(&["id", "name"])
+                    .from(TABLE_NAME)
+                    .where_(col("name").like(lit("user-12%")))
+                    .limit(20),
+            )
+            .await
+            .expect("like exact query");
+        assert!(!like_exact.rows.is_empty());
+        like_exact_lat.push(t0.elapsed().as_micros());
+
+        let t0 = Instant::now();
+        let like_residual = db
+            .query(
+                PROJECT_ID,
+                SCOPE_ID,
+                Query::select(&["id", "name"])
+                    .from(TABLE_NAME)
+                    .where_(col("name").like(lit("user-1%7%")))
+                    .limit(20),
+            )
+            .await
+            .expect("like residual query");
+        assert!(
+            like_residual
+                .rows
+                .iter()
+                .all(|row| matches!(&row.values[1], Value::Text(name) if name.starts_with("user-1") && name.contains('7')))
+        );
+        like_residual_lat.push(t0.elapsed().as_micros());
+
+        let t0 = Instant::now();
+        let partial = db
+            .query(
+                PROJECT_ID,
+                SCOPE_ID,
+                Query::select(&["id", "name"])
+                    .from("partial_users")
+                    .where_(col("age").eq(lit(25_i64)))
+                    .limit(20),
+            )
+            .await
+            .expect("partial index query");
+        assert!(!partial.rows.is_empty());
+        partial_lat.push(t0.elapsed().as_micros());
+
+        let t0 = Instant::now();
+        let composite = db
+            .query(
+                PROJECT_ID,
+                SCOPE_ID,
+                Query::select(&["id", "name"])
+                    .from("composite_users")
+                    .where_(col("age").eq(lit(25_i64)))
+                    .limit(20),
+            )
+            .await
+            .expect("composite index query");
+        assert!(!composite.rows.is_empty());
+        composite_lat.push(t0.elapsed().as_micros());
+    }
+
+    let (eq_p50, eq_p99) = latency_us(&mut eq_lat);
+    let (in_p50, in_p99) = latency_us(&mut in_lat);
+    let (like_exact_p50, like_exact_p99) = latency_us(&mut like_exact_lat);
+    let (like_residual_p50, like_residual_p99) = latency_us(&mut like_residual_lat);
+    let (partial_p50, partial_p99) = latency_us(&mut partial_lat);
+    let (composite_p50, composite_p99) = latency_us(&mut composite_lat);
+
+    eprintln!(
+        "benchmark_index_predicate_shapes: eq_p50={}us eq_p99={}us in_p50={}us in_p99={}us like_exact_p50={}us like_exact_p99={}us like_residual_p50={}us like_residual_p99={}us partial_p50={}us partial_p99={}us composite_p50={}us composite_p99={}us",
+        eq_p50,
+        eq_p99,
+        in_p50,
+        in_p99,
+        like_exact_p50,
+        like_exact_p99,
+        like_residual_p50,
+        like_residual_p99,
+        partial_p50,
+        partial_p99,
+        composite_p50,
+        composite_p99
+    );
+
+    assert!(eq_p99 > 0);
+    assert!(in_p99 > 0);
+    assert!(like_exact_p99 > 0);
+    assert!(like_residual_p99 > 0);
+    assert!(partial_p99 > 0);
+    assert!(composite_p99 > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

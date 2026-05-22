@@ -194,9 +194,17 @@ pub(crate) fn explain_access_path_for_query(
                         .to_string(),
                 );
             } else {
-                trace.push(
-                    "residual predicate is evaluated on rows returned by index lookup".to_string(),
-                );
+                if indexed.predicate_exact {
+                    trace.push(
+                        "index lookup fully satisfies predicate; no residual filter needed"
+                            .to_string(),
+                    );
+                } else {
+                    trace.push(
+                        "residual predicate is evaluated on rows returned by index lookup"
+                            .to_string(),
+                    );
+                }
             }
             return Ok(AccessPathDiagnostics {
                 selected_indexes,
@@ -416,6 +424,7 @@ fn execute_query_with_options_capturing_signed(
         });
     }
 
+    let mut has_residual_filter = query.predicate.is_some();
     let estimated_rows: usize;
     let row_source: Box<dyn Iterator<Item = Row> + Send + '_> =
         if let Some(async_index) = &options.async_index {
@@ -456,10 +465,11 @@ fn execute_query_with_options_capturing_signed(
                 table,
                 predicate,
                 candidate_limit,
-            )?
-            .map(|result| result.pks);
+            )?;
             match indexed_pks {
-                Some(pks) => {
+                Some(indexed) => {
+                    has_residual_filter = !indexed.predicate_exact;
+                    let pks = indexed.pks;
                     if let Some(collector) = read_set.as_deref_mut() {
                         collector.record_touched_pks(
                             snapshot,
@@ -515,7 +525,7 @@ fn execute_query_with_options_capturing_signed(
         &query,
         options.async_index.clone(),
         estimated_rows as u64,
-        query.predicate.is_some(),
+        has_residual_filter,
     )?;
 
     let mut root: Box<dyn Operator + Send + '_> = Box::new(ScanOperator::new(row_source));
@@ -534,8 +544,8 @@ fn execute_query_with_options_capturing_signed(
                 }
             }
             ExecutionStage::Filter => {
-                if let Some(predicate) = query.predicate.clone() {
-                    let compiled = compile_expr(&predicate, &columns, &query.table)?;
+                if let Some(predicate) = query.predicate.as_ref() {
+                    let compiled = compile_expr(predicate, &columns, &query.table)?;
                     root = Box::new(FilterOperator::new(root, compiled));
                 }
             }
@@ -594,8 +604,8 @@ fn execute_query_with_options_capturing_signed(
                         reason: "having requires aggregate or group_by".into(),
                     });
                 }
-                if let Some(having) = query.having.clone() {
-                    let compiled = compile_expr(&having, &row_columns, &query.table)?;
+                if let Some(having) = query.having.as_ref() {
+                    let compiled = compile_expr(having, &row_columns, &query.table)?;
                     root = Box::new(FilterOperator::new(root, compiled));
                 }
             }

@@ -1274,7 +1274,6 @@ pub fn apply_mutation_trusted_if_eligible(
                     &project_id,
                     &scope_id,
                     &table_name,
-                    primary_key,
                     encoded_pk,
                     row,
                     commit_seq,
@@ -1968,16 +1967,7 @@ fn apply_upsert_trusted_fast(
     }
     let encoded_pk = EncodedKey::from_values(&primary_key);
     apply_upsert_trusted_fast_with_schema(
-        catalog,
-        keyspace,
-        &schema,
-        project_id,
-        scope_id,
-        table_name,
-        primary_key,
-        encoded_pk,
-        row,
-        commit_seq,
+        catalog, keyspace, &schema, project_id, scope_id, table_name, encoded_pk, row, commit_seq,
     )
 }
 
@@ -1989,7 +1979,6 @@ fn apply_upsert_trusted_fast_with_schema(
     project_id: &str,
     scope_id: &str,
     table_name: &str,
-    primary_key: Vec<Value>,
     encoded_pk: EncodedKey,
     row: Row,
     commit_seq: u64,
@@ -2001,7 +1990,7 @@ fn apply_upsert_trusted_fast_with_schema(
         project_id,
         scope_id,
         table_name,
-        encoded_pk,
+        encoded_pk.clone(),
         row.clone(),
         commit_seq,
     );
@@ -2012,7 +2001,7 @@ fn apply_upsert_trusted_fast_with_schema(
         project_id,
         scope_id,
         table_name,
-        &primary_key,
+        &encoded_pk,
         old_row.as_ref(),
         Some(&row),
     )?;
@@ -2195,7 +2184,7 @@ fn apply_upsert_once_with_schema_and_old_row(
         project_id,
         scope_id,
         table_name,
-        &primary_key,
+        &encoded_pk,
         old_row.as_ref(),
         Some(&row),
     )?;
@@ -2656,8 +2645,9 @@ fn apply_delete_internal_with_schema(
     primary_key: &[Value],
     commit_seq: u64,
 ) -> Result<(), AedbError> {
+    let encoded_pk = EncodedKey::from_values(primary_key);
     let Some(old_row) = keyspace
-        .get_row(project_id, scope_id, table_name, primary_key)
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
         .cloned()
     else {
         return Ok(());
@@ -2667,7 +2657,8 @@ fn apply_delete_internal_with_schema(
         catalog, keyspace, project_id, scope_id, table_name, &old_row, commit_seq, 0,
     )?;
 
-    let removed = keyspace.delete_row(project_id, scope_id, table_name, primary_key, commit_seq);
+    let removed =
+        keyspace.delete_row_by_encoded(project_id, scope_id, table_name, &encoded_pk, commit_seq);
     maintain_secondary_indexes(
         catalog,
         keyspace,
@@ -2675,7 +2666,7 @@ fn apply_delete_internal_with_schema(
         project_id,
         scope_id,
         table_name,
-        primary_key,
+        &encoded_pk,
         removed.as_ref(),
         None,
     )?;
@@ -3240,7 +3231,7 @@ fn apply_delete_internal_encoded_with_schema(
     else {
         return Ok(());
     };
-    let primary_values = extract_primary_key_from_row(schema, &old_row)?;
+    extract_primary_key_from_row(schema, &old_row)?;
     handle_referencing_foreign_keys(
         catalog,
         keyspace,
@@ -3260,7 +3251,7 @@ fn apply_delete_internal_encoded_with_schema(
         project_id,
         scope_id,
         table_name,
-        &primary_values,
+        primary_key,
         removed.as_ref(),
         None,
     )?;
@@ -3375,7 +3366,7 @@ fn apply_upsert_on_conflict_once(
                 &project_id,
                 &scope_id,
                 &table_name,
-                &existing_pk_values,
+                &existing_pk,
                 Some(&existing_row),
                 Some(&final_row),
             )?;
@@ -3401,6 +3392,7 @@ fn apply_upsert_on_conflict_once(
             None,
         )?;
         keyspace.table_mut(&project_id, &scope_id, &table_name);
+        let proposed_encoded_pk = EncodedKey::from_values(&proposed_pk);
         maintain_secondary_indexes(
             catalog,
             keyspace,
@@ -3408,15 +3400,15 @@ fn apply_upsert_on_conflict_once(
             &project_id,
             &scope_id,
             &table_name,
-            &proposed_pk,
+            &proposed_encoded_pk,
             None,
             Some(&row),
         )?;
-        keyspace.upsert_row(
+        keyspace.upsert_row_by_encoded_pk(
             &project_id,
             &scope_id,
             &table_name,
-            proposed_pk,
+            proposed_encoded_pk,
             row,
             commit_seq,
         );
@@ -3801,21 +3793,21 @@ fn maintain_secondary_indexes(
     project_id: &str,
     scope_id: &str,
     table_name: &str,
-    primary_key: &[crate::catalog::types::Value],
+    encoded_pk: &EncodedKey,
     old_row: Option<&crate::catalog::types::Row>,
     new_row: Option<&crate::catalog::types::Row>,
 ) -> Result<(), AedbError> {
+    let ns = namespace_key(project_id, scope_id);
     let table = keyspace
-        .table_by_namespace_key_mut(&namespace_key(project_id, scope_id), table_name)
+        .table_by_namespace_key_mut(&ns, table_name)
         .ok_or_else(|| AedbError::NotFound {
             resource_type: ErrorResourceType::Table,
             resource_id: format!("{project_id}.{scope_id}.{table_name}"),
         })?;
-    let encoded_pk = EncodedKey::from_values(primary_key);
     let modified_columns_mask = calculate_modified_columns_bitmask(schema, old_row, new_row);
 
     for ((p, t, idx_name), idx_def) in &catalog.indexes {
-        if p != &namespace_key(project_id, scope_id) || t != table_name {
+        if p != &ns || t != table_name {
             continue;
         }
         if old_row.is_some()
@@ -3849,7 +3841,7 @@ fn maintain_secondary_indexes(
             && secondary_index.should_include_row(before, schema, table_name)?
         {
             let old_key = extract_index_key_encoded(before, schema, &idx_def.columns)?;
-            secondary_index.remove(&old_key, &encoded_pk);
+            secondary_index.remove(&old_key, encoded_pk);
         }
         if let Some(after) = new_row
             && secondary_index.should_include_row(after, schema, table_name)?
@@ -3867,7 +3859,7 @@ fn maintain_secondary_indexes(
                 crate::catalog::schema::IndexType::UniqueHash
             ) && secondary_index
                 .unique_existing(&new_key)
-                .is_some_and(|existing| existing != encoded_pk)
+                .is_some_and(|existing| existing.as_slice() != encoded_pk.as_slice())
             {
                 return Err(AedbError::Validation(format!(
                     "unique index violation on {idx_name}"
@@ -3893,15 +3885,19 @@ fn rebuild_index_for_table(
         .tables
         .get(&(ns.clone(), table_name.to_string()))
         .ok_or_else(|| AedbError::Validation("table missing".into()))?;
+    let idx_def =
+        catalog
+            .indexes
+            .get(&(ns.clone(), table_name.to_string(), index_name.to_string()));
+    let index_type = idx_def
+        .map(|d| &d.index_type)
+        .unwrap_or(&crate::catalog::schema::IndexType::BTree);
+    let columns_bitmask = idx_def.map(|d| d.columns_bitmask).unwrap_or(0);
+    let partial_filter = idx_def.and_then(|d| d.partial_filter.clone());
     let table = keyspace.table_mut_by_namespace_key(&ns, table_name);
 
     let mut secondary_index = crate::storage::keyspace::SecondaryIndex {
-        store: match catalog
-            .indexes
-            .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
-            .map(|d| &d.index_type)
-            .unwrap_or(&crate::catalog::schema::IndexType::BTree)
-        {
+        store: match index_type {
             crate::catalog::schema::IndexType::BTree | crate::catalog::schema::IndexType::Art => {
                 crate::storage::keyspace::SecondaryIndexStore::BTree(im::OrdMap::new())
             }
@@ -3912,38 +3908,21 @@ fn rebuild_index_for_table(
                 crate::storage::keyspace::SecondaryIndexStore::UniqueHash(im::HashMap::new())
             }
         },
-        columns_bitmask: catalog
-            .indexes
-            .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
-            .map(|d| d.columns_bitmask)
-            .unwrap_or(0),
-        partial_filter: catalog
-            .indexes
-            .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
-            .and_then(|d| d.partial_filter.clone()),
+        columns_bitmask,
+        partial_filter,
     };
     for (pk, row) in &table.rows {
         if secondary_index.should_include_row(row, schema, table_name)? {
-            if matches!(
-                catalog
-                    .indexes
-                    .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
-                    .map(|d| &d.index_type),
-                Some(crate::catalog::schema::IndexType::UniqueHash)
-            ) && has_null_in_columns(schema, row, columns)?
+            if matches!(index_type, crate::catalog::schema::IndexType::UniqueHash)
+                && has_null_in_columns(schema, row, columns)?
             {
                 continue;
             }
             let index_key = extract_index_key_encoded(row, schema, columns)?;
-            if matches!(
-                catalog
-                    .indexes
-                    .get(&(ns.clone(), table_name.to_string(), index_name.to_string()))
-                    .map(|d| &d.index_type),
-                Some(crate::catalog::schema::IndexType::UniqueHash)
-            ) && secondary_index
-                .unique_existing(&index_key)
-                .is_some_and(|existing| existing != *pk)
+            if matches!(index_type, crate::catalog::schema::IndexType::UniqueHash)
+                && secondary_index
+                    .unique_existing(&index_key)
+                    .is_some_and(|existing| existing != *pk)
             {
                 return Err(AedbError::Validation(format!(
                     "unique index violation on {index_name}"

@@ -149,9 +149,7 @@ pub(super) fn execute_join_query(
                     .unwrap_or_default();
                 for left in &rows {
                     for right in &join_rows {
-                        let mut values = left.values.clone();
-                        values.extend(right.values.clone());
-                        joined.push(Row { values });
+                        push_joined_row(&mut joined, left, right);
                     }
                 }
             }
@@ -164,22 +162,16 @@ pub(super) fn execute_join_query(
                 })?;
                 if can_probe_right_primary_key {
                     for left in &rows {
-                        let key = left.values[left_idx].clone();
                         let matched = join_table.and_then(|table| {
-                            let encoded = EncodedKey::from_values(&[key]);
+                            let encoded = EncodedKey::from_values(std::slice::from_ref(
+                                &left.values[left_idx],
+                            ));
                             table.rows.get(&encoded)
                         });
                         if let Some(right) = matched {
-                            let mut values = left.values.clone();
-                            values.extend(right.values.clone());
-                            joined.push(Row { values });
+                            push_joined_row(&mut joined, left, right);
                         } else if matches!(join.join_type, JoinType::Left) {
-                            let mut values = left.values.clone();
-                            values.extend(std::iter::repeat_n(
-                                Value::Null,
-                                join_schema.columns.len(),
-                            ));
-                            joined.push(Row { values });
+                            push_left_with_nulls(&mut joined, left, join_schema.columns.len());
                         }
                     }
                 } else {
@@ -195,20 +187,12 @@ pub(super) fn execute_join_query(
                             .push(right);
                     }
                     for left in &rows {
-                        let key = left.values[left_idx].clone();
-                        if let Some(matches) = right_map.get(&key) {
+                        if let Some(matches) = right_map.get(&left.values[left_idx]) {
                             for right in matches {
-                                let mut values = left.values.clone();
-                                values.extend(right.values.clone());
-                                joined.push(Row { values });
+                                push_joined_row(&mut joined, left, right);
                             }
                         } else if matches!(join.join_type, JoinType::Left) {
-                            let mut values = left.values.clone();
-                            values.extend(std::iter::repeat_n(
-                                Value::Null,
-                                join_schema.columns.len(),
-                            ));
-                            joined.push(Row { values });
+                            push_left_with_nulls(&mut joined, left, join_schema.columns.len());
                         }
                     }
                 }
@@ -231,18 +215,12 @@ pub(super) fn execute_join_query(
                         .push(left);
                 }
                 for right in &join_rows {
-                    let key = right.values[right_idx].clone();
-                    if let Some(matches) = left_map.get(&key) {
+                    if let Some(matches) = left_map.get(&right.values[right_idx]) {
                         for left in matches {
-                            let mut values = left.values.clone();
-                            values.extend(right.values.clone());
-                            joined.push(Row { values });
+                            push_joined_row(&mut joined, left, right);
                         }
                     } else {
-                        let mut values =
-                            std::iter::repeat_n(Value::Null, join_col_offset).collect::<Vec<_>>();
-                        values.extend(right.values.clone());
-                        joined.push(Row { values });
+                        push_nulls_with_right(&mut joined, join_col_offset, right);
                     }
                 }
             }
@@ -470,4 +448,25 @@ fn is_single_column_primary_key_join(
         .get(right_idx)
         .map(|column| column.name == join_schema.primary_key[0])
         .unwrap_or(false)
+}
+
+fn push_joined_row(out: &mut Vec<Row>, left: &Row, right: &Row) {
+    let mut values = Vec::with_capacity(left.values.len().saturating_add(right.values.len()));
+    values.extend_from_slice(&left.values);
+    values.extend_from_slice(&right.values);
+    out.push(Row { values });
+}
+
+fn push_left_with_nulls(out: &mut Vec<Row>, left: &Row, null_count: usize) {
+    let mut values = Vec::with_capacity(left.values.len().saturating_add(null_count));
+    values.extend_from_slice(&left.values);
+    values.extend(std::iter::repeat_n(Value::Null, null_count));
+    out.push(Row { values });
+}
+
+fn push_nulls_with_right(out: &mut Vec<Row>, null_count: usize, right: &Row) {
+    let mut values = Vec::with_capacity(null_count.saturating_add(right.values.len()));
+    values.extend(std::iter::repeat_n(Value::Null, null_count));
+    values.extend_from_slice(&right.values);
+    out.push(Row { values });
 }

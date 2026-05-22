@@ -109,6 +109,7 @@ Clippy treats warnings as errors. `clippy::too_many_arguments` is not globally a
 - Backup chain restore checks pass on a clean directory.
 - Offline invariant checks pass on a restored dataset.
 - Operational metrics are captured for baseline commit latency, queue depth, and durable-head lag.
+- `max_memory_estimate_bytes` is sized with headroom: AEDB's keyspace counter now includes conservative table-row structural overhead, but it is still a storage-engine estimate rather than an exact process RSS limit.
 - Any on-disk behavior change has a documented compatibility decision, migration/restore tests, and release notes; see [PERSISTENCE_COMPATIBILITY.md](PERSISTENCE_COMPATIBILITY.md).
 - Runtime dependency additions have PR rationale covering license, advisory status, duplicate versions, and why the crate is not dev-only.
 
