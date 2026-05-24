@@ -1,4 +1,29 @@
-use crate::*;
+use crate::backup::{
+    BackupManifest, extract_backup_archive, load_backup_manifest, resolve_backup_path,
+    verify_backup_files, write_backup_archive, write_backup_manifest,
+};
+use crate::backup_chain::{
+    copy_file_prefix_sha256_hex, load_verified_backup_chain, read_segments,
+    read_segments_for_checkpoint, resolve_target_seq_for_time, scan_segment_seq_range,
+    segment_seq_from_name, validate_backup_chain_compatibility, verify_hash_chain_batch,
+};
+use crate::catalog::namespace_key;
+use crate::checkpoint::loader::load_checkpoint_with_key;
+use crate::checkpoint::writer::write_checkpoint_with_key;
+use crate::config::AedbConfig;
+use crate::error::AedbError;
+use crate::manifest::atomic::write_manifest_atomic_signed;
+use crate::manifest::schema::Manifest;
+use crate::open_support::create_private_dir_all;
+use crate::query::plan::ConsistencyMode;
+use crate::recovery::recover_with_config;
+use crate::recovery::replay::{ReplaySegmentsRequest, replay_segments};
+use crate::storage::keyspace::{Keyspace, NamespaceId};
+use crate::{AedbInstance, RemoteBackupAdapter};
+use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 impl AedbInstance {
     pub async fn backup_full_to_remote(
@@ -225,8 +250,7 @@ impl AedbInstance {
             ));
         }
         create_private_dir_all(data_dir)?;
-        let effective_target =
-            target_seq.unwrap_or(chain.last().expect("non-empty").1.wal_head_seq);
+        let effective_target = target_seq.unwrap_or(last_backup_manifest(&chain)?.wal_head_seq);
         let full = &chain[0].1;
         if effective_target < full.checkpoint_seq {
             return Err(AedbError::Validation(
@@ -269,17 +293,17 @@ impl AedbInstance {
                     last_verified_chain = Some(last);
                 }
             }
-            current_seq = replay_segments(
-                &wal_paths,
-                current_seq,
-                Some(replay_to),
-                None,
-                false,
-                config.strict_recovery(),
-                &mut keyspace,
-                &mut catalog,
-                &mut idempotency,
-            )?;
+            current_seq = replay_segments(ReplaySegmentsRequest {
+                segments: &wal_paths,
+                from_seq_exclusive: current_seq,
+                to_seq_inclusive: Some(replay_to),
+                segment_replay_byte_limits: None,
+                hash_chain_required: false,
+                strict_recovery: config.strict_recovery(),
+                keyspace: &mut keyspace,
+                catalog: &mut catalog,
+                idempotency: &mut idempotency,
+            })?;
             if current_seq >= effective_target {
                 break;
             }
@@ -337,8 +361,7 @@ impl AedbInstance {
         target_seq: Option<u64>,
     ) -> Result<u64, AedbError> {
         let chain = load_verified_backup_chain(backup_dirs, config)?;
-        let effective_target =
-            target_seq.unwrap_or(chain.last().expect("non-empty").1.wal_head_seq);
+        let effective_target = target_seq.unwrap_or(last_backup_manifest(&chain)?.wal_head_seq);
         let live = recover_with_config(data_dir, config)?;
 
         let temp = tempfile::tempdir()?;
@@ -473,4 +496,11 @@ impl AedbInstance {
         write_manifest_atomic_signed(&manifest, data_dir, config.hmac_key())?;
         Ok(merged_seq)
     }
+}
+
+fn last_backup_manifest(chain: &[(PathBuf, BackupManifest)]) -> Result<&BackupManifest, AedbError> {
+    chain
+        .last()
+        .map(|(_, manifest)| manifest)
+        .ok_or_else(|| AedbError::Validation("backup chain cannot be empty".into()))
 }

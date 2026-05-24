@@ -1,4 +1,18 @@
-use super::*;
+use super::{
+    AedbConfig, AedbError, AedbInstance, CallerContext, ColumnDef, ColumnType, ConsistencyMode,
+    DdlOperation, Expr, IdempotencyKey, KvIntegerAmount, KvIntegerMissingPolicy,
+    KvIntegerUnderflowPolicy, KvU64MissingPolicy, KvU64OverflowPolicy, KvU64UnderflowPolicy,
+    KvU256MissingPolicy, KvU256UnderflowPolicy, MAX_COUNTER_SHARDS, Mutation, Permission, Query,
+    QueryError, QueryOptions, ReadAssertion, Row, StorageMode, TransactionEnvelope, Value,
+    WriteClass, WriteIntent, create_table, u64_be_test, u256_be_test,
+};
+use crate::catalog::KV_INDEX_TABLE;
+use crate::commit::validation::KvU64MutatorOp;
+use crate::preflight::PreflightResult;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn kv_write_helpers_respect_scope_boundaries() {
@@ -160,9 +174,7 @@ async fn kv_projection_table_materializes_kv_state() {
             .query(
                 "p",
                 "app",
-                Query::select(&["*"])
-                    .from(crate::catalog::KV_INDEX_TABLE)
-                    .limit(10),
+                Query::select(&["*"]).from(KV_INDEX_TABLE).limit(10),
             )
             .await
             .expect("query projection table");
@@ -170,7 +182,7 @@ async fn kv_projection_table_materializes_kv_state() {
             projected = Some(result.rows);
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     let rows = projected.expect("projection rows");
@@ -212,7 +224,7 @@ async fn kv_projection_table_is_managed_and_read_only() {
         .commit(Mutation::Upsert {
             project_id: "p".into(),
             scope_id: "app".into(),
-            table_name: crate::catalog::KV_INDEX_TABLE.into(),
+            table_name: KV_INDEX_TABLE.into(),
             primary_key: vec![Value::Blob(b"k".to_vec())],
             row: Row {
                 values: vec![
@@ -490,13 +502,13 @@ async fn disk_backed_spilled_value_corruption_fails_closed_for_reads_and_commit_
             project_id: "p".into(),
             scope_id: "app".into(),
             key: b"blob".to_vec(),
-            op: crate::commit::validation::KvU64MutatorOp::Set,
+            op: KvU64MutatorOp::Set,
             operand_be: 1u64.to_be_bytes(),
             expected_seq: Some(1),
         })
         .await;
     assert!(
-        matches!(preflight, crate::preflight::PreflightResult::Err { reason } if reason.contains("persistent value hash mismatch"))
+        matches!(preflight, PreflightResult::Err { reason } if reason.contains("persistent value hash mismatch"))
     );
 
     let commit_err = db

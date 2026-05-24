@@ -1,4 +1,7 @@
-use super::*;
+use super::{AsyncProjectionData, INLINE_KV_VALUE_MAX_BYTES, KvData, Namespace, TableData};
+use crate::catalog::types::{Row, Value};
+use crate::storage::kv_segment::KvSegmentMeta;
+use crate::storage::value_store::PersistentValueRef;
 
 fn estimate_row_bytes(row: &Row) -> usize {
     const ROW_BASE_OVERHEAD_BYTES: usize = 48;

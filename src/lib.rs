@@ -1,8 +1,11 @@
 pub mod backup;
+mod backup_chain;
 pub mod catalog;
 pub mod checkpoint;
 pub mod commit;
 pub mod config;
+mod config_validation;
+mod ddl_lifecycle;
 pub mod declarative;
 pub mod engine_interface;
 pub mod error;
@@ -13,325 +16,84 @@ mod lib_tests;
 pub mod manifest;
 pub mod migration;
 pub mod offline;
+mod open_support;
 pub mod order_book;
 pub mod permission;
 pub mod preflight;
+mod preflight_commit;
 pub mod query;
+mod query_authorization;
+mod query_cursor;
+mod query_runtime;
 pub mod recovery;
 pub mod repository;
 pub mod snapshot;
 pub mod storage;
 pub mod sync_bridge;
+mod table_mutation;
+mod trust_mode;
 pub mod version_store;
 pub mod wal;
 
 mod api;
 
-use crate::backup::{
-    BackupManifest, extract_backup_archive, load_backup_manifest, resolve_backup_path,
-    sha256_file_hex, verify_backup_files, write_backup_archive, write_backup_manifest,
-};
+use crate::backup_chain::read_segments_for_checkpoint;
 use crate::catalog::namespace_key;
 use crate::catalog::schema::{AsyncIndexDef, IndexDef, TableSchema};
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
-use crate::checkpoint::loader::load_checkpoint_with_key;
 use crate::checkpoint::writer::write_checkpoint_with_key;
 use crate::commit::action::{ActionCommitOutcome, ActionCommitResult, ActionEnvelopeRequest};
 use crate::commit::executor::{
     CommitExecutor, CommitResult, ENVELOPE_OVERHEAD_UPPER_BOUND, ExecutorMetrics,
     IdempotencyOutcome, MUTATION_OVERHEAD_UPPER_BOUND,
 };
-use crate::commit::tx::{
-    ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
-};
-use crate::commit::validation::{
-    KvU64MissingPolicy, KvU64MutatorOp, KvU64OverflowPolicy, KvU64UnderflowPolicy, KvU256MutatorOp,
-    MAX_COUNTER_SHARDS, Mutation, TableUpdateExpr, validate_mutation_with_config,
-    validate_permissions,
-};
-use crate::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
+use crate::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
+use crate::commit::validation::{Mutation, TableUpdateExpr, validate_permissions};
+use crate::config::{AedbConfig, DurabilityMode, StorageMode};
+use crate::config_validation::{validate_arcana_config, validate_config, validate_secure_config};
+use crate::ddl_lifecycle::{ddl_would_apply, order_ddl_ops_for_batch};
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
-use crate::lib_helpers::*;
+use crate::lib_helpers::{seed_system_global_admin, should_fallback_to_recovery};
 use crate::manifest::atomic::write_manifest_atomic_signed;
-use crate::manifest::schema::{Manifest, SegmentMeta};
+use crate::manifest::schema::Manifest;
 use crate::migration::{
     Migration, MigrationRecord, checksum_hex, decode_record, encode_record, migration_key,
 };
-use crate::order_book::{
-    ExecInstruction, FillSpec, InstrumentConfig, OrderBookDepth, OrderBookTableMode, OrderRecord,
-    OrderRequest, OrderSide, OrderType, Spread, TimeInForce, key_client_id, key_order,
-    read_last_execution_report, read_open_orders, read_order_status, read_recent_trades,
-    read_spread, read_top_n, scoped_instrument, u256_from_be,
-};
-use crate::permission::{CallerContext, Permission};
+use crate::permission::CallerContext;
 use crate::preflight::{PreflightResult, preflight_plan_with_config, preflight_with_config};
+use crate::preflight_commit::commit_from_preflight_plan;
 use crate::query::error::QueryError;
-use crate::query::executor::{QueryResult, execute_query_with_options};
+use crate::query::executor::QueryResult;
 use crate::query::plan::{ConsistencyMode, Expr, Order, Query, QueryOptions};
-use crate::query::planner::{ExecutionStage, build_physical_plan};
-use crate::query::{KvCursor, KvScanResult, ScopedKvEntry};
-use crate::recovery::replay::replay_segments;
+use crate::query::planner::ExecutionStage;
+use crate::query_authorization::ensure_external_caller_allowed;
+use crate::query_cursor::{sign_query_cursor, verify_signed_query_cursor};
+use crate::query_runtime::{
+    QueryExecutionContext, ensure_stable_order_from_catalog, execute_query_against_view,
+    explain_query_against_view, query_error_to_aedb,
+};
 use crate::recovery::{recover_at_seq_with_config, recover_with_config};
 use crate::snapshot::gc::{SnapshotHandle, SnapshotManager};
 use crate::snapshot::reader::SnapshotReadView;
 use crate::storage::encoded_key::EncodedKey;
-use crate::storage::keyspace::{Keyspace, KvEntry, NamespaceId};
-use crate::storage::kv_segment::KvSegmentStore;
-use crate::storage::value_store::PersistentValueStore;
-use crate::wal::frame::{FrameError, FrameReader};
-use crate::wal::segment::{SEGMENT_HEADER_SIZE, SegmentHeader};
-use hmac::{Hmac, Mac};
+use crate::storage::keyspace::NamespaceId;
+use crate::table_mutation::{apply_table_update_exprs, extract_primary_key_values};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::fs::File;
 use std::future::Future;
-use std::io::{BufReader, Read, Write};
-use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-use uuid::Uuid;
-
-const TRUST_MODE_MARKER_FILE: &str = "trust_mode.json";
-const TRUST_MODE_MARKER_HMAC_FILE: &str = "trust_mode.hmac";
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct TrustModeMarker {
-    #[serde(default)]
-    ever_non_strict_recovery: bool,
-    #[serde(default)]
-    ever_hash_chain_disabled: bool,
-}
-
-fn trust_mode_marker_path(dir: &Path) -> PathBuf {
-    dir.join(TRUST_MODE_MARKER_FILE)
-}
-
-fn trust_mode_marker_hmac_path(dir: &Path) -> PathBuf {
-    dir.join(TRUST_MODE_MARKER_HMAC_FILE)
-}
-
-fn hmac_hex(key: &[u8], bytes: &[u8]) -> Result<String, AedbError> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| AedbError::InvalidConfig {
-        message: format!("invalid hmac key: {e}"),
-    })?;
-    mac.update(bytes);
-    Ok(hex::encode(mac.finalize().into_bytes()))
-}
-
-fn verify_trust_mode_marker_hmac(dir: &Path, key: &[u8], bytes: &[u8]) -> Result<(), AedbError> {
-    let expected = fs::read_to_string(trust_mode_marker_hmac_path(dir)).map_err(|_| {
-        AedbError::IntegrityError {
-            message: "trust mode marker hmac missing".into(),
-        }
-    })?;
-    let expected_bytes = hex::decode(expected.trim()).map_err(|_| AedbError::IntegrityError {
-        message: "trust mode marker hmac must be hex".into(),
-    })?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| AedbError::InvalidConfig {
-        message: format!("invalid hmac key: {e}"),
-    })?;
-    mac.update(bytes);
-    mac.verify_slice(&expected_bytes)
-        .map_err(|_| AedbError::IntegrityError {
-            message: "trust mode marker hmac mismatch".into(),
-        })
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AedbError> {
-    use std::io::Write as _;
-
-    let dir = path
-        .parent()
-        .ok_or_else(|| AedbError::Validation(format!("path has no parent: {}", path.display())))?;
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(bytes)?;
-    tmp.flush()?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| AedbError::Io(e.error))?;
-    fs::File::open(path)?.sync_all()?;
-    fs::File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
-fn load_trust_mode_marker(
-    dir: &Path,
-    signing_key: Option<&[u8]>,
-) -> Result<Option<TrustModeMarker>, AedbError> {
-    let path = trust_mode_marker_path(dir);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(&path)?;
-    if let Some(key) = signing_key {
-        verify_trust_mode_marker_hmac(dir, key, &bytes)?;
-    }
-    let marker: TrustModeMarker =
-        serde_json::from_slice(&bytes).map_err(|e| AedbError::Validation(e.to_string()))?;
-    Ok(Some(marker))
-}
-
-fn persist_trust_mode_marker(
-    dir: &Path,
-    marker: &TrustModeMarker,
-    signing_key: Option<&[u8]>,
-) -> Result<(), AedbError> {
-    let bytes = serde_json::to_vec(marker).map_err(|e| AedbError::Encode(e.to_string()))?;
-    write_atomic(&trust_mode_marker_path(dir), &bytes)?;
-    let hmac_path = trust_mode_marker_hmac_path(dir);
-    if let Some(key) = signing_key {
-        let signature = hmac_hex(key, &bytes)?;
-        write_atomic(&hmac_path, signature.as_bytes())?;
-    } else if hmac_path.exists() {
-        fs::remove_file(&hmac_path)?;
-        fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn enforce_and_record_trust_mode(dir: &Path, config: &AedbConfig) -> Result<(), AedbError> {
-    let mut marker = load_trust_mode_marker(dir, config.hmac_key())?.unwrap_or_default();
-    if config.strict_recovery()
-        && (marker.ever_non_strict_recovery || marker.ever_hash_chain_disabled)
-    {
-        return Err(AedbError::Validation(
-            "strict open denied: data directory was previously opened with non-strict recovery or hash-chain disabled"
-                .into(),
-        ));
-    }
-
-    let mut changed = false;
-    if !config.strict_recovery() && !marker.ever_non_strict_recovery {
-        marker.ever_non_strict_recovery = true;
-        changed = true;
-    }
-    if !config.hash_chain_required && !marker.ever_hash_chain_disabled {
-        marker.ever_hash_chain_disabled = true;
-        changed = true;
-    }
-    if changed {
-        persist_trust_mode_marker(dir, &marker, config.hmac_key())?;
-    }
-    Ok(())
-}
-
-/// Creates a directory with restrictive permissions (0o700 on Unix) to prevent
-/// unauthorized access to database files on multi-user systems.
-fn create_private_dir_all(path: &Path) -> Result<(), AedbError> {
-    #[cfg(unix)]
-    {
-        use std::fs::DirBuilder;
-        use std::os::unix::fs::DirBuilderExt;
-        use std::os::unix::fs::PermissionsExt;
-
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700) // Owner read/write/execute only
-            .create(path)?;
-        let metadata = fs::metadata(path)?;
-        if !metadata.is_dir() {
-            return Err(AedbError::Validation(format!(
-                "path is not a directory: {}",
-                path.display()
-            )));
-        }
-        let mut perms = metadata.permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(path, perms)?;
-    }
-    #[cfg(not(unix))]
-    {
-        fs::create_dir_all(path)?;
-    }
-    Ok(())
-}
-
-fn derive_cursor_signing_key(config: &AedbConfig, dir: &Path) -> [u8; 32] {
-    let mut material = Vec::new();
-    if let Some(key) = config.hmac_key() {
-        material.extend_from_slice(key);
-        material.extend_from_slice(dir.to_string_lossy().as_bytes());
-    } else {
-        material.extend_from_slice(Uuid::new_v4().as_bytes());
-        material.extend_from_slice(dir.to_string_lossy().as_bytes());
-    }
-    blake3::derive_key("aedb-query-cursor-v1", &material)
-}
-
-fn attach_configured_value_store(
-    keyspace: &mut Keyspace,
-    config: &AedbConfig,
-    dir: &Path,
-) -> Result<(), AedbError> {
-    if matches!(config.storage_mode, StorageMode::DiskBacked) {
-        let store = Arc::new(PersistentValueStore::open_with_hot_cache_bytes(
-            dir,
-            config.persistent_value_hot_cache_bytes,
-        )?);
-        let segment_store = Arc::new(KvSegmentStore::open_with_block_cache_bytes(
-            dir,
-            config.kv_segment_block_cache_bytes,
-        )?);
-        keyspace
-            .attach_persistent_value_store(store, config.persistent_value_inline_threshold_bytes)?;
-        keyspace.attach_kv_segment_store(segment_store);
-        keyspace.spill_kv_values_to_memory_target(config.max_memory_estimate_bytes)?;
-        keyspace.flush_kv_to_segments_to_memory_target(config.max_memory_estimate_bytes)?;
-    } else {
-        keyspace.detach_persistent_value_store();
-    }
-    Ok(())
-}
-
-fn reclaim_eligible_wal_segments(
-    dir: &Path,
-    snapshot_manager: &Arc<Mutex<SnapshotManager>>,
-    manifest_hmac_key: Option<&[u8]>,
-) -> Result<usize, AedbError> {
-    let manifest = match crate::manifest::atomic::load_manifest_signed(dir, manifest_hmac_key) {
-        Ok(manifest) => manifest,
-        Err(_) => return Ok(0),
-    };
-    let Some(checkpointed_through_seq) = manifest.checkpoints.last().map(|cp| cp.seq) else {
-        return Ok(0);
-    };
-    let segments = read_segments(dir)?;
-    let segment_seqs: Vec<u64> = segments.iter().map(|segment| segment.segment_seq).collect();
-    let eligible = {
-        let mgr = snapshot_manager.lock();
-        mgr.eligible_segment_reclaims(
-            &segment_seqs,
-            checkpointed_through_seq,
-            manifest.active_segment_seq,
-        )
-    };
-    if eligible.is_empty() {
-        return Ok(0);
-    }
-
-    let mut reclaimed = 0usize;
-    for seq in eligible {
-        let path = dir.join(format!("segment_{seq:016}.aedbwal"));
-        if path.exists() {
-            fs::remove_file(&path)?;
-            reclaimed = reclaimed.saturating_add(1);
-        }
-    }
-    Ok(reclaimed)
-}
 
 pub struct AedbInstance {
     _config: AedbConfig,
@@ -1233,8 +995,8 @@ impl AedbInstance {
             kv_segment_block_cache_bytes = config.kv_segment_block_cache_bytes,
             "aedb config"
         );
-        create_private_dir_all(dir)?;
-        enforce_and_record_trust_mode(dir, &config)?;
+        open_support::create_private_dir_all(dir)?;
+        trust_mode::enforce_and_record_trust_mode(dir, &config)?;
         let has_existing = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".aedb"));
@@ -1243,7 +1005,7 @@ impl AedbInstance {
         let (executor, startup_recovered_seq) = if has_existing {
             let mut recovered = recover_with_config(dir, &config)?;
             recovered.keyspace.set_backend(config.primary_index_backend);
-            attach_configured_value_store(&mut recovered.keyspace, &config, dir)?;
+            open_support::attach_configured_value_store(&mut recovered.keyspace, &config, dir)?;
             if require_authenticated_calls {
                 seed_system_global_admin(&mut recovered.catalog);
             }
@@ -1266,7 +1028,7 @@ impl AedbInstance {
             }
             let mut keyspace =
                 crate::storage::keyspace::Keyspace::with_backend(config.primary_index_backend);
-            attach_configured_value_store(&mut keyspace, &config, dir)?;
+            open_support::attach_configured_value_store(&mut keyspace, &config, dir)?;
             (
                 CommitExecutor::with_state(
                     dir,
@@ -1282,7 +1044,7 @@ impl AedbInstance {
         };
         let startup_recovery_micros =
             recovery_start.elapsed().unwrap_or_default().as_micros() as u64;
-        let cursor_signing_key = derive_cursor_signing_key(&config, dir);
+        let cursor_signing_key = open_support::derive_cursor_signing_key(&config, dir);
         let snapshot_manager = Arc::new(Mutex::new(SnapshotManager::default()));
         let wal_gc_shutdown = Arc::new(AtomicBool::new(false));
         let wal_gc_dir = dir.to_path_buf();
@@ -1297,7 +1059,7 @@ impl AedbInstance {
                     let mut mgr = wal_gc_snapshot_manager.lock();
                     let _ = mgr.gc();
                 }
-                if let Err(err) = reclaim_eligible_wal_segments(
+                if let Err(err) = open_support::reclaim_eligible_wal_segments(
                     &wal_gc_dir,
                     &wal_gc_snapshot_manager,
                     wal_gc_hmac_key.as_deref(),

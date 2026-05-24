@@ -1,11 +1,14 @@
-use super::*;
+use super::{AedbConfig, AedbError, AedbInstance, ColumnDef, ColumnType, DdlOperation, Mutation};
+use crate::migration::Migration;
+use std::sync::Arc;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn migrations_are_idempotent_and_checksum_guarded() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
-    let migration = crate::migration::Migration {
+    let migration = Migration {
         version: 1,
         name: "create-users".into(),
         project_id: "p".into(),
@@ -42,7 +45,7 @@ async fn migrations_are_idempotent_and_checksum_guarded() {
         .expect("apply 1");
     db.apply_migration(migration).await.expect("apply 2");
 
-    let changed = crate::migration::Migration {
+    let changed = Migration {
         version: 1,
         name: "create-users-v2".into(),
         project_id: "p".into(),
@@ -63,7 +66,7 @@ async fn run_migrations_reports_applied_and_skipped_versions() {
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
-    let migration = crate::migration::Migration {
+    let migration = Migration {
         version: 1,
         name: "create-users".into(),
         project_id: "p".into(),
@@ -115,7 +118,7 @@ async fn concurrent_apply_migration_converges_idempotently() {
     let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
-    let migration = crate::migration::Migration {
+    let migration = Migration {
         version: 1,
         name: "create-users".into(),
         project_id: "p".into(),

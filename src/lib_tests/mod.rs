@@ -3,7 +3,7 @@ use super::{
     QueryBatchItem, QueryCommitTelemetryHook, QueryTelemetryEvent, REACTIVE_ACK_CACHE_MAX_ENTRIES,
     RECOVERY_CACHE_TTL, ReactiveCheckpointAckCacheKey, ReactiveCheckpointAckState,
     ReactiveProcessorOptions, ReadOnlySqlAdapter, RecoveryCache, RemoteBackupAdapter,
-    SYSTEM_CALLER_ID, reclaim_eligible_wal_segments,
+    SYSTEM_CALLER_ID,
 };
 use crate::PredicateEvaluationPath;
 use crate::catalog::schema::{ColumnDef, IndexType};
@@ -20,17 +20,14 @@ use crate::commit::validation::{
 };
 use crate::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use crate::error::{AedbError, AedbErrorCode, ResourceType as ErrorResourceType};
+use crate::open_support::reclaim_eligible_wal_segments;
 use crate::permission::{CallerContext, Permission};
 use crate::query::error::QueryError;
 use crate::query::plan::{ConsistencyMode, Expr, Query, QueryOptions};
 use crate::query::planner::ExecutionStage;
 use std::fs;
-use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use tempfile::tempdir;
 
 fn mk_recovery_view(seq: u64) -> crate::snapshot::reader::SnapshotReadView {
     crate::snapshot::reader::SnapshotReadView {

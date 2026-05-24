@@ -1,31 +1,43 @@
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
-use crate::catalog::schema::TableSchema;
 use crate::catalog::types::Row;
 use crate::query::error::QueryError;
-use crate::query::operators::{
-    AggregateOperator, FilterOperator, LimitOperator, Operator, ScanOperator, SortOperator,
-    compile_expr,
-};
-use crate::query::plan::{Query, QueryOptions};
-use crate::query::planner::{ExecutionStage, build_physical_plan};
-use crate::storage::encoded_key::EncodedKey;
+use crate::query::plan::Query;
+use crate::query::plan::QueryOptions;
+use crate::query::planner::build_physical_plan;
 use crate::storage::keyspace::KeyspaceSnapshot;
 
+mod access_path;
 mod aggregate;
+mod composite_index;
 mod cursor;
+mod execution_setup;
+mod index_diagnostics;
+mod index_lookup;
+mod index_utils;
 mod indexing;
 mod join;
+mod operator_pipeline;
+mod ordered_scan;
+mod pagination;
+mod point_lookup;
 mod predicate;
 mod read_set;
 mod validate;
 
-use aggregate::{aggregate_col_idx, aggregate_output_name};
-use cursor::{
-    CursorToken, decode_cursor, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor,
+pub(crate) use access_path::{AccessPathDiagnostics, explain_access_path_for_query};
+use cursor::{CursorToken, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor};
+use execution_setup::prepare_execution_setup;
+use indexing::indexed_pks_for_predicate_limited;
+use operator_pipeline::{OperatorPipelineRequest, build_operator_pipeline};
+use ordered_scan::{
+    OrderedIndexScanRequest, OrderedPredicateIndexScanRequest, ordered_index_scan_for_query,
+    ordered_predicate_index_scan_for_query,
 };
-use indexing::{indexed_pks_for_predicate_limited, indexed_pks_for_predicate_with_trace};
-use predicate::extract_primary_key_values;
+use pagination::{
+    compute_page_window, compute_remaining_limit_after_page, compute_split_recommended,
+};
+use point_lookup::{PrimaryKeyPointQueryRequest, try_primary_key_point_query};
 pub use read_set::ReadSetCollector;
 use validate::validate_query;
 
@@ -43,29 +55,6 @@ pub struct QueryResult {
     /// paginated request rather than re-running the same query without a
     /// cursor — useful for soft-fanout and rate-limiting decisions.
     pub split_recommended: bool,
-}
-
-/// 75% of the effective scan budget; once `rows_examined` crosses this
-/// threshold we hint to the caller that they should paginate.
-pub(crate) const SOFT_LIMIT_PCT_NUM: usize = 3;
-pub(crate) const SOFT_LIMIT_PCT_DEN: usize = 4;
-
-#[inline]
-pub(crate) fn compute_split_recommended(rows_examined: usize, budget: usize) -> bool {
-    if budget == 0 {
-        return false;
-    }
-    // rows_examined * 4 >= budget * 3 — integer-safe comparison for >= 75%.
-    rows_examined
-        .saturating_mul(SOFT_LIMIT_PCT_DEN)
-        .ge(&budget.saturating_mul(SOFT_LIMIT_PCT_NUM))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AccessPathDiagnostics {
-    pub selected_indexes: Vec<String>,
-    pub predicate_evaluation_path: crate::PredicateEvaluationPath,
-    pub plan_trace: Vec<String>,
 }
 
 pub fn execute_query(
@@ -88,147 +77,6 @@ pub fn execute_query(
     )
 }
 
-pub(crate) fn explain_access_path_for_query(
-    snapshot: &KeyspaceSnapshot,
-    catalog: &Catalog,
-    project_id: &str,
-    scope_id: &str,
-    query: &Query,
-    options: &QueryOptions,
-) -> Result<AccessPathDiagnostics, QueryError> {
-    if !query.joins.is_empty() {
-        let mut trace = Vec::new();
-        trace.push("join query: predicate evaluation happens after join execution".to_string());
-        if query.predicate.is_some() {
-            trace.push("post-join filter stage evaluates query predicate".to_string());
-        }
-        return Ok(AccessPathDiagnostics {
-            selected_indexes: Vec::new(),
-            predicate_evaluation_path: crate::PredicateEvaluationPath::JoinExecution,
-            plan_trace: trace,
-        });
-    }
-
-    let mut selected_indexes = Vec::new();
-    let mut trace = Vec::new();
-    let mut predicate_evaluation_path = crate::PredicateEvaluationPath::None;
-
-    let mut effective_options = options.clone();
-    if effective_options.async_index.is_none() {
-        effective_options.async_index = query.use_index.clone();
-    }
-
-    if let Some(async_index) = &effective_options.async_index {
-        selected_indexes.push(async_index.clone());
-        trace.push(format!(
-            "selected async index projection '{async_index}' as row source"
-        ));
-        predicate_evaluation_path = crate::PredicateEvaluationPath::AsyncIndexProjection;
-        if query.predicate.is_some() {
-            trace.push("query predicate is evaluated as filter on projected rows".to_string());
-        }
-        return Ok(AccessPathDiagnostics {
-            selected_indexes,
-            predicate_evaluation_path,
-            plan_trace: trace,
-        });
-    }
-
-    let (exec_project_id, exec_scope_id, exec_table_name) =
-        join::resolve_table_ref(project_id, scope_id, &query.table);
-    let mut query = query.clone();
-    query.table = exec_table_name;
-    let table_key = (
-        namespace_key(&exec_project_id, &exec_scope_id),
-        query.table.clone(),
-    );
-    let schema = catalog
-        .tables
-        .get(&table_key)
-        .ok_or_else(|| QueryError::TableNotFound {
-            project_id: exec_project_id.clone(),
-            table: query.table.clone(),
-        })?;
-    let table = snapshot.table(&exec_project_id, &exec_scope_id, &query.table);
-
-    if let Some(predicate) = query.predicate.as_ref() {
-        if query.limit != Some(0)
-            && query.group_by.is_empty()
-            && query.aggregates.is_empty()
-            && query.having.is_none()
-            && query.order_by.is_empty()
-            && options.cursor.is_none()
-            && extract_primary_key_values(predicate, &schema.primary_key).is_some()
-        {
-            trace.push("primary-key equality predicate detected; using direct row lookup".into());
-            return Ok(AccessPathDiagnostics {
-                selected_indexes,
-                predicate_evaluation_path: crate::PredicateEvaluationPath::PrimaryKeyEqLookup,
-                plan_trace: trace,
-            });
-        }
-
-        if let Some(table) = table
-            && let Some(indexed) = indexed_pks_for_predicate_with_trace(
-                catalog,
-                &exec_project_id,
-                &exec_scope_id,
-                &query.table,
-                table,
-                predicate,
-            )?
-        {
-            if !indexed.selected_indexes.is_empty() {
-                selected_indexes.extend(indexed.selected_indexes.clone());
-                predicate_evaluation_path = crate::PredicateEvaluationPath::SecondaryIndexLookup;
-            } else {
-                predicate_evaluation_path = crate::PredicateEvaluationPath::FullScanFilter;
-            }
-            trace.extend(indexed.plan_trace);
-            if matches!(
-                predicate_evaluation_path,
-                crate::PredicateEvaluationPath::FullScanFilter
-            ) {
-                trace.push(
-                    "no matching secondary index; evaluating predicate during table scan"
-                        .to_string(),
-                );
-            } else {
-                if indexed.predicate_exact {
-                    trace.push(
-                        "index lookup fully satisfies predicate; no residual filter needed"
-                            .to_string(),
-                    );
-                } else {
-                    trace.push(
-                        "residual predicate is evaluated on rows returned by index lookup"
-                            .to_string(),
-                    );
-                }
-            }
-            return Ok(AccessPathDiagnostics {
-                selected_indexes,
-                predicate_evaluation_path,
-                plan_trace: trace,
-            });
-        }
-
-        trace.push("predicate not indexable for current schema/index set".to_string());
-        return Ok(AccessPathDiagnostics {
-            selected_indexes,
-            predicate_evaluation_path: crate::PredicateEvaluationPath::FullScanFilter,
-            plan_trace: trace,
-        });
-    }
-
-    trace.push("no predicate supplied; full table scan path".to_string());
-    Ok(AccessPathDiagnostics {
-        selected_indexes,
-        predicate_evaluation_path,
-        plan_trace: trace,
-    })
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn execute_query_with_options(
     snapshot: &KeyspaceSnapshot,
@@ -241,7 +89,7 @@ pub fn execute_query_with_options(
     max_scan_rows: usize,
     cursor_signing_key: Option<&[u8; 32]>,
 ) -> Result<QueryResult, QueryError> {
-    execute_query_with_options_capturing_signed(
+    execute_query_with_options_capturing_signed(SignedQueryExecutionRequest {
         snapshot,
         catalog,
         project_id,
@@ -250,24 +98,57 @@ pub fn execute_query_with_options(
         options,
         snapshot_seq,
         max_scan_rows,
-        None,
+        read_set: None,
         cursor_signing_key,
-    )
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
+pub struct CapturingQueryExecutionRequest<'a, 'r> {
+    pub snapshot: &'a KeyspaceSnapshot,
+    pub catalog: &'a Catalog,
+    pub project_id: &'a str,
+    pub scope_id: &'a str,
+    pub query: Query,
+    pub options: &'a QueryOptions,
+    pub snapshot_seq: u64,
+    pub max_scan_rows: usize,
+    pub read_set: Option<&'r mut ReadSetCollector>,
+}
+
 pub fn execute_query_with_options_capturing(
-    snapshot: &KeyspaceSnapshot,
-    catalog: &Catalog,
-    project_id: &str,
-    scope_id: &str,
+    request: CapturingQueryExecutionRequest<'_, '_>,
+) -> Result<QueryResult, QueryError> {
+    execute_query_with_options_capturing_signed(SignedQueryExecutionRequest {
+        snapshot: request.snapshot,
+        catalog: request.catalog,
+        project_id: request.project_id,
+        scope_id: request.scope_id,
+        query: request.query,
+        options: request.options,
+        snapshot_seq: request.snapshot_seq,
+        max_scan_rows: request.max_scan_rows,
+        read_set: request.read_set,
+        cursor_signing_key: None,
+    })
+}
+
+struct SignedQueryExecutionRequest<'a, 'r> {
+    snapshot: &'a KeyspaceSnapshot,
+    catalog: &'a Catalog,
+    project_id: &'a str,
+    scope_id: &'a str,
     query: Query,
-    options: &QueryOptions,
+    options: &'a QueryOptions,
     snapshot_seq: u64,
     max_scan_rows: usize,
-    read_set: Option<&mut ReadSetCollector>,
+    read_set: Option<&'r mut ReadSetCollector>,
+    cursor_signing_key: Option<&'a [u8; 32]>,
+}
+
+fn execute_query_with_options_capturing_signed(
+    request: SignedQueryExecutionRequest<'_, '_>,
 ) -> Result<QueryResult, QueryError> {
-    execute_query_with_options_capturing_signed(
+    let SignedQueryExecutionRequest {
         snapshot,
         catalog,
         project_id,
@@ -276,73 +157,14 @@ pub fn execute_query_with_options_capturing(
         options,
         snapshot_seq,
         max_scan_rows,
-        read_set,
-        None,
-    )
-}
+        mut read_set,
+        cursor_signing_key,
+    } = request;
 
-#[allow(clippy::too_many_arguments)]
-fn execute_query_with_options_capturing_signed(
-    snapshot: &KeyspaceSnapshot,
-    catalog: &Catalog,
-    project_id: &str,
-    scope_id: &str,
-    query: Query,
-    options: &QueryOptions,
-    snapshot_seq: u64,
-    max_scan_rows: usize,
-    mut read_set: Option<&mut ReadSetCollector>,
-    cursor_signing_key: Option<&[u8; 32]>,
-) -> Result<QueryResult, QueryError> {
-    let mut options = options.clone();
-    if options.async_index.is_none() {
-        options.async_index = query.use_index.clone();
-    }
-
-    // Validate expression depth to prevent stack overflow from deeply nested expressions
-    if let Some(pred) = &query.predicate {
-        pred.validate_depth()
-            .map_err(|e| QueryError::InvalidQuery {
-                reason: e.to_string(),
-            })?;
-    }
-    if let Some(having) = &query.having {
-        having
-            .validate_depth()
-            .map_err(|e| QueryError::InvalidQuery {
-                reason: e.to_string(),
-            })?;
-    }
-
-    if !options.allow_full_scan
-        && query.limit.is_none()
-        && query.offset.is_none()
-        && query.predicate.is_none()
-        && query.group_by.is_empty()
-        && query.aggregates.is_empty()
-        && query.having.is_none()
-    {
-        return Err(QueryError::InvalidQuery {
-            reason: "full scan requires limit/cursor or allow_full_scan".into(),
-        });
-    }
-
-    let cursor_state = match &options.cursor {
-        Some(encoded) => Some(decode_cursor(encoded, cursor_signing_key)?),
-        None => None,
-    };
-    if let Some(cursor) = &cursor_state
-        && cursor.snapshot_seq != snapshot_seq
-    {
-        return Err(QueryError::InvalidQuery {
-            reason: "cursor snapshot_seq mismatch".into(),
-        });
-    }
-    if cursor_state.is_some() && query.offset.unwrap_or(0) > 0 {
-        return Err(QueryError::InvalidQuery {
-            reason: "OFFSET cannot be combined with cursor pagination".into(),
-        });
-    }
+    let execution_setup =
+        prepare_execution_setup(&query, options, snapshot_seq, cursor_signing_key)?;
+    let options = execution_setup.options;
+    let cursor_state = execution_setup.cursor_state;
 
     if !query.joins.is_empty() {
         // Join paths fall back to coarse table-range capture: record each
@@ -355,7 +177,7 @@ fn execute_query_with_options_capturing_signed(
                 collector.record_full_table_scan(snapshot, &jp, &js, &jt);
             }
         }
-        return join::execute_join_query(
+        return join::execute_join_query(join::JoinQueryExecutionRequest {
             snapshot,
             catalog,
             project_id,
@@ -366,7 +188,7 @@ fn execute_query_with_options_capturing_signed(
             max_scan_rows,
             cursor_state,
             cursor_signing_key,
-        );
+        });
     }
 
     let (exec_project_id, exec_scope_id, exec_table_name) =
@@ -386,46 +208,29 @@ fn execute_query_with_options_capturing_signed(
         })?;
     let table = snapshot.table(&exec_project_id, &exec_scope_id, &query.table);
     let mut materialized_seq = None;
-    if let Some(result) = try_primary_key_point_query(
+    if let Some(result) = try_primary_key_point_query(PrimaryKeyPointQueryRequest {
         snapshot,
         schema,
         table,
-        &exec_project_id,
-        &exec_scope_id,
-        &query,
-        &cursor_state,
+        project_id: &exec_project_id,
+        scope_id: &exec_scope_id,
+        query: &query,
+        cursor_state: &cursor_state,
         snapshot_seq,
-        read_set.as_deref_mut(),
-    )? {
+        read_set: read_set.as_deref_mut(),
+    })? {
         return Ok(result);
     }
     validate_query(schema, &query)?;
 
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-    let page_size = query.limit.unwrap_or_else(|| {
-        cursor_state
-            .as_ref()
-            .map(|c| c.page_size)
-            .unwrap_or(max_scan_rows.min(100))
-    });
-    let effective_page_size = page_size.min(max_scan_rows);
-    let row_offset_count = query.offset.unwrap_or(0);
-    let page_window = row_offset_count
-        .checked_add(effective_page_size)
-        .and_then(|n| n.checked_add(1))
-        .ok_or(QueryError::ScanBoundExceeded {
-            estimated_rows: u64::MAX,
-            max_scan_rows: max_scan_rows as u64,
-        })?;
-    if row_offset_count.saturating_add(effective_page_size) > max_scan_rows {
-        return Err(QueryError::ScanBoundExceeded {
-            estimated_rows: row_offset_count.saturating_add(effective_page_size) as u64,
-            max_scan_rows: max_scan_rows as u64,
-        });
-    }
+    let page_window = compute_page_window(&query, &cursor_state, max_scan_rows)?;
 
     let mut has_residual_filter = query.predicate.is_some();
     let estimated_rows: usize;
+    let mut row_source_satisfies_order = false;
+    let mut row_source_index_used = options.async_index.clone();
+    let mut row_source_applies_offset = false;
     let row_source: Box<dyn Iterator<Item = Row> + Send + '_> =
         if let Some(async_index) = &options.async_index {
             let projection = snapshot
@@ -447,13 +252,49 @@ fn execute_query_with_options_capturing_signed(
                 );
             }
             Box::new(projection.rows.values().cloned())
+        } else if let (Some(predicate), Some(table)) = (&query.predicate, table)
+            && let Some(ordered_scan) =
+                ordered_predicate_index_scan_for_query(OrderedPredicateIndexScanRequest {
+                    catalog,
+                    project_id: &exec_project_id,
+                    scope_id: &exec_scope_id,
+                    schema,
+                    query: &query,
+                    table,
+                    predicate,
+                    offset: page_window.row_offset_count,
+                    limit: page_window.page_read_limit,
+                    has_cursor: cursor_state.is_some(),
+                })
+        {
+            has_residual_filter = false;
+            row_source_satisfies_order = true;
+            row_source_applies_offset = true;
+            row_source_index_used = Some(ordered_scan.index_name);
+            if let Some(collector) = read_set.as_deref_mut() {
+                collector.record_touched_pks(
+                    snapshot,
+                    schema,
+                    &exec_project_id,
+                    &exec_scope_id,
+                    &query.table,
+                    &ordered_scan.pks,
+                );
+            }
+            estimated_rows = ordered_scan.pks.len();
+            Box::new(
+                ordered_scan
+                    .pks
+                    .into_iter()
+                    .filter_map(move |pk| table.rows.get(&pk).cloned()),
+            )
         } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
             let candidate_limit = if cursor_state.is_none()
                 && query.order_by.is_empty()
                 && query.aggregates.is_empty()
                 && query.having.is_none()
             {
-                Some(page_window)
+                Some(page_window.row_source_window_limit)
             } else {
                 None
             };
@@ -499,6 +340,37 @@ fn execute_query_with_options_capturing_signed(
                     Box::new(table.rows.values().cloned())
                 }
             }
+        } else if let Some(table) = table
+            && let Some(ordered_scan) = ordered_index_scan_for_query(OrderedIndexScanRequest {
+                catalog,
+                project_id: &exec_project_id,
+                scope_id: &exec_scope_id,
+                schema,
+                query: &query,
+                table,
+                offset: page_window.row_offset_count,
+                limit: page_window.page_read_limit,
+                has_cursor: cursor_state.is_some(),
+            })
+        {
+            row_source_satisfies_order = true;
+            row_source_applies_offset = true;
+            row_source_index_used = Some(ordered_scan.index_name);
+            if let Some(collector) = read_set {
+                collector.record_full_table_scan(
+                    snapshot,
+                    &exec_project_id,
+                    &exec_scope_id,
+                    &query.table,
+                );
+            }
+            estimated_rows = ordered_scan.pks.len();
+            Box::new(
+                ordered_scan
+                    .pks
+                    .into_iter()
+                    .filter_map(move |pk| table.rows.get(&pk).cloned()),
+            )
         } else {
             if let Some(collector) = read_set {
                 collector.record_full_table_scan(
@@ -523,110 +395,23 @@ fn execute_query_with_options_capturing_signed(
     let physical_plan = build_physical_plan(
         schema,
         &query,
-        options.async_index.clone(),
+        row_source_index_used,
         estimated_rows as u64,
         has_residual_filter,
     )?;
 
-    let mut root: Box<dyn Operator + Send + '_> = Box::new(ScanOperator::new(row_source));
-    let mut selected_indices: Option<Vec<usize>> = None;
-    let mut row_columns = columns.clone();
-    for stage in &physical_plan.stages {
-        match stage {
-            ExecutionStage::Scan => {}
-            ExecutionStage::Limit => {
-                if cursor_state.is_none()
-                    && query.order_by.is_empty()
-                    && query.aggregates.is_empty()
-                    && query.having.is_none()
-                {
-                    root = Box::new(LimitOperator::new(root, page_window));
-                }
-            }
-            ExecutionStage::Filter => {
-                if let Some(predicate) = query.predicate.as_ref() {
-                    let compiled = compile_expr(predicate, &columns, &query.table)?;
-                    root = Box::new(FilterOperator::new(root, compiled));
-                }
-            }
-            ExecutionStage::Sort => {
-                let order_by = query
-                    .order_by
-                    .iter()
-                    .map(|(order_col, order)| {
-                        row_columns
-                            .iter()
-                            .position(|c| c == order_col)
-                            .map(|idx| (idx, *order))
-                            .ok_or_else(|| QueryError::ColumnNotFound {
-                                table: query.table.clone(),
-                                column: order_col.clone(),
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let top_k_limit = if cursor_state.is_none() {
-                    Some(page_window)
-                } else {
-                    None
-                };
-                root = Box::new(SortOperator::new_with_limit(root, order_by, top_k_limit));
-            }
-            ExecutionStage::Aggregate => {
-                let group_by_idx = query
-                    .group_by
-                    .iter()
-                    .map(|name| {
-                        columns.iter().position(|c| c == name).ok_or_else(|| {
-                            QueryError::ColumnNotFound {
-                                table: query.table.clone(),
-                                column: name.clone(),
-                            }
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let agg_col_idx = query
-                    .aggregates
-                    .iter()
-                    .map(|agg| aggregate_col_idx(agg, &columns))
-                    .collect::<Result<Vec<_>, _>>()?;
-                root = Box::new(AggregateOperator::new(
-                    root,
-                    query.aggregates.clone(),
-                    group_by_idx,
-                    agg_col_idx,
-                ));
-                row_columns = query.group_by.clone();
-                row_columns.extend(query.aggregates.iter().map(aggregate_output_name));
-            }
-            ExecutionStage::Having => {
-                if query.aggregates.is_empty() {
-                    return Err(QueryError::InvalidQuery {
-                        reason: "having requires aggregate or group_by".into(),
-                    });
-                }
-                if let Some(having) = query.having.as_ref() {
-                    let compiled = compile_expr(having, &row_columns, &query.table)?;
-                    root = Box::new(FilterOperator::new(root, compiled));
-                }
-            }
-            ExecutionStage::Project => {
-                selected_indices = Some(
-                    query
-                        .select
-                        .iter()
-                        .map(|col| {
-                            row_columns.iter().position(|c| c == col).ok_or_else(|| {
-                                QueryError::ColumnNotFound {
-                                    table: query.table.clone(),
-                                    column: col.clone(),
-                                }
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?,
-                );
-            }
-        }
-    }
+    let pipeline = build_operator_pipeline(OperatorPipelineRequest {
+        row_source,
+        physical_plan: &physical_plan,
+        query: &query,
+        columns,
+        row_source_satisfies_order,
+        cursor_absent: cursor_state.is_none(),
+        row_source_window_limit: page_window.row_source_window_limit,
+    })?;
+    let mut root = pipeline.root;
+    let selected_indices = pipeline.selected_indices;
+    let row_columns = pipeline.row_columns;
 
     let sort_indices: Vec<(usize, crate::query::plan::Order)> = if !query.order_by.is_empty() {
         query
@@ -653,24 +438,29 @@ fn execute_query_with_options_capturing_signed(
     };
     let mut sliced: Vec<Row> = Vec::new();
     let mut skipped = 0usize;
+    let effective_row_offset_count = if row_source_applies_offset {
+        0
+    } else {
+        page_window.row_offset_count
+    };
     while let Some(row) = root.next() {
         if let Some(cursor) = &cursor_state
             && !row_after_cursor(&row, cursor, &sort_indices, &pk_indices)
         {
             continue;
         }
-        if skipped < row_offset_count {
+        if skipped < effective_row_offset_count {
             skipped += 1;
             continue;
         }
         sliced.push(row);
-        if sliced.len() > effective_page_size {
+        if sliced.len() > page_window.effective_page_size {
             break;
         }
     }
-    let has_more = sliced.len() > effective_page_size;
+    let has_more = sliced.len() > page_window.effective_page_size;
     if has_more {
-        sliced.truncate(effective_page_size);
+        sliced.truncate(page_window.effective_page_size);
     }
     let cursor_last_row = sliced.last().cloned();
     let sliced: Vec<Row> = if let Some(selected) = &selected_indices {
@@ -692,7 +482,7 @@ fn execute_query_with_options_capturing_signed(
         cursor_state.as_ref().and_then(|c| c.remaining_limit),
         returned_rows,
     );
-    let cursor = if has_more && row_offset_count == 0 {
+    let cursor = if has_more && page_window.row_offset_count == 0 {
         let last_row = cursor_last_row.ok_or_else(|| QueryError::InvalidQuery {
             reason: "invalid cursor state".into(),
         })?;
@@ -701,7 +491,7 @@ fn execute_query_with_options_capturing_signed(
                 snapshot_seq,
                 last_sort_key: extract_sort_key(&last_row, &sort_indices),
                 last_pk: extract_pk_key(&last_row, &pk_indices),
-                page_size,
+                page_size: page_window.page_size,
                 remaining_limit: remaining_limit_after_page,
             },
             cursor_signing_key,
@@ -724,25 +514,6 @@ fn execute_query_with_options_capturing_signed(
     })
 }
 
-/// Compute `remaining_limit` for the cursor we are about to emit.
-///
-/// If the user did not supply a `query.limit` and the incoming cursor did not
-/// carry one either, the chain is uncapped and we propagate `None`. Otherwise
-/// we subtract this page's returned rows from the smallest applicable cap.
-#[inline]
-pub(crate) fn compute_remaining_limit_after_page(
-    query_limit: Option<usize>,
-    cursor_remaining: Option<usize>,
-    returned_this_page: usize,
-) -> Option<usize> {
-    match (query_limit, cursor_remaining) {
-        (None, None) => None,
-        (Some(q), None) => Some(q.saturating_sub(returned_this_page)),
-        (None, Some(c)) => Some(c.saturating_sub(returned_this_page)),
-        (Some(q), Some(c)) => Some(q.min(c).saturating_sub(returned_this_page)),
-    }
-}
-
 fn query_requires_full_evaluation(query: &Query, has_cursor: bool) -> bool {
     has_cursor
         || !query.group_by.is_empty()
@@ -751,106 +522,21 @@ fn query_requires_full_evaluation(query: &Query, has_cursor: bool) -> bool {
         || query.limit.is_none()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn try_primary_key_point_query(
-    snapshot: &KeyspaceSnapshot,
-    schema: &TableSchema,
-    table: Option<&crate::storage::keyspace::TableData>,
-    project_id: &str,
-    scope_id: &str,
-    query: &Query,
-    cursor_state: &Option<CursorToken>,
-    snapshot_seq: u64,
-    read_set: Option<&mut ReadSetCollector>,
-) -> Result<Option<QueryResult>, QueryError> {
-    if cursor_state.is_some()
-        || query.predicate.is_none()
-        || query.offset.unwrap_or(0) > 0
-        || !query.group_by.is_empty()
-        || !query.aggregates.is_empty()
-        || query.having.is_some()
-        || !query.order_by.is_empty()
-    {
-        return Ok(None);
-    }
-    if query.limit == Some(0) {
-        return Ok(Some(QueryResult {
-            rows: Vec::new(),
-            rows_examined: 0,
-            cursor: None,
-            truncated: false,
-            snapshot_seq,
-            materialized_seq: None,
-            split_recommended: false,
-        }));
-    }
-
-    let Some(predicate) = query.predicate.as_ref() else {
-        return Ok(None);
-    };
-    validate::validate_expr_types(schema, predicate)?;
-    let Some(primary_key) = extract_primary_key_values(predicate, &schema.primary_key) else {
-        return Ok(None);
-    };
-
-    if let Some(collector) = read_set {
-        collector.record_point(
-            snapshot,
-            project_id,
-            scope_id,
-            &query.table,
-            primary_key.clone(),
-        );
-    }
-
-    let selected_indices = resolve_selected_indices(schema, query)?;
-    let encoded_pk = EncodedKey::from_values(&primary_key);
-    let maybe_row = table.and_then(|t| t.rows.get(&encoded_pk));
-    let rows = match maybe_row {
-        Some(row) => vec![project_selected_row(row, selected_indices.as_deref())],
-        None => Vec::new(),
-    };
-
-    Ok(Some(QueryResult {
-        rows,
-        rows_examined: 1,
-        cursor: None,
-        truncated: false,
-        snapshot_seq,
-        materialized_seq: None,
-        split_recommended: false,
-    }))
-}
-
-fn resolve_selected_indices(
-    schema: &TableSchema,
-    query: &Query,
-) -> Result<Option<Vec<usize>>, QueryError> {
-    if query.select.len() == 1 && query.select[0] == "*" {
-        return Ok(None);
-    }
-    let mut indices = Vec::with_capacity(query.select.len());
-    for col in &query.select {
-        let column_index = schema
-            .columns
-            .iter()
-            .position(|c| c.name == *col)
-            .ok_or_else(|| QueryError::ColumnNotFound {
-                table: query.table.clone(),
-                column: col.clone(),
-            })?;
-        indices.push(column_index);
-    }
-    Ok(Some(indices))
-}
-
-fn project_selected_row(row: &Row, selected_indices: Option<&[usize]>) -> Row {
-    match selected_indices {
-        Some(indices) => Row {
-            values: indices.iter().map(|idx| row.values[*idx].clone()).collect(),
-        },
-        None => row.clone(),
-    }
-}
+#[cfg(test)]
+mod index_tests;
+#[cfg(test)]
+mod join_tests;
+#[cfg(test)]
+mod ordered_tests;
+#[cfg(test)]
+mod page_tests;
+#[cfg(test)]
+mod pagination_tests;
+#[cfg(test)]
+mod read_set_tests;
+#[cfg(test)]
+mod scan_bound_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod validation_tests;

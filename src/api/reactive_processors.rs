@@ -1,4 +1,32 @@
-use crate::*;
+use crate::catalog::SYSTEM_PROJECT_ID;
+use crate::catalog::types::{Row, Value};
+use crate::commit::executor::CommitResult;
+use crate::commit::tx::{
+    ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
+};
+use crate::commit::validation::Mutation;
+use crate::error::{AedbError, ResourceType as ErrorResourceType};
+use crate::permission::{CallerContext, Permission};
+use crate::query::plan::ConsistencyMode;
+use crate::query_authorization::ensure_external_caller_allowed;
+use crate::storage::encoded_key::EncodedKey;
+use crate::{
+    AedbInstance, EVENT_OUTBOX_TABLE, EventOutboxRecord, EventStreamPage,
+    REACTIVE_PROCESSOR_CHECKPOINTS_TABLE, REACTIVE_PROCESSOR_REGISTRY_TABLE,
+    ReactiveCheckpointAckCacheKey, ReactiveProcessorHandler, ReactiveProcessorHealth,
+    ReactiveProcessorInfo, ReactiveProcessorLag, ReactiveProcessorOptions,
+    ReactiveProcessorRegistration, ReactiveProcessorRetryState, ReactiveProcessorRuntime,
+    ReactiveProcessorRuntimeStatus, ReactiveProcessorSloStatus, SYSTEM_SCOPE_ID,
+    prune_reactive_ack_cache, reactive_processor_checkpoint_mutation,
+    reactive_processor_dlq_mutation, reactive_processor_registry_mutation, system_now_micros,
+};
+use std::collections::HashSet;
+use std::future::Future;
+use std::ops::Bound;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex as AsyncMutex;
 
 impl AedbInstance {
     pub async fn emit_event(
@@ -101,7 +129,7 @@ impl AedbInstance {
         }
         if let Some(caller) = caller {
             let required = Permission::TableRead {
-                project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+                project_id: SYSTEM_PROJECT_ID.to_string(),
                 scope_id: SYSTEM_SCOPE_ID.to_string(),
                 table_name: EVENT_OUTBOX_TABLE.to_string(),
             };
@@ -113,11 +141,12 @@ impl AedbInstance {
                 return Err(AedbError::PermissionDenied("permission denied".into()));
             }
         }
-        let Some(table) = lease.view.keyspace.table(
-            crate::catalog::SYSTEM_PROJECT_ID,
-            SYSTEM_SCOPE_ID,
-            EVENT_OUTBOX_TABLE,
-        ) else {
+        let Some(table) =
+            lease
+                .view
+                .keyspace
+                .table(SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID, EVENT_OUTBOX_TABLE)
+        else {
             return Ok(EventStreamPage {
                 events: Vec::new(),
                 next_commit_seq: None,
@@ -362,7 +391,7 @@ impl AedbInstance {
     ) -> Result<(), AedbError> {
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let required = Permission::TableWrite {
-            project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+            project_id: SYSTEM_PROJECT_ID.to_string(),
             scope_id: SYSTEM_SCOPE_ID.to_string(),
             table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
         };
@@ -385,7 +414,7 @@ impl AedbInstance {
         let checkpoint_key = Value::Text(processor_name.to_string().into());
         let checkpoint_pk = EncodedKey::from_values(std::slice::from_ref(&checkpoint_key));
         let checkpoint_table = lease.view.keyspace.table(
-            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_PROJECT_ID,
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
         );
@@ -410,7 +439,7 @@ impl AedbInstance {
         let read_set = ReadSet {
             points: vec![ReadSetEntry {
                 key: ReadKey::TableRow {
-                    project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+                    project_id: SYSTEM_PROJECT_ID.to_string(),
                     scope_id: SYSTEM_SCOPE_ID.to_string(),
                     table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
                     primary_key,
@@ -464,7 +493,7 @@ impl AedbInstance {
         let lease = self.acquire_snapshot(consistency).await?;
         if let Some(caller) = caller {
             let required = Permission::TableRead {
-                project_id: crate::catalog::SYSTEM_PROJECT_ID.to_string(),
+                project_id: SYSTEM_PROJECT_ID.to_string(),
                 scope_id: SYSTEM_SCOPE_ID.to_string(),
                 table_name: REACTIVE_PROCESSOR_CHECKPOINTS_TABLE.to_string(),
             };
@@ -478,7 +507,7 @@ impl AedbInstance {
         }
         let mut checkpoint_seq = 0u64;
         if let Some(table) = lease.view.keyspace.table(
-            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_PROJECT_ID,
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
         ) {
@@ -579,7 +608,7 @@ impl AedbInstance {
                 resource_type: ErrorResourceType::Table,
                 resource_id: format!(
                     "{}.{}.{}:{}",
-                    crate::catalog::SYSTEM_PROJECT_ID,
+                    SYSTEM_PROJECT_ID,
                     SYSTEM_SCOPE_ID,
                     REACTIVE_PROCESSOR_REGISTRY_TABLE,
                     processor_name
@@ -687,7 +716,7 @@ impl AedbInstance {
                 resource_type: ErrorResourceType::Table,
                 resource_id: format!(
                     "{}.{}.{}:{}",
-                    crate::catalog::SYSTEM_PROJECT_ID,
+                    SYSTEM_PROJECT_ID,
                     SYSTEM_SCOPE_ID,
                     REACTIVE_PROCESSOR_REGISTRY_TABLE,
                     processor_name
@@ -1182,7 +1211,7 @@ impl AedbInstance {
     ) -> Result<Option<ReactiveProcessorRegistration>, AedbError> {
         let lease = self.acquire_snapshot(consistency).await?;
         let Some(table) = lease.view.keyspace.table(
-            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_PROJECT_ID,
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_REGISTRY_TABLE,
         ) else {
@@ -1201,7 +1230,7 @@ impl AedbInstance {
     ) -> Result<Vec<ReactiveProcessorRegistration>, AedbError> {
         let lease = self.acquire_snapshot(consistency).await?;
         let Some(table) = lease.view.keyspace.table(
-            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_PROJECT_ID,
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_REGISTRY_TABLE,
         ) else {

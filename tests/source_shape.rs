@@ -54,29 +54,115 @@ fn readme_stays_product_focused() {
     }
 }
 
+#[test]
+fn source_modules_do_not_use_parent_or_crate_glob_imports() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut violations = Vec::new();
+
+    for path in collect_rust_sources(&root.join("src")) {
+        let source = fs::read_to_string(&path).expect("read source");
+        for (line_number, line) in source.lines().enumerate() {
+            if matches!(line.trim(), "use super::*;" | "use crate::*;") {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("source path under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                violations.push(format!("{}:{}", rel, line_number + 1));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "source modules should import explicit dependencies instead of parent globs:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn source_modules_do_not_use_wildcard_reexports() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut violations = Vec::new();
+
+    for path in collect_rust_sources(&root.join("src")) {
+        let source = fs::read_to_string(&path).expect("read source");
+        for (line_number, line) in source.lines().enumerate() {
+            let trimmed = line.trim();
+            if (trimmed.starts_with("pub use ") || trimmed.starts_with("pub(crate) use "))
+                && trimmed.ends_with("::*;")
+            {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("source path under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                violations.push(format!("{}:{}", rel, line_number + 1));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "source modules should re-export explicit items instead of wildcard exports:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn implementation_modules_keep_tests_in_dedicated_files() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut violations = Vec::new();
+
+    for path in collect_rust_sources(&root.join("src")) {
+        if is_dedicated_test_source(&path) {
+            continue;
+        }
+        let source = fs::read_to_string(&path).expect("read source");
+        let lines: Vec<_> = source.lines().collect();
+        for (line_index, pair) in lines.windows(2).enumerate() {
+            if pair[0].trim() == "#[cfg(test)]" && pair[1].trim() == "mod tests {" {
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("source path under root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                violations.push(format!("{}:{}", rel, line_index + 1));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "implementation modules should move inline test bodies into dedicated test files:\n{}",
+        violations.join("\n")
+    );
+}
+
 fn large_file_budgets() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
         // Central commit engine internals. Split only along scheduler/apply/replay-safe boundaries.
         ("src/commit/executor/internals.rs", 5_200),
         ("src/commit/executor/tests.rs", 4_300),
-        ("src/commit/apply.rs", 4_100),
-        ("src/storage/keyspace.rs", 4_200),
-        ("src/lib.rs", 3_700),
-        ("src/catalog/mod.rs", 3_200),
-        ("src/commit/validation.rs", 2_900),
-        ("src/order_book.rs", 2_500),
-        ("src/query/executor/tests.rs", 2_100),
-        ("src/commit/executor/mod.rs", 2_000),
-        ("src/lib_helpers.rs", 1_900),
-        ("src/lib_tests/auth.rs", 4_400),
+        ("src/commit/apply.rs", 4_050),
+        ("src/storage/keyspace.rs", 2_900),
+        ("src/lib.rs", 3_300),
+        ("src/catalog/mod.rs", 2_150),
+        ("src/commit/validation.rs", 2_800),
+        ("src/order_book.rs", 2_200),
+        ("src/commit/executor/mod.rs", 1_900),
+        ("src/lib_tests/auth.rs", 4_350),
         ("src/lib_tests/query_api.rs", 2_200),
-        ("src/lib_tests/commit_ops.rs", 1_800),
-        ("src/api/order_book_api.rs", 1_700),
-        ("src/api/kv_api.rs", 1_550),
-        ("src/api/reactive_processors.rs", 1_500),
-        ("src/lib_tests/backup_restore.rs", 1_600),
-        ("src/lib_tests/kv_api.rs", 1_600),
-        ("src/preflight/mod.rs", 1_650),
+        ("src/lib_tests/commit_ops.rs", 1_750),
+        ("src/api/order_book_api.rs", 1_610),
+        ("src/api/kv_api.rs", 1_480),
+        ("src/api/reactive_processors.rs", 1_455),
+        ("src/lib_tests/backup_restore.rs", 1_550),
+        ("src/lib_tests/kv_api.rs", 1_550),
+        // Helper facades should stay thin. Add narrowly named modules instead of rebuilding catch-alls.
+        ("src/lib_helpers.rs", 55),
+        // Query executor test coverage is split by behavior; keep the shared fixture module small.
+        ("src/query/executor/tests.rs", 320),
     ])
 }
 
@@ -96,4 +182,10 @@ fn collect_rust_sources_inner(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+fn is_dedicated_test_source(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
 }

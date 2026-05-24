@@ -1,4 +1,16 @@
-use super::*;
+use super::{
+    AedbConfig, AedbError, AedbInstance, ColumnDef, ColumnType, ConsistencyMode, DdlOperation,
+    EchoSqlAdapter, ErrorResourceType, ExecutionStage, Expr, IndexType, LocalRemoteAdapter,
+    Mutation, PredicateEvaluationPath, Query, QueryBatchItem, QueryCommitTelemetryHook, QueryError,
+    QueryOptions, ReadAssertion, RecordingTelemetryHook, Row, TransactionEnvelope, Value,
+    WriteClass, WriteIntent, create_table,
+};
+use crate::commit::tx::ReadSet;
+use crate::commit::validation::CompareOp;
+use crate::query::plan::Order;
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn api_open_commit_query_shutdown() {
@@ -261,7 +273,7 @@ async fn async_projection_index_reports_materialized_seq() {
             assert_eq!(q.rows.len(), 1);
             return;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("async index did not catch up, last materialized_seq={observed:?}");
 }
@@ -290,7 +302,7 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
             idempotency_key: None,
             write_class: WriteClass::Standard,
             assertions: Vec::new(),
-            read_set: crate::commit::tx::ReadSet::default(),
+            read_set: ReadSet::default(),
             write_intent: WriteIntent {
                 mutations: too_many,
             },
@@ -321,7 +333,7 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
         idempotency_key: None,
         write_class: WriteClass::Standard,
         assertions: Vec::new(),
-        read_set: crate::commit::tx::ReadSet::default(),
+        read_set: ReadSet::default(),
         write_intent: WriteIntent {
             mutations: ok_batch,
         },
@@ -355,7 +367,7 @@ async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
             idempotency_key: None,
             write_class: WriteClass::Standard,
             assertions: too_many,
-            read_set: crate::commit::tx::ReadSet::default(),
+            read_set: ReadSet::default(),
             write_intent: WriteIntent {
                 mutations: vec![Mutation::KvSet {
                     project_id: "p".into(),
@@ -559,7 +571,7 @@ async fn index_introspection_apis_return_index_definitions() {
         index_name: "idx_users_name".into(),
         if_not_exists: false,
         columns: vec!["name".into()],
-        index_type: crate::catalog::schema::IndexType::BTree,
+        index_type: IndexType::BTree,
         partial_filter: None,
     })
     .await
@@ -1101,6 +1113,89 @@ async fn exists_and_explain_diagnostics_work() {
 }
 
 #[tokio::test]
+async fn explain_reports_ordered_index_row_source() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "score".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "items".into(),
+        index_name: "by_score".into(),
+        if_not_exists: false,
+        columns: vec!["score".into()],
+        index_type: IndexType::BTree,
+        partial_filter: None,
+    }))
+    .await
+    .expect("score index");
+
+    for (id, score) in [(1_i64, 30_i64), (2, 10), (3, 20)] {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(id)],
+            row: Row::from_values(vec![Value::Integer(id), Value::Integer(score)]),
+        })
+        .await
+        .expect("seed item");
+    }
+
+    let explain = db
+        .explain_query(
+            "p",
+            "app",
+            Query::select(&["id", "score"])
+                .from("items")
+                .order_by("score", Order::Asc)
+                .limit(2),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("explain ordered index");
+
+    assert_eq!(explain.index_used, Some("by_score".to_string()));
+    assert_eq!(explain.selected_indexes, vec!["by_score".to_string()]);
+    assert_eq!(
+        explain.predicate_evaluation_path,
+        PredicateEvaluationPath::None
+    );
+    assert!(
+        !explain.stages.contains(&ExecutionStage::Sort),
+        "ordered row source already satisfies ORDER BY"
+    );
+    assert!(
+        explain
+            .plan_trace
+            .iter()
+            .any(|line| line.contains("ordered row source")),
+        "plan trace should report ordered index row source"
+    );
+}
+
+#[tokio::test]
 async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_paths() {
     let dir = tempdir().expect("temp");
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
@@ -1228,6 +1323,10 @@ async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_path
             .iter()
             .any(|line| line.contains("by_user_id")),
         "plan trace should include selected index name"
+    );
+    assert!(
+        !indexed_explain.stages.contains(&ExecutionStage::Filter),
+        "exact indexed equality should not report a residual filter stage"
     );
 }
 
@@ -1380,6 +1479,10 @@ async fn uuid_text_equality_parity_between_primary_key_and_secondary_index_paths
         pk_explain.predicate_evaluation_path,
         PredicateEvaluationPath::PrimaryKeyEqLookup
     );
+    assert!(
+        !pk_explain.stages.contains(&ExecutionStage::Filter),
+        "primary-key equality should not report a residual filter stage"
+    );
 
     let secondary_explain = db
         .explain_query("p", "app", secondary_query, QueryOptions::default())
@@ -1393,6 +1496,10 @@ async fn uuid_text_equality_parity_between_primary_key_and_secondary_index_paths
         secondary_explain
             .selected_indexes
             .contains(&"by_user_uuid".to_string())
+    );
+    assert!(
+        !secondary_explain.stages.contains(&ExecutionStage::Filter),
+        "exact secondary-index equality should not report a residual filter stage"
     );
 }
 
@@ -1901,7 +2008,7 @@ async fn count_compare_assertions_respect_scan_budget() {
                 scope_id: "app".into(),
                 table_name: "items".into(),
                 filter: None,
-                op: crate::commit::validation::CompareOp::Eq,
+                op: CompareOp::Eq,
                 threshold: 5,
             }],
             read_set: Default::default(),

@@ -1,22 +1,50 @@
 mod partition_derivation;
 pub(super) use partition_derivation::*;
 
+#[cfg(test)]
+use super::COORDINATOR_TEST_DELAY_MS;
+use super::coordinator::CoordinatorLockManager;
+use super::global_index::GlobalUniqueIndexState;
+use super::parallel_runtime::ParallelApplyRuntime;
 use super::parallel_runtime::ParallelTask;
-use super::*;
-use crate::catalog::SYSTEM_PROJECT_ID;
+use super::{
+    CommitRequest, CommitResult, EpochOutcome, EpochProcessResult, ExecutorState,
+    GLOBAL_PARTITION_TOKEN, IdempotencyOutcome, InternalSequencedCommit, MAX_EPOCH_DEFER,
+    SequencedCommit,
+};
+use crate::catalog::schema::TableSchema;
+use crate::catalog::types::{Row, Value};
+use crate::catalog::{Catalog, SYSTEM_PROJECT_ID, namespace_key};
+use crate::commit::apply::{apply_mutation, apply_mutation_trusted_if_eligible};
 use crate::commit::assertions::validate_assertions;
-use crate::commit::tx::{AssertionActual, ReadAssertion};
-use crate::commit::validation::KvIntegerAmount;
+use crate::commit::tx::{
+    AssertionActual, IdempotencyKey, IdempotencyRecord, ReadAssertion, TransactionEnvelope,
+    WriteClass,
+};
+use crate::commit::validation::{KvIntegerAmount, Mutation, validate_permissions};
+use crate::config::{AedbConfig, DurabilityMode};
+use crate::error::AedbError;
 use crate::lib_helpers::{
     ddl_would_apply, lifecycle_template_for_ddl, lifecycle_templates_for_mutation,
 };
+use crate::permission::CallerContext;
+use crate::storage::encoded_key::EncodedKey;
+use crate::storage::index::extract_index_key_encoded;
+use crate::storage::keyspace::{Keyspace, KvData, Namespace, NamespaceId};
+use crate::version_store::CommitDelta;
 use crate::wal::segment::PendingFrame;
+use parking_lot::RwLock;
 use primitive_types::U256;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::ops::Bound;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc as tokio_mpsc;
+use tracing::warn;
 
 const MEMORY_ESTIMATE_INTERVAL_MICROS: u64 = 250_000;
 const SINGLE_REQUEST_PARALLEL_APPLY_MUTATION_THRESHOLD: usize = 1024;
@@ -4486,7 +4514,7 @@ pub(super) fn refresh_async_indexes(
             for delta in deltas {
                 for mutation in &delta.mutations {
                     if matches!(
-                        mutation,
+                        &mutation,
                         Mutation::TableIncU256 {
                             project_id,
                             scope_id,
