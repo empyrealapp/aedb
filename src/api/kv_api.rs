@@ -1,4 +1,24 @@
-use crate::*;
+use crate::catalog::DEFAULT_SCOPE_ID;
+use crate::catalog::types::Value;
+use crate::commit::tx::{ReadAssertion, ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
+use crate::commit::validation::{
+    KvU64MissingPolicy, KvU64MutatorOp, KvU64OverflowPolicy, KvU64UnderflowPolicy, KvU256MutatorOp,
+    MAX_COUNTER_SHARDS, Mutation,
+};
+use crate::error::AedbError;
+use crate::lib_helpers::next_prefix_bytes;
+use crate::permission::{CallerContext, Permission};
+use crate::query::error::QueryError;
+use crate::query::plan::ConsistencyMode;
+use crate::query::{KvCursor, KvScanResult, ScopedKvEntry};
+use crate::query_authorization::ensure_external_caller_allowed;
+use crate::storage::keyspace::KvEntry;
+use crate::{
+    AedbInstance, CommitResult, ENVELOPE_OVERHEAD_UPPER_BOUND, MUTATION_OVERHEAD_UPPER_BOUND,
+    TableU256MutationRequest,
+};
+use std::ops::Bound;
+use std::time::Instant;
 
 impl AedbInstance {
     pub async fn kv_get(
@@ -47,14 +67,8 @@ impl AedbInstance {
         consistency: ConsistencyMode,
         caller: &CallerContext,
     ) -> Result<Option<KvEntry>, QueryError> {
-        self.kv_get(
-            project_id,
-            crate::catalog::DEFAULT_SCOPE_ID,
-            key,
-            consistency,
-            caller,
-        )
-        .await
+        self.kv_get(project_id, DEFAULT_SCOPE_ID, key, consistency, caller)
+            .await
     }
 
     pub(crate) async fn kv_get_unchecked(
@@ -315,7 +329,7 @@ impl AedbInstance {
     ) -> Result<KvScanResult, QueryError> {
         self.kv_scan_prefix(
             project_id,
-            crate::catalog::DEFAULT_SCOPE_ID,
+            DEFAULT_SCOPE_ID,
             prefix,
             limit,
             cursor,
@@ -512,8 +526,7 @@ impl AedbInstance {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<CommitResult, AedbError> {
-        self.kv_set(project_id, crate::catalog::DEFAULT_SCOPE_ID, key, value)
-            .await
+        self.kv_set(project_id, DEFAULT_SCOPE_ID, key, value).await
     }
 
     pub async fn kv_set_as(
@@ -650,8 +663,7 @@ impl AedbInstance {
         project_id: &str,
         key: Vec<u8>,
     ) -> Result<CommitResult, AedbError> {
-        self.kv_del(project_id, crate::catalog::DEFAULT_SCOPE_ID, key)
-            .await
+        self.kv_del(project_id, DEFAULT_SCOPE_ID, key).await
     }
 
     pub async fn kv_del_as(
@@ -987,15 +999,15 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: None,
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::KeyVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::KeyVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 key: key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::KvSet {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),
@@ -1020,15 +1032,15 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: Some(caller),
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::KeyVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::KeyVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 key: key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::KvSet {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),

@@ -1,20 +1,14 @@
 use crate::catalog::Catalog;
-use crate::catalog::namespace_key;
-use crate::catalog::schema::TableSchema;
 use crate::catalog::types::{Row, Value};
-use crate::commit::apply::{apply_mutation, apply_mutation_trusted_if_eligible};
 use crate::commit::tx::{
-    IdempotencyKey, IdempotencyRecord, ReadBound, ReadKey, ReadRange, TransactionEnvelope,
-    WriteClass, WriteIntent,
+    IdempotencyKey, IdempotencyRecord, TransactionEnvelope, WriteClass, WriteIntent,
 };
-use crate::commit::validation::{Mutation, validate_permissions};
+use crate::commit::validation::Mutation;
 use crate::config::{AedbConfig, DurabilityMode};
 use crate::error::AedbError;
 use crate::permission::CallerContext;
 use crate::snapshot::reader::SnapshotReadView;
-use crate::storage::encoded_key::EncodedKey;
-use crate::storage::index::extract_index_key_encoded;
-use crate::storage::keyspace::{Keyspace, KeyspaceSnapshot, KvData, Namespace, NamespaceId};
+use crate::storage::keyspace::{Keyspace, KeyspaceSnapshot};
 use crate::version_store::{CommitDelta, VersionStore};
 use crate::wal::segment::{SegmentConfig, SegmentManager};
 use adaptive::AdaptiveEpochState;
@@ -26,16 +20,15 @@ use group_commit::{
 use parallel_runtime::ParallelApplyRuntime;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc as tokio_mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone)]
 pub struct CommitResult {

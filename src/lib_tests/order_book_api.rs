@@ -1,4 +1,14 @@
-use super::*;
+use super::{
+    AedbConfig, AedbError, AedbInstance, CallerContext, CommitFinality, ConsistencyMode,
+    DdlOperation, DurabilityMode, Mutation, Permission, QueryError,
+};
+use crate::order_book::{
+    ExecInstruction, OrderRequest, OrderSide, OrderStatus, OrderType, SelfTradePrevention,
+    TimeInForce, key_client_id,
+};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn order_book_new_with_durable_finality_waits_until_durable_head_catches_up() {
@@ -23,14 +33,14 @@ async fn order_book_new_with_durable_finality_waits_until_durable_head_catches_u
         .order_book_new_with_finality(
             "p",
             "app",
-            crate::order_book::OrderRequest {
+            OrderRequest {
                 instrument: "BTC-USD".into(),
                 client_order_id: "oid-1".into(),
-                side: crate::order_book::OrderSide::Bid,
-                order_type: crate::order_book::OrderType::Limit,
-                time_in_force: crate::order_book::TimeInForce::Gtc,
-                exec_instructions: crate::order_book::ExecInstruction(0),
-                self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+                side: OrderSide::Bid,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Gtc,
+                exec_instructions: ExecInstruction(0),
+                self_trade_prevention: SelfTradePrevention::None,
                 price_ticks: 100,
                 qty_be: {
                     let mut out = [0u8; 32];
@@ -69,14 +79,14 @@ async fn order_book_new_fok_reject_is_dropped_before_wal_append() {
         .order_book_new(
             "p",
             "app",
-            crate::order_book::OrderRequest {
+            OrderRequest {
                 instrument: "BTC-USD".into(),
                 client_order_id: "fok-no-liq-1".into(),
-                side: crate::order_book::OrderSide::Bid,
-                order_type: crate::order_book::OrderType::Limit,
-                time_in_force: crate::order_book::TimeInForce::Fok,
-                exec_instructions: crate::order_book::ExecInstruction(0),
-                self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+                side: OrderSide::Bid,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Fok,
+                exec_instructions: ExecInstruction(0),
+                self_trade_prevention: SelfTradePrevention::None,
                 price_ticks: 100,
                 qty_be: {
                     let mut out = [0u8; 32];
@@ -119,14 +129,14 @@ async fn order_book_write_requires_authenticated_caller_in_secure_mode() {
         .order_book_new(
             "p",
             "app",
-            crate::order_book::OrderRequest {
+            OrderRequest {
                 instrument: "BTC-USD".into(),
                 client_order_id: "oid-secure".into(),
-                side: crate::order_book::OrderSide::Bid,
-                order_type: crate::order_book::OrderType::Limit,
-                time_in_force: crate::order_book::TimeInForce::Gtc,
-                exec_instructions: crate::order_book::ExecInstruction(0),
-                self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+                side: OrderSide::Bid,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Gtc,
+                exec_instructions: ExecInstruction(0),
+                self_trade_prevention: SelfTradePrevention::None,
                 price_ticks: 100,
                 qty_be: {
                     let mut out = [0u8; 32];
@@ -178,14 +188,14 @@ async fn secure_mode_supports_order_book_writes_via_authenticated_as_apis() {
         alice.clone(),
         "p",
         "app",
-        crate::order_book::OrderRequest {
+        OrderRequest {
             instrument: "BTC-USD".into(),
             client_order_id: "oid-secure-as".into(),
-            side: crate::order_book::OrderSide::Bid,
-            order_type: crate::order_book::OrderType::Limit,
-            time_in_force: crate::order_book::TimeInForce::Gtc,
-            exec_instructions: crate::order_book::ExecInstruction(0),
-            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
             price_ticks: 100,
             qty_be: {
                 let mut out = [0u8; 32];
@@ -208,7 +218,7 @@ async fn secure_mode_supports_order_book_writes_via_authenticated_as_apis() {
         .await
         .expect("status query")
         .expect("order exists");
-    assert_eq!(status.status, crate::order_book::OrderStatus::Cancelled);
+    assert_eq!(status.status, OrderStatus::Cancelled);
 }
 
 #[tokio::test]
@@ -220,14 +230,14 @@ async fn open_orders_requires_kv_read_permission() {
     db.order_book_new(
         "p",
         "app",
-        crate::order_book::OrderRequest {
+        OrderRequest {
             instrument: "BTC-USD".into(),
             client_order_id: "cid-open-orders-1".into(),
-            side: crate::order_book::OrderSide::Bid,
-            order_type: crate::order_book::OrderType::Limit,
-            time_in_force: crate::order_book::TimeInForce::Gtc,
-            exec_instructions: crate::order_book::ExecInstruction(0),
-            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
             price_ticks: 100,
             qty_be: {
                 let mut out = [0u8; 32];
@@ -314,14 +324,14 @@ async fn strict_cancel_rejects_already_final_order() {
     db.order_book_new(
         "p",
         "app",
-        crate::order_book::OrderRequest {
+        OrderRequest {
             instrument: "BTC-USD".into(),
             client_order_id: "strict-final".into(),
-            side: crate::order_book::OrderSide::Bid,
-            order_type: crate::order_book::OrderType::Limit,
-            time_in_force: crate::order_book::TimeInForce::Gtc,
-            exec_instructions: crate::order_book::ExecInstruction(0),
-            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
             price_ticks: 100,
             qty_be: {
                 let mut out = [0u8; 32];
@@ -377,14 +387,14 @@ async fn strict_cancel_by_client_id_rejects_already_final_order() {
     db.order_book_new(
         "p",
         "app",
-        crate::order_book::OrderRequest {
+        OrderRequest {
             instrument: "BTC-USD".into(),
             client_order_id: "strict-client-final".into(),
-            side: crate::order_book::OrderSide::Bid,
-            order_type: crate::order_book::OrderType::Limit,
-            time_in_force: crate::order_book::TimeInForce::Gtc,
-            exec_instructions: crate::order_book::ExecInstruction(0),
-            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
             price_ticks: 100,
             qty_be: {
                 let mut out = [0u8; 32];
@@ -434,7 +444,7 @@ async fn strict_cancel_by_client_id_rejects_invalid_mapping_encoding() {
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
         scope_id: "app".into(),
-        key: crate::order_book::key_client_id("BTC-USD", "alice", "cid-corrupt"),
+        key: key_client_id("BTC-USD", "alice", "cid-corrupt"),
         value: vec![1, 2, 3, 4],
     })
     .await
@@ -463,14 +473,14 @@ async fn strict_cancel_by_client_id_detects_owner_mismatch_under_tampered_mappin
     db.order_book_new(
         "p",
         "app",
-        crate::order_book::OrderRequest {
+        OrderRequest {
             instrument: "BTC-USD".into(),
             client_order_id: "cid-owner-a".into(),
-            side: crate::order_book::OrderSide::Bid,
-            order_type: crate::order_book::OrderType::Limit,
-            time_in_force: crate::order_book::TimeInForce::Gtc,
-            exec_instructions: crate::order_book::ExecInstruction(0),
-            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
             price_ticks: 100,
             qty_be: {
                 let mut out = [0u8; 32];
@@ -489,7 +499,7 @@ async fn strict_cancel_by_client_id_detects_owner_mismatch_under_tampered_mappin
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
         scope_id: "app".into(),
-        key: crate::order_book::key_client_id("BTC-USD", "bob", "cid-owner-b"),
+        key: key_client_id("BTC-USD", "bob", "cid-owner-b"),
         value: 1u64.to_be_bytes().to_vec(),
     })
     .await
@@ -540,14 +550,14 @@ async fn strict_cancel_replace_rejects_already_final_order() {
     db.order_book_new(
         "p",
         "app",
-        crate::order_book::OrderRequest {
+        OrderRequest {
             instrument: "BTC-USD".into(),
             client_order_id: "strict-cr-final".into(),
-            side: crate::order_book::OrderSide::Bid,
-            order_type: crate::order_book::OrderType::Limit,
-            time_in_force: crate::order_book::TimeInForce::Gtc,
-            exec_instructions: crate::order_book::ExecInstruction(0),
-            self_trade_prevention: crate::order_book::SelfTradePrevention::None,
+            side: OrderSide::Bid,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            exec_instructions: ExecInstruction(0),
+            self_trade_prevention: SelfTradePrevention::None,
             price_ticks: 100,
             qty_be: {
                 let mut out = [0u8; 32];

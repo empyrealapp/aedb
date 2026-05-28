@@ -1,4 +1,17 @@
-use super::*;
+use super::{
+    AedbConfig, AedbError, AedbInstance, CallerContext, ColumnDef, ColumnType, ConsistencyMode,
+    DdlOperation, DurabilityMode, Expr, IdempotencyKey, Mutation, Permission, Query, QueryError,
+    QueryOptions, ReadAssertion, ResourceType, RestrictiveSqlAdapter, Row, SYSTEM_CALLER_ID,
+    TransactionEnvelope, Value, WriteClass, WriteIntent, create_table,
+};
+use crate::commit::tx::ReadSet;
+use crate::commit::validation::CompareOp;
+use std::fs;
+use std::ops::Bound;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn permissions_enforced_at_preflight_commit_and_query() {
@@ -97,10 +110,7 @@ async fn permissions_enforced_at_preflight_commit_and_query() {
         )
         .await
         .expect_err("preflight denied");
-    assert!(matches!(
-        denied,
-        crate::error::AedbError::PermissionDenied(_)
-    ));
+    assert!(matches!(denied, AedbError::PermissionDenied(_)));
 
     let q = db
         .query_with_options_as(
@@ -108,7 +118,7 @@ async fn permissions_enforced_at_preflight_commit_and_query() {
             "p",
             "app",
             Query::select(&["*"]).from("users").limit(10),
-            crate::query::plan::QueryOptions::default(),
+            QueryOptions::default(),
         )
         .await
         .expect("query with read perm");
@@ -192,14 +202,11 @@ async fn join_queries_require_permissions_for_all_referenced_tables() {
             "p",
             "app",
             query.clone(),
-            crate::query::plan::QueryOptions::default(),
+            QueryOptions::default(),
         )
         .await
         .expect_err("join should require global table read");
-    assert!(matches!(
-        denied,
-        crate::query::error::QueryError::PermissionDenied { .. }
-    ));
+    assert!(matches!(denied, QueryError::PermissionDenied { .. }));
 
     db.commit(Mutation::Ddl(DdlOperation::GrantPermission {
         actor_id: None,
@@ -214,13 +221,7 @@ async fn join_queries_require_permissions_for_all_referenced_tables() {
     .await
     .expect("grant global read");
     let _ = db
-        .query_with_options_as(
-            Some(&caller),
-            "p",
-            "app",
-            query,
-            crate::query::plan::QueryOptions::default(),
-        )
+        .query_with_options_as(Some(&caller), "p", "app", query, QueryOptions::default())
         .await
         .expect("join allowed");
 }
@@ -292,7 +293,7 @@ async fn permission_revocation_between_preflight_and_commit_is_caught() {
         .commit_as(caller, mutation)
         .await
         .expect_err("denied at commit");
-    assert!(matches!(err, crate::error::AedbError::PermissionDenied(_)));
+    assert!(matches!(err, AedbError::PermissionDenied(_)));
 }
 
 #[tokio::test]
@@ -773,19 +774,13 @@ async fn kv_permission_overlap_revoke_precedence_is_explicit() {
         .kv_get("p", "app", b"order:1", ConsistencyMode::AtLatest, &alice)
         .await
         .expect_err("revoke broad grant should deny non-matching key");
-    assert!(matches!(
-        denied_key,
-        crate::query::error::QueryError::PermissionDenied { .. }
-    ));
+    assert!(matches!(denied_key, QueryError::PermissionDenied { .. }));
 
     let denied_scope = db
         .kv_get("p", "private", b"user:1", ConsistencyMode::AtLatest, &alice)
         .await
         .expect_err("narrow app grant should not spill into private scope");
-    assert!(matches!(
-        denied_scope,
-        crate::query::error::QueryError::PermissionDenied { .. }
-    ));
+    assert!(matches!(denied_scope, QueryError::PermissionDenied { .. }));
 }
 
 #[tokio::test]
@@ -1036,10 +1031,7 @@ async fn grant_and_revoke_authorization_matrix_is_enforced() {
         )
         .await
         .expect_err("reader should lose access after revoke");
-    assert!(matches!(
-        denied_query,
-        crate::query::error::QueryError::PermissionDenied { .. }
-    ));
+    assert!(matches!(denied_query, QueryError::PermissionDenied { .. }));
 }
 
 #[tokio::test]
@@ -2161,7 +2153,7 @@ async fn postflight_assertions_require_read_permission_in_secure_mode() {
                     project_id: "p".into(),
                     scope_id: "app".into(),
                     key: b"secret".to_vec(),
-                    op: crate::commit::validation::CompareOp::Eq,
+                    op: CompareOp::Eq,
                     threshold: b"guess".to_vec(),
                 }],
             },
@@ -2208,10 +2200,10 @@ async fn envelope_assertions_require_read_permission_in_secure_mode() {
                 project_id: "p".into(),
                 scope_id: "app".into(),
                 key: b"secret".to_vec(),
-                op: crate::commit::validation::CompareOp::Eq,
+                op: CompareOp::Eq,
                 threshold: b"guess".to_vec(),
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
+            read_set: ReadSet::default(),
             write_intent: WriteIntent {
                 mutations: Vec::new(),
             },
@@ -4148,7 +4140,7 @@ fn assertion_denial_cases() -> Vec<(&'static str, ReadAssertion)> {
                 project_id: "p".into(),
                 scope_id: "app".into(),
                 key: b"secret:key".to_vec(),
-                op: crate::commit::validation::CompareOp::Eq,
+                op: CompareOp::Eq,
                 threshold: b"wrong".to_vec(),
             },
         ),
@@ -4198,7 +4190,7 @@ fn assertion_denial_cases() -> Vec<(&'static str, ReadAssertion)> {
                 table_name: "secret_rows".into(),
                 primary_key: vec![Value::Integer(1)],
                 column: "amount".into(),
-                op: crate::commit::validation::CompareOp::Eq,
+                op: CompareOp::Eq,
                 threshold: Value::Integer(0),
             },
         ),
@@ -4209,7 +4201,7 @@ fn assertion_denial_cases() -> Vec<(&'static str, ReadAssertion)> {
                 scope_id: "app".into(),
                 table_name: "secret_rows".into(),
                 filter: Some(Expr::Eq("amount".into(), Value::Integer(42))),
-                op: crate::commit::validation::CompareOp::Eq,
+                op: CompareOp::Eq,
                 threshold: 0,
             },
         ),
@@ -4221,7 +4213,7 @@ fn assertion_denial_cases() -> Vec<(&'static str, ReadAssertion)> {
                 table_name: "secret_rows".into(),
                 column: "amount".into(),
                 filter: Some(Expr::Eq("id".into(), Value::Integer(1))),
-                op: crate::commit::validation::CompareOp::Eq,
+                op: CompareOp::Eq,
                 threshold: Value::Integer(0),
             },
         ),
@@ -4270,7 +4262,7 @@ async fn secure_mode_denies_every_read_assertion_variant_before_evaluation() {
                 idempotency_key: None,
                 write_class: WriteClass::Standard,
                 assertions: vec![assertion],
-                read_set: crate::commit::tx::ReadSet::default(),
+                read_set: ReadSet::default(),
                 write_intent: WriteIntent {
                     mutations: vec![Mutation::KvSet {
                         project_id: "p".into(),

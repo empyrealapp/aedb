@@ -1,4 +1,12 @@
-use super::*;
+use super::{
+    AedbConfig, AedbError, AedbInstance, CallerContext, ConsistencyMode, DdlOperation, Expr,
+    LifecycleEvent, LifecycleHook, Mutation, Permission, Query, QueryOptions,
+    ReactiveProcessorOptions, RecordingLifecycleHook, Value,
+};
+use crate::catalog::SYSTEM_PROJECT_ID;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn event_stream_and_processor_lag_as_require_explicit_permissions() {
@@ -493,7 +501,7 @@ async fn reactive_processor_scheduler_dead_letters_after_retry_exhaustion() {
 
     let dlq = db
         .query(
-            crate::catalog::SYSTEM_PROJECT_ID,
+            SYSTEM_PROJECT_ID,
             "app",
             Query::select(&["processor_name", "event_key", "attempts"])
                 .from("reactive_processor_dead_letters")
@@ -577,7 +585,7 @@ async fn reactive_processor_scheduler_uses_explicit_caller_permissions() {
             delegable: false,
             caller_id: "proc_sched".into(),
             permission: Permission::TableWrite {
-                project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+                project_id: SYSTEM_PROJECT_ID.into(),
                 scope_id: "app".into(),
                 table_name: "reactive_processor_registry".into(),
             },
@@ -628,17 +636,17 @@ async fn reactive_processor_scheduler_uses_explicit_caller_permissions() {
 
     for permission in [
         Permission::TableRead {
-            project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+            project_id: SYSTEM_PROJECT_ID.into(),
             scope_id: "app".into(),
             table_name: "event_outbox".into(),
         },
         Permission::TableRead {
-            project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+            project_id: SYSTEM_PROJECT_ID.into(),
             scope_id: "app".into(),
             table_name: "reactive_processor_checkpoints".into(),
         },
         Permission::TableWrite {
-            project_id: crate::catalog::SYSTEM_PROJECT_ID.into(),
+            project_id: SYSTEM_PROJECT_ID.into(),
             scope_id: "app".into(),
             table_name: "reactive_processor_checkpoints".into(),
         },

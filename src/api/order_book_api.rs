@@ -1,4 +1,24 @@
-use crate::*;
+use crate::catalog::types::{Row, Value};
+use crate::commit::executor::CommitResult;
+use crate::commit::tx::{
+    ReadAssertion, ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
+};
+use crate::commit::validation::{Mutation, validate_mutation_with_config};
+use crate::error::AedbError;
+use crate::order_book::{
+    ExecInstruction, ExecutionReport, FillRecord, FillSpec, InstrumentConfig, OrderBookDepth,
+    OrderBookTableMode, OrderRecord, OrderRequest, OrderSide, OrderStatus, OrderType, Spread,
+    TimeInForce, key_client_id, key_order, read_last_execution_report, read_open_orders,
+    read_order_status, read_recent_trades, read_spread, read_top_n, scoped_instrument,
+    u256_from_be,
+};
+use crate::permission::{CallerContext, Permission};
+use crate::preflight::PreflightResult;
+use crate::query::error::QueryError;
+use crate::query::plan::ConsistencyMode;
+use crate::query_authorization::ensure_query_caller_allowed;
+use crate::{AedbInstance, CommitFinality, CompareAndSwapRequest};
+use std::sync::atomic::Ordering;
 
 impl AedbInstance {
     pub async fn order_book_new(
@@ -426,7 +446,7 @@ impl AedbInstance {
         }
         if !matches!(
             order.status,
-            crate::order_book::OrderStatus::Open | crate::order_book::OrderStatus::PartiallyFilled
+            OrderStatus::Open | OrderStatus::PartiallyFilled
         ) || u256_from_be(order.remaining_qty_be).is_zero()
         {
             return Err(AedbError::Validation(format!(
@@ -603,7 +623,7 @@ impl AedbInstance {
         }
         if !matches!(
             order.status,
-            crate::order_book::OrderStatus::Open | crate::order_book::OrderStatus::PartiallyFilled
+            OrderStatus::Open | OrderStatus::PartiallyFilled
         ) || u256_from_be(order.remaining_qty_be).is_zero()
         {
             return Err(AedbError::Validation(format!(
@@ -898,7 +918,7 @@ impl AedbInstance {
         }
         if !matches!(
             order.status,
-            crate::order_book::OrderStatus::Open | crate::order_book::OrderStatus::PartiallyFilled
+            OrderStatus::Open | OrderStatus::PartiallyFilled
         ) || u256_from_be(order.remaining_qty_be).is_zero()
         {
             return Err(AedbError::Validation(format!(
@@ -1250,7 +1270,7 @@ impl AedbInstance {
         limit: u32,
         consistency: ConsistencyMode,
         caller: &CallerContext,
-    ) -> Result<Vec<crate::order_book::FillRecord>, QueryError> {
+    ) -> Result<Vec<FillRecord>, QueryError> {
         ensure_query_caller_allowed(caller)?;
         let lease = self
             .acquire_snapshot(consistency)
@@ -1320,7 +1340,7 @@ impl AedbInstance {
         instrument: &str,
         consistency: ConsistencyMode,
         caller: &CallerContext,
-    ) -> Result<Option<crate::order_book::ExecutionReport>, QueryError> {
+    ) -> Result<Option<ExecutionReport>, QueryError> {
         ensure_query_caller_allowed(caller)?;
         let lease = self
             .acquire_snapshot(consistency)
@@ -1354,16 +1374,16 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: None,
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::RowVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::RowVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: table_name.to_string(),
                 primary_key: primary_key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::Upsert {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),
@@ -1384,16 +1404,16 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: Some(request.caller),
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::RowVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::RowVersion {
                 project_id: request.project_id.clone(),
                 scope_id: request.scope_id.clone(),
                 table_name: request.table_name.clone(),
                 primary_key: request.primary_key.clone(),
                 expected_seq: request.expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::Upsert {
                     project_id: request.project_id,
                     scope_id: request.scope_id,
@@ -1444,16 +1464,16 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: None,
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::RowVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::RowVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: table_name.to_string(),
                 primary_key: primary_key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::TableIncU256 {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),
@@ -1483,16 +1503,16 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: Some(caller),
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::RowVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::RowVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: table_name.to_string(),
                 primary_key: primary_key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::TableIncU256 {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),
@@ -1521,16 +1541,16 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: None,
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::RowVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::RowVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: table_name.to_string(),
                 primary_key: primary_key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::TableDecU256 {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),
@@ -1560,16 +1580,16 @@ impl AedbInstance {
         self.commit_envelope(TransactionEnvelope {
             caller: Some(caller),
             idempotency_key: None,
-            write_class: crate::commit::tx::WriteClass::Standard,
-            assertions: vec![crate::commit::tx::ReadAssertion::RowVersion {
+            write_class: WriteClass::Standard,
+            assertions: vec![ReadAssertion::RowVersion {
                 project_id: project_id.to_string(),
                 scope_id: scope_id.to_string(),
                 table_name: table_name.to_string(),
                 primary_key: primary_key.clone(),
                 expected_seq,
             }],
-            read_set: crate::commit::tx::ReadSet::default(),
-            write_intent: crate::commit::tx::WriteIntent {
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
                 mutations: vec![Mutation::TableDecU256 {
                     project_id: project_id.to_string(),
                     scope_id: scope_id.to_string(),

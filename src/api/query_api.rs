@@ -1,4 +1,23 @@
-use crate::*;
+use crate::catalog::namespace_key;
+use crate::catalog::types::Value;
+use crate::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
+use crate::commit::validation::{Mutation, TableUpdateExpr};
+use crate::error::AedbError;
+use crate::query::error::QueryError;
+use crate::query::executor::QueryResult;
+use crate::query::plan::{ConsistencyMode, Expr, Order, Query, QueryOptions};
+use crate::query_authorization::{ensure_external_caller_allowed, ensure_query_caller_allowed};
+use crate::query_runtime::{
+    QueryExecutionContext, execute_query_against_view, explain_query_against_view,
+    resolve_query_table_ref,
+};
+use crate::{
+    AedbInstance, CallerContext, CommitResult, ListPageResult, ListWithTotalRequest,
+    LookupThenHydrateRequest, MutateWhereReturningResult, QueryBatchItem, QueryDiagnostics,
+    QueryWithDiagnosticsResult, ReadOnlySqlAdapter, ReadTx, SqlTransactionPlan,
+    UpdateWhereExprRequest, UpdateWhereRequest,
+};
+use std::time::Instant;
 
 impl AedbInstance {
     #[deprecated(
@@ -93,15 +112,17 @@ impl AedbInstance {
 
         let mut collector = crate::query::executor::ReadSetCollector::new();
         let mut result = crate::query::executor::execute_query_with_options_capturing(
-            snapshot.as_ref(),
-            catalog.as_ref(),
-            project_id,
-            scope_id,
-            query,
-            &options,
-            seq,
-            self._config.max_scan_rows,
-            Some(&mut collector),
+            crate::query::executor::CapturingQueryExecutionRequest {
+                snapshot: snapshot.as_ref(),
+                catalog: catalog.as_ref(),
+                project_id,
+                scope_id,
+                query,
+                options: &options,
+                snapshot_seq: seq,
+                max_scan_rows: self._config.max_scan_rows,
+                read_set: Some(&mut collector),
+            },
         )?;
         self.sign_query_result_cursor(&mut result)?;
         Ok((result, collector.into_inner()))

@@ -89,15 +89,34 @@ impl SecondaryIndex {
         end: Bound<EncodedKey>,
         limit: usize,
     ) -> Vec<EncodedKey> {
+        self.scan_range_window_ordered(start, end, 0, limit, false)
+    }
+
+    pub fn scan_range_window_ordered(
+        &self,
+        start: Bound<EncodedKey>,
+        end: Bound<EncodedKey>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Vec<EncodedKey> {
         if limit == 0 {
             return Vec::new();
         }
         match &self.store {
-            SecondaryIndexStore::BTree(entries) => entries
-                .range((start, end))
-                .flat_map(|(_, pks)| pks.iter().cloned())
-                .take(limit)
-                .collect(),
+            SecondaryIndexStore::BTree(entries) => {
+                let mut out = Vec::with_capacity(index_scan_capacity_hint(limit));
+                let mut skipped = 0usize;
+                append_window_entries(
+                    entries.range((start, end)),
+                    offset,
+                    limit,
+                    reverse,
+                    &mut skipped,
+                    &mut out,
+                );
+                out
+            }
             SecondaryIndexStore::Hash(_) | SecondaryIndexStore::UniqueHash(_) => Vec::new(),
         }
     }
@@ -118,6 +137,16 @@ impl SecondaryIndex {
         offset: usize,
         limit: usize,
     ) -> Vec<EncodedKey> {
+        self.scan_prefix_window_ordered(prefix, offset, limit, false)
+    }
+
+    pub fn scan_prefix_window_ordered(
+        &self,
+        prefix: Option<&EncodedKey>,
+        offset: usize,
+        limit: usize,
+        reverse: bool,
+    ) -> Vec<EncodedKey> {
         if limit == 0 {
             return Vec::new();
         }
@@ -125,47 +154,38 @@ impl SecondaryIndex {
             return Vec::new();
         };
 
-        let mut out = Vec::with_capacity(limit);
+        let mut out = Vec::with_capacity(index_scan_capacity_hint(limit));
         let mut skipped = 0usize;
 
         match prefix {
-            None => {
-                for (_, pks) in entries {
-                    for pk in pks {
-                        if skipped < offset {
-                            skipped += 1;
-                            continue;
-                        }
-                        if out.len() < limit {
-                            out.push(pk.clone());
-                        }
-                        if out.len() >= limit {
-                            return out;
-                        }
-                    }
-                }
-            }
+            None => append_window_entries(
+                entries.iter(),
+                offset,
+                limit,
+                reverse,
+                &mut skipped,
+                &mut out,
+            ),
             Some(prefix_key) => {
                 let range_end = prefix_successor(prefix_key);
-                let iter = match range_end {
-                    Some(end) => {
-                        entries.range((Bound::Included(prefix_key.clone()), Bound::Excluded(end)))
-                    }
-                    None => entries.range((Bound::Included(prefix_key.clone()), Bound::Unbounded)),
-                };
-                for (_, pks) in iter {
-                    for pk in pks {
-                        if skipped < offset {
-                            skipped += 1;
-                            continue;
-                        }
-                        if out.len() < limit {
-                            out.push(pk.clone());
-                        }
-                        if out.len() >= limit {
-                            return out;
-                        }
-                    }
+                if let Some(end) = range_end {
+                    append_window_entries(
+                        entries.range((Bound::Included(prefix_key.clone()), Bound::Excluded(end))),
+                        offset,
+                        limit,
+                        reverse,
+                        &mut skipped,
+                        &mut out,
+                    );
+                } else {
+                    append_window_entries(
+                        entries.range((Bound::Included(prefix_key.clone()), Bound::Unbounded)),
+                        offset,
+                        limit,
+                        reverse,
+                        &mut skipped,
+                        &mut out,
+                    );
                 }
             }
         }
@@ -212,6 +232,56 @@ impl SecondaryIndex {
     }
 }
 
+fn append_window_entries<'a, I>(
+    entries: I,
+    offset: usize,
+    limit: usize,
+    reverse: bool,
+    skipped: &mut usize,
+    out: &mut Vec<EncodedKey>,
+) where
+    I: DoubleEndedIterator<Item = (&'a EncodedKey, &'a im::OrdSet<EncodedKey>)>,
+{
+    if reverse {
+        for (_, pks) in entries.rev() {
+            if append_window_pks(pks, offset, limit, skipped, out) {
+                return;
+            }
+        }
+    } else {
+        for (_, pks) in entries {
+            if append_window_pks(pks, offset, limit, skipped, out) {
+                return;
+            }
+        }
+    }
+}
+
+fn index_scan_capacity_hint(limit: usize) -> usize {
+    const MAX_INITIAL_INDEX_SCAN_CAPACITY: usize = 1024;
+    limit.min(MAX_INITIAL_INDEX_SCAN_CAPACITY)
+}
+
+fn append_window_pks(
+    pks: &im::OrdSet<EncodedKey>,
+    offset: usize,
+    limit: usize,
+    skipped: &mut usize,
+    out: &mut Vec<EncodedKey>,
+) -> bool {
+    for pk in pks {
+        if *skipped < offset {
+            *skipped += 1;
+            continue;
+        }
+        out.push(pk.clone());
+        if out.len() >= limit {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn extract_index_key(
     row: &Row,
     schema: &TableSchema,
@@ -241,121 +311,5 @@ pub fn extract_index_key_encoded(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{extract_index_key, extract_index_key_encoded};
-    use crate::catalog::schema::{ColumnDef, TableSchema};
-    use crate::catalog::types::{ColumnType, Row, Value};
-    use crate::storage::encoded_key::EncodedKey;
-    use crate::storage::keyspace::SecondaryIndex;
-    use std::ops::Bound;
-
-    #[test]
-    fn secondary_index_insert_remove_and_range() {
-        let mut secondary_index = SecondaryIndex::default();
-        secondary_index.insert(
-            EncodedKey::from_values(&[Value::Integer(10)]),
-            EncodedKey::from_values(&[Value::Integer(1)]),
-        );
-        secondary_index.insert(
-            EncodedKey::from_values(&[Value::Integer(20)]),
-            EncodedKey::from_values(&[Value::Integer(2)]),
-        );
-        secondary_index.insert(
-            EncodedKey::from_values(&[Value::Integer(30)]),
-            EncodedKey::from_values(&[Value::Integer(3)]),
-        );
-
-        let eq = secondary_index.scan_eq(&EncodedKey::from_values(&[Value::Integer(20)]));
-        assert_eq!(eq, vec![EncodedKey::from_values(&[Value::Integer(2)])]);
-
-        let range = secondary_index.scan_range(
-            Bound::Included(EncodedKey::from_values(&[Value::Integer(15)])),
-            Bound::Included(EncodedKey::from_values(&[Value::Integer(30)])),
-        );
-        assert_eq!(range.len(), 2);
-
-        secondary_index.remove(
-            &EncodedKey::from_values(&[Value::Integer(20)]),
-            &EncodedKey::from_values(&[Value::Integer(2)]),
-        );
-        assert!(
-            secondary_index
-                .scan_eq(&EncodedKey::from_values(&[Value::Integer(20)]))
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn extract_index_key_reads_schema_positions() {
-        let schema = TableSchema {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            table_name: "t".into(),
-            owner_id: None,
-            columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    col_type: ColumnType::Integer,
-                    nullable: false,
-                },
-                ColumnDef {
-                    name: "age".into(),
-                    col_type: ColumnType::Integer,
-                    nullable: false,
-                },
-            ],
-            primary_key: vec!["id".into()],
-            constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-        };
-        let row = Row::from_values(vec![Value::Integer(1), Value::Integer(42)]);
-        let key = extract_index_key(&row, &schema, &["age".into()]).expect("extract");
-        assert_eq!(key, vec![Value::Integer(42)]);
-        let encoded = extract_index_key_encoded(&row, &schema, &["age".into()]).expect("encoded");
-        assert_eq!(encoded, EncodedKey::from_values(&[Value::Integer(42)]));
-    }
-
-    #[test]
-    fn extract_index_key_pads_short_rows_with_null() {
-        // Schema declares three columns but the row was written under an older
-        // schema with only the first value. Index extraction must not panic on
-        // the missing slot — it should substitute Null so migrations against
-        // legacy rows can complete.
-        let schema = TableSchema {
-            project_id: "p".into(),
-            scope_id: "app".into(),
-            table_name: "t".into(),
-            owner_id: None,
-            columns: vec![
-                ColumnDef {
-                    name: "id".into(),
-                    col_type: ColumnType::Integer,
-                    nullable: false,
-                },
-                ColumnDef {
-                    name: "age".into(),
-                    col_type: ColumnType::Integer,
-                    nullable: true,
-                },
-                ColumnDef {
-                    name: "tag".into(),
-                    col_type: ColumnType::Text,
-                    nullable: true,
-                },
-            ],
-            primary_key: vec!["id".into()],
-            constraints: Vec::new(),
-            foreign_keys: Vec::new(),
-        };
-        let short_row = Row::from_values(vec![Value::Integer(1)]);
-        let key =
-            extract_index_key(&short_row, &schema, &["age".into(), "tag".into()]).expect("extract");
-        assert_eq!(key, vec![Value::Null, Value::Null]);
-        let encoded = extract_index_key_encoded(&short_row, &schema, &["age".into(), "tag".into()])
-            .expect("encoded");
-        assert_eq!(
-            encoded,
-            EncodedKey::from_values(&[Value::Null, Value::Null])
-        );
-    }
-}
+#[path = "index_tests.rs"]
+mod tests;

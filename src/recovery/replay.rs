@@ -14,18 +14,31 @@ use tracing::warn;
 
 const WAL_REPLAY_BUFFER_BYTES: usize = 1024 * 1024;
 
-#[allow(clippy::too_many_arguments)]
-pub fn replay_segments(
-    segments: &[PathBuf],
-    from_seq_exclusive: u64,
-    to_seq_inclusive: Option<u64>,
-    segment_replay_byte_limits: Option<&HashMap<PathBuf, u64>>,
-    hash_chain_required: bool,
-    strict_recovery: bool,
-    keyspace: &mut Keyspace,
-    catalog: &mut Catalog,
-    idempotency: &mut HashMap<IdempotencyKey, IdempotencyRecord>,
-) -> Result<u64, AedbError> {
+pub struct ReplaySegmentsRequest<'a> {
+    pub segments: &'a [PathBuf],
+    pub from_seq_exclusive: u64,
+    pub to_seq_inclusive: Option<u64>,
+    pub segment_replay_byte_limits: Option<&'a HashMap<PathBuf, u64>>,
+    pub hash_chain_required: bool,
+    pub strict_recovery: bool,
+    pub keyspace: &'a mut Keyspace,
+    pub catalog: &'a mut Catalog,
+    pub idempotency: &'a mut HashMap<IdempotencyKey, IdempotencyRecord>,
+}
+
+pub fn replay_segments(request: ReplaySegmentsRequest<'_>) -> Result<u64, AedbError> {
+    let ReplaySegmentsRequest {
+        segments,
+        from_seq_exclusive,
+        to_seq_inclusive,
+        segment_replay_byte_limits,
+        hash_chain_required,
+        strict_recovery,
+        keyspace,
+        catalog,
+        idempotency,
+    } = request;
+
     let valid_segment_count = validated_hash_chain_prefix_len_from_checkpoint(
         segments,
         hash_chain_required,

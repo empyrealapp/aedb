@@ -1,7 +1,9 @@
+use super::aggregate::{aggregate_col_idx, aggregate_output_name};
+use super::pagination::{
+    compute_page_window, compute_remaining_limit_after_page, compute_split_recommended,
+};
 use super::{
-    CursorToken, QueryResult, aggregate_col_idx, aggregate_output_name,
-    compute_remaining_limit_after_page, compute_split_recommended, encode_cursor, extract_pk_key,
-    extract_sort_key, row_after_cursor,
+    CursorToken, QueryResult, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor,
 };
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
@@ -13,19 +15,35 @@ use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
 use std::collections::HashMap;
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct JoinQueryExecutionRequest<'a> {
+    pub snapshot: &'a KeyspaceSnapshot,
+    pub catalog: &'a Catalog,
+    pub project_id: &'a str,
+    pub scope_id: &'a str,
+    pub query: Query,
+    pub options: QueryOptions,
+    pub snapshot_seq: u64,
+    pub max_scan_rows: usize,
+    pub cursor_state: Option<CursorToken>,
+    pub cursor_signing_key: Option<&'a [u8; 32]>,
+}
+
 pub(super) fn execute_join_query(
-    snapshot: &KeyspaceSnapshot,
-    catalog: &Catalog,
-    project_id: &str,
-    scope_id: &str,
-    query: Query,
-    options: QueryOptions,
-    snapshot_seq: u64,
-    max_scan_rows: usize,
-    cursor_state: Option<CursorToken>,
-    cursor_signing_key: Option<&[u8; 32]>,
+    request: JoinQueryExecutionRequest<'_>,
 ) -> Result<QueryResult, QueryError> {
+    let JoinQueryExecutionRequest {
+        snapshot,
+        catalog,
+        project_id,
+        scope_id,
+        query,
+        options,
+        snapshot_seq,
+        max_scan_rows,
+        cursor_state,
+        cursor_signing_key,
+    } = request;
+
     if query.offset.unwrap_or(0) > 0 && query.limit.is_none() {
         return Err(QueryError::InvalidQuery {
             reason: "OFFSET requires LIMIT".into(),
@@ -285,51 +303,10 @@ pub(super) fn execute_join_query(
         rows.retain(|r| crate::query::operators::eval_compiled_expr_public(&compiled, r));
     }
 
-    if !query.order_by.is_empty() {
-        let order_pairs: Vec<(usize, crate::query::plan::Order)> = query
-            .order_by
-            .iter()
-            .map(|(col, ord)| {
-                columns
-                    .iter()
-                    .position(|c| c == col)
-                    .map(|idx| (idx, *ord))
-                    .ok_or_else(|| QueryError::ColumnNotFound {
-                        table: "join".into(),
-                        column: col.clone(),
-                    })
-            })
-            .collect::<Result<_, _>>()?;
-        rows.sort_by(|a, b| {
-            for (idx, ord) in &order_pairs {
-                let cmp = a.values[*idx].cmp(&b.values[*idx]);
-                let ord_cmp = match ord {
-                    crate::query::plan::Order::Asc => cmp,
-                    crate::query::plan::Order::Desc => cmp.reverse(),
-                };
-                if !ord_cmp.is_eq() {
-                    return ord_cmp;
-                }
-            }
-            std::cmp::Ordering::Equal
-        });
-    }
+    order_join_rows(&mut rows, &columns, &query)?;
 
     let rows_examined = rows.len();
-    let page_size = query.limit.unwrap_or_else(|| {
-        cursor_state
-            .as_ref()
-            .map(|c| c.page_size)
-            .unwrap_or(max_scan_rows.min(100))
-    });
-    let effective_page_size = page_size.min(max_scan_rows);
-    let row_offset_count = query.offset.unwrap_or(0);
-    if row_offset_count.saturating_add(effective_page_size) > max_scan_rows {
-        return Err(QueryError::ScanBoundExceeded {
-            estimated_rows: row_offset_count.saturating_add(effective_page_size) as u64,
-            max_scan_rows: max_scan_rows as u64,
-        });
-    }
+    let page_window = compute_page_window(&query, &cursor_state, max_scan_rows)?;
     let sort_indices: Vec<(usize, crate::query::plan::Order)> = if !query.order_by.is_empty() {
         query
             .order_by
@@ -348,42 +325,22 @@ pub(super) fn execute_join_query(
         {
             continue;
         }
-        if skipped < row_offset_count {
+        if skipped < page_window.row_offset_count {
             skipped += 1;
             continue;
         }
         sliced.push(row);
-        if sliced.len() > effective_page_size {
+        if sliced.len() > page_window.effective_page_size {
             break;
         }
     }
-    let has_more = sliced.len() > effective_page_size;
+    let has_more = sliced.len() > page_window.effective_page_size;
     if has_more {
-        sliced.truncate(effective_page_size);
+        sliced.truncate(page_window.effective_page_size);
     }
     let cursor_last_row = sliced.last().cloned();
 
-    if !query.select.is_empty() && query.select[0] != "*" {
-        let idxs: Vec<usize> = query
-            .select
-            .iter()
-            .map(|col| {
-                columns
-                    .iter()
-                    .position(|c| c == col)
-                    .ok_or_else(|| QueryError::ColumnNotFound {
-                        table: "join".into(),
-                        column: col.clone(),
-                    })
-            })
-            .collect::<Result<_, _>>()?;
-        sliced = sliced
-            .into_iter()
-            .map(|r| Row {
-                values: idxs.iter().map(|i| r.values[*i].clone()).collect(),
-            })
-            .collect();
-    }
+    sliced = project_join_rows(sliced, &columns, &query)?;
 
     let returned_rows = sliced.len();
     let remaining_limit_after_page = compute_remaining_limit_after_page(
@@ -391,7 +348,7 @@ pub(super) fn execute_join_query(
         cursor_state.as_ref().and_then(|c| c.remaining_limit),
         returned_rows,
     );
-    let cursor = if has_more && row_offset_count == 0 {
+    let cursor = if has_more && page_window.row_offset_count == 0 {
         let last_row = cursor_last_row.ok_or_else(|| QueryError::InvalidQuery {
             reason: "invalid cursor state".into(),
         })?;
@@ -400,7 +357,7 @@ pub(super) fn execute_join_query(
                 snapshot_seq,
                 last_sort_key: extract_sort_key(&last_row, &sort_indices),
                 last_pk: extract_pk_key(&last_row, &pk_indices),
-                page_size,
+                page_size: page_window.page_size,
                 remaining_limit: remaining_limit_after_page,
             },
             cursor_signing_key,
@@ -448,6 +405,72 @@ fn is_single_column_primary_key_join(
         .get(right_idx)
         .map(|column| column.name == join_schema.primary_key[0])
         .unwrap_or(false)
+}
+
+fn order_join_rows(rows: &mut [Row], columns: &[String], query: &Query) -> Result<(), QueryError> {
+    if query.order_by.is_empty() {
+        return Ok(());
+    }
+    let order_pairs: Vec<(usize, crate::query::plan::Order)> = query
+        .order_by
+        .iter()
+        .map(|(col, ord)| {
+            columns
+                .iter()
+                .position(|c| c == col)
+                .map(|idx| (idx, *ord))
+                .ok_or_else(|| QueryError::ColumnNotFound {
+                    table: "join".into(),
+                    column: col.clone(),
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    rows.sort_by(|a, b| {
+        for (idx, ord) in &order_pairs {
+            let cmp = a.values[*idx].cmp(&b.values[*idx]);
+            let ord_cmp = match ord {
+                crate::query::plan::Order::Asc => cmp,
+                crate::query::plan::Order::Desc => cmp.reverse(),
+            };
+            if !ord_cmp.is_eq() {
+                return ord_cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(())
+}
+
+fn project_join_rows(
+    rows: Vec<Row>,
+    columns: &[String],
+    query: &Query,
+) -> Result<Vec<Row>, QueryError> {
+    if query.select.is_empty() || query.select[0] == "*" {
+        return Ok(rows);
+    }
+    let selected_indices: Vec<usize> = query
+        .select
+        .iter()
+        .map(|col| {
+            columns
+                .iter()
+                .position(|c| c == col)
+                .ok_or_else(|| QueryError::ColumnNotFound {
+                    table: "join".into(),
+                    column: col.clone(),
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|row| Row {
+            values: selected_indices
+                .iter()
+                .map(|idx| row.values[*idx].clone())
+                .collect(),
+        })
+        .collect())
 }
 
 fn push_joined_row(out: &mut Vec<Row>, left: &Row, right: &Row) {
