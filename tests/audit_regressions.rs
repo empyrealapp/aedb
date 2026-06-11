@@ -35,8 +35,16 @@ async fn hash_index_range_predicate_returns_all_matching_rows() {
         scope_id: "app".into(),
         table_name: "items".into(),
         columns: vec![
-            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
-            ColumnDef { name: "score".into(), col_type: ColumnType::Integer, nullable: false },
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "score".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
         ],
         primary_key: vec!["id".into()],
     }))
@@ -79,7 +87,11 @@ async fn hash_index_range_predicate_returns_all_matching_rows() {
         .await
         .expect("range query on hash index");
     // scores 11..=19 -> 9 rows. Pre-fix this returned 0.
-    assert_eq!(gt.rows.len(), 9, "hash-indexed range predicate dropped rows");
+    assert_eq!(
+        gt.rows.len(),
+        9,
+        "hash-indexed range predicate dropped rows"
+    );
     for row in &gt.rows {
         match row.values[1] {
             Value::Integer(s) => assert!(s > 10, "row {s} violates predicate"),
@@ -116,9 +128,17 @@ async fn equi_join_null_keys_do_not_match() {
             scope_id: "app".into(),
             table_name: table.into(),
             columns: vec![
-                ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
+                ColumnDef {
+                    name: "id".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
                 // Non-PK, nullable join key -> forces the hash-join path.
-                ColumnDef { name: "k".into(), col_type: ColumnType::Integer, nullable: true },
+                ColumnDef {
+                    name: "k".into(),
+                    col_type: ColumnType::Integer,
+                    nullable: true,
+                },
             ],
             primary_key: vec!["id".into()],
         }))
@@ -135,9 +155,15 @@ async fn equi_join_null_keys_do_not_match() {
         row: Row::from_values(vec![Value::Integer(id), k]),
     };
     db.commit(seed("left_t", 1, Value::Null)).await.expect("l1");
-    db.commit(seed("left_t", 2, Value::Integer(5))).await.expect("l2");
-    db.commit(seed("right_t", 10, Value::Null)).await.expect("r1");
-    db.commit(seed("right_t", 11, Value::Integer(5))).await.expect("r2");
+    db.commit(seed("left_t", 2, Value::Integer(5)))
+        .await
+        .expect("l2");
+    db.commit(seed("right_t", 10, Value::Null))
+        .await
+        .expect("r1");
+    db.commit(seed("right_t", 11, Value::Integer(5)))
+        .await
+        .expect("r2");
 
     let joined = db
         .query_with_options(
@@ -148,7 +174,10 @@ async fn equi_join_null_keys_do_not_match() {
                 .alias("x")
                 .inner_join("right_t", "x.k", "k")
                 .with_last_join_alias("y"),
-            QueryOptions { allow_full_scan: true, ..QueryOptions::default() },
+            QueryOptions {
+                allow_full_scan: true,
+                ..QueryOptions::default()
+            },
         )
         .await
         .expect("join query");
@@ -172,9 +201,21 @@ async fn aggregates_handle_floats_and_ignore_nulls() {
         scope_id: "app".into(),
         table_name: "t".into(),
         columns: vec![
-            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
-            ColumnDef { name: "amount".into(), col_type: ColumnType::Float, nullable: false },
-            ColumnDef { name: "opt".into(), col_type: ColumnType::Integer, nullable: true },
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "amount".into(),
+                col_type: ColumnType::Float,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "opt".into(),
+                col_type: ColumnType::Integer,
+                nullable: true,
+            },
         ],
         primary_key: vec!["id".into()],
     }))
