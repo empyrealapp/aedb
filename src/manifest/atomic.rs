@@ -228,7 +228,7 @@ fn reconstruct_manifest(dir: &Path) -> Result<Manifest, AedbError> {
     Ok(manifest)
 }
 
-fn parse_checkpoint_seq(name: &str) -> Option<u64> {
+pub(crate) fn parse_checkpoint_seq(name: &str) -> Option<u64> {
     if !name.starts_with("checkpoint_") || !name.ends_with(".aedb.zst") {
         return None;
     }
@@ -254,7 +254,7 @@ fn fsync_file(path: &Path) -> Result<(), AedbError> {
     Ok(())
 }
 
-fn fsync_dir(path: &Path) -> Result<(), AedbError> {
+pub(crate) fn fsync_dir(path: &Path) -> Result<(), AedbError> {
     let dir = fs::File::open(path)?;
     dir.sync_all()?;
     Ok(())

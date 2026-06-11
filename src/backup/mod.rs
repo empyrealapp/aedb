@@ -246,6 +246,12 @@ pub fn sha256_file_hex(path: &Path) -> Result<String, AedbError> {
     Ok(hex_string(hasher.finalize().as_slice()))
 }
 
+/// SHA-256 of an in-memory buffer, hex-encoded. Matches `sha256_file_hex` so a
+/// payload already read into memory can be verified without re-reading the file.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex_string(Sha256::digest(bytes).as_slice())
+}
+
 fn hmac_hex(key: &[u8], bytes: &[u8]) -> Result<String, AedbError> {
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key)

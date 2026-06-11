@@ -2,9 +2,9 @@ mod integrity;
 pub mod replay;
 pub mod scanner;
 
-use crate::backup::sha256_file_hex;
+use crate::backup::sha256_hex;
 use crate::catalog::Catalog;
-use crate::checkpoint::loader::load_checkpoint_with_key;
+use crate::checkpoint::loader::load_checkpoint_bytes_with_key;
 use crate::commit::tx::{IdempotencyKey, IdempotencyRecord};
 use crate::config::{AedbConfig, RecoveryMode, StorageMode};
 use crate::error::{AedbError, RecoveryIntegrityDiagnostic, RecoveryIntegrityKind};
@@ -17,6 +17,7 @@ use crate::storage::keyspace::Keyspace;
 use crate::storage::kv_segment::KvSegmentStore;
 use crate::storage::value_store::PersistentValueStore;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -398,6 +399,11 @@ fn load_latest_valid_checkpoint(
             continue;
         }
         candidates = candidates.saturating_add(1);
+        // Read the payload once and reuse it for both the manifest-digest check
+        // and decoding, instead of streaming the file for a hash and then
+        // reading it a second time inside the loader.
+        let bytes = fs::read(&cp_path)?;
+        let mut manifest_hash_verified = false;
         if cp.sha256_hex.is_empty() {
             if config.strict_recovery() {
                 failures = failures.saturating_add(1);
@@ -417,7 +423,7 @@ fn load_latest_valid_checkpoint(
             );
             continue;
         } else {
-            let actual = sha256_file_hex(&cp_path)?;
+            let actual = sha256_hex(&bytes);
             if actual != cp.sha256_hex {
                 failures = failures.saturating_add(1);
                 warn!(
@@ -427,9 +433,16 @@ fn load_latest_valid_checkpoint(
                 );
                 continue;
             }
+            manifest_hash_verified = true;
         }
         info!("recovery: load checkpoint {}", cp.filename);
-        match load_checkpoint_with_key(&cp_path, config.checkpoint_key()) {
+        // Skip the loader's internal trailer re-hash when the full payload was
+        // already verified against the manifest digest above.
+        match load_checkpoint_bytes_with_key(
+            &bytes,
+            config.checkpoint_key(),
+            !manifest_hash_verified,
+        ) {
             Ok(loaded) => return Ok(Some(loaded)),
             Err(err) => {
                 failures = failures.saturating_add(1);
