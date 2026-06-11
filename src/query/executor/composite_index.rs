@@ -1,4 +1,5 @@
 use crate::catalog::namespace_key;
+use crate::catalog::schema::IndexType;
 use crate::catalog::types::Value;
 use crate::query::error::QueryError;
 use crate::query::executor::index_diagnostics::{
@@ -94,6 +95,15 @@ fn select_composite_prefix_index<'a>(
             .take_while(|col| equalities.contains_key(*col))
             .count();
         if prefix_cols == 0 {
+            continue;
+        }
+        // A Hash/UniqueHash store can only serve a full-key equality lookup
+        // (scan_eq); a partial prefix routes through scan_prefix*, which returns
+        // no rows for hash stores. Skip them for partial prefixes so the caller
+        // falls back to a residual full-scan filter rather than dropping rows.
+        if prefix_cols < idx_def.columns.len()
+            && !matches!(idx_def.index_type, IndexType::BTree | IndexType::Art)
+        {
             continue;
         }
         if best

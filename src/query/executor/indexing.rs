@@ -1,5 +1,6 @@
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
+use crate::catalog::schema::IndexType;
 use crate::catalog::types::Value;
 use crate::query::error::QueryError;
 use crate::storage::encoded_key::EncodedKey;
@@ -180,12 +181,19 @@ fn indexed_pks_for_predicate_uncapped(
     let mut selected_index_name: Option<&str> = None;
     let ns = namespace_key(context.project_id, context.scope_id);
     let mut equalities = None;
+    // Range/Like/Between lookups require an ordered index. Hash/UniqueHash stores
+    // return no rows for range scans (see SecondaryIndex::scan_range_window_ordered),
+    // so selecting one for a range predicate would silently drop matching rows.
+    // Skip them here and fall back to a residual full-scan filter instead.
+    let lookup_requires_ordered_index = matches!(lookup, IndexLookup::Range { .. });
     for ((p, t, idx_name), idx_def) in &context.catalog.indexes {
         if p != &ns
             || t != context.table_name
             || idx_def.columns.len() != 1
             || idx_def.columns[0] != column
             || !context.table.indexes.contains_key(idx_name)
+            || (lookup_requires_ordered_index
+                && !matches!(idx_def.index_type, IndexType::BTree | IndexType::Art))
         {
             continue;
         }

@@ -808,7 +808,7 @@ pub(in crate::commit::executor) fn revalidate_read_set_for_keyspace(
                 project_id,
                 scope_id,
                 key,
-            } => keyspace.kv_version(project_id, scope_id, key),
+            } => keyspace.try_kv_version(project_id, scope_id, key)?,
         };
         if current_version > envelope.base_seq || current_version > entry.version_at_read {
             return Err(AedbError::Conflict(format!(

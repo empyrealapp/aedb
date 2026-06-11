@@ -199,6 +199,14 @@ pub(super) fn execute_join_query(
                     // Hash join for non-PK equality predicates.
                     let mut right_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                     for right in &join_rows {
+                        // SQL three-valued logic: NULL never equals NULL, so a NULL
+                        // join key can never match. Excluding NULL keys from the
+                        // probe map makes NULL-keyed left rows fall through to the
+                        // outer-join null-extension branch instead of spuriously
+                        // matching other NULL-keyed right rows.
+                        if matches!(right.values[right_idx], Value::Null) {
+                            continue;
+                        }
                         right_map
                             .entry(right.values[right_idx].clone())
                             .or_default()
@@ -227,6 +235,12 @@ pub(super) fn execute_join_query(
                     .unwrap_or_default();
                 let mut left_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                 for left in &rows {
+                    // NULL never equals NULL (see the inner/left hash-join note):
+                    // keep NULL keys out of the probe map so NULL-keyed right rows
+                    // fall through to right-join null-extension.
+                    if matches!(left.values[left_idx], Value::Null) {
+                        continue;
+                    }
                     left_map
                         .entry(left.values[left_idx].clone())
                         .or_default()
