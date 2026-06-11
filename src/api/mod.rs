@@ -1,5 +1,11 @@
 pub(crate) mod backup_restore;
+pub(crate) mod effect_checkpoint;
+pub(crate) mod event_query;
+pub(crate) mod event_retention;
+pub(crate) mod inspect;
 pub(crate) mod kv_api;
+pub(crate) mod monitor;
 pub(crate) mod order_book_api;
+pub(crate) mod projection;
 pub(crate) mod query_api;
 pub(crate) mod reactive_processors;
