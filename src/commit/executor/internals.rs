@@ -184,7 +184,7 @@ fn apply_keyspace_only_mutation(
         } => Some((|| {
             if let Some(expected_seq) = expected_seq {
                 let actual = keyspace
-                    .kv_get(project_id, scope_id, key)
+                    .try_kv_get(project_id, scope_id, key)?
                     .map(|entry| entry.version)
                     .unwrap_or(0);
                 if actual != *expected_seq {
@@ -329,7 +329,7 @@ fn apply_keyspace_only_mutation(
         } => Some((|| {
             if let Some(expected_seq) = expected_seq {
                 let actual = keyspace
-                    .kv_get(project_id, scope_id, key)
+                    .try_kv_get(project_id, scope_id, key)?
                     .map(|entry| entry.version)
                     .unwrap_or(0);
                 if actual != *expected_seq {
@@ -2446,11 +2446,18 @@ pub(super) fn process_commit_epoch(
             );
         }
     }
-    if state.wal.should_rotate().is_some() {
-        let _ = state
-            .wal
-            .rotate()
-            .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())));
+    if let Some(reason) = state.wal.should_rotate()
+        && let Err(err) = state.wal.rotate()
+    {
+        // The epoch is already durable at this point, so a rotation failure does
+        // not invalidate the committed data. It must not be silent, though: a
+        // persistent failure lets the active segment grow unbounded and degrades
+        // recovery, so surface it for operators rather than dropping it.
+        warn!(
+            reason = ?reason,
+            error = %err,
+            "aedb WAL segment rotation failed; active segment will continue to grow"
+        );
     }
 
     let durable_head = state.durable_head_seq;
@@ -2763,11 +2770,18 @@ fn process_inline_kv_set_epoch_fast_path(
             );
         }
     }
-    if state.wal.should_rotate().is_some() {
-        let _ = state
-            .wal
-            .rotate()
-            .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())));
+    if let Some(reason) = state.wal.should_rotate()
+        && let Err(err) = state.wal.rotate()
+    {
+        // The epoch is already durable at this point, so a rotation failure does
+        // not invalidate the committed data. It must not be silent, though: a
+        // persistent failure lets the active segment grow unbounded and degrades
+        // recovery, so surface it for operators rather than dropping it.
+        warn!(
+            reason = ?reason,
+            error = %err,
+            "aedb WAL segment rotation failed; active segment will continue to grow"
+        );
     }
 
     let durable_head = state.durable_head_seq;
@@ -3100,7 +3114,7 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
         cancellations.push(cancel);
     }
 
-    for (deferred, rx) in deferred_commits.iter().zip(receivers.into_iter()) {
+    for (deferred, rx) in deferred_commits.iter().zip(receivers) {
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(epoch_apply_timeout_ms) {
             for c in &cancellations {
@@ -4748,7 +4762,7 @@ fn apply_kv_projection_delta(
                 KvProjectionRow {
                     key: key.clone(),
                     value: value.clone(),
-                    commit_seq: state.keyspace.kv_version(project_id, scope_id, key),
+                    commit_seq: state.keyspace.try_kv_version(project_id, scope_id, key)?,
                     updated_at: now_micros(),
                 },
             )?;
@@ -4825,7 +4839,7 @@ fn apply_kv_projection_delta(
             key,
             ..
         } if namespace_key(p, s) == namespace => {
-            if let Some(entry) = state.keyspace.kv_get(project_id, scope_id, key) {
+            if let Some(entry) = state.keyspace.try_kv_get(project_id, scope_id, key)? {
                 upsert_kv_projection_row(
                     state,
                     project_id,
@@ -5016,10 +5030,10 @@ pub(super) fn apply_projection_delta(
                 projection_rows.clear();
             }
         }
-        Mutation::Ddl(crate::catalog::DdlOperation::DropProject { project_id, .. }) => {
-            if ns.starts_with(&(project_id.to_owned() + "::")) {
-                projection_rows.clear();
-            }
+        Mutation::Ddl(crate::catalog::DdlOperation::DropProject { project_id, .. })
+            if ns.starts_with(&(project_id.to_owned() + "::")) =>
+        {
+            projection_rows.clear();
         }
         _ => {}
     }

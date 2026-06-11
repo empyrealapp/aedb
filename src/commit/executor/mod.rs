@@ -1647,11 +1647,7 @@ impl CommitExecutor {
     pub fn metrics(&self) -> ExecutorMetrics {
         let commits_total = self.telemetry.commits_total.load(Ordering::Relaxed);
         let total_latency = self.telemetry.total_latency_micros.load(Ordering::Relaxed);
-        let avg_commit_latency_micros = if commits_total == 0 {
-            0
-        } else {
-            total_latency / commits_total
-        };
+        let avg_commit_latency_micros = total_latency.checked_div(commits_total).unwrap_or(0);
         let coordinator_apply_attempts = self
             .telemetry
             .coordinator_apply_attempts
@@ -1660,43 +1656,29 @@ impl CommitExecutor {
             .telemetry
             .coordinator_apply_micros
             .load(Ordering::Relaxed);
-        let avg_coordinator_apply_micros = if coordinator_apply_attempts == 0 {
-            0
-        } else {
-            coordinator_apply_micros / coordinator_apply_attempts
-        };
+        let avg_coordinator_apply_micros = coordinator_apply_micros
+            .checked_div(coordinator_apply_attempts)
+            .unwrap_or(0);
         let wal_sync_ops = self.telemetry.wal_sync_ops.load(Ordering::Relaxed);
         let wal_sync_micros = self.telemetry.wal_sync_micros.load(Ordering::Relaxed);
         let wal_append_ops = self.telemetry.wal_append_ops.load(Ordering::Relaxed);
         let wal_append_bytes = self.telemetry.wal_append_bytes.load(Ordering::Relaxed);
         let wal_append_micros = self.telemetry.wal_append_micros.load(Ordering::Relaxed);
-        let avg_wal_append_micros = if wal_append_ops == 0 {
-            0
-        } else {
-            wal_append_micros / wal_append_ops
-        };
-        let avg_wal_sync_micros = if wal_sync_ops == 0 {
-            0
-        } else {
-            wal_sync_micros / wal_sync_ops
-        };
+        let avg_wal_append_micros = wal_append_micros.checked_div(wal_append_ops).unwrap_or(0);
+        let avg_wal_sync_micros = wal_sync_micros.checked_div(wal_sync_ops).unwrap_or(0);
         let prestage_validate_ops = self.telemetry.prestage_validate_ops.load(Ordering::Relaxed);
         let prestage_validate_micros = self
             .telemetry
             .prestage_validate_micros
             .load(Ordering::Relaxed);
-        let avg_prestage_validate_micros = if prestage_validate_ops == 0 {
-            0
-        } else {
-            prestage_validate_micros / prestage_validate_ops
-        };
+        let avg_prestage_validate_micros = prestage_validate_micros
+            .checked_div(prestage_validate_ops)
+            .unwrap_or(0);
         let epoch_process_ops = self.telemetry.epoch_process_ops.load(Ordering::Relaxed);
         let epoch_process_micros = self.telemetry.epoch_process_micros.load(Ordering::Relaxed);
-        let avg_epoch_process_micros = if epoch_process_ops == 0 {
-            0
-        } else {
-            epoch_process_micros / epoch_process_ops
-        };
+        let avg_epoch_process_micros = epoch_process_micros
+            .checked_div(epoch_process_ops)
+            .unwrap_or(0);
         ExecutorMetrics {
             inflight_commits: self.telemetry.inflight_commits.load(Ordering::Relaxed),
             queued_commits: self.telemetry.queued_commits.load(Ordering::Relaxed),

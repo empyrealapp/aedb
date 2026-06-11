@@ -1601,12 +1601,12 @@ pub fn validate_permissions(
         Mutation::OrderBookCancel { owner, .. }
         | Mutation::OrderBookCancelReplace { owner, .. }
         | Mutation::OrderBookReduce { owner, .. }
-        | Mutation::OrderBookMassCancel { owner, .. } => {
-            if !is_admin && owner != &caller.caller_id {
-                return Err(AedbError::PermissionDenied(
-                    "order owner must match caller".into(),
-                ));
-            }
+        | Mutation::OrderBookMassCancel { owner, .. }
+            if !is_admin && owner != &caller.caller_id =>
+        {
+            return Err(AedbError::PermissionDenied(
+                "order owner must match caller".into(),
+            ));
         }
         _ => {}
     }

@@ -635,23 +635,59 @@ pub struct AggregateOperator {
     examined: usize,
 }
 
+/// A numeric column value coerced for SUM/AVG accumulation. Integer-family
+/// values (`U8`/`U64`/`Integer`) accumulate as `i64` to preserve the historical
+/// integer result type; `Float` switches the accumulator to floating point.
+enum NumericInput {
+    Int(i64),
+    Float(f64),
+}
+
+fn numeric_input(value: &Value) -> Option<NumericInput> {
+    match value {
+        Value::Integer(v) => Some(NumericInput::Int(*v)),
+        Value::U8(v) => Some(NumericInput::Int(*v as i64)),
+        Value::U64(v) => Some(NumericInput::Int(*v as i64)),
+        Value::Float(v) => Some(NumericInput::Float(*v)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum AggregateState {
     Count(i64),
-    Sum(i64),
+    Sum {
+        int: i64,
+        float: f64,
+        has_float: bool,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
-    Avg { total: i64, count: i64 },
+    Avg {
+        int: i64,
+        float: f64,
+        has_float: bool,
+        count: i64,
+    },
 }
 
 impl AggregateState {
     fn from_aggregate(aggregate: &Aggregate) -> Self {
         match aggregate {
             Aggregate::Count => AggregateState::Count(0),
-            Aggregate::Sum(_) => AggregateState::Sum(0),
+            Aggregate::Sum(_) => AggregateState::Sum {
+                int: 0,
+                float: 0.0,
+                has_float: false,
+            },
             Aggregate::Min(_) => AggregateState::Min(None),
             Aggregate::Max(_) => AggregateState::Max(None),
-            Aggregate::Avg(_) => AggregateState::Avg { total: 0, count: 0 },
+            Aggregate::Avg(_) => AggregateState::Avg {
+                int: 0,
+                float: 0.0,
+                has_float: false,
+                count: 0,
+            },
         }
     }
 
@@ -660,42 +696,68 @@ impl AggregateState {
             (AggregateState::Count(v), Aggregate::Count) => {
                 *v = v.saturating_add(1);
             }
-            (AggregateState::Sum(sum), Aggregate::Sum(_)) => {
+            (
+                AggregateState::Sum {
+                    int,
+                    float,
+                    has_float,
+                },
+                Aggregate::Sum(_),
+            ) => {
                 if let Some(column_index) = aggregate_column_index {
-                    let v = match &row.values[column_index] {
-                        Value::Integer(v) => *v,
-                        Value::U8(v) => *v as i64,
-                        _ => 0,
-                    };
-                    *sum = sum.saturating_add(v);
+                    match numeric_input(&row.values[column_index]) {
+                        Some(NumericInput::Int(v)) => *int = int.saturating_add(v),
+                        Some(NumericInput::Float(v)) => {
+                            *float += v;
+                            *has_float = true;
+                        }
+                        None => {}
+                    }
                 }
             }
             (AggregateState::Min(state), Aggregate::Min(_)) => {
                 if let Some(column_index) = aggregate_column_index {
-                    let value = row.values[column_index].clone();
-                    if state.as_ref().is_none_or(|current| value < *current) {
-                        *state = Some(value);
+                    // SQL MIN/MAX ignore NULLs; without this guard a NULL (which
+                    // sorts below every other value) would always win MIN.
+                    let value = &row.values[column_index];
+                    if !matches!(value, Value::Null)
+                        && state.as_ref().is_none_or(|current| value < current)
+                    {
+                        *state = Some(value.clone());
                     }
                 }
             }
             (AggregateState::Max(state), Aggregate::Max(_)) => {
                 if let Some(column_index) = aggregate_column_index {
-                    let value = row.values[column_index].clone();
-                    if state.as_ref().is_none_or(|current| value > *current) {
-                        *state = Some(value);
+                    let value = &row.values[column_index];
+                    if !matches!(value, Value::Null)
+                        && state.as_ref().is_none_or(|current| value > current)
+                    {
+                        *state = Some(value.clone());
                     }
                 }
             }
-            (AggregateState::Avg { total, count }, Aggregate::Avg(_)) => {
+            (
+                AggregateState::Avg {
+                    int,
+                    float,
+                    has_float,
+                    count,
+                },
+                Aggregate::Avg(_),
+            ) => {
                 if let Some(column_index) = aggregate_column_index {
-                    let maybe_v = match &row.values[column_index] {
-                        Value::Integer(v) => Some(*v),
-                        Value::U8(v) => Some(*v as i64),
-                        _ => None,
-                    };
-                    if let Some(v) = maybe_v {
-                        *total = total.saturating_add(v);
-                        *count = count.saturating_add(1);
+                    match numeric_input(&row.values[column_index]) {
+                        Some(NumericInput::Int(v)) => {
+                            *int = int.saturating_add(v);
+                            *count = count.saturating_add(1);
+                        }
+                        Some(NumericInput::Float(v)) => {
+                            *float += v;
+                            *has_float = true;
+                            *count = count.saturating_add(1);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -706,14 +768,34 @@ impl AggregateState {
     fn finalize(self) -> Value {
         match self {
             AggregateState::Count(v) => Value::Integer(v),
-            AggregateState::Sum(v) => Value::Integer(v),
+            AggregateState::Sum {
+                int,
+                float,
+                has_float,
+            } => {
+                if has_float {
+                    Value::Float(int as f64 + float)
+                } else {
+                    Value::Integer(int)
+                }
+            }
             AggregateState::Min(v) => v.unwrap_or(Value::Null),
             AggregateState::Max(v) => v.unwrap_or(Value::Null),
-            AggregateState::Avg { total, count } => {
+            AggregateState::Avg {
+                int,
+                float,
+                has_float,
+                count,
+            } => {
                 if count == 0 {
                     Value::Null
                 } else {
-                    Value::Float(total as f64 / count as f64)
+                    let total = if has_float {
+                        int as f64 + float
+                    } else {
+                        int as f64
+                    };
+                    Value::Float(total / count as f64)
                 }
             }
         }

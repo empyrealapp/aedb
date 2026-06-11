@@ -389,11 +389,21 @@ fn extract_legacy_archive_file<R: Read>(
 }
 
 fn write_compressed_payload_file_synced(path: &Path, compressed: &[u8]) -> Result<(), AedbError> {
-    let mut decoder =
+    let decoder =
         zstd::stream::Decoder::new(compressed).map_err(|e| AedbError::Decode(e.to_string()))?;
+    // Bound decompression to the per-file payload cap so a maliciously crafted
+    // (highly compressible) archive entry cannot expand without limit and
+    // exhaust memory/disk on restore. The `+ 1` lets us detect overruns.
+    let mut limited = decoder.take(MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES + 1);
     let mut file =
         BufWriter::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, fs::File::create(path)?);
-    std::io::copy(&mut decoder, &mut file)?;
+    let written =
+        std::io::copy(&mut limited, &mut file).map_err(|e| AedbError::Decode(e.to_string()))?;
+    if written > MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES {
+        return Err(AedbError::Decode(
+            "backup archive entry exceeds maximum decompressed size".into(),
+        ));
+    }
     file.flush()?;
     file.get_ref().sync_all()?;
     if let Some(parent) = path.parent() {

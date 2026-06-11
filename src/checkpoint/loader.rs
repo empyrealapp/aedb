@@ -9,7 +9,14 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::Path;
+
+/// Upper bound on decompressed checkpoint size. A checkpoint is fully
+/// materialized in memory when loaded, so any realistic checkpoint is far below
+/// this; the cap exists only to stop a maliciously crafted (highly compressible)
+/// checkpoint from expanding without limit and exhausting memory on recovery.
+const MAX_CHECKPOINT_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 pub fn load_checkpoint(
     path: &Path,
@@ -53,10 +60,11 @@ pub fn load_checkpoint_with_key(
         }
         Cow::Borrowed(compressed)
     };
-    let mut decoder = zstd::stream::Decoder::new(compressed.as_ref())
+    let decoder = zstd::stream::Decoder::new(compressed.as_ref())
         .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))?;
+    let mut limited = decoder.take(MAX_CHECKPOINT_DECOMPRESSED_BYTES);
     let data: CheckpointData =
-        rmp_serde::from_read(&mut decoder).map_err(|e| AedbError::Decode(e.to_string()))?;
+        rmp_serde::from_read(&mut limited).map_err(|e| AedbError::Decode(e.to_string()))?;
     let mut keyspace = Keyspace {
         primary_index_backend: data.keyspace.primary_index_backend,
         value_store: None,

@@ -2448,11 +2448,9 @@ impl AedbInstance {
         };
         let durable_wait_ops = self.durable_wait_ops.load(Ordering::Relaxed);
         let durable_wait_micros = self.durable_wait_micros.load(Ordering::Relaxed);
-        let avg_durable_wait_micros = if durable_wait_ops == 0 {
-            0
-        } else {
-            durable_wait_micros / durable_wait_ops
-        };
+        let avg_durable_wait_micros = durable_wait_micros
+            .checked_div(durable_wait_ops)
+            .unwrap_or(0);
         let upstream_validation_rejections =
             self.upstream_validation_rejections.load(Ordering::Relaxed);
         OperationalMetrics {
