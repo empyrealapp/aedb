@@ -157,7 +157,7 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/api/order_book_api.rs", 1_610),
         ("src/api/kv_api.rs", 1_480),
         ("src/api/reactive_processors.rs", 1_455),
-        ("src/lib_tests/backup_restore.rs", 1_550),
+        ("src/lib_tests/backup_restore.rs", 1_680),
         ("src/lib_tests/kv_api.rs", 1_550),
         // Helper facades should stay thin. Add narrowly named modules instead of rebuilding catch-alls.
         ("src/lib_helpers.rs", 55),

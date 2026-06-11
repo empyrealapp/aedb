@@ -45,18 +45,41 @@ pub fn load_checkpoint_with_key(
     AedbError,
 > {
     let bytes = fs::read(path)?;
+    load_checkpoint_bytes_with_key(&bytes, encryption_key, true)
+}
+
+/// Decodes an already-read checkpoint payload. `verify_trailer` controls the
+/// unencrypted self-check: callers that have already verified the full payload
+/// against a trusted digest (e.g. recovery comparing against the manifest's
+/// `sha256_hex`) can pass `false` to skip re-hashing the compressed body, which
+/// avoids a redundant full pass over large checkpoints.
+pub(crate) fn load_checkpoint_bytes_with_key(
+    bytes: &[u8],
+    encryption_key: Option<&[u8; 32]>,
+    verify_trailer: bool,
+) -> Result<
+    (
+        Keyspace,
+        Catalog,
+        u64,
+        HashMap<IdempotencyKey, IdempotencyRecord>,
+    ),
+    AedbError,
+> {
     let compressed: Cow<'_, [u8]> = if bytes.starts_with(b"AEDBENC1") {
         let key = encryption_key
             .ok_or_else(|| AedbError::Validation("checkpoint requires key".into()))?;
-        Cow::Owned(decrypt_checkpoint_payload(&bytes, key)?)
+        Cow::Owned(decrypt_checkpoint_payload(bytes, key)?)
     } else {
         if bytes.len() < 32 {
             return Err(AedbError::Decode("checkpoint too small".into()));
         }
         let (compressed, trailer_hash) = bytes.split_at(bytes.len() - 32);
-        let actual = Sha256::digest(compressed);
-        if actual.as_slice() != trailer_hash {
-            return Err(AedbError::Validation("checkpoint hash mismatch".into()));
+        if verify_trailer {
+            let actual = Sha256::digest(compressed);
+            if actual.as_slice() != trailer_hash {
+                return Err(AedbError::Validation("checkpoint hash mismatch".into()));
+            }
         }
         Cow::Borrowed(compressed)
     };
@@ -65,16 +88,25 @@ pub fn load_checkpoint_with_key(
     let mut limited = decoder.take(MAX_CHECKPOINT_DECOMPRESSED_BYTES);
     let data: CheckpointData =
         rmp_serde::from_read(&mut limited).map_err(|e| AedbError::Decode(e.to_string()))?;
-    let mut keyspace = Keyspace {
+    // The checkpoint serializes the fully-materialized `mem_bytes` (computed in
+    // `materialized_for_checkpoint`), and we reconstruct the keyspace in that
+    // same inline form, so the stored value is authoritative. Trust it to skip
+    // a full walk over every entry on restore; in debug builds we still verify.
+    let mem_bytes = data.keyspace.mem_bytes;
+    let keyspace = Keyspace {
         primary_index_backend: data.keyspace.primary_index_backend,
         value_store: None,
         kv_segment_store: None,
         persistent_value_inline_threshold_bytes: usize::MAX,
         namespaces: data.keyspace.namespaces,
         async_indexes: data.keyspace.async_indexes,
-        mem_bytes: 0,
+        mem_bytes,
     };
-    keyspace.refresh_mem_bytes();
+    debug_assert_eq!(
+        keyspace.recompute_memory_bytes_full(),
+        mem_bytes,
+        "checkpoint mem_bytes disagrees with recomputed value"
+    );
     Ok((keyspace, data.catalog, data.seq, data.idempotency))
 }
 

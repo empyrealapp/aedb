@@ -88,7 +88,11 @@ pub(crate) fn reclaim_eligible_wal_segments(
         Ok(manifest) => manifest,
         Err(_) => return Ok(0),
     };
-    let Some(checkpointed_through_seq) = manifest.checkpoints.last().map(|cp| cp.seq) else {
+    // Anchor WAL reclamation to the OLDEST retained checkpoint, not the newest,
+    // so that falling back to an older retained checkpoint can still replay the
+    // WAL forward. Reclaiming only below the oldest retained seq keeps the
+    // intermediate segments any fallback would need.
+    let Some(checkpointed_through_seq) = manifest.checkpoints.iter().map(|cp| cp.seq).min() else {
         return Ok(0);
     };
     let segments = read_segments(dir)?;
@@ -105,9 +109,24 @@ pub(crate) fn reclaim_eligible_wal_segments(
         return Ok(0);
     }
 
+    // Hard invariant: never reclaim a segment the current manifest still
+    // references for replay. The manifest lists every segment needed to roll
+    // forward from the oldest retained checkpoint, so this keeps reclamation
+    // consistent with the recovery segment set and prevents recovery from
+    // observing a manifest-referenced-but-missing segment.
+    let referenced: std::collections::HashSet<&str> = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.filename.as_str())
+        .collect();
+
     let mut reclaimed = 0usize;
     for seq in eligible {
-        let path = dir.join(format!("segment_{seq:016}.aedbwal"));
+        let filename = format!("segment_{seq:016}.aedbwal");
+        if referenced.contains(filename.as_str()) {
+            continue;
+        }
+        let path = dir.join(&filename);
         if path.exists() {
             fs::remove_file(&path)?;
             reclaimed = reclaimed.saturating_add(1);

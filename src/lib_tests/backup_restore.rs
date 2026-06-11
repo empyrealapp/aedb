@@ -703,6 +703,106 @@ async fn checkpoint_now_enables_clean_restart() {
 }
 
 #[tokio::test]
+async fn checkpoint_retention_keeps_recent_checkpoints_and_prunes_older_files() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig::default().with_checkpoint_retention_count(2);
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    // Drive several checkpoints, each at a strictly higher seq.
+    let mut checkpoint_seqs = Vec::new();
+    for i in 0..4u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("k{i}").into_bytes(),
+            value: format!("v{i}").into_bytes(),
+        })
+        .await
+        .expect("write");
+        checkpoint_seqs.push(db.checkpoint_now().await.expect("checkpoint"));
+    }
+
+    // Manifest retains exactly the two newest checkpoints, newest last.
+    let manifest = crate::manifest::atomic::load_manifest(dir.path()).expect("manifest");
+    assert_eq!(manifest.checkpoints.len(), 2, "retention count honored");
+    let retained_seqs: Vec<u64> = manifest.checkpoints.iter().map(|cp| cp.seq).collect();
+    let mut expected = checkpoint_seqs.clone();
+    expected.sort_unstable();
+    assert_eq!(retained_seqs, expected[expected.len() - 2..].to_vec());
+
+    // Superseded checkpoint files are pruned from disk; only retained remain.
+    let on_disk: Vec<String> = fs::read_dir(dir.path())
+        .expect("read dir")
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.starts_with("checkpoint_") && name.ends_with(".aedb.zst"))
+        .collect();
+    assert_eq!(on_disk.len(), 2, "older checkpoint files pruned: {on_disk:?}");
+
+    // A clean reopen still recovers the latest state.
+    drop(db);
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let entry = reopened
+        .kv_get_no_auth("p", "app", b"k3", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv_get")
+        .expect("present");
+    assert_eq!(entry.value, b"v3".to_vec());
+}
+
+#[tokio::test]
+async fn checkpoint_does_not_prune_older_checkpoints_when_prior_manifest_unreadable() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig::production([7u8; 32]).with_checkpoint_retention_count(3);
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    for i in 0..2u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("k{i}").into_bytes(),
+            value: b"v".to_vec(),
+        })
+        .await
+        .expect("write");
+        db.checkpoint_now().await.expect("checkpoint");
+    }
+
+    let count_checkpoints = || {
+        fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with("checkpoint_") && name.ends_with(".aedb.zst"))
+            .count()
+    };
+    let before = count_checkpoints();
+    assert!(before >= 2, "expected retained checkpoints, got {before}");
+
+    // Make the signed manifest unreadable: under an HMAC key reconstruction is
+    // disabled, so the next checkpoint sees no prior manifest.
+    let _ = fs::remove_file(dir.path().join("manifest.hmac"));
+    let _ = fs::remove_file(dir.path().join("manifest.hmac.prev"));
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"k2".to_vec(),
+        value: b"v".to_vec(),
+    })
+    .await
+    .expect("write");
+    db.checkpoint_now().await.expect("cp3");
+
+    // The new checkpoint is written, but older files are NOT pruned away.
+    assert!(
+        count_checkpoints() > before,
+        "older checkpoints must survive an unreadable prior manifest"
+    );
+}
+
+#[tokio::test]
 async fn checkpoint_now_in_batch_mode_flushes_wal_and_recovers_tail() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {

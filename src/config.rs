@@ -101,6 +101,12 @@ pub struct AedbConfig {
     /// zstd compression level used for checkpoint payloads.
     /// Typical useful range is 0..=19 where lower is faster and larger.
     pub checkpoint_compression_level: i32,
+    /// Number of most-recent checkpoints to retain in the manifest. Older
+    /// checkpoints (and the WAL segments that precede the oldest retained one)
+    /// are eligible for reclamation. Keeping more than one provides a fallback
+    /// if the newest checkpoint is corrupt, at the cost of extra disk usage.
+    /// Effective value is clamped to at least 1.
+    pub checkpoint_retention_count: usize,
     /// HMAC key for manifest integrity. Wrapped in Arc<Zeroizing<>> to ensure
     /// the key is securely zeroed from memory when the last reference is dropped.
     pub manifest_hmac_key: Option<Arc<Zeroizing<Vec<u8>>>>,
@@ -177,6 +183,7 @@ impl Default for AedbConfig {
             checkpoint_encryption_key: None,
             checkpoint_key_id: None,
             checkpoint_compression_level: 3,
+            checkpoint_retention_count: 3,
             manifest_hmac_key: None,
             cursor_signing_key: None,
             recovery_mode: RecoveryMode::Strict,
@@ -284,5 +291,18 @@ impl AedbConfig {
     pub fn with_checkpoint_compression_level(mut self, level: i32) -> Self {
         self.checkpoint_compression_level = level;
         self
+    }
+
+    /// Sets how many recent checkpoints to retain in the manifest. Values below
+    /// 1 are clamped to 1 by [`AedbConfig::checkpoint_retention_count`].
+    pub fn with_checkpoint_retention_count(mut self, count: usize) -> Self {
+        self.checkpoint_retention_count = count;
+        self
+    }
+
+    /// Effective checkpoint retention count, clamped to at least 1 so the live
+    /// checkpoint is always kept.
+    pub fn checkpoint_retention_count(&self) -> usize {
+        self.checkpoint_retention_count.max(1)
     }
 }

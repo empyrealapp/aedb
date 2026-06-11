@@ -55,6 +55,9 @@ use crate::config_validation::{validate_arcana_config, validate_config, validate
 use crate::ddl_lifecycle::{ddl_would_apply, order_ddl_ops_for_batch};
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
+use crate::checkpoint::retention::{
+    merge_retained_checkpoints, prune_superseded_checkpoint_files,
+};
 use crate::lib_helpers::{seed_system_global_admin, should_fallback_to_recovery};
 use crate::manifest::atomic::write_manifest_atomic_signed;
 use crate::manifest::schema::Manifest;
@@ -2392,6 +2395,7 @@ impl AedbInstance {
         let checkpoint_key = self._config.checkpoint_key().copied();
         let checkpoint_key_id = self._config.checkpoint_key_id.clone();
         let compression_level = self._config.checkpoint_compression_level;
+        let retention_count = self._config.checkpoint_retention_count();
         let manifest_hmac_key = self._config.hmac_key().map(|key| key.to_vec());
         tokio::task::spawn_blocking(move || -> Result<(), AedbError> {
             let checkpoint = write_checkpoint_with_key(
@@ -2405,7 +2409,24 @@ impl AedbInstance {
                 compression_level,
             )?;
 
-            let segments = read_segments_for_checkpoint(&dir, seq)?;
+            // Retain the previous `retention_count` checkpoints so a corrupt
+            // newest checkpoint can fall back to an older one; WAL is anchored to
+            // the OLDEST retained checkpoint so fallback can still replay forward.
+            // If the prior manifest cannot be loaded (first checkpoint, or
+            // corrupt/untrusted under an HMAC key where reconstruction is
+            // disabled), use an empty prior list but DO NOT prune: collapsing the
+            // window to the new seq would delete the older checkpoint files that
+            // are the whole point of retention, right when the manifest is suspect.
+            let prior_manifest =
+                crate::manifest::atomic::load_manifest_signed(&dir, manifest_hmac_key.as_deref());
+            let prune_allowed = prior_manifest.is_ok();
+            let prior = prior_manifest
+                .map(|manifest| manifest.checkpoints)
+                .unwrap_or_default();
+            let checkpoints = merge_retained_checkpoints(prior, checkpoint, retention_count);
+            let oldest_retained_seq = checkpoints.first().map(|cp| cp.seq).unwrap_or(seq);
+
+            let segments = read_segments_for_checkpoint(&dir, oldest_retained_seq)?;
             let active_segment_seq = segments
                 .last()
                 .map(|segment| segment.segment_seq)
@@ -2414,10 +2435,15 @@ impl AedbInstance {
                 durable_seq: seq,
                 visible_seq: seq,
                 active_segment_seq,
-                checkpoints: vec![checkpoint],
+                checkpoints,
                 segments,
             };
             write_manifest_atomic_signed(&manifest, &dir, manifest_hmac_key.as_deref())?;
+            // Manifest is durable (including a dir fsync) before we remove the
+            // now-unreferenced older checkpoint files.
+            if prune_allowed {
+                prune_superseded_checkpoint_files(&dir, oldest_retained_seq);
+            }
             Ok(())
         })
         .await
