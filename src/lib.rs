@@ -516,6 +516,265 @@ pub struct EventStreamPage {
     pub snapshot_seq: u64,
 }
 
+/// Scan direction for [`AedbInstance::query_events`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventOrder {
+    /// Oldest first, ordered by ascending commit sequence (default).
+    #[default]
+    Ascending,
+    /// Newest first, ordered by descending commit sequence. Use for
+    /// "latest N events by type" style queries.
+    Descending,
+}
+
+/// Equality filter against a top-level field of an event's JSON payload.
+///
+/// Lets callers query by `recipient`, `instance_id`, `block`, or any other
+/// attribute carried inside the opaque payload without changing the event
+/// schema. Filters are evaluated at scan time (not via a secondary index),
+/// so always pair them with a `topic` and/or sequence/time bound plus a
+/// sensible `limit` to keep scans bounded (see `max_scan_rows`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventFieldFilter {
+    /// Top-level JSON key to match, e.g. `"recipient"` or `"instance_id"`.
+    pub field: String,
+    /// Expected value, compared against the payload value rendered as a
+    /// string: JSON strings compare by content; numbers and booleans by
+    /// their canonical textual form.
+    pub equals: String,
+}
+
+/// Ergonomic query over the canonical event log (the `event_outbox` system
+/// table). Supports filtering by event type (`topic`), project/scope,
+/// commit-sequence range (cursor pagination), time range, and arbitrary
+/// payload fields (recipient, instance_id, block, ...), in either direction.
+///
+/// Construct with [`EventQuery::new`] and the builder methods, then pass to
+/// [`AedbInstance::query_events`]. Pagination is commit-atomic: a page never
+/// splits the events emitted by a single commit, and the returned
+/// [`EventStreamPage::next_commit_seq`] is the cursor for the next page
+/// (feed it back as `from_commit_seq_exclusive` for ascending queries, or
+/// `to_commit_seq_exclusive` for descending queries).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EventQuery {
+    /// Event type filter (matches the emit `topic`). `None` matches all.
+    pub topic: Option<String>,
+    /// Restrict to events emitted under this project. `None` matches all.
+    pub project_id: Option<String>,
+    /// Restrict to events emitted under this scope. `None` matches all.
+    pub scope_id: Option<String>,
+    /// Exclusive lower bound on commit sequence (ascending cursor).
+    pub from_commit_seq_exclusive: Option<u64>,
+    /// Exclusive upper bound on commit sequence (descending cursor).
+    pub to_commit_seq_exclusive: Option<u64>,
+    /// Inclusive lower bound on event timestamp (micros since epoch).
+    pub from_ts_micros: Option<u64>,
+    /// Inclusive upper bound on event timestamp (micros since epoch).
+    pub to_ts_micros: Option<u64>,
+    /// Payload field equality filters (ANDed together).
+    pub field_filters: Vec<EventFieldFilter>,
+    /// Scan direction.
+    pub order: EventOrder,
+    /// Maximum number of events to return in this page.
+    pub limit: usize,
+}
+
+/// Lifecycle state of an exactly-once external-effect checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectStatus {
+    /// The effect has been claimed but not yet completed (may be mid-flight).
+    Pending,
+    /// The effect completed exactly once; its internal mutations were applied.
+    Committed,
+}
+
+/// Outcome of [`AedbInstance::begin_effect`] — claiming a dedupe key before
+/// performing a side effect (e.g. an external submission or a credit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffectClaim {
+    /// No prior attempt existed; the caller now owns this key and should
+    /// perform the effect, then call [`AedbInstance::complete_effect`].
+    Fresh,
+    /// A prior attempt claimed this key but never completed. `attempts` is the
+    /// total number of claims so far (including this one). The caller must
+    /// decide whether the external effect is safe to repeat — for a
+    /// non-idempotent external API this signals "reconcile before resubmitting".
+    InProgress { attempts: u64 },
+    /// The effect already completed exactly once. The caller must NOT repeat it.
+    /// `result_json` is whatever was recorded at completion (e.g. a tx hash).
+    AlreadyCommitted { result_json: String },
+}
+
+/// A durable record of an external-effect checkpoint. Stored in KV under an
+/// engine-reserved key, so it survives restart, checkpoint, and restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectCheckpointRecord {
+    pub project_id: String,
+    pub scope_id: String,
+    pub dedupe_key: String,
+    pub status: EffectStatus,
+    pub attempts: u64,
+    pub created_at_micros: u64,
+    pub updated_at_micros: u64,
+    pub result_json: String,
+}
+
+/// What a single commit produced — the events it emitted. Answers "what
+/// effects/events did this action commit?" for debugging.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitTrace {
+    pub commit_seq: u64,
+    pub events: Vec<EventOutboxRecord>,
+}
+
+/// Summary of the canonical event log (the `event_outbox` system table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLogSummary {
+    pub count: u64,
+    pub oldest_seq: Option<u64>,
+    pub newest_seq: Option<u64>,
+}
+
+/// Aggregated inspection of one project/scope: its monitors and the state of
+/// its external-effect checkpoints. A one-call dashboard for "which monitor
+/// checkpoint advanced" and "which effects committed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceInspection {
+    pub project_id: String,
+    pub scope_id: String,
+    pub monitors: Vec<MonitorStatus>,
+    pub effect_pending: u64,
+    pub effect_committed: u64,
+}
+
+/// Retention policy for compacting the canonical event log. Events are pruned
+/// only when **every** active constraint permits it (retain if any says keep).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventRetentionPolicy {
+    /// Prune events older than this many microseconds. `None` = no age bound.
+    pub max_age_micros: Option<u64>,
+    /// Always keep at least this many most-recent events. `None` = no count bound.
+    pub keep_last: Option<u64>,
+    /// When true (recommended), never prune events that a reactive processor has
+    /// not yet consumed (i.e. never prune above the slowest processor
+    /// checkpoint). Manual stream consumers must track their own cursors.
+    pub respect_processor_checkpoints: bool,
+    /// Cap the number of events pruned in a single call. `None` defers to
+    /// `max_scan_rows`. If the eligible set is larger, the call reports
+    /// `more_remaining` so the caller can loop.
+    pub max_prune_per_run: Option<usize>,
+}
+
+/// Result of an [`AedbInstance::compact_events`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCompactionReport {
+    /// Number of events deleted.
+    pub pruned_count: u64,
+    /// Smallest commit sequence pruned (the start of the archived range).
+    pub archived_min_seq: Option<u64>,
+    /// Largest commit sequence pruned (the end of the archived range).
+    pub archived_max_seq: Option<u64>,
+    /// The reactive-processor checkpoint floor that capped pruning, if any.
+    pub processor_floor_seq: Option<u64>,
+    /// True if the eligible set was larger than the per-run cap; call again to
+    /// continue.
+    pub more_remaining: bool,
+}
+
+/// A held monitor lease: a single-owner claim with a fencing token and expiry.
+/// The `fencing_token` strictly increases each time ownership changes, so a
+/// checkpoint advance can be rejected if a newer owner has taken over (fencing
+/// out a zombie monitor).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorLease {
+    pub owner_id: String,
+    pub fencing_token: u64,
+    pub lease_until_micros: u64,
+}
+
+/// Result of attempting to acquire a monitor lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseOutcome {
+    /// The caller now holds the lease.
+    Acquired(MonitorLease),
+    /// Another owner holds a live lease; retry after `lease_until_micros`.
+    Held {
+        owner_id: String,
+        lease_until_micros: u64,
+    },
+}
+
+/// Result of renewing a monitor lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewOutcome {
+    Renewed(MonitorLease),
+    /// The fencing token is stale — another owner has taken over. Re-acquire.
+    LeaseLost,
+}
+
+/// Result of a lease-fenced checkpoint advance.
+#[derive(Debug, Clone)]
+pub enum FencedCommit {
+    /// The checkpoint update and caller mutations were applied atomically.
+    Applied(CommitResult),
+    /// The fencing token is no longer current (lease lost or expired). Nothing
+    /// was applied; the caller must re-acquire the lease.
+    LeaseLost,
+}
+
+/// Partial update to a monitor checkpoint. `None` fields are left unchanged.
+/// Used to record scan progress (last scanned block, cursor) and retry state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MonitorCheckpointUpdate {
+    /// The block the monitor started scanning from (typically set once).
+    pub start_block: Option<u64>,
+    /// Highest block fully scanned so far.
+    pub last_scanned_block: Option<u64>,
+    /// Opaque last-processed cursor (e.g. a Nado page cursor).
+    pub last_processed_cursor: Option<String>,
+    /// Retry counter for the current backoff cycle.
+    pub retry_count: Option<u32>,
+    /// Last error string; `Some("")` clears it.
+    pub last_error: Option<String>,
+}
+
+/// Full inspection view of a monitor: scan checkpoint, retry state, and lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorStatus {
+    pub project_id: String,
+    pub scope_id: String,
+    pub monitor: String,
+    pub start_block: Option<u64>,
+    pub last_scanned_block: Option<u64>,
+    pub last_processed_cursor: Option<String>,
+    pub last_update_micros: u64,
+    pub retry_count: u32,
+    pub last_error: Option<String>,
+    pub owner_id: Option<String>,
+    pub fencing_token: u64,
+    pub lease_until_micros: u64,
+}
+
+/// A single entry from a latest-per-key projection view (see the projection
+/// API: latest protocol status, account position summaries, pending intents).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionEntry {
+    pub entity_key: String,
+    pub value_json: String,
+    pub updated_at_micros: u64,
+}
+
+/// Outcome of [`AedbInstance::complete_effect`].
+#[derive(Debug, Clone)]
+pub enum CompleteEffect {
+    /// The internal mutations and the "committed" marker were applied together
+    /// in a single atomic commit (exactly-once).
+    Applied(CommitResult),
+    /// The effect had already been completed by an earlier call; the internal
+    /// mutations were NOT applied again. `result_json` is the recorded result.
+    AlreadyCommitted { result_json: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReactiveProcessorLag {
     pub processor_name: String,

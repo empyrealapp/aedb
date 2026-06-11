@@ -238,6 +238,10 @@ cargo run -p aedb-explorer -- scan-table --data-dir /tmp/aedb-data --project dem
 - `aedb::repository`: typed repository/pagination helpers
 - `aedb::declarative`: declarative schema migration builders
 - `aedb::backup`, `aedb::checkpoint`, `aedb::recovery`: durability and restore path
+- Event & effect primitives (on `AedbInstance`): ergonomic event queries, exactly-once
+  effect checkpoints, bounded projections, monitor leases, event retention, and inspection.
+  See [docs/EVENT_AND_EFFECT_PRIMITIVES.md](docs/EVENT_AND_EFFECT_PRIMITIVES.md) and the
+  runnable `cargo run --example event_effect_primitives`.
 
 ## Development
 
