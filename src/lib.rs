@@ -42,6 +42,7 @@ use crate::catalog::namespace_key;
 use crate::catalog::schema::{AsyncIndexDef, IndexDef, TableSchema};
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
+use crate::checkpoint::retention::{merge_retained_checkpoints, prune_superseded_checkpoint_files};
 use crate::checkpoint::writer::write_checkpoint_with_key;
 use crate::commit::action::{ActionCommitOutcome, ActionCommitResult, ActionEnvelopeRequest};
 use crate::commit::executor::{
@@ -55,9 +56,6 @@ use crate::config_validation::{validate_arcana_config, validate_config, validate
 use crate::ddl_lifecycle::{ddl_would_apply, order_ddl_ops_for_batch};
 use crate::error::AedbError;
 use crate::error::ResourceType as ErrorResourceType;
-use crate::checkpoint::retention::{
-    merge_retained_checkpoints, prune_superseded_checkpoint_files,
-};
 use crate::lib_helpers::{seed_system_global_admin, should_fallback_to_recovery};
 use crate::manifest::atomic::write_manifest_atomic_signed;
 use crate::manifest::schema::Manifest;

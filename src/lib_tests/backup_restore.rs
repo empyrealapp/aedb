@@ -738,7 +738,11 @@ async fn checkpoint_retention_keeps_recent_checkpoints_and_prunes_older_files() 
         .filter_map(|entry| entry.file_name().into_string().ok())
         .filter(|name| name.starts_with("checkpoint_") && name.ends_with(".aedb.zst"))
         .collect();
-    assert_eq!(on_disk.len(), 2, "older checkpoint files pruned: {on_disk:?}");
+    assert_eq!(
+        on_disk.len(),
+        2,
+        "older checkpoint files pruned: {on_disk:?}"
+    );
 
     // A clean reopen still recovers the latest state.
     drop(db);
