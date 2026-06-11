@@ -2991,8 +2991,8 @@ async fn secure_multi_agent_profile_identifies_core_shortcomings() {
                         .await;
                     if matches!(denied, Err(AedbError::PermissionDenied(_))) {
                         stats.unauthorized_denied += 1;
-                    } else if let Err(other) = denied {
-                        return Err(other);
+                    } else {
+                        denied?;
                     }
                 }
             }

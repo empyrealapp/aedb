@@ -3114,7 +3114,7 @@ pub(super) fn apply_deferred_parallel_single_partition_commits(
         cancellations.push(cancel);
     }
 
-    for (deferred, rx) in deferred_commits.iter().zip(receivers.into_iter()) {
+    for (deferred, rx) in deferred_commits.iter().zip(receivers) {
         let elapsed = started.elapsed();
         if elapsed > Duration::from_millis(epoch_apply_timeout_ms) {
             for c in &cancellations {
@@ -5030,10 +5030,10 @@ pub(super) fn apply_projection_delta(
                 projection_rows.clear();
             }
         }
-        Mutation::Ddl(crate::catalog::DdlOperation::DropProject { project_id, .. }) => {
-            if ns.starts_with(&(project_id.to_owned() + "::")) {
-                projection_rows.clear();
-            }
+        Mutation::Ddl(crate::catalog::DdlOperation::DropProject { project_id, .. })
+            if ns.starts_with(&(project_id.to_owned() + "::")) =>
+        {
+            projection_rows.clear();
         }
         _ => {}
     }

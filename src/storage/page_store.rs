@@ -180,7 +180,7 @@ impl PagedStore {
                 .max(PAGE_FRAME_HEADER_BYTES);
             let mut write_buf = Vec::with_capacity(write_buf_capacity);
             file.seek(SeekFrom::End(0))?;
-            for (payload, page_len) in payloads.iter().zip(page_lens.into_iter()) {
+            for (payload, page_len) in payloads.iter().zip(page_lens) {
                 let page_id = PageId(next_page_id);
                 let blake3_hash = page_hash(page_id, payload);
                 let mut header = [0u8; PAGE_FRAME_HEADER_BYTES];
