@@ -453,6 +453,7 @@ async fn strict_open_rejects_directory_previously_opened_in_non_strict_mode() {
 
     let db = AedbInstance::open(permissive, dir.path()).expect("open permissive");
     db.shutdown().await.expect("shutdown permissive");
+    drop(db); // release the data-directory lock before reopening
 
     let strict = AedbConfig::production([7u8; 32]);
     let err = match AedbInstance::open(strict, dir.path()) {
@@ -477,6 +478,7 @@ async fn strict_open_rejects_tampered_trust_mode_marker() {
 
     let db = AedbInstance::open(permissive, dir.path()).expect("open permissive");
     db.shutdown().await.expect("shutdown permissive");
+    drop(db); // release the data-directory lock before reopening
 
     fs::write(
         dir.path().join("trust_mode.json"),

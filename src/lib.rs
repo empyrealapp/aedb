@@ -85,6 +85,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use fs2::FileExt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -122,6 +123,13 @@ pub struct AedbInstance {
     startup_recovered_seq: u64,
     wal_gc_shutdown: Arc<AtomicBool>,
     wal_gc_thread: Option<std::thread::JoinHandle<()>>,
+    /// Exclusive advisory lock on the data directory, held for the lifetime of
+    /// the instance. Prevents a second `AedbInstance` from opening the same
+    /// directory concurrently, which would race two writers (and two WAL-GC
+    /// threads) against the same segments/manifest and corrupt the store. The
+    /// OS releases the lock when this file handle is dropped (i.e. when the
+    /// instance is dropped, after its GC thread is joined).
+    _dir_lock: fs::File,
 }
 
 const SYSTEM_SCOPE_ID: &str = "app";
@@ -997,6 +1005,38 @@ impl AedbInstance {
             "aedb config"
         );
         open_support::create_private_dir_all(dir)?;
+
+        // Acquire an exclusive advisory lock on the data directory before
+        // touching any state. This is the single guard that makes it safe to
+        // assume there is exactly one writer per directory: a second open() on
+        // the same dir (e.g. a stray reopen while the first instance is still
+        // alive) fails fast here instead of silently corrupting WAL segments or
+        // having two GC threads delete each other's live segments. The lock
+        // file name deliberately avoids the ".aedb" substring so it is not
+        // mistaken for existing state by the recovery probe below.
+        let dir_lock = {
+            let lock_path = dir.join(".dirlock");
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)?;
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Err(AedbError::Unavailable {
+                        message: format!(
+                            "another AedbInstance already holds an exclusive lock on {dir:?}; \
+                             refusing to open a second instance on the same data directory \
+                             (concurrent writers would corrupt WAL segments and the manifest)"
+                        ),
+                    });
+                }
+                Err(err) => return Err(AedbError::Io(err)),
+            }
+        };
+
         trust_mode::enforce_and_record_trust_mode(dir, &config)?;
         let has_existing = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
@@ -1094,6 +1134,7 @@ impl AedbInstance {
             startup_recovered_seq,
             wal_gc_shutdown,
             wal_gc_thread: Some(wal_gc_thread),
+            _dir_lock: dir_lock,
         })
     }
 
@@ -2368,6 +2409,12 @@ impl AedbInstance {
     }
 
     pub async fn shutdown(&self) -> Result<(), AedbError> {
+        // Quiesce background reactive-processor loops first. They hold a
+        // Weak<self> and upgrade it per iteration; stopping them ensures no loop
+        // is holding a strong ref when the caller drops its Arc, so the instance
+        // can fully drop and release the exclusive data-directory lock. Registry
+        // state is left untouched so processors auto-resume on the next start.
+        self.stop_all_reactive_runtimes_for_shutdown().await;
         // Ensure batch durability tails are flushed before checkpointing shutdown state.
         let _ = self.force_fsync().await?;
         let _ = self.checkpoint_now().await?;
