@@ -688,6 +688,9 @@ async fn checkpoint_now_enables_clean_restart() {
     let seq = db.checkpoint_now().await.expect("checkpoint");
     assert!(seq >= 3);
 
+    // Release the exclusive data-directory lock before reopening the same dir.
+    drop(db);
+
     let reopened = AedbInstance::open(AedbConfig::default(), dir.path()).expect("reopen");
     let rows = reopened
         .query(

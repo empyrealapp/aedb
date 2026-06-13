@@ -561,6 +561,28 @@ impl AedbInstance {
         self.pause_reactive_processor(processor_name).await
     }
 
+    /// Stop all running reactive-processor loops WITHOUT mutating their
+    /// persisted enabled/disabled registry state, so they auto-resume on the
+    /// next start.
+    ///
+    /// Used during `shutdown()`: the loops hold a `Weak<AedbInstance>` and
+    /// upgrade it for the duration of each iteration. If they keep running while
+    /// the caller drops its `Arc`, a loop mid-iteration keeps the instance alive
+    /// (and the exclusive data-directory lock held), so a fresh open of the same
+    /// directory in the same process would spuriously fail. Aborting the loops
+    /// here lets the instance fully drop and release the lock.
+    pub(crate) async fn stop_all_reactive_runtimes_for_shutdown(&self) {
+        let runtimes: Vec<ReactiveProcessorRuntime> = {
+            let mut map = self.reactive_processor_runtimes.lock().await;
+            map.drain().map(|(_, runtime)| runtime).collect()
+        };
+        for runtime in runtimes {
+            runtime.stop.store(true, Ordering::Release);
+            runtime.join.abort();
+            let _ = runtime.join.await;
+        }
+    }
+
     pub async fn pause_reactive_processor(&self, processor_name: &str) -> Result<(), AedbError> {
         if processor_name.trim().is_empty() {
             return Err(AedbError::Validation(

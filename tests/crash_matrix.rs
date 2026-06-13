@@ -20,6 +20,29 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+/// Reopen a data dir after a simulated crash (`drop` without `shutdown`).
+///
+/// A real crash is process death, which releases the OS-level data-directory
+/// lock instantly. In-process, a detached reactive-processor loop may still be
+/// mid-iteration holding a transient strong ref when `drop` returns, so the
+/// instance (and its lock) is released a few milliseconds later. Retry briefly
+/// to model a supervisor restarting the process.
+async fn reopen_after_simulated_crash(config: AedbConfig, dir: &Path) -> AedbInstance {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match AedbInstance::open(config.clone(), dir) {
+            Ok(db) => return db,
+            Err(AedbError::Unavailable { .. }) if Instant::now() < deadline => {
+                // Yield via the runtime (not a blocking sleep) so the detached
+                // reactive-processor loop can run, drop its transient strong
+                // ref, and let the prior instance fully drop + release the lock.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(err) => panic!("reopen: {err:?}"),
+        }
+    }
+}
+
 fn production_config() -> AedbConfig {
     AedbConfig::production([7u8; 32])
 }
@@ -389,7 +412,7 @@ async fn crash_matrix_reactive_processor_registry_and_checkpoint_resume_after_cr
     // Simulate crash: drop instance without graceful shutdown.
     drop(db);
 
-    let db2 = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("reopen"));
+    let db2 = Arc::new(reopen_after_simulated_crash(config.clone(), dir.path()).await);
     let resumed = db2
         .register_reactive_processor_handler("resume_after_crash", move |_db, _events| async move {
             Ok(())
@@ -458,7 +481,7 @@ async fn crash_matrix_reactive_processor_dlq_survives_crash_recovery() {
 
     drop(db);
 
-    let db2 = AedbInstance::open(config, dir.path()).expect("reopen");
+    let db2 = reopen_after_simulated_crash(config, dir.path()).await;
     let dlq = db2
         .query(
             aedb::catalog::SYSTEM_PROJECT_ID,
