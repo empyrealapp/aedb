@@ -119,6 +119,12 @@ pub struct AedbConfig {
     pub recovery_mode: RecoveryMode,
     pub hash_chain_required: bool,
     pub primary_index_backend: PrimaryIndexBackend,
+    /// When enabled (and a persistent value store is attached), table-row
+    /// payloads are spilled to disk under memory pressure instead of rejecting
+    /// the commit. Coldest rows spill first and are paged back in on read
+    /// through the value store's hot cache. Keys, indexes, and row versions
+    /// remain resident. No effect in `StorageMode::InMemory`.
+    pub table_row_spill_enabled: bool,
     /// Capacity of the public commit-delta broadcast channel
     /// exposed via `AedbInstance::subscribe_commits`. Subscribers
     /// that fall behind beyond this many buffered deltas will
@@ -189,6 +195,7 @@ impl Default for AedbConfig {
             recovery_mode: RecoveryMode::Strict,
             hash_chain_required: true,
             primary_index_backend: PrimaryIndexBackend::OrdMap,
+            table_row_spill_enabled: true,
             commit_broadcast_capacity: 1024,
         }
     }

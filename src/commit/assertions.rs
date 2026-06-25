@@ -7,7 +7,7 @@ use crate::commit::{ReadByteBudget, row_byte_size, value_byte_size};
 use crate::error::AedbError;
 use crate::query::plan::{Expr, MAX_EXPR_IN_LIST_VALUES, MAX_LIKE_PATTERN_BYTES};
 use crate::storage::encoded_key::EncodedKey;
-use crate::storage::keyspace::Keyspace;
+use crate::storage::keyspace::{Keyspace, StoredRow};
 use primitive_types::U256;
 use std::cmp::Ordering;
 
@@ -329,11 +329,12 @@ fn evaluate_assertion(
             let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) else {
                 return Ok(Some(AssertionActual::Missing));
             };
-            let Some(row) = table.rows.get(&EncodedKey::from_values(primary_key)) else {
+            let Some(stored) = table.rows.get(&EncodedKey::from_values(primary_key)) else {
                 return Ok(Some(AssertionActual::Missing));
             };
+            let row = keyspace.materialize_row(stored)?;
             if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(row))?;
+                budget.charge(row_byte_size(&row))?;
             }
             let Some(current) = row.values.get(column_idx) else {
                 return Ok(Some(AssertionActual::Missing));
@@ -359,6 +360,7 @@ fn evaluate_assertion(
                 .map(|table| {
                     count_matching_rows(
                         table.rows.values(),
+                        keyspace,
                         schema,
                         filter,
                         max_scan_rows,
@@ -391,6 +393,7 @@ fn evaluate_assertion(
                 None => zero_for_threshold(threshold),
                 Some(table) => sum_rows_for_column(
                     table.rows.values(),
+                    keyspace,
                     schema,
                     column_idx,
                     filter,
@@ -569,7 +572,8 @@ fn col_value<'a>(row: &'a Row, schema: &TableSchema, col: &str) -> Result<&'a Va
 }
 
 fn sum_rows_for_column<'a>(
-    rows: impl Iterator<Item = &'a Row>,
+    rows: impl Iterator<Item = &'a StoredRow>,
+    keyspace: &Keyspace,
     schema: &TableSchema,
     column_idx: usize,
     filter: &Option<Expr>,
@@ -580,14 +584,15 @@ fn sum_rows_for_column<'a>(
     match col_type {
         ColumnType::U8 | ColumnType::U64 | ColumnType::Integer | ColumnType::Timestamp => {
             let mut sum: i64 = 0;
-            for (scanned, row) in rows.enumerate() {
+            for (scanned, stored) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+                let row = keyspace.materialize_row(stored)?;
                 if let Some(budget) = read_bytes.as_deref_mut() {
                     let touched_bytes =
                         row.values.get(column_idx).map(value_byte_size).unwrap_or(0);
                     budget.charge(touched_bytes)?;
                 }
-                if !match_filter(row, schema, filter)? {
+                if !match_filter(&row, schema, filter)? {
                     continue;
                 }
                 if let Some(value) = row.values.get(column_idx) {
@@ -614,14 +619,15 @@ fn sum_rows_for_column<'a>(
         }
         ColumnType::Float => {
             let mut sum = 0.0f64;
-            for (scanned, row) in rows.enumerate() {
+            for (scanned, stored) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+                let row = keyspace.materialize_row(stored)?;
                 if let Some(budget) = read_bytes.as_deref_mut() {
                     let touched_bytes =
                         row.values.get(column_idx).map(value_byte_size).unwrap_or(0);
                     budget.charge(touched_bytes)?;
                 }
-                if !match_filter(row, schema, filter)? {
+                if !match_filter(&row, schema, filter)? {
                     continue;
                 }
                 if let Some(Value::Float(v)) = row.values.get(column_idx) {
@@ -632,14 +638,15 @@ fn sum_rows_for_column<'a>(
         }
         ColumnType::U256 => {
             let mut sum = U256::zero();
-            for (scanned, row) in rows.enumerate() {
+            for (scanned, stored) in rows.enumerate() {
                 ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+                let row = keyspace.materialize_row(stored)?;
                 if let Some(budget) = read_bytes.as_deref_mut() {
                     let touched_bytes =
                         row.values.get(column_idx).map(value_byte_size).unwrap_or(0);
                     budget.charge(touched_bytes)?;
                 }
-                if !match_filter(row, schema, filter)? {
+                if !match_filter(&row, schema, filter)? {
                     continue;
                 }
                 if let Some(Value::U256(v)) = row.values.get(column_idx) {
@@ -658,19 +665,21 @@ fn sum_rows_for_column<'a>(
 }
 
 fn count_matching_rows<'a>(
-    rows: impl Iterator<Item = &'a Row>,
+    rows: impl Iterator<Item = &'a StoredRow>,
+    keyspace: &Keyspace,
     schema: &TableSchema,
     filter: &Option<Expr>,
     max_scan_rows: usize,
     mut read_bytes: Option<&mut ReadByteBudget>,
 ) -> Result<u64, AedbError> {
     let mut count = 0u64;
-    for (scanned, row) in rows.enumerate() {
+    for (scanned, stored) in rows.enumerate() {
         ensure_assertion_scan_budget(scanned + 1, max_scan_rows)?;
+        let row = keyspace.materialize_row(stored)?;
         if let Some(budget) = read_bytes.as_deref_mut() {
-            budget.charge(row_byte_size(row))?;
+            budget.charge(row_byte_size(&row))?;
         }
-        if match_filter(row, schema, filter)? {
+        if match_filter(&row, schema, filter)? {
             count = count.saturating_add(1);
         }
     }

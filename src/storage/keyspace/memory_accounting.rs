@@ -1,4 +1,6 @@
-use super::{AsyncProjectionData, INLINE_KV_VALUE_MAX_BYTES, KvData, Namespace, TableData};
+use super::{
+    AsyncProjectionData, INLINE_KV_VALUE_MAX_BYTES, KvData, Namespace, StoredRow, TableData,
+};
 use crate::catalog::types::{Row, Value};
 use crate::storage::kv_segment::KvSegmentMeta;
 use crate::storage::value_store::PersistentValueRef;
@@ -27,6 +29,16 @@ pub(crate) fn row_mem_cost(row: &Row) -> usize {
     estimate_row_bytes(row)
         .saturating_add(32)
         .saturating_mul(TABLE_ROW_RESIDENT_FACTOR)
+}
+
+/// Resident cost of a stored row. A spilled row keeps only a value-ref stub in
+/// memory (plus its key entry overhead), so it is accounted like a spilled KV
+/// value rather than its full payload.
+pub(crate) fn stored_row_mem_cost(stored: &StoredRow) -> usize {
+    match stored {
+        StoredRow::Resident(row) => row_mem_cost(row),
+        StoredRow::Spilled(value_ref) => persistent_value_ref_cost(value_ref),
+    }
 }
 
 pub(crate) fn projection_row_mem_cost(row: &Row) -> usize {
@@ -88,7 +100,7 @@ pub(crate) fn kv_segment_meta_cost(meta: &KvSegmentMeta) -> usize {
 }
 
 pub(crate) fn table_data_mem_cost(t: &TableData) -> usize {
-    t.rows.values().map(row_mem_cost).sum::<usize>()
+    t.rows.values().map(stored_row_mem_cost).sum::<usize>()
 }
 
 pub(crate) fn kv_data_mem_cost(kv: &KvData) -> usize {

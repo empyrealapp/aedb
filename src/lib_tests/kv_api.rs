@@ -1445,6 +1445,10 @@ async fn memory_limit_is_enforced_before_wal_commit() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig {
         max_memory_estimate_bytes: 1_000,
+        // This test covers the hard-reject path; disable row spill so the
+        // memory ceiling is enforced by rejection rather than by paging rows
+        // out to disk (which is exercised separately below).
+        table_row_spill_enabled: false,
         ..AedbConfig::default()
     };
     let db = AedbInstance::open(config, dir.path()).expect("open");
@@ -1524,4 +1528,86 @@ fn mutation_write_keys_kv_and_scope_variants() {
         WriteKey::ScopeAll { project_id, scope_id }
             if project_id == "p" && scope_id == "s"
     ));
+}
+
+#[tokio::test]
+async fn row_spill_lets_table_grow_beyond_memory_budget_and_persists() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        // Tiny ceiling so table-row payloads must spill to disk under pressure
+        // instead of the commit being rejected.
+        max_memory_estimate_bytes: 8 * 1024,
+        persistent_value_hot_cache_bytes: 4 * 1024,
+        table_row_spill_enabled: true,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "items",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "blob".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+
+    let payload = "x".repeat(512);
+    for i in 0..64i64 {
+        db.commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(i)],
+            row: Row::from_values(vec![
+                Value::Integer(i),
+                Value::Text(format!("{payload}-{i}").into()),
+            ]),
+        })
+        .await
+        .expect("insert should succeed via row spill rather than be rejected");
+    }
+
+    // Every row is readable, including cold rows paged back in from disk.
+    let rows = db
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["id", "blob"]).from("items").limit(1000),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query rows");
+    assert_eq!(rows.rows.len(), 64, "all spilled rows must be readable");
+
+    db.shutdown().await.expect("shutdown");
+    drop(db);
+
+    // Spilled-row payloads survive recovery.
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let recovered = reopened
+        .query_with_options(
+            "p",
+            "app",
+            Query::select(&["id", "blob"]).from("items").limit(1000),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query rows after recovery");
+    assert_eq!(recovered.rows.len(), 64, "rows must survive recovery");
+    reopened.shutdown().await.expect("shutdown reopened");
 }

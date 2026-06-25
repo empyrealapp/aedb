@@ -82,10 +82,13 @@ pub(super) fn execute_join_query(
             max_scan_rows: max_scan_rows as u64,
         });
     }
-    let mut rows: Vec<Row> = snapshot
-        .table(&base_ns_project, &base_ns_scope, &base_table)
-        .map(|t| t.rows.values().cloned().collect())
-        .unwrap_or_default();
+    let mut rows: Vec<Row> = Vec::new();
+    if let Some(t) = snapshot.table(&base_ns_project, &base_ns_scope, &base_table) {
+        rows.reserve(t.rows.len());
+        for stored in t.rows.values() {
+            rows.push(snapshot.materialize_row(stored)?.into_owned());
+        }
+    }
 
     for join in &query.joins {
         let (jp, js, jt) = resolve_table_ref(project_id, scope_id, &join.table);
@@ -162,9 +165,13 @@ pub(super) fn execute_join_query(
         let mut joined = Vec::new();
         match join.join_type {
             JoinType::Cross => {
-                let join_rows: Vec<&Row> = join_table
-                    .map(|table| table.rows.values().collect())
-                    .unwrap_or_default();
+                let mut join_rows: Vec<Row> = Vec::new();
+                if let Some(table) = join_table {
+                    join_rows.reserve(table.rows.len());
+                    for stored in table.rows.values() {
+                        join_rows.push(snapshot.materialize_row(stored)?.into_owned());
+                    }
+                }
                 for left in &rows {
                     for right in &join_rows {
                         push_joined_row(&mut joined, left, right);
@@ -180,22 +187,30 @@ pub(super) fn execute_join_query(
                 })?;
                 if can_probe_right_primary_key {
                     for left in &rows {
-                        let matched = join_table.and_then(|table| {
+                        let matched_stored = join_table.and_then(|table| {
                             let encoded = EncodedKey::from_values(std::slice::from_ref(
                                 &left.values[left_idx],
                             ));
                             table.rows.get(&encoded)
                         });
-                        if let Some(right) = matched {
+                        let matched = match matched_stored {
+                            Some(stored) => Some(snapshot.materialize_row(stored)?.into_owned()),
+                            None => None,
+                        };
+                        if let Some(right) = &matched {
                             push_joined_row(&mut joined, left, right);
                         } else if matches!(join.join_type, JoinType::Left) {
                             push_left_with_nulls(&mut joined, left, join_schema.columns.len());
                         }
                     }
                 } else {
-                    let join_rows: Vec<&Row> = join_table
-                        .map(|table| table.rows.values().collect())
-                        .unwrap_or_default();
+                    let mut join_rows: Vec<Row> = Vec::new();
+                    if let Some(table) = join_table {
+                        join_rows.reserve(table.rows.len());
+                        for stored in table.rows.values() {
+                            join_rows.push(snapshot.materialize_row(stored)?.into_owned());
+                        }
+                    }
                     // Hash join for non-PK equality predicates.
                     let mut right_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                     for right in &join_rows {
@@ -230,9 +245,13 @@ pub(super) fn execute_join_query(
                 let right_idx = right_idx.ok_or_else(|| QueryError::InvalidQuery {
                     reason: "join requires right join key".into(),
                 })?;
-                let join_rows: Vec<&Row> = join_table
-                    .map(|table| table.rows.values().collect())
-                    .unwrap_or_default();
+                let mut join_rows: Vec<Row> = Vec::new();
+                if let Some(table) = join_table {
+                    join_rows.reserve(table.rows.len());
+                    for stored in table.rows.values() {
+                        join_rows.push(snapshot.materialize_row(stored)?.into_owned());
+                    }
+                }
                 let mut left_map: HashMap<Value, Vec<&Row>> = HashMap::new();
                 for left in &rows {
                     // NULL never equals NULL (see the inner/left hash-join note):

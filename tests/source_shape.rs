@@ -145,8 +145,9 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/commit/executor/internals.rs", 5_200),
         ("src/commit/executor/tests.rs", 4_300),
         ("src/commit/apply.rs", 4_050),
-        ("src/storage/keyspace.rs", 2_900),
-        ("src/lib.rs", 3_360),
+        // Row-spill support (StoredRow + spill_table_rows + materialize helpers).
+        ("src/storage/keyspace.rs", 3_250),
+        ("src/lib.rs", 3_650),
         ("src/catalog/mod.rs", 2_150),
         ("src/commit/validation.rs", 2_800),
         ("src/order_book.rs", 2_200),
@@ -156,9 +157,9 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/lib_tests/commit_ops.rs", 1_750),
         ("src/api/order_book_api.rs", 1_610),
         ("src/api/kv_api.rs", 1_480),
-        ("src/api/reactive_processors.rs", 1_480),
-        ("src/lib_tests/backup_restore.rs", 1_680),
-        ("src/lib_tests/kv_api.rs", 1_550),
+        ("src/api/reactive_processors.rs", 1_520),
+        ("src/lib_tests/backup_restore.rs", 1_780),
+        ("src/lib_tests/kv_api.rs", 1_650),
         // Helper facades should stay thin. Add narrowly named modules instead of rebuilding catch-alls.
         ("src/lib_helpers.rs", 55),
         // Query executor test coverage is split by behavior; keep the shared fixture module small.

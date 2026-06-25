@@ -2206,6 +2206,47 @@ pub(super) fn process_commit_epoch(
             }
         };
     }
+    if state.config.table_row_spill_enabled
+        && pre_wal_memory_estimate > state.config.max_memory_estimate_bytes
+    {
+        pre_wal_memory_estimate = match working_keyspace
+            .spill_table_rows_to_memory_target(state.config.max_memory_estimate_bytes)
+        {
+            Ok(memory_estimate) => memory_estimate,
+            Err(err) => {
+                overwrite_assertion_failures_with_wal_error(
+                    &mut outcomes,
+                    &err,
+                    "epoch aborted during table row spill",
+                );
+                for failed in sequenced {
+                    outcomes.push(EpochOutcome {
+                        request: failed.request,
+                        result: Err(AedbError::Validation(format!(
+                            "epoch aborted during table row spill: {err}"
+                        ))),
+                        post_apply_delta: None,
+                    });
+                }
+                return EpochProcessResult {
+                    outcomes,
+                    coordinator_apply_attempts,
+                    coordinator_apply_micros,
+                    parallel_apply_micros,
+                    pre_wal_micros,
+                    finalize_micros: 0,
+                    read_set_conflicts,
+                    wal_append_ops,
+                    wal_append_bytes,
+                    wal_append_micros,
+                    wal_sync_ops,
+                    wal_sync_micros,
+                    sync_executed,
+                    catalog_changed,
+                };
+            }
+        };
+    }
     if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
         let err_message = format!(
             "memory estimate exceeded before WAL commit: memory_estimate_bytes={}, max_memory_estimate_bytes={}",
@@ -3276,7 +3317,7 @@ fn merge_parallel_namespace_result(
     targets: &ParallelMergeTargets,
 ) {
     use crate::storage::keyspace::{
-        compact_kv_key, kv_entry_cost, kv_tombstone_cost, row_mem_cost, small_kv_entry_cost,
+        compact_kv_key, kv_entry_cost, kv_tombstone_cost, small_kv_entry_cost, stored_row_mem_cost,
         table_data_mem_cost,
     };
     let mut added: usize = 0;
@@ -3310,10 +3351,14 @@ fn merge_parallel_namespace_result(
         let dest_table = dest.tables.entry(table_name.clone()).or_default();
         let source_table = namespace.tables.get(&table_name);
         for row_key in row_keys {
-            let prev_row_cost = dest_table.rows.get(row_key).map(row_mem_cost).unwrap_or(0);
+            let prev_row_cost = dest_table
+                .rows
+                .get(row_key)
+                .map(stored_row_mem_cost)
+                .unwrap_or(0);
             match source_table.and_then(|table| table.rows.get(row_key)) {
                 Some(row) => {
-                    added = added.saturating_add(row_mem_cost(row));
+                    added = added.saturating_add(stored_row_mem_cost(row));
                     dest_table.rows.insert(row_key.clone(), row.clone());
                 }
                 None => {
@@ -3846,10 +3891,11 @@ pub(super) fn enforce_global_unique_scope_invariants(
         } => {
             let schema = table_schema_for(catalog, project_id, scope_id, table_name)?;
             let row_key = EncodedKey::from_values(primary_key);
-            let existing = keyspace
+            let existing_stored = keyspace
                 .table_by_namespace_key(&namespace_key(project_id, scope_id), table_name)
                 .and_then(|t| t.rows.get(&row_key))
                 .ok_or_else(|| AedbError::Validation("row not found".into()))?;
+            let existing = keyspace.materialize_row(existing_stored)?;
             let Some(col_idx) = schema.columns.iter().position(|c| c.name == *column) else {
                 return Err(AedbError::Validation(format!("column not found: {column}")));
             };
@@ -3871,7 +3917,7 @@ pub(super) fn enforce_global_unique_scope_invariants(
             };
             let mut next_be = [0u8; 32];
             next.to_big_endian(&mut next_be);
-            let mut next_row = existing.clone();
+            let mut next_row = existing.into_owned();
             next_row.values[col_idx] = Value::U256(next_be);
             enforce_global_unique_for_row(
                 catalog,
@@ -3959,11 +4005,12 @@ pub(super) fn enforce_global_unique_for_row(
             {
                 continue;
             }
-            for (pk, row) in &table.rows {
+            for (pk, stored) in &table.rows {
                 if ns_key.as_str() == current_ns && pk == &incoming_pk_encoded {
                     continue;
                 }
-                let existing_key = extract_index_key_encoded(row, schema, &def.columns)?;
+                let row = keyspace.materialize_row(stored)?;
+                let existing_key = extract_index_key_encoded(&row, schema, &def.columns)?;
                 if existing_key == incoming_index_key {
                     return Err(AedbError::Validation(format!(
                         "global unique constraint violation on {} ({})",
@@ -4486,8 +4533,9 @@ pub(super) fn refresh_async_indexes(
             && projection_rows.is_empty()
             && let Some(table) = state.keyspace.table_by_namespace_key(ns, table_name)
         {
-            for (pk, row) in &table.rows {
-                let projected = project_row(row, schema, &def.projected_columns)?;
+            for (pk, stored) in &table.rows {
+                let row = state.keyspace.materialize_row(stored)?;
+                let projected = project_row(&row, schema, &def.projected_columns)?;
                 projection_rows.insert(pk.clone(), projected);
             }
             materialized_seq = target_seq;
@@ -4505,8 +4553,9 @@ pub(super) fn refresh_async_indexes(
                 );
                 projection_rows.clear();
                 if let Some(table) = state.keyspace.table_by_namespace_key(ns, table_name) {
-                    for (pk, row) in &table.rows {
-                        let projected = project_row(row, schema, &def.projected_columns)?;
+                    for (pk, stored) in &table.rows {
+                        let row = state.keyspace.materialize_row(stored)?;
+                        let projected = project_row(&row, schema, &def.projected_columns)?;
                         projection_rows.insert(pk.clone(), projected);
                     }
                 }
@@ -4595,8 +4644,9 @@ pub(super) fn refresh_async_indexes(
             if requires_rebuild {
                 projection_rows.clear();
                 if let Some(table) = state.keyspace.table_by_namespace_key(ns, table_name) {
-                    for (pk, row) in &table.rows {
-                        let projected = project_row(row, schema, &def.projected_columns)?;
+                    for (pk, stored) in &table.rows {
+                        let row = state.keyspace.materialize_row(stored)?;
+                        let projected = project_row(&row, schema, &def.projected_columns)?;
                         projection_rows.insert(pk.clone(), projected);
                     }
                 }

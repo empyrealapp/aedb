@@ -114,6 +114,7 @@ async fn recover_replays_wal_without_checkpoint() {
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(99)])
+            .expect("get_row")
             .is_some()
     );
 }
@@ -259,6 +260,7 @@ async fn recover_uses_checkpoint_and_replays_only_durable_tail() {
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(19)])
+            .expect("get_row")
             .is_none()
     );
 }
@@ -333,12 +335,14 @@ async fn recover_replays_only_through_manifest_durable_seq() {
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(4)])
+            .expect("get_row")
             .is_some()
     );
     assert!(
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(9)])
+            .expect("get_row")
             .is_none()
     );
 }
@@ -421,6 +425,7 @@ async fn recover_falls_back_to_older_checkpoint_when_latest_is_corrupt() {
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(1)])
+            .expect("get_row")
             .is_some()
     );
 }
@@ -480,6 +485,7 @@ async fn recover_uses_discovered_checkpoint_without_manifest_reference() {
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(7)])
+            .expect("get_row")
             .is_some()
     );
 }

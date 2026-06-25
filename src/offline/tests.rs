@@ -21,7 +21,7 @@ fn check_invariants_detects_secondary_index_mismatch() {
         structural_version: 0,
         indexes: ImHashMap::new(),
     };
-    table.rows.insert(pk.clone(), row.clone());
+    table.rows.insert(pk.clone(), row.clone().into());
     table.row_versions.insert(pk.clone(), 1);
     table.indexes.insert(
         "by_owner".into(),

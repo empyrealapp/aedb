@@ -1185,10 +1185,13 @@ fn load_table_u256_field(
         .position(|c| c.name == column)
         .ok_or_else(|| AedbError::Validation(format!("column not found: {column}")).to_string())?;
     let row_key = EncodedKey::from_values(primary_key);
-    let row = snapshot
+    let stored = snapshot
         .table(project_id, scope_id, table_name)
         .and_then(|t| t.rows.get(&row_key))
         .ok_or_else(|| AedbError::Validation("row not found".into()).to_string())?;
+    let row = snapshot
+        .materialize_row(stored)
+        .map_err(|e| e.to_string())?;
     let value = row
         .values
         .get(col_idx)

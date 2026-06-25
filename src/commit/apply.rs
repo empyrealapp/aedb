@@ -98,7 +98,7 @@ pub fn apply_mutation_with_read_budget(
                     extract_primary_key_from_row_with_indices(&row, &schema, &primary_key_indices)?;
                 let encoded_pk = EncodedKey::from_values(&primary_key);
                 if keyspace
-                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)
+                    .row_slot(&project_id, &scope_id, &table_name, &encoded_pk)
                     .is_some()
                 {
                     return Err(AedbError::DuplicatePK {
@@ -159,8 +159,8 @@ pub fn apply_mutation_with_read_budget(
                     extract_primary_key_from_row_with_indices(&row, &schema, &primary_key_indices)?;
                 let encoded_pk = EncodedKey::from_values(&primary_key);
                 let old_row = keyspace
-                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)
-                    .cloned();
+                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)?
+                    .map(|row| row.into_owned());
                 apply_upsert_once_with_schema_and_old_row(
                     catalog,
                     keyspace,
@@ -1090,8 +1090,8 @@ fn apply_table_u256_arithmetic(
     let current_row = keyspace
         .table_by_namespace_key(&namespace_key(project_id, scope_id), table_name)
         .and_then(|t| t.rows.get(&EncodedKey::from_values(primary_key)))
-        .ok_or_else(|| AedbError::Validation("row not found".into()))?
-        .clone();
+        .ok_or_else(|| AedbError::Validation("row not found".into()))?;
+    let current_row = keyspace.materialize_row(current_row)?.into_owned();
     let current_value = match current_row.values.get(column_idx) {
         Some(Value::U256(bytes)) => U256::from_big_endian(bytes.as_slice()),
         _ => {
@@ -1184,7 +1184,7 @@ pub fn apply_mutation_trusted_if_eligible(
                 };
                 let encoded_pk = EncodedKey::from_values(&primary_key);
                 if keyspace
-                    .get_row_by_encoded(&project_id, &scope_id, &table_name, &encoded_pk)
+                    .row_slot(&project_id, &scope_id, &table_name, &encoded_pk)
                     .is_some()
                 {
                     result = Err(AedbError::DuplicatePK {
@@ -1984,8 +1984,8 @@ fn apply_upsert_trusted_fast_with_schema(
     commit_seq: u64,
 ) -> Result<(), AedbError> {
     let old_row = keyspace
-        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
-        .cloned();
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)?
+        .map(|row| row.into_owned());
     keyspace.upsert_row_by_encoded_pk(
         project_id,
         scope_id,
@@ -2055,7 +2055,7 @@ fn apply_insert_once(
 ) -> Result<(), AedbError> {
     let encoded_pk = EncodedKey::from_values(&primary_key);
     if keyspace
-        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
+        .row_slot(project_id, scope_id, table_name, &encoded_pk)
         .is_some()
     {
         return Err(AedbError::DuplicatePK {
@@ -2128,8 +2128,8 @@ fn apply_upsert_once_with_schema(
 ) -> Result<(), AedbError> {
     let encoded_pk = EncodedKey::from_values(&primary_key);
     let old_row = keyspace
-        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
-        .cloned();
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)?
+        .map(|row| row.into_owned());
     apply_upsert_once_with_schema_and_old_row(
         catalog,
         keyspace,
@@ -2248,8 +2248,8 @@ fn find_existing_conflict_row(
             let proposed_pk = extract_primary_key_from_row(schema, proposed)?;
             let encoded = EncodedKey::from_values(&proposed_pk);
             let row = keyspace
-                .get_row_by_encoded(project_id, scope_id, table_name, &encoded)
-                .cloned();
+                .get_row_by_encoded(project_id, scope_id, table_name, &encoded)?
+                .map(|row| row.into_owned());
             Ok(row.map(|r| (encoded, r)))
         }
         ConflictTarget::Index(index_name) => lookup_existing_by_unique_index(
@@ -2340,7 +2340,10 @@ fn lookup_existing_by_unique_index(
     let Some(encoded_pk) = index.unique_existing(&lookup_key) else {
         return Ok(None);
     };
-    let existing = table.rows.get(&encoded_pk).cloned();
+    let existing = match table.rows.get(&encoded_pk) {
+        Some(stored) => Some(keyspace.materialize_row(stored)?.into_owned()),
+        None => None,
+    };
     Ok(existing.map(|row| (encoded_pk, row)))
 }
 
@@ -2472,11 +2475,12 @@ fn validate_unique_constraint(
             key: format!("{lookup_key:?}"),
         });
     } else if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (pk, existing_row) in &table.rows {
+        for (pk, existing_stored) in &table.rows {
             if *pk == pk_encoded {
                 continue;
             }
-            let existing_key = extract_index_key_encoded(existing_row, schema, columns)?;
+            let existing_row = keyspace.materialize_row(existing_stored)?;
+            let existing_key = extract_index_key_encoded(&existing_row, schema, columns)?;
             if existing_key == lookup_key {
                 return Err(AedbError::UniqueViolation {
                     table: table_name.to_string(),
@@ -2532,11 +2536,11 @@ fn validate_foreign_keys(
 
         if ref_schema.primary_key == fk.references_columns {
             let exists = keyspace
-                .get_row(
+                .row_slot(
                     &fk.references_project_id,
                     &fk.references_scope_id,
                     &fk.references_table,
-                    &values,
+                    &EncodedKey::from_values(&values),
                 )
                 .is_some();
             if !exists {
@@ -2647,8 +2651,8 @@ fn apply_delete_internal_with_schema(
 ) -> Result<(), AedbError> {
     let encoded_pk = EncodedKey::from_values(primary_key);
     let Some(old_row) = keyspace
-        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
-        .cloned()
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)?
+        .map(|row| row.into_owned())
     else {
         return Ok(());
     };
@@ -2657,8 +2661,13 @@ fn apply_delete_internal_with_schema(
         catalog, keyspace, project_id, scope_id, table_name, &old_row, commit_seq, 0,
     )?;
 
-    let removed =
-        keyspace.delete_row_by_encoded(project_id, scope_id, table_name, &encoded_pk, commit_seq);
+    let removed = keyspace.delete_row_by_encoded(
+        project_id,
+        scope_id,
+        table_name,
+        &encoded_pk,
+        commit_seq,
+    )?;
     maintain_secondary_indexes(
         catalog,
         keyspace,
@@ -2701,12 +2710,13 @@ fn apply_delete_where_internal(
     )?;
     let mut to_delete: Vec<EncodedKey> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (scanned_rows, (encoded_pk, row)) in table.rows.iter().enumerate() {
+        for (scanned_rows, (encoded_pk, stored)) in table.rows.iter().enumerate() {
             ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+            let row = keyspace.materialize_row(stored)?;
             if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(row))?;
+                budget.charge(row_byte_size(&row))?;
             }
-            if !eval_compiled_expr_public(&compiled, row) {
+            if !eval_compiled_expr_public(&compiled, &row) {
                 continue;
             }
             to_delete.push(encoded_pk.clone());
@@ -2771,15 +2781,16 @@ fn apply_update_where_internal(
     }
     let mut staged: Vec<Row> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (scanned_rows, row) in table.rows.values().enumerate() {
+        for (scanned_rows, stored) in table.rows.values().enumerate() {
             ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+            let row = keyspace.materialize_row(stored)?;
             if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(row))?;
+                budget.charge(row_byte_size(&row))?;
             }
-            if !eval_compiled_expr_public(&compiled, row) {
+            if !eval_compiled_expr_public(&compiled, &row) {
                 continue;
             }
-            staged.push(row.clone());
+            staged.push(row.into_owned());
             if limit.is_some_and(|max| staged.len() >= max) {
                 break;
             }
@@ -2866,15 +2877,16 @@ fn apply_update_where_expr_internal(
     }
     let mut staged: Vec<Row> = Vec::new();
     if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (scanned_rows, row) in table.rows.values().enumerate() {
+        for (scanned_rows, stored) in table.rows.values().enumerate() {
             ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+            let row = keyspace.materialize_row(stored)?;
             if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(row))?;
+                budget.charge(row_byte_size(&row))?;
             }
-            if !eval_compiled_expr_public(&compiled, row) {
+            if !eval_compiled_expr_public(&compiled, &row) {
                 continue;
             }
-            staged.push(row.clone());
+            staged.push(row.into_owned());
             if limit.is_some_and(|max| staged.len() >= max) {
                 break;
             }
@@ -3061,7 +3073,8 @@ fn handle_referencing_foreign_keys(
                 continue;
             };
             let mut matched_pks: Vec<EncodedKey> = Vec::new();
-            for (pk, row) in dep_table.rows {
+            for (pk, stored) in dep_table.rows {
+                let row = keyspace.materialize_row(&stored)?;
                 let mut matched = true;
                 for (i, fk_col) in fk.columns.iter().enumerate() {
                     let fk_idx = dep_schema
@@ -3123,8 +3136,8 @@ fn handle_referencing_foreign_keys(
                                 &dep_scope_id,
                                 dep_table_name,
                                 &pk_encoded,
-                            )
-                            .cloned()
+                            )?
+                            .map(|row| row.into_owned())
                             .ok_or_else(|| AedbError::Validation("dependent row missing".into()))?;
                         for fk_col in &fk.columns {
                             if let Some(column_index) =
@@ -3226,8 +3239,8 @@ fn apply_delete_internal_encoded_with_schema(
 ) -> Result<(), AedbError> {
     ensure_cascade_delete_depth(cascade_depth)?;
     let Some(old_row) = keyspace
-        .get_row_by_encoded(project_id, scope_id, table_name, primary_key)
-        .cloned()
+        .get_row_by_encoded(project_id, scope_id, table_name, primary_key)?
+        .map(|row| row.into_owned())
     else {
         return Ok(());
     };
@@ -3242,8 +3255,13 @@ fn apply_delete_internal_encoded_with_schema(
         commit_seq,
         cascade_depth,
     )?;
-    let removed =
-        keyspace.delete_row_by_encoded(project_id, scope_id, table_name, primary_key, commit_seq);
+    let removed = keyspace.delete_row_by_encoded(
+        project_id,
+        scope_id,
+        table_name,
+        primary_key,
+        commit_seq,
+    )?;
     maintain_secondary_indexes(
         catalog,
         keyspace,
@@ -3516,7 +3534,8 @@ fn handle_referencing_foreign_keys_on_update(
                 continue;
             };
             let mut matched_pks: Vec<EncodedKey> = Vec::new();
-            for (pk, row) in dep_table.rows {
+            for (pk, stored) in dep_table.rows {
+                let row = keyspace.materialize_row(&stored)?;
                 let mut matched = true;
                 for (i, fk_col) in fk.columns.iter().enumerate() {
                     let fk_idx = dep_schema
@@ -3564,8 +3583,8 @@ fn handle_referencing_foreign_keys_on_update(
                                 &dep_scope_id,
                                 dep_table_name,
                                 &pk_encoded,
-                            )
-                            .cloned()
+                            )?
+                            .map(|row| row.into_owned())
                             .ok_or_else(|| AedbError::Validation("dependent row missing".into()))?;
                         for (i, fk_col) in fk.columns.iter().enumerate() {
                             if let Some(column_index) =
@@ -3673,8 +3692,9 @@ fn prevalidate_ddl_with_data(
                     if let Some(table) = keyspace
                         .table_by_namespace_key(&namespace_key(project_id, scope_id), table_name)
                     {
-                        for row in table.rows.values() {
-                            let pk = extract_primary_key_from_row(schema, row)?;
+                        for stored in table.rows.values() {
+                            let row = keyspace.materialize_row(stored)?;
+                            let pk = extract_primary_key_from_row(schema, &row)?;
                             let mut tmp_schema = schema.clone();
                             tmp_schema.constraints.push(constraint.clone());
                             validate_row_constraints(
@@ -3685,7 +3705,7 @@ fn prevalidate_ddl_with_data(
                                 scope_id,
                                 table_name,
                                 &pk,
-                                row,
+                                &row,
                                 None,
                             )?;
                         }
@@ -3699,8 +3719,9 @@ fn prevalidate_ddl_with_data(
                     {
                         let mut tmp_schema = schema.clone();
                         tmp_schema.foreign_keys.push(fk.clone());
-                        for row in table.rows.values() {
-                            validate_foreign_keys(catalog, keyspace, &tmp_schema, row, None)?;
+                        for stored in table.rows.values() {
+                            let row = keyspace.materialize_row(stored)?;
+                            validate_foreign_keys(catalog, keyspace, &tmp_schema, &row, None)?;
                         }
                     }
                     Ok(())
@@ -3894,6 +3915,21 @@ fn rebuild_index_for_table(
         .unwrap_or(&crate::catalog::schema::IndexType::BTree);
     let columns_bitmask = idx_def.map(|d| d.columns_bitmask).unwrap_or(0);
     let partial_filter = idx_def.and_then(|d| d.partial_filter.clone());
+    // Materialize all rows up front (paging in spilled payloads) so the index
+    // build below can hold a mutable borrow of the table without conflicting
+    // with the value store read path.
+    let materialized_rows: Vec<(EncodedKey, Row)> =
+        match keyspace.table_by_namespace_key(&ns, table_name) {
+            Some(table) => {
+                let mut rows = Vec::with_capacity(table.rows.len());
+                for (pk, stored) in &table.rows {
+                    rows.push((pk.clone(), keyspace.materialize_row(stored)?.into_owned()));
+                }
+                rows
+            }
+            None => Vec::new(),
+        };
+
     let table = keyspace.table_mut_by_namespace_key(&ns, table_name);
 
     let mut secondary_index = crate::storage::keyspace::SecondaryIndex {
@@ -3911,7 +3947,7 @@ fn rebuild_index_for_table(
         columns_bitmask,
         partial_filter,
     };
-    for (pk, row) in &table.rows {
+    for (pk, row) in &materialized_rows {
         if secondary_index.should_include_row(row, schema, table_name)? {
             if matches!(index_type, crate::catalog::schema::IndexType::UniqueHash)
                 && has_null_in_columns(schema, row, columns)?

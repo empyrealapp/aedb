@@ -167,14 +167,14 @@ impl AedbInstance {
             Value::Text("".into()),
             Value::Text("".into()),
         ]);
-        for row in table
+        for (_, stored) in table
             .rows
             .range((Bound::Included(start_key), Bound::Unbounded))
-            .map(|(_, row)| row)
         {
             if events.len() >= limit {
                 break;
             }
+            let row = lease.view.keyspace.materialize_row(stored)?;
             let (
                 Some(Value::Integer(commit_seq_i64)),
                 Some(Value::Timestamp(ts_i64)),
@@ -418,14 +418,21 @@ impl AedbInstance {
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
         );
-        let current_checkpoint = checkpoint_table
-            .and_then(|table| table.rows.get(&checkpoint_pk))
-            .and_then(|row| row.values.get(1))
-            .and_then(|v| match v {
-                Value::Integer(i) => u64::try_from(*i).ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let current_checkpoint =
+            match checkpoint_table.and_then(|table| table.rows.get(&checkpoint_pk)) {
+                Some(stored) => lease
+                    .view
+                    .keyspace
+                    .materialize_row(stored)?
+                    .values
+                    .get(1)
+                    .and_then(|v| match v {
+                        Value::Integer(i) => u64::try_from(*i).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                None => 0,
+            };
         if checkpoint_seq < current_checkpoint {
             return Err(AedbError::Validation(format!(
                 "checkpoint_seq {checkpoint_seq} regresses current checkpoint {current_checkpoint}"
@@ -512,10 +519,11 @@ impl AedbInstance {
             REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
         ) {
             let pk = EncodedKey::from_values(&[Value::Text(processor_name.to_string().into())]);
-            if let Some(row) = table.rows.get(&pk)
-                && let Some(Value::Integer(v)) = row.values.get(1)
-            {
-                checkpoint_seq = u64::try_from(*v).unwrap_or(0);
+            if let Some(stored) = table.rows.get(&pk) {
+                let row = lease.view.keyspace.materialize_row(stored)?;
+                if let Some(Value::Integer(v)) = row.values.get(1) {
+                    checkpoint_seq = u64::try_from(*v).unwrap_or(0);
+                }
             }
         }
         let head_seq = lease.view.seq;
@@ -1240,10 +1248,11 @@ impl AedbInstance {
             return Ok(None);
         };
         let pk = EncodedKey::from_values(&[Value::Text(processor_name.to_string().into())]);
-        let Some(row) = table.rows.get(&pk) else {
+        let Some(stored) = table.rows.get(&pk) else {
             return Ok(None);
         };
-        Self::decode_reactive_processor_registration_row(row)
+        let row = lease.view.keyspace.materialize_row(stored)?;
+        Self::decode_reactive_processor_registration_row(&row)
     }
 
     async fn load_reactive_processor_registrations(
@@ -1259,9 +1268,10 @@ impl AedbInstance {
             return Ok(Vec::new());
         };
         let mut out = Vec::with_capacity(table.rows.len());
-        for row in table.rows.values() {
+        for stored in table.rows.values() {
+            let row = lease.view.keyspace.materialize_row(stored)?;
             out.push(
-                Self::decode_reactive_processor_registration_row(row)?.ok_or_else(|| {
+                Self::decode_reactive_processor_registration_row(&row)?.ok_or_else(|| {
                     AedbError::Validation(
                         "reactive processor registry row missing processor_name".into(),
                     )

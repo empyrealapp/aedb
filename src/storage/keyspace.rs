@@ -2,7 +2,8 @@ mod memory_accounting;
 pub(crate) use memory_accounting::{
     kv_entry_cost, kv_inline_entry_cost, kv_segment_meta_cost, kv_tombstone_cost,
     namespace_mem_cost, persistent_value_ref_cost, persistent_value_ref_resident_cost,
-    projection_data_mem_cost, row_mem_cost, small_kv_entry_cost, table_data_mem_cost,
+    projection_data_mem_cost, row_mem_cost, small_kv_entry_cost, stored_row_mem_cost,
+    table_data_mem_cost,
 };
 
 use crate::catalog::namespace_key;
@@ -70,11 +71,56 @@ pub struct SecondaryIndex {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TableData {
-    pub rows: OrdMap<EncodedKey, Row>,
+    pub rows: OrdMap<EncodedKey, StoredRow>,
     pub row_versions: OrdMap<EncodedKey, u64>,
     #[serde(default)]
     pub structural_version: u64,
     pub indexes: HashMap<String, SecondaryIndex>,
+}
+
+/// A table row that is either resident in memory or spilled to the persistent
+/// value store. Spilled rows keep only a `PersistentValueRef` (offset/len/hash)
+/// in the in-memory keyspace tree; the payload bytes are materialized on demand
+/// through the value store's hot cache. This mirrors the inline/spilled model
+/// used by `KvEntry` so table-heavy workloads can grow beyond RAM instead of
+/// having writes rejected at the memory ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredRow {
+    Resident(Row),
+    Spilled(PersistentValueRef),
+}
+
+impl Default for StoredRow {
+    fn default() -> Self {
+        StoredRow::Resident(Row { values: Vec::new() })
+    }
+}
+
+impl From<Row> for StoredRow {
+    fn from(row: Row) -> Self {
+        StoredRow::Resident(row)
+    }
+}
+
+impl StoredRow {
+    /// Returns the row payload only if it is currently resident in memory.
+    pub fn resident(&self) -> Option<&Row> {
+        match self {
+            StoredRow::Resident(row) => Some(row),
+            StoredRow::Spilled(_) => None,
+        }
+    }
+
+    pub fn value_ref(&self) -> Option<&PersistentValueRef> {
+        match self {
+            StoredRow::Resident(_) => None,
+            StoredRow::Spilled(value_ref) => Some(value_ref),
+        }
+    }
+
+    pub fn is_spilled(&self) -> bool {
+        matches!(self, StoredRow::Spilled(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +474,35 @@ fn materialize_kv_entry(
         Ok(out)
     } else {
         Ok(entry.clone())
+    }
+}
+
+/// Serializes a table row payload for storage in the persistent value store.
+pub(crate) fn encode_row_payload(row: &Row) -> Result<Vec<u8>, crate::error::AedbError> {
+    rmp_serde::to_vec(row).map_err(|e| crate::error::AedbError::Encode(e.to_string()))
+}
+
+/// Deserializes a table row payload read back from the persistent value store.
+fn decode_row_payload(bytes: &[u8]) -> Result<Row, crate::error::AedbError> {
+    rmp_serde::from_slice(bytes).map_err(|e| crate::error::AedbError::Decode(e.to_string()))
+}
+
+/// Materializes a stored row, reading spilled payloads through the value store
+/// (which serves resident bytes from its hot cache and pages cold bytes in from
+/// the mmap-backed file). Resident rows are returned as a borrow with no copy.
+fn materialize_row<'a>(
+    stored: &'a StoredRow,
+    value_store: Option<&PersistentValueStore>,
+) -> Result<std::borrow::Cow<'a, Row>, crate::error::AedbError> {
+    match stored {
+        StoredRow::Resident(row) => Ok(std::borrow::Cow::Borrowed(row)),
+        StoredRow::Spilled(value_ref) => {
+            let store = value_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+                message: "persistent value store is not attached".into(),
+            })?;
+            let bytes = store.read(value_ref)?;
+            Ok(std::borrow::Cow::Owned(decode_row_payload(&bytes)?))
+        }
     }
 }
 
@@ -981,6 +1056,124 @@ impl Keyspace {
         Ok(self.estimate_memory_bytes())
     }
 
+    /// Spills resident table-row payloads to the persistent value store until
+    /// the estimated resident memory drops to `target_bytes` (or no further
+    /// reduction is possible). Coldest rows (lowest commit version) are spilled
+    /// first; their payloads are paged back in on read through the value store's
+    /// hot cache. Keys, indexes, and row versions remain resident.
+    pub fn spill_table_rows_to_memory_target(
+        &mut self,
+        target_bytes: usize,
+    ) -> Result<usize, crate::error::AedbError> {
+        let mut memory_estimate = self.estimate_memory_bytes();
+        if memory_estimate <= target_bytes {
+            return Ok(memory_estimate);
+        }
+
+        let Some(store) = self.value_store.clone() else {
+            return Ok(memory_estimate);
+        };
+
+        let new_cost = persistent_value_ref_resident_cost();
+        let mut candidates: Vec<(NamespaceId, String, EncodedKey, usize)> = Vec::new();
+        let mut heap_entries = Vec::new();
+        for (namespace_id, namespace) in self.namespaces.iter() {
+            for (table_name, table) in namespace.tables.iter() {
+                for (key, stored) in table.rows.iter() {
+                    let StoredRow::Resident(row) = stored else {
+                        continue;
+                    };
+                    let old_cost = row_mem_cost(row);
+                    if old_cost <= new_cost {
+                        continue;
+                    }
+                    let memory_reduction_bytes = old_cost - new_cost;
+                    let version = table.row_versions.get(key).copied().unwrap_or(0);
+                    let candidate_index = candidates.len();
+                    candidates.push((
+                        namespace_id.clone(),
+                        table_name.clone(),
+                        key.clone(),
+                        memory_reduction_bytes,
+                    ));
+                    heap_entries.push(Reverse((version, memory_reduction_bytes, candidate_index)));
+                }
+            }
+        }
+        let mut oldest_first = BinaryHeap::from(heap_entries);
+
+        let mut plans: Vec<(NamespaceId, String, EncodedKey, usize)> = Vec::new();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        while memory_estimate > target_bytes {
+            let Some(Reverse((_, _, candidate_index))) = oldest_first.pop() else {
+                break;
+            };
+            let Some((namespace_id, table_name, key, memory_reduction_bytes)) =
+                candidates.get(candidate_index)
+            else {
+                continue;
+            };
+            let Some(row) = self
+                .namespaces
+                .get(namespace_id)
+                .and_then(|namespace| namespace.tables.get(table_name))
+                .and_then(|table| table.rows.get(key))
+                .and_then(StoredRow::resident)
+            else {
+                continue;
+            };
+            payloads.push(encode_row_payload(row)?);
+            plans.push((
+                namespace_id.clone(),
+                table_name.clone(),
+                key.clone(),
+                *memory_reduction_bytes,
+            ));
+            memory_estimate = memory_estimate.saturating_sub(*memory_reduction_bytes);
+        }
+
+        if plans.is_empty() {
+            return Ok(memory_estimate);
+        }
+
+        let payload_slices: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let value_refs = store.append_many_cold_slices(&payload_slices)?;
+        self.apply_row_spill_plans(plans, value_refs);
+
+        Ok(self.estimate_memory_bytes())
+    }
+
+    fn apply_row_spill_plans(
+        &mut self,
+        plans: Vec<(NamespaceId, String, EncodedKey, usize)>,
+        value_refs: Vec<PersistentValueRef>,
+    ) {
+        for ((namespace_id, table_name, key, _reduction), value_ref) in
+            plans.into_iter().zip(value_refs)
+        {
+            let Some(table) = self
+                .namespaces_mut()
+                .get_mut(&namespace_id)
+                .and_then(|namespace| namespace.tables.get_mut(&table_name))
+            else {
+                continue;
+            };
+            let Some(stored) = table.rows.get(&key) else {
+                continue;
+            };
+            let StoredRow::Resident(row) = stored else {
+                continue;
+            };
+            let old_cost = row_mem_cost(row);
+            let new_cost = persistent_value_ref_cost(&value_ref);
+            table.rows.insert(key, StoredRow::Spilled(value_ref));
+            self.mem_bytes = self
+                .mem_bytes
+                .saturating_add(new_cost)
+                .saturating_sub(old_cost);
+        }
+    }
+
     pub fn flush_kv_to_segments_to_memory_target(
         &mut self,
         target_bytes: usize,
@@ -1353,11 +1546,14 @@ impl Keyspace {
         let new_cost = row_mem_cost(&row);
         let old_cost = {
             let table = self.table_mut(project_id, scope_id, table_name);
-            let old_cost = table.rows.get(&encoded_pk).map(row_mem_cost).unwrap_or(0);
-            if old_cost == 0 {
+            let existing = table.rows.get(&encoded_pk);
+            let old_cost = existing.map(stored_row_mem_cost).unwrap_or(0);
+            if existing.is_none() {
                 table.structural_version = commit_seq;
             }
-            table.rows.insert(encoded_pk.clone(), row);
+            table
+                .rows
+                .insert(encoded_pk.clone(), StoredRow::Resident(row));
             table.row_versions.insert(encoded_pk.clone(), commit_seq);
             old_cost
         };
@@ -1373,7 +1569,7 @@ impl Keyspace {
         scope_id: &str,
         table_name: &str,
         pk: &[Value],
-    ) -> Option<&Row> {
+    ) -> Result<Option<std::borrow::Cow<'_, Row>>, crate::error::AedbError> {
         let encoded_pk = EncodedKey::from_values(pk);
         self.get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
     }
@@ -1384,7 +1580,36 @@ impl Keyspace {
         scope_id: &str,
         table_name: &str,
         encoded_pk: &EncodedKey,
-    ) -> Option<&Row> {
+    ) -> Result<Option<std::borrow::Cow<'_, Row>>, crate::error::AedbError> {
+        let stored = self
+            .namespace(&NamespaceId::project_scope(project_id, scope_id))
+            .and_then(|ns| ns.tables.get(table_name))
+            .and_then(|t| t.rows.get(encoded_pk));
+        match stored {
+            Some(stored) => Ok(Some(materialize_row(stored, self.value_store.as_deref())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Materializes a stored row using this keyspace's value store, paging in
+    /// spilled payloads on demand. Resident rows are returned without a copy.
+    pub fn materialize_row<'a>(
+        &'a self,
+        stored: &'a StoredRow,
+    ) -> Result<std::borrow::Cow<'a, Row>, crate::error::AedbError> {
+        materialize_row(stored, self.value_store.as_deref())
+    }
+
+    /// Returns the raw stored slot for a row without materializing spilled
+    /// payloads. Use for existence and identity checks where the value is not
+    /// needed.
+    pub fn row_slot(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        encoded_pk: &EncodedKey,
+    ) -> Option<&StoredRow> {
         self.namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.tables.get(table_name))
             .and_then(|t| t.rows.get(encoded_pk))
@@ -1397,7 +1622,7 @@ impl Keyspace {
         table_name: &str,
         pk: &[Value],
         commit_seq: u64,
-    ) -> Option<Row> {
+    ) -> Result<Option<Row>, crate::error::AedbError> {
         let encoded_pk = EncodedKey::from_values(pk);
         self.delete_row_by_encoded(project_id, scope_id, table_name, &encoded_pk, commit_seq)
     }
@@ -1409,12 +1634,16 @@ impl Keyspace {
         table_name: &str,
         encoded_pk: &EncodedKey,
         commit_seq: u64,
-    ) -> Option<Row> {
+    ) -> Result<Option<Row>, crate::error::AedbError> {
         let removed = {
-            let table = self
+            let table = match self
                 .namespace_mut(NamespaceId::project_scope(project_id, scope_id))
                 .tables
-                .get_mut(table_name)?;
+                .get_mut(table_name)
+            {
+                Some(table) => table,
+                None => return Ok(None),
+            };
             table.row_versions.remove(encoded_pk);
             let removed = table.rows.remove(encoded_pk);
             if removed.is_some() {
@@ -1422,10 +1651,14 @@ impl Keyspace {
             }
             removed
         };
-        if let Some(row) = &removed {
-            self.mem_bytes = self.mem_bytes.saturating_sub(row_mem_cost(row));
+        match removed {
+            Some(stored) => {
+                self.mem_bytes = self.mem_bytes.saturating_sub(stored_row_mem_cost(&stored));
+                let row = materialize_row(&stored, self.value_store.as_deref())?.into_owned();
+                Ok(Some(row))
+            }
+            None => Ok(None),
         }
-        removed
     }
 
     /// Creates a snapshot of the keyspace.
@@ -2590,6 +2823,31 @@ impl KeyspaceSnapshot {
             .and_then(|ns| ns.tables.get(table_name))
     }
 
+    /// Materializes a stored row using this snapshot's value store, paging in
+    /// spilled payloads on demand. Resident rows are returned without a copy.
+    pub fn materialize_row<'a>(
+        &'a self,
+        stored: &'a StoredRow,
+    ) -> Result<std::borrow::Cow<'a, Row>, crate::error::AedbError> {
+        materialize_row(stored, self.value_store.as_deref())
+    }
+
+    pub fn get_row_by_encoded(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        encoded_pk: &EncodedKey,
+    ) -> Result<Option<std::borrow::Cow<'_, Row>>, crate::error::AedbError> {
+        match self
+            .table(project_id, scope_id, table_name)
+            .and_then(|t| t.rows.get(encoded_pk))
+        {
+            Some(stored) => Ok(Some(self.materialize_row(stored)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
         self.try_kv_get(project_id, scope_id, key)
             .expect("persistent value store read failed")
@@ -2748,6 +3006,42 @@ impl KeyspaceSnapshot {
             namespace.kv.segments.clear();
             for (key, entry) in materialized_entries {
                 namespace.kv.entries.insert(key, entry);
+            }
+        }
+        // Materialize spilled table rows back inline so the checkpoint is
+        // self-contained once the value store is detached below.
+        let row_namespace_ids: Vec<NamespaceId> = self
+            .namespaces
+            .iter()
+            .filter(|(_, namespace)| {
+                namespace
+                    .tables
+                    .values()
+                    .any(|table| table.rows.values().any(StoredRow::is_spilled))
+            })
+            .map(|(namespace_id, _)| namespace_id.clone())
+            .collect();
+        for namespace_id in row_namespace_ids {
+            let Some(namespace) = Arc::make_mut(&mut out.namespaces).get_mut(&namespace_id) else {
+                continue;
+            };
+            let table_names: Vec<String> = namespace.tables.keys().cloned().collect();
+            for table_name in table_names {
+                let Some(table) = namespace.tables.get_mut(&table_name) else {
+                    continue;
+                };
+                let spilled_keys: Vec<EncodedKey> = table
+                    .rows
+                    .iter()
+                    .filter(|(_, stored)| stored.is_spilled())
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in spilled_keys {
+                    if let Some(stored) = table.rows.get(&key) {
+                        let row = materialize_row(stored, value_store)?.into_owned();
+                        table.rows.insert(key, StoredRow::Resident(row));
+                    }
+                }
             }
         }
         out.value_store = None;

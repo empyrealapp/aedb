@@ -223,9 +223,10 @@ impl AedbInstance {
         let range = table.rows.range((start_bound, end_bound));
         match query.order {
             EventOrder::Ascending => {
-                for row in range.map(|(_, row)| row) {
+                for (_, stored) in range {
+                    let row = lease.view.keyspace.materialize_row(stored)?;
                     if !Self::consume_event_row(
-                        row,
+                        &row,
                         query,
                         limit,
                         max_scan_rows,
@@ -239,9 +240,10 @@ impl AedbInstance {
                 }
             }
             EventOrder::Descending => {
-                for row in range.rev().map(|(_, row)| row) {
+                for (_, stored) in range.rev() {
+                    let row = lease.view.keyspace.materialize_row(stored)?;
                     if !Self::consume_event_row(
-                        row,
+                        &row,
                         query,
                         limit,
                         max_scan_rows,

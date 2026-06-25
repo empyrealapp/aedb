@@ -137,7 +137,7 @@ impl AedbInstance {
             .map(|age| crate::system_now_micros().saturating_sub(age));
         // Processor floor: never prune above the slowest reactive checkpoint.
         let processor_floor = if policy.respect_processor_checkpoints {
-            self.min_processor_checkpoint(&lease.view.keyspace)
+            self.min_processor_checkpoint(&lease.view.keyspace)?
         } else {
             None
         };
@@ -151,7 +151,8 @@ impl AedbInstance {
         let mut index: u64 = 0;
         let mut more_remaining = false;
 
-        for row in table.rows.values() {
+        for stored in table.rows.values() {
+            let row = lease.view.keyspace.materialize_row(stored)?;
             let (
                 Some(Value::Integer(seq_i64)),
                 Some(Value::Timestamp(ts_i64)),
@@ -220,21 +221,24 @@ impl AedbInstance {
     fn min_processor_checkpoint(
         &self,
         keyspace: &crate::storage::keyspace::KeyspaceSnapshot,
-    ) -> Option<u64> {
-        let table = keyspace.table(
+    ) -> Result<Option<u64>, AedbError> {
+        let Some(table) = keyspace.table(
             SYSTEM_PROJECT_ID,
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         let mut min: Option<u64> = None;
-        for row in table.rows.values() {
+        for stored in table.rows.values() {
+            let row = keyspace.materialize_row(stored)?;
             if let Some(Value::Integer(seq)) = row.values.get(1)
                 && let Ok(seq) = u64::try_from(*seq)
             {
                 min = Some(min.map_or(seq, |m| m.min(seq)));
             }
         }
-        min
+        Ok(min)
     }
 }
 

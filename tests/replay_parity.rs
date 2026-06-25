@@ -432,7 +432,9 @@ async fn replay_parity_under_concurrent_shared_key_writers() {
         });
     }
     while let Some(result) = tasks.join_next().await {
-        result.expect("writer task panicked").expect("commutative inc must commit");
+        result
+            .expect("writer task panicked")
+            .expect("commutative inc must commit");
     }
 
     let live = read_account_balances(&db, ROWS).await;

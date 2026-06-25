@@ -1644,3 +1644,96 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
             || format!("{err}").contains("segment hash chain mismatch")
     );
 }
+
+#[tokio::test]
+async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        storage_mode: StorageMode::DiskBacked,
+        // Tiny ceiling so table-row payloads spill to disk before the checkpoint.
+        max_memory_estimate_bytes: 8 * 1024,
+        persistent_value_hot_cache_bytes: 4 * 1024,
+        table_row_spill_enabled: true,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.commit(Mutation::Ddl(DdlOperation::CreateTable {
+        owner_id: None,
+        if_not_exists: false,
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "items".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "blob".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+        ],
+        primary_key: vec!["id".into()],
+    }))
+    .await
+    .expect("table");
+
+    let payload = "y".repeat(512);
+    for i in 0..64i64 {
+        db.commit(Mutation::Upsert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "items".into(),
+            primary_key: vec![Value::Integer(i)],
+            row: Row {
+                values: vec![
+                    Value::Integer(i),
+                    Value::Text(format!("{payload}-{i}").into()),
+                ],
+            },
+        })
+        .await
+        .expect("insert spills under pressure");
+    }
+
+    // Take a checkpoint while rows are spilled. This forces
+    // `materialized_for_checkpoint` to page every spilled row back inline so the
+    // checkpoint payload is self-contained (the value store is detached in it).
+    db.checkpoint_now().await.expect("checkpoint");
+    drop(db);
+
+    // Restore from the checkpoint and confirm every spilled row round-tripped.
+    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let rows = reopened
+        .query(
+            "p",
+            "app",
+            Query::select(&["id", "blob"]).from("items").limit(1000),
+        )
+        .await
+        .expect("query after restore");
+    assert_eq!(
+        rows.rows.len(),
+        64,
+        "all spilled rows must survive checkpoint+restore"
+    );
+
+    let one = reopened
+        .query(
+            "p",
+            "app",
+            Query::select(&["id", "blob"])
+                .from("items")
+                .where_(Expr::Eq("id".into(), Value::Integer(42))),
+        )
+        .await
+        .expect("point query after restore");
+    assert_eq!(one.rows.len(), 1);
+    assert_eq!(
+        one.rows[0].values[1],
+        Value::Text(format!("{payload}-42").into())
+    );
+}
