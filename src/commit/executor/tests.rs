@@ -1401,14 +1401,16 @@ async fn same_table_different_rows_can_merge_after_parallel_apply() {
         state
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(1)])
-            .cloned(),
+            .expect("get_row")
+            .map(|r| r.into_owned()),
         Some(base_row(1, "alice"))
     );
     assert_eq!(
         state
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(2)])
-            .cloned(),
+            .expect("get_row")
+            .map(|r| r.into_owned()),
         Some(base_row(2, "bob"))
     );
 }
@@ -2557,7 +2559,9 @@ async fn upsert_on_conflict_pk_do_nothing_preserves_existing_row() {
     let row = snapshot
         .table("u", "app", "users")
         .and_then(|t| t.rows.get(&EncodedKey::from_values(&[Value::Integer(1)])))
-        .expect("row");
+        .expect("row")
+        .resident()
+        .expect("resident row");
     assert_eq!(row.values[1], Value::Text("alice".into()));
 }
 
@@ -2652,7 +2656,9 @@ async fn upsert_on_conflict_index_do_update_updates_existing_row() {
     let row = snapshot
         .table("u", "app", "users")
         .and_then(|t| t.rows.get(&EncodedKey::from_values(&[Value::Integer(1)])))
-        .expect("existing row by pk");
+        .expect("existing row by pk")
+        .resident()
+        .expect("resident row");
     assert_eq!(row.values[2], Value::Text("Alice Updated".into()));
     assert!(
         snapshot
@@ -2732,7 +2738,9 @@ async fn upsert_on_conflict_do_update_with_adds_existing_and_proposed() {
             t.rows
                 .get(&EncodedKey::from_values(&[Value::Text("login".into())]))
         })
-        .expect("row");
+        .expect("row")
+        .resident()
+        .expect("resident row");
     assert_eq!(row.values[1], Value::Integer(7));
 }
 
@@ -2790,7 +2798,9 @@ async fn upsert_batch_on_conflict_is_sequential_within_commit() {
     let row = snapshot
         .table("b", "app", "users")
         .and_then(|t| t.rows.get(&EncodedKey::from_values(&[Value::Integer(1)])))
-        .expect("row");
+        .expect("row")
+        .resident()
+        .expect("resident row");
     assert_eq!(row.values[1], Value::Text("second".into()));
 }
 
@@ -2855,6 +2865,8 @@ async fn upsert_batch_applies_all_rows_in_single_commit() {
             .rows
             .get(&EncodedKey::from_values(&[Value::Integer(1)]))
             .expect("row 1")
+            .resident()
+            .expect("resident row 1")
             .values[1],
         Value::Text("one".into())
     );
@@ -2863,6 +2875,8 @@ async fn upsert_batch_applies_all_rows_in_single_commit() {
             .rows
             .get(&EncodedKey::from_values(&[Value::Integer(3)]))
             .expect("row 3")
+            .resident()
+            .expect("resident row 3")
             .values[1],
         Value::Text("three".into())
     );

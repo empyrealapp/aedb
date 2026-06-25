@@ -237,9 +237,14 @@ fn checksum_state(state: &SnapshotDumpState) -> Result<String, AedbError> {
             hash_encoded(&mut h, &table.structural_version)?;
 
             hash_label(&mut h, "rows");
-            for (pk, row) in table.rows.iter() {
+            for (pk, stored) in table.rows.iter() {
                 hash_bytes(&mut h, pk.as_slice());
-                hash_encoded(&mut h, row)?;
+                // Hash the logical (materialized) row, never the StoredRow enum, so
+                // the state digest is independent of whether a row is currently
+                // spilled to the value store. Spill state is non-deterministic and
+                // must not affect replay parity.
+                let row = state.keyspace.materialize_row(stored)?;
+                hash_encoded(&mut h, &*row)?;
             }
 
             hash_label(&mut h, "row_versions");
@@ -439,8 +444,18 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                         SecondaryIndexStore::Hash(entries) => entries.clear(),
                         SecondaryIndexStore::UniqueHash(entries) => entries.clear(),
                     }
-                    for (encoded_pk, row) in &table_data.rows {
-                        match index.should_include_row(row, schema, table_name) {
+                    for (encoded_pk, stored) in &table_data.rows {
+                        let row = match recovered.keyspace.materialize_row(stored) {
+                            Ok(row) => row,
+                            Err(err) => {
+                                violations.push(format!(
+                                    "row materialization failed in namespace={:?} table={table_name}: {err}",
+                                    ns_id
+                                ));
+                                continue;
+                            }
+                        };
+                        match index.should_include_row(&row, schema, table_name) {
                             Ok(true) => {}
                             Ok(false) => continue,
                             Err(err) => {
@@ -466,7 +481,7 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                             }
                         };
                         let index_key = match extract_index_key_encoded(
-                            row,
+                            &row,
                             schema,
                             &index_def.columns,
                         ) {
@@ -577,7 +592,14 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                 continue;
             };
 
-            for row in child_table.rows.values() {
+            for stored in child_table.rows.values() {
+                let row = match recovered.keyspace.materialize_row(stored) {
+                    Ok(row) => row,
+                    Err(err) => {
+                        violations.push(format!("fk {} child row read failed: {err}", fk.name));
+                        continue;
+                    }
+                };
                 let child_values: Vec<crate::catalog::types::Value> = child_positions
                     .iter()
                     .filter_map(|idx| row.values.get(*idx).cloned())
@@ -593,7 +615,15 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
                     continue;
                 }
                 let mut found = false;
-                for parent_row in parent_table.rows.values() {
+                for parent_stored in parent_table.rows.values() {
+                    let parent_row = match recovered.keyspace.materialize_row(parent_stored) {
+                        Ok(row) => row,
+                        Err(err) => {
+                            violations
+                                .push(format!("fk {} parent row read failed: {err}", fk.name));
+                            continue;
+                        }
+                    };
                     let parent_values: Vec<crate::catalog::types::Value> = parent_positions
                         .iter()
                         .filter_map(|idx| parent_row.values.get(*idx).cloned())

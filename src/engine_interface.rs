@@ -238,7 +238,7 @@ impl AedbInstance {
             scope_id,
             keyed_state,
             key,
-        );
+        )?;
         Ok(snapshot.row)
     }
 
@@ -271,7 +271,7 @@ impl AedbInstance {
             scope_id,
             keyed_state,
             key,
-        );
+        )?;
         Ok(snapshot
             .row
             .and_then(|row| row.values.get(col_idx).cloned()))
@@ -363,7 +363,7 @@ impl AedbInstance {
             scope_id,
             keyed_state,
             key.clone(),
-        );
+        )?;
         let assertion = keyed_state_assertion(project_id, scope_id, keyed_state, &key, &snapshot);
         let next = update_fn(snapshot.row)?;
         let mutation = match next {
@@ -443,10 +443,13 @@ impl AedbInstance {
             index.scan_prefix_window(Some(&prefix), req.offset, req.limit)
         };
 
-        Ok(pks
-            .into_iter()
-            .filter_map(|pk| table.rows.get(&pk).cloned())
-            .collect())
+        let mut out = Vec::new();
+        for pk in pks {
+            if let Some(stored) = table.rows.get(&pk) {
+                out.push(lease.view.keyspace.materialize_row(stored)?.into_owned());
+            }
+        }
+        Ok(out)
     }
 
     pub async fn keyed_state_index_rank(
@@ -493,7 +496,7 @@ impl AedbInstance {
         let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
         let checkpoint_pk =
             EncodedKey::from_values(&[Value::Text(processor_id.to_string().into())]);
-        let checkpoint_seq = lease
+        let checkpoint_stored = lease
             .view
             .keyspace
             .table(
@@ -501,13 +504,21 @@ impl AedbInstance {
                 SYSTEM_SCOPE_ID,
                 REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
             )
-            .and_then(|table| table.rows.get(&checkpoint_pk))
-            .and_then(|row| row.values.get(1))
-            .and_then(|v| match v {
-                Value::Integer(i) => u64::try_from(*i).ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
+            .and_then(|table| table.rows.get(&checkpoint_pk));
+        let checkpoint_seq = match checkpoint_stored {
+            Some(stored) => lease
+                .view
+                .keyspace
+                .materialize_row(stored)?
+                .values
+                .get(1)
+                .and_then(|v| match v {
+                    Value::Integer(i) => u64::try_from(*i).ok(),
+                    _ => None,
+                })
+                .unwrap_or(0),
+            None => 0,
+        };
         let head_seq = lease.view.seq;
 
         let mut events = Vec::with_capacity(max_count);
@@ -523,14 +534,14 @@ impl AedbInstance {
                 Value::Text("".into()),
                 Value::Text("".into()),
             ]);
-            for row in table
+            for (_, stored) in table
                 .rows
                 .range((Bound::Included(start_key), Bound::Unbounded))
-                .map(|(_, row)| row)
             {
                 if events.len() >= max_count {
                     break;
                 }
+                let row = lease.view.keyspace.materialize_row(stored)?;
                 let (
                     Some(Value::Integer(commit_seq_i64)),
                     Some(Value::Timestamp(ts_i64)),
@@ -637,14 +648,21 @@ impl AedbInstance {
             SYSTEM_SCOPE_ID,
             REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
         );
-        let current_checkpoint = checkpoint_table
-            .and_then(|table| table.rows.get(&checkpoint_pk))
-            .and_then(|row| row.values.get(1))
-            .and_then(|v| match v {
-                Value::Integer(i) => u64::try_from(*i).ok(),
-                _ => None,
-            })
-            .unwrap_or(0);
+        let current_checkpoint =
+            match checkpoint_table.and_then(|table| table.rows.get(&checkpoint_pk)) {
+                Some(stored) => lease
+                    .view
+                    .keyspace
+                    .materialize_row(stored)?
+                    .values
+                    .get(1)
+                    .and_then(|v| match v {
+                        Value::Integer(i) => u64::try_from(*i).ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                None => 0,
+            };
         let checkpoint_version = checkpoint_table
             .and_then(|table| table.row_versions.get(&checkpoint_pk))
             .copied()
@@ -914,18 +932,21 @@ fn keyed_state_snapshot_from_table(
     scope_id: &str,
     keyed_state: &str,
     key: Value,
-) -> KeyedStateSnapshot {
+) -> Result<KeyedStateSnapshot, AedbError> {
     let encoded = EncodedKey::from_values(std::slice::from_ref(&key));
     let table = keyspace.table(project_id, scope_id, keyed_state);
-    let row = table.and_then(|table| table.rows.get(&encoded).cloned());
+    let row = match table.and_then(|table| table.rows.get(&encoded)) {
+        Some(stored) => Some(keyspace.materialize_row(stored)?.into_owned()),
+        None => None,
+    };
     let version = table
         .and_then(|table| table.row_versions.get(&encoded).copied())
         .unwrap_or(0);
-    KeyedStateSnapshot {
+    Ok(KeyedStateSnapshot {
         row,
         version,
         snapshot_seq,
-    }
+    })
 }
 
 fn keyed_state_assertion(

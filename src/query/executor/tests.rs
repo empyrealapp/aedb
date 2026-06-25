@@ -137,14 +137,16 @@ pub(super) fn setup() -> (Keyspace, Catalog) {
         .table_by_namespace_key_mut(&namespace_key("A", "app"), "users")
         .expect("table");
     let mut secondary_index = SecondaryIndex::default();
-    for (pk, row) in &table.rows {
+    for (pk, stored) in &table.rows {
+        let row = stored.resident().expect("resident row");
         let age_key =
             extract_index_key_encoded(row, &schema, &["age".into()]).expect("age index key");
         secondary_index.insert(age_key, pk.clone());
     }
     table.indexes.insert("by_age".into(), secondary_index);
     let mut by_name = SecondaryIndex::default();
-    for (pk, row) in &table.rows {
+    for (pk, stored) in &table.rows {
+        let row = stored.resident().expect("resident row");
         let key =
             extract_index_key_encoded(row, &schema, &["name".into()]).expect("name index key");
         by_name.insert(key, pk.clone());

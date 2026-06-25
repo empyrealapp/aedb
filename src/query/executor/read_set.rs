@@ -72,7 +72,7 @@ impl ReadSetCollector {
             let version_at_read = table
                 .and_then(|t| t.row_versions.get(pk).copied())
                 .unwrap_or(0);
-            let primary_key = extract_pk_values(table, pk, &pk_column_indices);
+            let primary_key = extract_pk_values(snapshot, table, pk, &pk_column_indices);
             self.set.points.push(ReadSetEntry {
                 key: ReadKey::TableRow {
                     project_id: project_id.to_string(),
@@ -126,12 +126,14 @@ fn pk_column_indices_in_schema(schema: &TableSchema) -> Vec<usize> {
 }
 
 fn extract_pk_values(
+    snapshot: &KeyspaceSnapshot,
     table: Option<&TableData>,
     pk_encoded: &EncodedKey,
     pk_column_indices: &[usize],
 ) -> Vec<Value> {
     if let Some(t) = table
-        && let Some(row) = t.rows.get(pk_encoded)
+        && let Some(stored) = t.rows.get(pk_encoded)
+        && let Ok(row) = snapshot.materialize_row(stored)
     {
         return pk_column_indices
             .iter()

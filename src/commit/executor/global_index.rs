@@ -52,9 +52,10 @@ impl GlobalUniqueIndexState {
                 let Some(table_schema) = schema.get(&**ns_key) else {
                     continue;
                 };
-                for (pk, row) in &table.rows {
+                for (pk, stored) in &table.rows {
+                    let row = keyspace.materialize_row(stored)?;
                     let encoded_index_key =
-                        extract_index_key_encoded(row, table_schema, &index_key.columns)?;
+                        extract_index_key_encoded(&row, table_schema, &index_key.columns)?;
                     by_value.insert(encoded_index_key, (ns_key.clone(), pk.clone()));
                 }
             }
@@ -260,7 +261,7 @@ impl GlobalUniqueIndexState {
                     &namespace_key(project_id, scope_id),
                     table_name,
                     &row_key,
-                )
+                )?
                 .ok_or_else(|| AedbError::Validation("row not found".into()))?;
                 let Some(col_idx) = schema.columns.iter().position(|c| c.name == *column) else {
                     return Err(AedbError::Validation(format!("column not found: {column}")));
@@ -335,9 +336,9 @@ impl GlobalUniqueIndexState {
                 &current_ns,
                 input.table_name,
                 &incoming_pk_encoded,
-            ) {
+            )? {
                 let previous_key =
-                    extract_index_key_encoded(existing_row, &schema, &index_key.columns)?;
+                    extract_index_key_encoded(&existing_row, &schema, &index_key.columns)?;
                 map.remove(&previous_key);
             }
             map.insert(
@@ -362,12 +363,12 @@ impl GlobalUniqueIndexState {
         }
         let ns = namespace_key(project_id, scope_id);
         let pk = EncodedKey::from_values(primary_key);
-        let Some(row) = row_for_pk(keyspace, &ns, table_name, &pk) else {
+        let Some(row) = row_for_pk(keyspace, &ns, table_name, &pk)? else {
             return Ok(());
         };
         let schema = table_schema_for(catalog, project_id, scope_id, table_name)?;
         for index_key in defs_for_table(catalog, table_name) {
-            let key = extract_index_key_encoded(row, &schema, &index_key.columns)?;
+            let key = extract_index_key_encoded(&row, &schema, &index_key.columns)?;
             if let Some(map) = self.entries.get_mut(&index_key) {
                 map.remove(&key);
             }
@@ -396,19 +397,21 @@ fn table_has_global_unique_entries(
     })
 }
 
-fn row_for_pk<'a>(
-    keyspace: &'a Keyspace,
+fn row_for_pk(
+    keyspace: &Keyspace,
     ns: &str,
     table_name: &str,
     pk: &EncodedKey,
-) -> Option<&'a Row> {
-    keyspace
+) -> Result<Option<Row>, AedbError> {
+    let Some(stored) = keyspace
         .namespaces
-        .get(&NamespaceId::Project(ns.to_string()))?
-        .tables
-        .get(table_name)?
-        .rows
-        .get(pk)
+        .get(&NamespaceId::Project(ns.to_string()))
+        .and_then(|namespace| namespace.tables.get(table_name))
+        .and_then(|table| table.rows.get(pk))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(keyspace.materialize_row(stored)?.into_owned()))
 }
 
 fn defs_for_table(catalog: &Catalog, table_name: &str) -> Vec<IndexKey> {

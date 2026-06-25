@@ -25,7 +25,8 @@ fn install_composite_age_name_index(
         .table_by_namespace_key_mut(&ns, "users")
         .expect("table");
     let mut age_name_index = SecondaryIndex::default();
-    for (pk, row) in &table.rows {
+    for (pk, stored) in &table.rows {
+        let row = stored.resident().expect("resident row");
         let key = extract_index_key_encoded(row, &schema, &["age".into(), "name".into()])
             .expect("composite key");
         age_name_index.insert(key, pk.clone());
@@ -92,7 +93,7 @@ fn exact_index_predicate_limit_caps_candidate_materialization() {
             .get_mut("by_age")
             .expect("age index")
             .insert(age_key, encoded_pk);
-        table.rows.insert(EncodedKey::from_values(&pk), row);
+        table.rows.insert(EncodedKey::from_values(&pk), row.into());
     }
     let snapshot = keyspace.snapshot();
     let table = snapshot.table("A", "app", "users").expect("snapshot table");
@@ -515,7 +516,8 @@ fn partial_index_only_indexes_matching_rows() {
         partial_filter: Some(Expr::Gte("age".into(), Value::Integer(50))),
         ..SecondaryIndex::default()
     };
-    for (pk, row) in &table.rows {
+    for (pk, stored) in &table.rows {
+        let row = stored.resident().expect("resident row");
         if adults_only
             .should_include_row(row, &schema, "users")
             .expect("partial eval")

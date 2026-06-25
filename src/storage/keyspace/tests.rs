@@ -53,7 +53,8 @@ fn snapshot_isolation_works() {
 
     let s1 = ks.snapshot();
 
-    ks.delete_row(project, scope, table, &[Value::Integer(2)], 4);
+    ks.delete_row(project, scope, table, &[Value::Integer(2)], 4)
+        .expect("delete_row");
     ks.upsert_row(
         project,
         scope,
@@ -738,6 +739,7 @@ fn art_experimental_backend_uses_primary_ordmap_storage() {
             "users",
             &EncodedKey::from_values(&[Value::Integer(1)]),
         )
+        .expect("get_row")
         .expect("row");
     assert_eq!(row.values[0], Value::Text("alice".into()));
     assert_eq!(
@@ -976,7 +978,8 @@ fn mem_bytes_running_counter_matches_full_walk() {
 
     // Delete some rows.
     for i in 0..10_i64 {
-        ks.delete_row("p", "app", "users", &[Value::Integer(i)], 200);
+        ks.delete_row("p", "app", "users", &[Value::Integer(i)], 200)
+            .expect("delete_row");
     }
     assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
 
@@ -1105,4 +1108,166 @@ fn refresh_mem_bytes_recovers_from_external_construction() {
     ks.mem_bytes = 0;
     ks.refresh_mem_bytes();
     assert_eq!(ks.mem_bytes, expected);
+}
+
+#[test]
+fn spill_table_rows_replaces_resident_with_refs_and_keeps_readable() {
+    let dir = tempdir().expect("temp");
+    let store = Arc::new(
+        PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 64 * 1024).expect("open store"),
+    );
+    let mut ks = Keyspace::default();
+    ks.attach_persistent_value_store(store, usize::MAX)
+        .expect("attach value store");
+
+    // Insert several rows with large text payloads so each row's resident cost
+    // far exceeds a persistent value ref stub.
+    for i in 0..8i64 {
+        ks.upsert_row(
+            "p",
+            "app",
+            "t",
+            vec![Value::Integer(i)],
+            row(vec![
+                Value::Integer(i),
+                Value::Text(format!("payload-{i}-{}", "x".repeat(256)).into()),
+            ]),
+            i as u64 + 1,
+        );
+    }
+    let before_spill = ks.mem_bytes;
+
+    // Spill everything (target 0).
+    let after_spill = ks.spill_table_rows_to_memory_target(0).expect("spill rows");
+
+    assert_eq!(after_spill, ks.mem_bytes);
+    assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+    assert!(
+        ks.mem_bytes < before_spill,
+        "spilling rows must reduce resident memory"
+    );
+
+    // Every row slot is now a spilled ref, yet still materializes to the
+    // original payload through the value store.
+    for i in 0..8i64 {
+        let encoded = EncodedKey::from_values(&[Value::Integer(i)]);
+        let slot = ks
+            .row_slot("p", "app", "t", &encoded)
+            .expect("row slot present");
+        assert!(slot.is_spilled(), "row {i} should be spilled");
+
+        let row = ks
+            .get_row_by_encoded("p", "app", "t", &encoded)
+            .expect("materialize")
+            .expect("row present");
+        assert_eq!(row.values[0], Value::Integer(i));
+        assert_eq!(
+            row.values[1],
+            Value::Text(format!("payload-{i}-{}", "x".repeat(256)).into())
+        );
+    }
+}
+
+#[test]
+fn materialized_checkpoint_hydrates_spilled_rows_without_mutating_source() {
+    let dir = tempdir().expect("temp");
+    let store = Arc::new(
+        PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 0).expect("open store"),
+    );
+    let mut ks = Keyspace::default();
+    ks.attach_persistent_value_store(store, usize::MAX)
+        .expect("attach value store");
+    ks.upsert_row(
+        "p",
+        "app",
+        "t",
+        vec![Value::Integer(1)],
+        row(vec![Value::Integer(1), Value::Text("a".repeat(256).into())]),
+        1,
+    );
+    ks.spill_table_rows_to_memory_target(0).expect("spill rows");
+
+    let snapshot = ks.snapshot();
+    let encoded = EncodedKey::from_values(&[Value::Integer(1)]);
+    assert!(
+        snapshot
+            .table("p", "app", "t")
+            .and_then(|t| t.rows.get(&encoded))
+            .expect("slot")
+            .is_spilled()
+    );
+
+    let materialized = snapshot
+        .materialized_for_checkpoint()
+        .expect("materialize checkpoint");
+    let stored = materialized
+        .table("p", "app", "t")
+        .and_then(|t| t.rows.get(&encoded))
+        .expect("materialized slot");
+    assert!(!stored.is_spilled(), "checkpoint row must be inlined");
+    assert_eq!(
+        stored.resident().expect("resident").values[1],
+        Value::Text("a".repeat(256).into())
+    );
+    assert!(materialized.value_store.is_none());
+    assert_eq!(
+        materialized.mem_bytes,
+        materialized.recompute_memory_bytes_full()
+    );
+
+    // Source snapshot remains spilled (no mutation).
+    assert!(
+        snapshot
+            .table("p", "app", "t")
+            .and_then(|t| t.rows.get(&encoded))
+            .expect("source slot")
+            .is_spilled()
+    );
+}
+
+#[test]
+fn snapshot_taken_before_row_spill_still_reads_resident_rows() {
+    let dir = tempdir().expect("temp");
+    let store = Arc::new(
+        PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 64 * 1024).expect("open store"),
+    );
+    let mut ks = Keyspace::default();
+    ks.attach_persistent_value_store(store, usize::MAX)
+        .expect("attach value store");
+    ks.upsert_row(
+        "p",
+        "app",
+        "t",
+        vec![Value::Integer(1)],
+        row(vec![Value::Integer(1), Value::Text("a".repeat(256).into())]),
+        1,
+    );
+
+    // Snapshot before spilling: structural sharing means it keeps the resident row.
+    let pre_spill = ks.snapshot();
+    ks.spill_table_rows_to_memory_target(0).expect("spill rows");
+
+    let encoded = EncodedKey::from_values(&[Value::Integer(1)]);
+    assert!(
+        pre_spill
+            .table("p", "app", "t")
+            .and_then(|t| t.rows.get(&encoded))
+            .expect("pre-spill slot")
+            .resident()
+            .is_some(),
+        "snapshot taken before spill is isolated from the eviction"
+    );
+    // Working keyspace is spilled but still materializes the same value.
+    assert!(
+        ks.row_slot("p", "app", "t", &encoded)
+            .expect("slot")
+            .is_spilled()
+    );
+    assert_eq!(
+        ks.get_row_by_encoded("p", "app", "t", &encoded)
+            .expect("materialize")
+            .expect("row")
+            .values[1],
+        Value::Text("a".repeat(256).into())
+    );
 }

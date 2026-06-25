@@ -93,8 +93,20 @@ impl AedbInstance {
             });
         };
         let count = table.rows.len() as u64;
-        let oldest = table.rows.values().next().and_then(row_seq);
-        let newest = table.rows.values().next_back().and_then(row_seq);
+        let oldest = match table.rows.values().next() {
+            Some(stored) => {
+                let row = lease.view.keyspace.materialize_row(stored)?;
+                row_seq(&row)
+            }
+            None => None,
+        };
+        let newest = match table.rows.values().next_back() {
+            Some(stored) => {
+                let row = lease.view.keyspace.materialize_row(stored)?;
+                row_seq(&row)
+            }
+            None => None,
+        };
         Ok(EventLogSummary {
             count,
             oldest_seq: oldest,

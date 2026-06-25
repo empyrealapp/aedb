@@ -70,7 +70,10 @@ pub(super) fn try_primary_key_point_query(
     let encoded_pk = EncodedKey::from_values(&primary_key);
     let maybe_row = request.table.and_then(|t| t.rows.get(&encoded_pk));
     let rows = match maybe_row {
-        Some(row) => vec![project_selected_row(row, selected_indices.as_deref())],
+        Some(stored) => {
+            let row = request.snapshot.materialize_row(stored)?;
+            vec![project_selected_row(&row, selected_indices.as_deref())]
+        }
         None => Vec::new(),
     };
 

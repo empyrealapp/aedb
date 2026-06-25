@@ -282,12 +282,13 @@ fn execute_query_with_options_capturing_signed(
                 );
             }
             estimated_rows = ordered_scan.pks.len();
-            Box::new(
-                ordered_scan
-                    .pks
-                    .into_iter()
-                    .filter_map(move |pk| table.rows.get(&pk).cloned()),
-            )
+            let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
+            for pk in ordered_scan.pks {
+                if let Some(stored) = table.rows.get(&pk) {
+                    materialized.push(snapshot.materialize_row(stored)?.into_owned());
+                }
+            }
+            Box::new(materialized.into_iter())
         } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
             let candidate_limit = if cursor_state.is_none()
                 && query.order_by.is_empty()
@@ -322,10 +323,13 @@ fn execute_query_with_options_capturing_signed(
                         );
                     }
                     estimated_rows = pks.len();
-                    Box::new(
-                        pks.into_iter()
-                            .filter_map(move |pk| table.rows.get(&pk).cloned()),
-                    )
+                    let mut materialized = Vec::with_capacity(pks.len());
+                    for pk in pks {
+                        if let Some(stored) = table.rows.get(&pk) {
+                            materialized.push(snapshot.materialize_row(stored)?.into_owned());
+                        }
+                    }
+                    Box::new(materialized.into_iter())
                 }
                 None => {
                     if let Some(collector) = read_set {
@@ -337,7 +341,11 @@ fn execute_query_with_options_capturing_signed(
                         );
                     }
                     estimated_rows = table.rows.len();
-                    Box::new(table.rows.values().cloned())
+                    let mut materialized = Vec::with_capacity(table.rows.len());
+                    for stored in table.rows.values() {
+                        materialized.push(snapshot.materialize_row(stored)?.into_owned());
+                    }
+                    Box::new(materialized.into_iter())
                 }
             }
         } else if let Some(table) = table
@@ -365,12 +373,13 @@ fn execute_query_with_options_capturing_signed(
                 );
             }
             estimated_rows = ordered_scan.pks.len();
-            Box::new(
-                ordered_scan
-                    .pks
-                    .into_iter()
-                    .filter_map(move |pk| table.rows.get(&pk).cloned()),
-            )
+            let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
+            for pk in ordered_scan.pks {
+                if let Some(stored) = table.rows.get(&pk) {
+                    materialized.push(snapshot.materialize_row(stored)?.into_owned());
+                }
+            }
+            Box::new(materialized.into_iter())
         } else {
             if let Some(collector) = read_set {
                 collector.record_full_table_scan(
@@ -381,7 +390,14 @@ fn execute_query_with_options_capturing_signed(
                 );
             }
             estimated_rows = table.map_or(0, |t| t.rows.len());
-            Box::new(table.into_iter().flat_map(|t| t.rows.values().cloned()))
+            let mut materialized = Vec::new();
+            if let Some(t) = table {
+                materialized.reserve(t.rows.len());
+                for stored in t.rows.values() {
+                    materialized.push(snapshot.materialize_row(stored)?.into_owned());
+                }
+            }
+            Box::new(materialized.into_iter())
         };
 
     if estimated_rows > max_scan_rows

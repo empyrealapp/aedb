@@ -47,7 +47,8 @@ fn build_runtime_index(
         .table_by_namespace_key_mut(&ns, TABLE_NAME)
         .expect("users table");
     let mut runtime_index = SecondaryIndex::default();
-    for (pk, row) in &table.rows {
+    for (pk, stored) in &table.rows {
+        let row = stored.resident().expect("resident row");
         let key = extract_index_key_encoded(row, &schema, &columns).expect("runtime index key");
         runtime_index.insert(key, pk.clone());
     }

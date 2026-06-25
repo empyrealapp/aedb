@@ -1817,9 +1817,10 @@ impl AedbInstance {
             return Ok(Vec::new());
         };
         let encoded_pk = EncodedKey::from_values(&[Value::Integer(commit_seq as i64)]);
-        let Some(row) = table.rows.get(&encoded_pk) else {
+        let Some(stored) = table.rows.get(&encoded_pk) else {
             return Ok(Vec::new());
         };
+        let row = snapshot.materialize_row(stored)?;
         let Some(Value::Json(events_json)) = row.values.get(events_idx) else {
             return Ok(Vec::new());
         };
@@ -3141,7 +3142,13 @@ impl AedbInstance {
         let table = snapshot
             .table(project_id, scope_id, table_name)
             .ok_or_else(|| AedbError::Validation("table not found".into()))?;
-        let rows: Vec<crate::catalog::types::Row> = table.rows.values().cloned().collect();
+        let rows: Vec<crate::catalog::types::Row> = {
+            let mut materialized = Vec::with_capacity(table.rows.len());
+            for stored in table.rows.values() {
+                materialized.push(snapshot.materialize_row(stored)?.into_owned());
+            }
+            materialized
+        };
         let mut updated = 0u64;
         for chunk in rows.chunks(batch_size) {
             for row in chunk {
@@ -3196,7 +3203,13 @@ impl AedbInstance {
         let table = snapshot
             .table(project_id, scope_id, table_name)
             .ok_or_else(|| AedbError::Validation("table not found".into()))?;
-        let rows: Vec<crate::catalog::types::Row> = table.rows.values().cloned().collect();
+        let rows: Vec<crate::catalog::types::Row> = {
+            let mut materialized = Vec::with_capacity(table.rows.len());
+            for stored in table.rows.values() {
+                materialized.push(snapshot.materialize_row(stored)?.into_owned());
+            }
+            materialized
+        };
         let start_offset = snapshot
             .try_kv_get(project_id, scope_id, progress_key)?
             .and_then(|e| std::str::from_utf8(&e.value).ok()?.parse::<usize>().ok())
