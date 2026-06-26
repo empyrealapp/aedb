@@ -2394,6 +2394,94 @@ pub(super) fn process_commit_epoch(
         sync_executed = true;
     }
 
+    finalize_committed_epoch(
+        state,
+        EpochFinalizeInput {
+            working_keyspace,
+            working_catalog,
+            working_global_unique_index,
+            working_idempotency,
+            sequenced,
+            internal_sequenced,
+            outcomes,
+            wal_payload_size_bytes,
+            requires_sync,
+            catalog_changed,
+            coordinator_apply_attempts,
+            coordinator_apply_micros,
+            parallel_apply_micros,
+            pre_wal_micros,
+            read_set_conflicts,
+            wal_append_ops,
+            wal_append_bytes,
+            wal_append_micros,
+            wal_sync_ops,
+            wal_sync_micros,
+            sync_executed,
+        },
+    )
+}
+
+/// Owned inputs handed from the apply/WAL-append phase to the post-durability
+/// finalize phase. Bundling them lets the finalize step run as its own function
+/// — either inline (synchronous callers) or after the apply loop has released
+/// the state lock and performed the durability fsync off-lock.
+struct EpochFinalizeInput {
+    working_keyspace: Keyspace,
+    working_catalog: Catalog,
+    working_global_unique_index: GlobalUniqueIndexState,
+    working_idempotency: Option<HashMap<IdempotencyKey, IdempotencyRecord>>,
+    sequenced: Vec<SequencedCommit>,
+    internal_sequenced: Vec<InternalSequencedCommit>,
+    outcomes: Vec<EpochOutcome>,
+    wal_payload_size_bytes: usize,
+    requires_sync: bool,
+    catalog_changed: bool,
+    coordinator_apply_attempts: u64,
+    coordinator_apply_micros: u64,
+    parallel_apply_micros: u64,
+    pre_wal_micros: u64,
+    read_set_conflicts: u64,
+    wal_append_ops: u64,
+    wal_append_bytes: u64,
+    wal_append_micros: u64,
+    wal_sync_ops: u64,
+    wal_sync_micros: u64,
+    sync_executed: bool,
+}
+
+/// Apply the in-memory swap, advance the durability/visibility heads, publish
+/// version deltas, and build the per-commit outcomes. The WAL frames have
+/// already been appended (and, for the `requires_sync` path, fsynced) before
+/// this runs.
+fn finalize_committed_epoch(
+    state: &mut ExecutorState,
+    input: EpochFinalizeInput,
+) -> EpochProcessResult {
+    let EpochFinalizeInput {
+        working_keyspace,
+        working_catalog,
+        working_global_unique_index,
+        working_idempotency,
+        sequenced,
+        internal_sequenced,
+        mut outcomes,
+        wal_payload_size_bytes,
+        requires_sync,
+        catalog_changed,
+        coordinator_apply_attempts,
+        coordinator_apply_micros,
+        parallel_apply_micros,
+        pre_wal_micros,
+        read_set_conflicts,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        mut wal_sync_ops,
+        mut wal_sync_micros,
+        mut sync_executed,
+    } = input;
+
     let last_user_seq = sequenced.last().map(|c| c.seq).unwrap_or(state.current_seq);
     let last_internal_seq = internal_sequenced
         .last()
