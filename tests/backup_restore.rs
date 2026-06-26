@@ -145,7 +145,7 @@ async fn backup_full_is_hot_and_restore_is_consistent_at_backup_head() {
     let restore_dir = tempdir().expect("restore dir");
     let config = backup_test_config();
 
-    let db = Arc::new(AedbInstance::open(config.clone(), live_dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     for i in 0..2_000u64 {
@@ -280,7 +280,7 @@ async fn full_backup_of_disk_backed_values_is_self_contained() {
     };
     let value: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"blob".to_vec(), value.clone())
         .await
@@ -302,7 +302,7 @@ async fn full_backup_of_disk_backed_values_is_self_contained() {
     AedbInstance::restore_from_backup(backup_dir.path(), disk_restore_dir.path(), &config)
         .expect("restore disk-backed");
     let disk_restored =
-        AedbInstance::open(config.clone(), disk_restore_dir.path()).expect("open disk restored");
+        AedbInstance::open_anonymous(config.clone(), disk_restore_dir.path()).expect("open disk restored");
     let disk_value = disk_restored
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -317,7 +317,7 @@ async fn full_backup_of_disk_backed_values_is_self_contained() {
     AedbInstance::restore_from_backup(backup_dir.path(), memory_restore_dir.path(), &memory_config)
         .expect("restore in-memory");
     let memory_restored =
-        AedbInstance::open(memory_config, memory_restore_dir.path()).expect("open memory restored");
+        AedbInstance::open_anonymous(memory_config, memory_restore_dir.path()).expect("open memory restored");
     let memory_value = memory_restored
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -335,7 +335,7 @@ async fn incremental_chain_restore_to_target_seq_is_exact() {
     let restore_dir = tempdir().expect("restore dir");
     let config = backup_test_config();
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let mut seq_to_key = Vec::new();
@@ -430,7 +430,7 @@ async fn backup_incremental_is_hot_and_completes_without_stalling() {
     let inc_dir = tempdir().expect("inc dir");
     let config = backup_test_config();
 
-    let db = Arc::new(AedbInstance::open(config.clone(), live_dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     for i in 0..512u64 {
@@ -523,7 +523,7 @@ async fn incremental_chain_restore_fails_when_chain_cannot_reach_target() {
     let restore_dir = tempdir().expect("restore dir");
     let config = backup_test_config();
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for i in 0..20u64 {
@@ -580,7 +580,7 @@ async fn incremental_chain_restore_to_target_time_is_exact() {
     let restore_dir = tempdir().expect("restore dir");
     let config = backup_test_config();
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for i in 0..40u64 {
@@ -659,7 +659,7 @@ async fn namespace_restore_replaces_only_target_namespace() {
     let full_dir = tempdir().expect("full dir");
     let config = backup_test_config();
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "other").await.expect("scope other");
 
@@ -732,7 +732,7 @@ async fn strict_backup_chain_restore_succeeds_with_hash_chain_enforcement() {
     let restore_dir = tempdir().expect("restore dir");
     let config = strict_backup_chain_config();
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for i in 0..120u64 {
@@ -815,7 +815,7 @@ async fn strict_backup_chain_restore_rejects_tampered_incremental_segment() {
         .clone()
         .expect("production config must include manifest_hmac_key");
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for i in 0..140u64 {
@@ -916,7 +916,7 @@ async fn single_file_encrypted_backup_roundtrip_and_wrong_key_fails() {
     let key = [42u8; 32];
     let config = backup_test_config().with_checkpoint_key(key);
 
-    let db = AedbInstance::open(config.clone(), live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     for i in 0..20u64 {
         db.commit(Mutation::KvSet {
@@ -971,7 +971,7 @@ async fn parallel_disk_backed_updates_checkpoint_and_encrypted_file_restore_are_
     let backup_file = backup_file_dir.path().join("parallel_disk_backed.aedbarc");
     let config = production_e2e_config();
 
-    let db = Arc::new(AedbInstance::open(config.clone(), live_dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -1102,7 +1102,7 @@ async fn parallel_disk_backed_updates_checkpoint_and_encrypted_file_restore_are_
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(config.clone(), live_dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config.clone(), live_dir.path()).expect("reopen");
     assert_parallel_e2e_state(&reopened, EXPECTED_ROWS).await;
     let backup = reopened
         .backup_full_to_file(&backup_file)
@@ -1115,7 +1115,7 @@ async fn parallel_disk_backed_updates_checkpoint_and_encrypted_file_restore_are_
             .expect("restore file");
     assert_eq!(restored_seq, backup.wal_head_seq);
 
-    let restored = AedbInstance::open(config, restore_dir.path()).expect("open restored");
+    let restored = AedbInstance::open_anonymous(config, restore_dir.path()).expect("open restored");
     assert_parallel_e2e_state(&restored, EXPECTED_ROWS).await;
     restored.shutdown().await.expect("shutdown restored");
 }
@@ -1126,7 +1126,7 @@ async fn full_backup_excludes_stale_wal_segments() {
     let backup_dir = tempdir().expect("backup dir");
     let config = strict_backup_chain_config();
 
-    let db = AedbInstance::open(config, live_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, live_dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for i in 0..160u64 {

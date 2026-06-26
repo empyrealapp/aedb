@@ -24,7 +24,7 @@ fn decode_u64_u256(bytes: &[u8]) -> u64 {
 #[tokio::test]
 async fn integration_kv_updates_and_preflight_balance_checks() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("kv").await.expect("project");
 
     db.kv_set("kv", "app", b"greeting".to_vec(), b"hello".to_vec())
@@ -136,7 +136,7 @@ async fn integration_kv_updates_and_preflight_balance_checks() {
 #[tokio::test]
 async fn integration_preflight_plan_rejects_stale_kv_assertion() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("kv").await.expect("project");
     db.kv_set("kv", "app", b"balance".to_vec(), u256_be(100).to_vec())
         .await
@@ -178,7 +178,7 @@ async fn integration_preflight_plan_rejects_stale_kv_assertion() {
 #[tokio::test]
 async fn integration_postflight_check_does_not_enter_preflight_read_set() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("kv").await.expect("project");
     db.kv_set("kv", "app", b"balance".to_vec(), u256_be(1).to_vec())
         .await

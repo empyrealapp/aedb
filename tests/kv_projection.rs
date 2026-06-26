@@ -11,7 +11,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn kv_projection_table_materializes_kv_state() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.enable_kv_projection("p", "app")
         .await
@@ -70,7 +70,7 @@ async fn kv_projection_table_materializes_kv_state() {
 #[tokio::test]
 async fn kv_projection_table_is_managed_and_read_only() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.enable_kv_projection("p", "app")
         .await

@@ -40,7 +40,7 @@ proptest! {
             .expect("runtime");
         let outcome: Result<(), TestCaseError> = rt.block_on(async move {
             let dir = tempdir().expect("temp dir");
-            let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+            let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
             db.create_project("p").await.expect("project");
 
             let mut key = b"atomic-prop:".to_vec();
@@ -101,7 +101,7 @@ proptest! {
                 storage_mode: StorageMode::DiskBacked,
                 ..AedbConfig::default()
             };
-            let db = AedbInstance::open(config, dir.path()).expect("open");
+            let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
             db.create_project("p").await.expect("project");
             db.commit(Mutation::Ddl(DdlOperation::CreateTable {
                 owner_id: None,
@@ -236,7 +236,7 @@ proptest! {
             .expect("runtime");
         let outcome: Result<(), TestCaseError> = rt.block_on(async move {
             let dir = tempdir().expect("temp dir");
-            let db = AedbInstance::open(AedbConfig::production([7u8; 32]), dir.path()).expect("open");
+            let db = AedbInstance::open_anonymous(AedbConfig::production([7u8; 32]), dir.path()).expect("open");
             db.create_project("p").await.expect("project");
 
             let idem = IdempotencyKey(key_seed.to_be_bytes());
@@ -289,7 +289,7 @@ proptest! {
             let dump_b = dump_b_dir.path().join("b.aedbdump");
             let config = AedbConfig::production([8u8; 32]);
 
-            let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+            let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
             db.create_project("p").await.expect("project");
             for i in 0..writes {
                 let key = format!("replay-prop:{seed}:{i}").into_bytes();
@@ -367,7 +367,7 @@ proptest! {
             .expect("runtime");
         let outcome: Result<(), TestCaseError> = rt.block_on(async move {
             let dir = tempdir().expect("temp dir");
-            let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+            let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
             db.create_project("p").await.expect("project");
 
             let err = db

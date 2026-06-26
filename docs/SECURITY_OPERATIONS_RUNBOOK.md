@@ -9,9 +9,17 @@
 
 ## 2. Authenticated Caller Model
 
-- Use `AedbInstance::open_secure(...)` (or `open_production(...)`) in production paths.
+- `AedbInstance::open(...)` is authenticated-by-default: anonymous
+  `commit`/`kv_set`/`query` and every `*_no_auth` helper are rejected. Use
+  `open_secure(...)` (or `open_production(...)`) in production paths for the
+  additional secure-config validation (e.g. a configured manifest HMAC key).
+- `AedbInstance::open_anonymous(...)` is the explicit opt-out that permits
+  unauthenticated operations. Use it only for trusted, non-exposed deployments.
 - Require all caller-facing operations to use authenticated `*_as` APIs.
-- Do not expose anonymous commit/query APIs in host application routes.
+- The anonymous read/write surface is intentionally limited to the explicit
+  `*_no_auth` twins (`commit_no_auth`, `kv_set_no_auth`, `kv_del_no_auth`,
+  `query_no_auth`, `kv_get_no_auth`, ...); these all error under `open`/secure
+  mode. Do not expose them in host application routes.
 - Grant minimum permissions only (project/scope/table/KV-prefix scoped).
 
 ## 3. Audit Logging

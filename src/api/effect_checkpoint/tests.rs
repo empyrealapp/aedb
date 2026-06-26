@@ -7,7 +7,7 @@ use tempfile::tempdir;
 
 async fn open() -> (tempfile::TempDir, AedbInstance) {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     (dir, db)
@@ -188,7 +188,7 @@ async fn rejects_empty_key_and_bad_json() {
 async fn survives_restart() {
     let dir = tempdir().expect("temp");
     {
-        let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
         db.create_project("arcana").await.expect("project");
         db.create_scope("arcana", "app").await.expect("scope");
         db.complete_effect("arcana", "app", "persist", r#"{"x":1}"#.into(), vec![])
@@ -196,7 +196,7 @@ async fn survives_restart() {
             .unwrap();
         db.shutdown().await.expect("graceful shutdown");
     }
-    let db2 = AedbInstance::open(AedbConfig::default(), dir.path()).expect("reopen");
+    let db2 = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     let claim = db2.begin_effect("arcana", "app", "persist").await.unwrap();
     assert_eq!(
         claim,

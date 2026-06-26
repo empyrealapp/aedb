@@ -80,7 +80,7 @@ fn bench_upsert_at_table_size(c: &mut Criterion) {
     for &size in &[10_000_i64, 100_000, 500_000] {
         let dir = tempdir().expect("tempdir");
         let db = rt.block_on(async {
-            AedbInstance::open(AedbConfig::default(), dir.path()).expect("open")
+            AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open")
         });
         rt.block_on(async {
             setup_table(&db).await;
@@ -123,7 +123,7 @@ fn bench_kv_value_size(c: &mut Criterion) {
     for &vsize in &[64_usize, 1024, 16_384, 131_072] {
         let dir = tempdir().expect("tempdir");
         let db = rt.block_on(async {
-            AedbInstance::open(AedbConfig::default(), dir.path()).expect("open")
+            AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open")
         });
         rt.block_on(async {
             db.create_project(PROJECT_ID).await.expect("project");
@@ -160,7 +160,7 @@ fn bench_upsert_with_n_indexes(c: &mut Criterion) {
     for &nidx in &[0_usize, 1, 4, 8] {
         let dir = tempdir().expect("tempdir");
         let db = rt.block_on(async {
-            AedbInstance::open(AedbConfig::default(), dir.path()).expect("open")
+            AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open")
         });
         rt.block_on(async {
             db.create_project(PROJECT_ID).await.expect("project");

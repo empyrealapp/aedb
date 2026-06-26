@@ -18,7 +18,7 @@ const BATCH_INSERT_ROWS: i64 = 64;
 
 async fn setup_db(config: AedbConfig, seed_rows: i64) -> (tempfile::TempDir, AedbInstance) {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: PROJECT_ID.into(),

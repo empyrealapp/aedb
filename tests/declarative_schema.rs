@@ -33,7 +33,7 @@ fn table_spec_builds_table_and_index_ddl() {
 #[tokio::test]
 async fn declarative_migration_plan_runs_end_to_end() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     let sessions = TableSpec::new("sessions")
         .column("id", ColumnType::Text, false)
@@ -83,7 +83,7 @@ async fn declarative_migration_plan_runs_end_to_end() {
 #[tokio::test]
 async fn table_migration_builder_applies_and_rolls_back_schema_changes() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     let sessions = TableSpec::new("sessions")
         .column("id", ColumnType::Text, false)

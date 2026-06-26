@@ -5,7 +5,7 @@ use tempfile::tempdir;
 
 async fn open() -> (tempfile::TempDir, AedbInstance) {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     (dir, db)
@@ -199,7 +199,7 @@ async fn rejects_bad_input() {
 async fn series_survives_restart() {
     let dir = tempdir().expect("temp");
     {
-        let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
         db.create_project("arcana").await.expect("project");
         db.create_scope("arcana", "app").await.expect("scope");
         db.series_append("arcana", "app", "nav", r#"{"nav":1}"#, 5)
@@ -207,7 +207,7 @@ async fn series_survives_restart() {
             .unwrap();
         db.shutdown().await.expect("shutdown");
     }
-    let db2 = AedbInstance::open(AedbConfig::default(), dir.path()).expect("reopen");
+    let db2 = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     let pts = db2
         .series_read("arcana", "app", "nav", 10, false, ConsistencyMode::AtLatest)
         .await

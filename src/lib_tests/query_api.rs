@@ -15,7 +15,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn api_open_commit_query_shutdown() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -75,7 +75,7 @@ async fn api_open_commit_query_shutdown() {
 #[tokio::test]
 async fn insert_rejects_duplicate_primary_key() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -134,7 +134,7 @@ async fn insert_rejects_duplicate_primary_key() {
 #[tokio::test]
 async fn insert_batch_rejects_duplicate_primary_key() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -201,7 +201,7 @@ async fn insert_batch_rejects_duplicate_primary_key() {
 #[tokio::test]
 async fn async_projection_index_reports_materialized_seq() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -285,7 +285,7 @@ async fn envelope_mutation_count_cap_rejects_oversized_envelope() {
         max_mutations_per_envelope: 4,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let too_many: Vec<Mutation> = (0..5u8)
@@ -350,7 +350,7 @@ async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
         max_read_assertions_per_envelope: 2,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let too_many: Vec<ReadAssertion> = (0..3u8)
@@ -394,7 +394,7 @@ async fn envelope_assertion_count_cap_rejects_oversized_envelope() {
 #[tokio::test]
 async fn ddl_if_not_exists_is_idempotent_and_reports_applied() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     let first = db
         .commit_ddl(DdlOperation::CreateProject {
@@ -540,7 +540,7 @@ async fn ddl_if_not_exists_is_idempotent_and_reports_applied() {
 #[tokio::test]
 async fn index_introspection_apis_return_index_definitions() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.commit_ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -594,7 +594,7 @@ async fn index_introspection_apis_return_index_definitions() {
 #[tokio::test]
 async fn read_tx_keeps_snapshot_consistency_across_queries() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -669,7 +669,7 @@ async fn read_tx_keeps_snapshot_consistency_across_queries() {
 #[tokio::test]
 async fn list_batch_and_lookup_helpers_work() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -806,7 +806,7 @@ async fn list_batch_and_lookup_helpers_work() {
 #[tokio::test]
 async fn lookup_then_hydrate_fetches_all_pages_for_large_key_sets() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
 
@@ -896,7 +896,7 @@ async fn lookup_then_hydrate_fetches_all_pages_for_large_key_sets() {
 #[tokio::test]
 async fn telemetry_sql_and_remote_adapter_paths_work() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -966,7 +966,7 @@ async fn telemetry_sql_and_remote_adapter_paths_work() {
     )
     .expect("restore remote");
     let restored =
-        AedbInstance::open(AedbConfig::default(), restored_dir.path()).expect("open restored");
+        AedbInstance::open_anonymous(AedbConfig::default(), restored_dir.path()).expect("open restored");
     let restored_val = restored
         .kv_get_no_auth("p", "app", b"remote:test", ConsistencyMode::AtLatest)
         .await
@@ -982,7 +982,7 @@ async fn telemetry_sql_and_remote_adapter_paths_work() {
 #[tokio::test]
 async fn removing_last_telemetry_hook_disables_commit_and_query_callbacks() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1032,7 +1032,7 @@ async fn removing_last_telemetry_hook_disables_commit_and_query_callbacks() {
 #[tokio::test]
 async fn exists_and_explain_diagnostics_work() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1115,7 +1115,7 @@ async fn exists_and_explain_diagnostics_work() {
 #[tokio::test]
 async fn explain_reports_ordered_index_row_source() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1198,7 +1198,7 @@ async fn explain_reports_ordered_index_row_source() {
 #[tokio::test]
 async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_paths() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     let project_scope_id = "__project__";
     db.create_project("p").await.expect("project");
     db.create_scope("p", project_scope_id)
@@ -1333,7 +1333,7 @@ async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_path
 #[tokio::test]
 async fn uuid_text_equality_parity_between_primary_key_and_secondary_index_paths() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
 
@@ -1506,7 +1506,7 @@ async fn uuid_text_equality_parity_between_primary_key_and_secondary_index_paths
 #[tokio::test]
 async fn u8_column_type_supports_write_read_and_indexed_equality() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
 
@@ -1596,7 +1596,7 @@ async fn u8_column_type_supports_write_read_and_indexed_equality() {
 #[tokio::test]
 async fn u64_column_type_supports_write_read_and_indexed_equality() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
 
@@ -1686,7 +1686,7 @@ async fn u64_column_type_supports_write_read_and_indexed_equality() {
 #[tokio::test]
 async fn sql_transaction_plan_helpers_commit() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1741,7 +1741,7 @@ async fn list_with_total_respects_scan_bounds_for_count_queries() {
         max_scan_rows: 3,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1804,7 +1804,7 @@ async fn list_with_total_respects_scan_bounds_for_count_queries() {
 #[tokio::test]
 async fn delete_where_rejects_deep_predicate_trees() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1842,7 +1842,7 @@ async fn delete_where_rejects_deep_predicate_trees() {
 #[tokio::test]
 async fn insert_batch_rejects_duplicate_primary_keys_within_same_batch() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1902,7 +1902,7 @@ async fn delete_where_respects_scan_budget() {
         max_scan_rows: 3,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1969,7 +1969,7 @@ async fn count_compare_assertions_respect_scan_budget() {
         max_scan_rows: 3,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -2032,7 +2032,7 @@ async fn count_compare_assertions_respect_scan_budget() {
 #[tokio::test]
 async fn float_columns_reject_non_finite_values() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     create_table(
         &db,
@@ -2075,7 +2075,7 @@ async fn table_values_respect_max_table_value_bytes() {
         max_table_value_bytes: 8,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     create_table(
         &db,
@@ -2117,7 +2117,7 @@ async fn table_values_respect_max_table_value_bytes() {
 #[tokio::test]
 async fn cascade_delete_respects_max_depth() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
 

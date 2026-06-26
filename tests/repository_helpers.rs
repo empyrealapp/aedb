@@ -43,7 +43,7 @@ impl TryFromRow for BrokenRecord {
 #[tokio::test]
 async fn repository_context_commit_checked_and_page_query_work() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -121,7 +121,7 @@ async fn repository_context_commit_checked_and_page_query_work() {
 #[tokio::test]
 async fn repository_context_decoded_pages_surface_decode_errors() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -198,7 +198,7 @@ async fn repository_context_decoded_pages_surface_decode_errors() {
 #[tokio::test]
 async fn repository_context_explain_respects_caller_permissions() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");

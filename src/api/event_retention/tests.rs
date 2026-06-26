@@ -8,7 +8,7 @@ use tempfile::tempdir;
 
 async fn open() -> (tempfile::TempDir, AedbInstance) {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     (dir, db)
@@ -111,7 +111,7 @@ async fn huge_max_age_prunes_nothing() {
 async fn processor_checkpoint_floors_pruning() {
     let dir = tempdir().expect("temp");
     let db =
-        std::sync::Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+        std::sync::Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     // First 4 events are consumed by a processor; the rest are not.
@@ -205,7 +205,7 @@ async fn more_remaining_supports_incremental_compaction() {
 async fn pruned_events_stay_pruned_after_restart() {
     let dir = tempdir().expect("temp");
     {
-        let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
         db.create_project("arcana").await.expect("project");
         db.create_scope("arcana", "app").await.expect("scope");
         emit_n(&db, 10).await;
@@ -218,7 +218,7 @@ async fn pruned_events_stay_pruned_after_restart() {
         .unwrap();
         db.shutdown().await.expect("shutdown");
     }
-    let db2 = AedbInstance::open(AedbConfig::default(), dir.path()).expect("reopen");
+    let db2 = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     assert_eq!(remaining_keys(&db2).await, vec!["d8", "d9"]);
 }
 

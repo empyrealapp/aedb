@@ -9,7 +9,7 @@ const TTL: u64 = 60_000_000; // 60s — comfortably live for a test.
 
 async fn open() -> (tempfile::TempDir, AedbInstance) {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     (dir, db)
@@ -213,7 +213,7 @@ async fn rejects_empty_names() {
 async fn checkpoint_survives_restart() {
     let dir = tempdir().expect("temp");
     let token = {
-        let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
         db.create_project("arcana").await.expect("project");
         db.create_scope("arcana", "app").await.expect("scope");
         let l = lease(
@@ -237,7 +237,7 @@ async fn checkpoint_survives_restart() {
         db.shutdown().await.expect("shutdown");
         l.fencing_token
     };
-    let db2 = AedbInstance::open(AedbConfig::default(), dir.path()).expect("reopen");
+    let db2 = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     let status = db2
         .monitor_status("arcana", "app", "erc20", ConsistencyMode::AtLatest)
         .await

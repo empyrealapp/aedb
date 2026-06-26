@@ -19,7 +19,7 @@ async fn order_book_new_with_durable_finality_waits_until_durable_head_catches_u
         batch_max_bytes: usize::MAX,
         ..AedbConfig::default()
     };
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let fsync_db = Arc::clone(&db);
@@ -71,7 +71,7 @@ async fn order_book_new_with_durable_finality_waits_until_durable_head_catches_u
 #[tokio::test]
 async fn order_book_new_fok_reject_is_dropped_before_wal_append() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let before = db.operational_metrics().await;
 
@@ -224,7 +224,7 @@ async fn secure_mode_supports_order_book_writes_via_authenticated_as_apis() {
 #[tokio::test]
 async fn open_orders_requires_kv_read_permission() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -298,7 +298,7 @@ async fn open_orders_requires_kv_read_permission() {
 #[tokio::test]
 async fn strict_cancel_rejects_missing_order() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let err = db
@@ -318,7 +318,7 @@ async fn strict_cancel_rejects_missing_order() {
 #[tokio::test]
 async fn strict_cancel_rejects_already_final_order() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -361,7 +361,7 @@ async fn strict_cancel_rejects_already_final_order() {
 #[tokio::test]
 async fn strict_cancel_by_client_id_rejects_missing_mapping() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let err = db
@@ -381,7 +381,7 @@ async fn strict_cancel_by_client_id_rejects_missing_mapping() {
 #[tokio::test]
 async fn strict_cancel_by_client_id_rejects_already_final_order() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -438,7 +438,7 @@ async fn strict_cancel_by_client_id_rejects_already_final_order() {
 #[tokio::test]
 async fn strict_cancel_by_client_id_rejects_invalid_mapping_encoding() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSet {
@@ -467,7 +467,7 @@ async fn strict_cancel_by_client_id_rejects_invalid_mapping_encoding() {
 #[tokio::test]
 async fn strict_cancel_by_client_id_detects_owner_mismatch_under_tampered_mapping() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -522,7 +522,7 @@ async fn strict_cancel_by_client_id_detects_owner_mismatch_under_tampered_mappin
 #[tokio::test]
 async fn strict_reduce_rejects_missing_order() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let mut one = [0u8; 32];
     one[31] = 1;
@@ -544,7 +544,7 @@ async fn strict_reduce_rejects_missing_order() {
 #[tokio::test]
 async fn strict_cancel_replace_rejects_already_final_order() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
