@@ -191,7 +191,8 @@ async fn lifecycle_outbox_includes_app_emit_events() {
 #[tokio::test]
 async fn reactive_processor_scheduler_runs_with_period_and_batch_limits() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -280,7 +281,8 @@ async fn reactive_processor_scheduler_runs_with_period_and_batch_limits() {
 #[tokio::test]
 async fn reactive_processor_registry_persists_and_auto_resumes_on_handler_registration() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -326,7 +328,8 @@ async fn reactive_processor_registry_persists_and_auto_resumes_on_handler_regist
     db.shutdown().await.expect("graceful shutdown");
     drop(db);
 
-    let db2 = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen"));
+    let db2 =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen"));
     let processed_resume = Arc::clone(&processed);
     let resumed = db2
         .register_reactive_processor_handler("resume_processor", move |_db, events| {
@@ -370,7 +373,8 @@ async fn reactive_processor_registry_persists_and_auto_resumes_on_handler_regist
 #[tokio::test]
 async fn reactive_processor_scheduler_retries_and_then_succeeds() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -447,7 +451,8 @@ async fn reactive_processor_scheduler_retries_and_then_succeeds() {
 #[tokio::test]
 async fn reactive_processor_scheduler_dead_letters_after_retry_exhaustion() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -703,7 +708,8 @@ async fn reactive_processor_scheduler_uses_explicit_caller_permissions() {
 #[tokio::test]
 async fn reactive_processor_pause_resume_list_and_health_work() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -826,7 +832,8 @@ async fn reactive_processor_pause_resume_list_and_health_work() {
 #[tokio::test]
 async fn reactive_processor_resume_requires_registered_handler() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.start_reactive_processor(
@@ -846,7 +853,8 @@ async fn reactive_processor_resume_requires_registered_handler() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let db2 = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen"));
+    let db2 =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen"));
     let err = db2
         .resume_reactive_processor("resume_requires_handler")
         .await
@@ -857,7 +865,8 @@ async fn reactive_processor_resume_requires_registered_handler() {
 #[tokio::test]
 async fn reactive_processor_scheduler_can_run_periodically_without_events() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -906,7 +915,8 @@ async fn reactive_processor_scheduler_can_run_periodically_without_events() {
 #[tokio::test]
 async fn reactive_processor_slo_status_and_enforcement_detect_breaches() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 
@@ -968,7 +978,8 @@ async fn reactive_processor_slo_status_and_enforcement_detect_breaches() {
 #[tokio::test]
 async fn reactive_processor_slo_status_healthy_when_within_thresholds() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
 

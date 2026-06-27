@@ -724,9 +724,7 @@ pub fn preflight_plan_with_config(
         } => {
             let (max_version, structural_version) = snapshot
                 .table(project_id, scope_id, table_name)
-                .map(|t| {
-                    (t.max_version(), t.structural_version)
-                })
+                .map(|t| (t.max_version(), t.structural_version))
                 .unwrap_or((0, 0));
             read_set.ranges.push(ReadRangeEntry {
                 range: ReadRange::TableRange {

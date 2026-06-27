@@ -257,7 +257,8 @@ async fn snapshot_limit_enforced_on_read_path() {
 #[tokio::test]
 async fn idempotent_retry_does_not_double_apply_non_idempotent_mutation() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let key = IdempotencyKey([42u8; 16]);

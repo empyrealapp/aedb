@@ -173,7 +173,11 @@ async fn verify_database_handles_empty_table_without_false_violation() {
         table_name: "empty".into(),
         owner_id: None,
         if_not_exists: false,
-        columns: vec![ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false }],
+        columns: vec![ColumnDef {
+            name: "id".into(),
+            col_type: ColumnType::Integer,
+            nullable: false,
+        }],
         primary_key: vec!["id".into()],
     }))
     .await

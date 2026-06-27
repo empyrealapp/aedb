@@ -18,7 +18,6 @@
 //! Uses `DurabilityMode::Full`, so every `Ok` commit is fsynced before ack and
 //! must survive an abrupt drop. The shadow model is therefore an exact oracle.
 
-use aedb::{AedbInstance, CommitFinality};
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
@@ -27,6 +26,7 @@ use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use aedb::error::AedbError;
 use aedb::offline;
 use aedb::query::plan::{ConsistencyMode, Query, QueryOptions};
+use aedb::{AedbInstance, CommitFinality};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};

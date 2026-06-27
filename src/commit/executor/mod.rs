@@ -1797,19 +1797,20 @@ impl CommitExecutor {
         let (value_metrics, segment_metrics, keyspace_resident_bytes) = {
             let state = self.state.lock().await;
             let keyspace_resident_bytes = state.keyspace.mem_bytes as u64;
-            let value_metrics = state
-                .keyspace
-                .value_store
-                .as_ref()
-                .map_or((0, 0, 0, 0, 0), |store| {
-                    (
-                        store.len_bytes(),
-                        store.hot_cache_resident_bytes() as u64,
-                        store.hot_cache_capacity_bytes() as u64,
-                        store.hot_cache_hits(),
-                        store.hot_cache_misses(),
-                    )
-                });
+            let value_metrics =
+                state
+                    .keyspace
+                    .value_store
+                    .as_ref()
+                    .map_or((0, 0, 0, 0, 0), |store| {
+                        (
+                            store.len_bytes(),
+                            store.hot_cache_resident_bytes() as u64,
+                            store.hot_cache_capacity_bytes() as u64,
+                            store.hot_cache_hits(),
+                            store.hot_cache_misses(),
+                        )
+                    });
             let segment_metrics =
                 state
                     .keyspace

@@ -1025,7 +1025,8 @@ async fn crash_matrix_a17b_thousand_crash_cycles_preserve_state() {
         assert_a17_cycle_row(dir.path(), &writer_config, cycle).await;
     }
 
-    let final_db = AedbInstance::open_anonymous(writer_config.clone(), dir.path()).expect("final open");
+    let final_db =
+        AedbInstance::open_anonymous(writer_config.clone(), dir.path()).expect("final open");
     let final_rows = final_db
         .query(
             "p",

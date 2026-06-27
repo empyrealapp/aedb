@@ -110,8 +110,9 @@ async fn huge_max_age_prunes_nothing() {
 #[tokio::test]
 async fn processor_checkpoint_floors_pruning() {
     let dir = tempdir().expect("temp");
-    let db =
-        std::sync::Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db = std::sync::Arc::new(
+        AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"),
+    );
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     // First 4 events are consumed by a processor; the rest are not.

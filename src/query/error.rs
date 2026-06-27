@@ -61,8 +61,9 @@ impl QueryErrorCode {
             | QueryErrorCode::SnapshotExpired
             | QueryErrorCode::SnapshotLimitReached => QueryErrorClass::Retryable,
             QueryErrorCode::PermissionDenied => QueryErrorClass::Permission,
-            QueryErrorCode::ScanBoundExceeded
-            | QueryErrorCode::MaterializationBudgetExceeded => QueryErrorClass::Unavailable,
+            QueryErrorCode::ScanBoundExceeded | QueryErrorCode::MaterializationBudgetExceeded => {
+                QueryErrorClass::Unavailable
+            }
             QueryErrorCode::InternalError => QueryErrorClass::Integrity,
             QueryErrorCode::TableNotFound
             | QueryErrorCode::ColumnNotFound

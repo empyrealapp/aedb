@@ -242,7 +242,8 @@ async fn test_settlement_atomicity_large_batch() {
 #[tokio::test]
 async fn test_settlement_prevents_concurrent_ops() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_settlement_schema(&db).await;
 
     // Setup: Create 10 winners

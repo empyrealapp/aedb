@@ -238,7 +238,5 @@ fn print_usage() {
     eprintln!(
         "  aedb check invariants --data-dir <aedb-dir> [--hmac-key-hex <hex>] [--permissive]"
     );
-    eprintln!(
-        "  aedb verify --data-dir <aedb-dir> [--hmac-key-hex <hex>] [--permissive]"
-    );
+    eprintln!("  aedb verify --data-dir <aedb-dir> [--hmac-key-hex <hex>] [--permissive]");
 }

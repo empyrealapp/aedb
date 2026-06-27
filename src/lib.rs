@@ -11,10 +11,10 @@ pub mod engine_interface;
 pub mod error;
 pub mod faults;
 mod lib_helpers;
-pub mod locks;
 #[cfg(test)]
 #[allow(deprecated)]
 mod lib_tests;
+pub mod locks;
 pub mod manifest;
 pub mod migration;
 pub mod offline;
@@ -1477,10 +1477,7 @@ impl AedbInstance {
     /// opened with [`Self::open`], [`Self::open_secure`], or
     /// [`Self::open_production`]; prefer [`Self::commit_as`] in services. Open
     /// the instance with [`Self::open_anonymous`] to use this path.
-    pub async fn commit_no_auth(
-        &self,
-        mutation: Mutation,
-    ) -> Result<CommitResult, AedbError> {
+    pub async fn commit_no_auth(&self, mutation: Mutation) -> Result<CommitResult, AedbError> {
         if self.require_authenticated_calls {
             return Err(AedbError::PermissionDenied(
                 "commit_no_auth is unavailable in secure mode; use commit_as".into(),
@@ -2948,8 +2945,7 @@ impl AedbInstance {
             keyspace_memory_used_fraction: if runtime.keyspace_memory_budget_bytes == 0 {
                 0.0
             } else {
-                runtime.keyspace_resident_bytes as f64
-                    / runtime.keyspace_memory_budget_bytes as f64
+                runtime.keyspace_resident_bytes as f64 / runtime.keyspace_memory_budget_bytes as f64
             },
         }
     }

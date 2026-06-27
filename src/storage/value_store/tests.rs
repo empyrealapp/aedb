@@ -28,7 +28,9 @@ fn hot_cache_hit_and_miss_counters_track_lookups() {
     let store =
         PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 1024).expect("open store");
     // Cold append does not populate the hot cache.
-    let refs = store.append_many_cold(&[b"alpha".to_vec()]).expect("append");
+    let refs = store
+        .append_many_cold(&[b"alpha".to_vec()])
+        .expect("append");
     let value_ref = refs[0].clone();
 
     assert_eq!(store.hot_cache_hits(), 0);
