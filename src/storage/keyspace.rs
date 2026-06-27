@@ -676,7 +676,10 @@ fn tier_get_table_row(
             .inline_version()
             .or_else(|| table.row_versions.get(encoded_pk).copied())
             .unwrap_or(0);
-        return Ok(Some((version, materialize_row(stored, value_store)?.into_owned())));
+        return Ok(Some((
+            version,
+            materialize_row(stored, value_store)?.into_owned(),
+        )));
     }
     if table.row_segments.is_empty() {
         return Ok(None);
@@ -728,7 +731,10 @@ fn tier_scan_table_rows(
             if out.len() >= limit {
                 break;
             }
-            out.push((key.clone(), materialize_row(stored, value_store)?.into_owned()));
+            out.push((
+                key.clone(),
+                materialize_row(stored, value_store)?.into_owned(),
+            ));
         }
         return Ok(out);
     }
@@ -746,11 +752,7 @@ fn tier_scan_table_rows(
             for item in store.scan_range(segment, &byte_start, &byte_end)? {
                 let key = EncodedKey::from_bytes(item.key);
                 let version = item.entry.version;
-                if merged
-                    .get(&key)
-                    .map(|(v, _)| version > *v)
-                    .unwrap_or(true)
-                {
+                if merged.get(&key).map(|(v, _)| version > *v).unwrap_or(true) {
                     merged.insert(key, (version, Some(decode_row_payload(&item.entry.value)?)));
                 }
             }
@@ -773,7 +775,10 @@ fn tier_scan_table_rows(
             .unwrap_or(0);
         merged.insert(
             key.clone(),
-            (version, Some(materialize_row(stored, value_store)?.into_owned())),
+            (
+                version,
+                Some(materialize_row(stored, value_store)?.into_owned()),
+            ),
         );
     }
 
@@ -1446,7 +1451,9 @@ impl Keyspace {
             let old_cost = row_mem_cost(row);
             let new_cost = persistent_value_ref_cost(&value_ref);
             let version = table_row_version(table, &key);
-            table.rows.insert(key, StoredRow::spilled_versioned(version, value_ref));
+            table
+                .rows
+                .insert(key, StoredRow::spilled_versioned(version, value_ref));
             self.mem_bytes = self
                 .mem_bytes
                 .saturating_add(new_cost)
@@ -1524,7 +1531,8 @@ impl Keyspace {
             if entries.is_empty() {
                 continue;
             }
-            let meta = store.write_segment(&format!("rowseg_{namespace_id:?}_{table_name}"), entries)?;
+            let meta =
+                store.write_segment(&format!("rowseg_{namespace_id:?}_{table_name}"), entries)?;
             let filename = meta.filename.clone();
             let meta_cost = kv_segment_meta_cost(&meta);
             let Some(table) = self
@@ -1925,9 +1933,10 @@ impl Keyspace {
             if existing.is_none() {
                 table.structural_version = commit_seq;
             }
-            table
-                .rows
-                .insert(encoded_pk.clone(), StoredRow::resident_versioned(commit_seq, row));
+            table.rows.insert(
+                encoded_pk.clone(),
+                StoredRow::resident_versioned(commit_seq, row),
+            );
             // The version is now carried inline by the row. Clear any legacy
             // parallel-map entry for this key so the redundant resident copy of
             // the primary key is released as data is rewritten.
@@ -3606,9 +3615,7 @@ impl KeyspaceSnapshot {
                     table.rows.keys().cloned().collect();
                 let mut new_rows = table.rows.clone();
                 for segment in &table.row_segments {
-                    for item in
-                        store.scan_range(segment, &Bound::Unbounded, &Bound::Unbounded)?
-                    {
+                    for item in store.scan_range(segment, &Bound::Unbounded, &Bound::Unbounded)? {
                         let key = EncodedKey::from_bytes(item.key);
                         if hot_keys.contains(&key) {
                             continue; // hot copy always wins
@@ -3620,7 +3627,10 @@ impl KeyspaceSnapshot {
                             continue; // deleted after this segment was written
                         }
                         if let Some(existing) = new_rows.get(&key)
-                            && existing.inline_version().map(|v| v >= version).unwrap_or(false)
+                            && existing
+                                .inline_version()
+                                .map(|v| v >= version)
+                                .unwrap_or(false)
                         {
                             continue; // a newer segment already provided this key
                         }

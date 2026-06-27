@@ -254,7 +254,8 @@ async fn keyed_state_operations_reject_non_single_pk_tables() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_state_update_rejects_concurrent_overwrite() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");

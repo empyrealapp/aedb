@@ -359,7 +359,8 @@ fn evaluate_assertion(
         } => {
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
             let ns = namespace_key(project_id, scope_id);
-            let cold = tier_assertion_rows(keyspace, project_id, scope_id, table_name, max_scan_rows)?;
+            let cold =
+                tier_assertion_rows(keyspace, project_id, scope_id, table_name, max_scan_rows)?;
             let count = match (cold, keyspace.table_by_namespace_key(&ns, table_name)) {
                 (Some(stored), _) => count_matching_rows(
                     stored.iter(),
@@ -399,7 +400,8 @@ fn evaluate_assertion(
                 return Err(AedbError::Validation(format!("column not found: {column}")));
             };
             let ns = namespace_key(project_id, scope_id);
-            let cold = tier_assertion_rows(keyspace, project_id, scope_id, table_name, max_scan_rows)?;
+            let cold =
+                tier_assertion_rows(keyspace, project_id, scope_id, table_name, max_scan_rows)?;
             let sum = match (cold, keyspace.table_by_namespace_key(&ns, table_name)) {
                 (Some(stored), _) => sum_rows_for_column(
                     stored.iter(),

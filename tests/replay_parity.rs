@@ -451,7 +451,8 @@ async fn replay_parity_under_concurrent_shared_key_writers() {
     drop(db);
 
     // Recover from the WAL alone and require exact parity with the concurrent live run.
-    let recovered = AedbInstance::open_anonymous(config, &data_dir).expect("reopen after concurrent load");
+    let recovered =
+        AedbInstance::open_anonymous(config, &data_dir).expect("reopen after concurrent load");
     let recovered_balances = read_account_balances(&recovered, ROWS).await;
     assert_eq!(
         recovered_balances, live,

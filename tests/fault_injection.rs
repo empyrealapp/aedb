@@ -10,11 +10,11 @@
 //! runtime is single-threaded per test.
 #![allow(clippy::await_holding_lock)]
 
+use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use aedb::faults::{self, FaultPlan};
-use aedb::{AedbInstance, CommitFinality};
-use aedb::commit::validation::Mutation;
 use aedb::offline;
+use aedb::{AedbInstance, CommitFinality};
 use std::sync::Mutex;
 use tempfile::tempdir;
 

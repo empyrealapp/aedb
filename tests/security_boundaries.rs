@@ -353,7 +353,8 @@ async fn test_concurrent_boundary_operations() {
     use tokio::task::JoinSet;
 
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_accounts_table(&db).await;
 
     // Setup: Account at boundary

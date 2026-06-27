@@ -237,7 +237,8 @@ async fn security_stale_table_preflight_plan_cannot_overwrite_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_parallel_asserted_state_transition_has_single_winner() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"machine:1".to_vec(), b"open".to_vec())
         .await
@@ -432,7 +433,8 @@ async fn security_postflight_check_reverts_prior_atomic_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_parallel_atomic_adds_do_not_lose_updates() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"counter".to_vec(), u64_be(0).to_vec())
         .await
@@ -470,7 +472,8 @@ async fn security_parallel_atomic_adds_do_not_lose_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_hot_key_atomic_postflight_does_not_use_stale_precondition() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"balance".to_vec(), u64_be(32).to_vec())
         .await

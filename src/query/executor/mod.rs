@@ -230,167 +230,104 @@ fn execute_query_with_options_capturing_signed(
     let mut row_source_satisfies_order = false;
     let mut row_source_index_used = options.async_index.clone();
     let mut row_source_applies_offset = false;
-    let row_source: Box<dyn Iterator<Item = Row> + Send + '_> =
-        if let Some(async_index) = &options.async_index {
-            let projection = snapshot
-                .async_index(&exec_project_id, &exec_scope_id, &query.table, async_index)
-                .ok_or_else(|| QueryError::InvalidQuery {
-                    reason: "async index not found".into(),
-                })?;
-            materialized_seq = Some(projection.materialized_seq);
-            estimated_rows = projection.rows.len();
-            // Async-index projections expose their own materialized_seq; fall
-            // back to recording a coarse table range for the underlying table
-            // so writes invalidate subscribers.
-            if let Some(collector) = read_set.as_deref_mut() {
-                collector.record_full_table_scan(
-                    snapshot,
-                    &exec_project_id,
-                    &exec_scope_id,
-                    &query.table,
-                );
-            }
-            Box::new(projection.rows.values().cloned())
-        } else if let (Some(predicate), Some(table)) = (&query.predicate, table)
-            && let Some(ordered_scan) =
-                ordered_predicate_index_scan_for_query(OrderedPredicateIndexScanRequest {
-                    catalog,
-                    project_id: &exec_project_id,
-                    scope_id: &exec_scope_id,
-                    schema,
-                    query: &query,
-                    table,
-                    predicate,
-                    offset: page_window.row_offset_count,
-                    limit: page_window.page_read_limit,
-                    has_cursor: cursor_state.is_some(),
-                })
-        {
-            has_residual_filter = false;
-            row_source_satisfies_order = true;
-            row_source_applies_offset = true;
-            row_source_index_used = Some(ordered_scan.index_name);
-            if let Some(collector) = read_set.as_deref_mut() {
-                collector.record_touched_pks(
-                    snapshot,
-                    schema,
-                    &exec_project_id,
-                    &exec_scope_id,
-                    &query.table,
-                    &ordered_scan.pks,
-                );
-            }
-            estimated_rows = ordered_scan.pks.len();
-            let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
-            for pk in ordered_scan.pks {
-                if let Some(row) = snapshot.get_row_by_encoded(
-                        &exec_project_id,
-                        &exec_scope_id,
-                        &query.table,
-                        &pk,
-                    )? {
-                        materialized.push(row.into_owned());
-                    }
-            }
-            Box::new(materialized.into_iter())
-        } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
-            let candidate_limit = if cursor_state.is_none()
-                && query.order_by.is_empty()
-                && query.aggregates.is_empty()
-                && query.having.is_none()
-            {
-                Some(page_window.row_source_window_limit)
-            } else {
-                None
-            };
-            let indexed_pks = indexed_pks_for_predicate_limited(
-                catalog,
+    let row_source: Box<dyn Iterator<Item = Row> + Send + '_> = if let Some(async_index) =
+        &options.async_index
+    {
+        let projection = snapshot
+            .async_index(&exec_project_id, &exec_scope_id, &query.table, async_index)
+            .ok_or_else(|| QueryError::InvalidQuery {
+                reason: "async index not found".into(),
+            })?;
+        materialized_seq = Some(projection.materialized_seq);
+        estimated_rows = projection.rows.len();
+        // Async-index projections expose their own materialized_seq; fall
+        // back to recording a coarse table range for the underlying table
+        // so writes invalidate subscribers.
+        if let Some(collector) = read_set.as_deref_mut() {
+            collector.record_full_table_scan(
+                snapshot,
                 &exec_project_id,
                 &exec_scope_id,
                 &query.table,
-                table,
-                predicate,
-                candidate_limit,
-            )?;
-            match indexed_pks {
-                Some(indexed) => {
-                    has_residual_filter = !indexed.predicate_exact;
-                    let pks = indexed.pks;
-                    if let Some(collector) = read_set.as_deref_mut() {
-                        collector.record_touched_pks(
-                            snapshot,
-                            schema,
-                            &exec_project_id,
-                            &exec_scope_id,
-                            &query.table,
-                            &pks,
-                        );
-                    }
-                    estimated_rows = pks.len();
-                    let mut materialized = Vec::with_capacity(pks.len());
-                    for pk in pks {
-                        if let Some(row) = snapshot.get_row_by_encoded(
-                        &exec_project_id,
-                        &exec_scope_id,
-                        &query.table,
-                        &pk,
-                    )? {
-                        materialized.push(row.into_owned());
-                    }
-                    }
-                    Box::new(materialized.into_iter())
-                }
-                None => {
-                    if let Some(collector) = read_set {
-                        collector.record_full_table_scan(
-                            snapshot,
-                            &exec_project_id,
-                            &exec_scope_id,
-                            &query.table,
-                        );
-                    }
-                    let scanned = snapshot.tier_scan_rows(
-                        &exec_project_id,
-                        &exec_scope_id,
-                        &query.table,
-                        std::ops::Bound::Unbounded,
-                        std::ops::Bound::Unbounded,
-                        usize::MAX,
-                    )?;
-                    estimated_rows = scanned.len();
-                    let materialized: Vec<crate::catalog::types::Row> =
-                        scanned.into_iter().map(|(_, row)| row).collect();
-                    Box::new(materialized.into_iter())
-                }
-            }
-        } else if let Some(table) = table
-            && let Some(ordered_scan) = ordered_index_scan_for_query(OrderedIndexScanRequest {
+            );
+        }
+        Box::new(projection.rows.values().cloned())
+    } else if let (Some(predicate), Some(table)) = (&query.predicate, table)
+        && let Some(ordered_scan) =
+            ordered_predicate_index_scan_for_query(OrderedPredicateIndexScanRequest {
                 catalog,
                 project_id: &exec_project_id,
                 scope_id: &exec_scope_id,
                 schema,
                 query: &query,
                 table,
+                predicate,
                 offset: page_window.row_offset_count,
                 limit: page_window.page_read_limit,
                 has_cursor: cursor_state.is_some(),
             })
-        {
-            row_source_satisfies_order = true;
-            row_source_applies_offset = true;
-            row_source_index_used = Some(ordered_scan.index_name);
-            if let Some(collector) = read_set {
-                collector.record_full_table_scan(
-                    snapshot,
-                    &exec_project_id,
-                    &exec_scope_id,
-                    &query.table,
-                );
+    {
+        has_residual_filter = false;
+        row_source_satisfies_order = true;
+        row_source_applies_offset = true;
+        row_source_index_used = Some(ordered_scan.index_name);
+        if let Some(collector) = read_set.as_deref_mut() {
+            collector.record_touched_pks(
+                snapshot,
+                schema,
+                &exec_project_id,
+                &exec_scope_id,
+                &query.table,
+                &ordered_scan.pks,
+            );
+        }
+        estimated_rows = ordered_scan.pks.len();
+        let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
+        for pk in ordered_scan.pks {
+            if let Some(row) =
+                snapshot.get_row_by_encoded(&exec_project_id, &exec_scope_id, &query.table, &pk)?
+            {
+                materialized.push(row.into_owned());
             }
-            estimated_rows = ordered_scan.pks.len();
-            let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
-            for pk in ordered_scan.pks {
-                if let Some(row) = snapshot.get_row_by_encoded(
+        }
+        Box::new(materialized.into_iter())
+    } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
+        let candidate_limit = if cursor_state.is_none()
+            && query.order_by.is_empty()
+            && query.aggregates.is_empty()
+            && query.having.is_none()
+        {
+            Some(page_window.row_source_window_limit)
+        } else {
+            None
+        };
+        let indexed_pks = indexed_pks_for_predicate_limited(
+            catalog,
+            &exec_project_id,
+            &exec_scope_id,
+            &query.table,
+            table,
+            predicate,
+            candidate_limit,
+        )?;
+        match indexed_pks {
+            Some(indexed) => {
+                has_residual_filter = !indexed.predicate_exact;
+                let pks = indexed.pks;
+                if let Some(collector) = read_set.as_deref_mut() {
+                    collector.record_touched_pks(
+                        snapshot,
+                        schema,
+                        &exec_project_id,
+                        &exec_scope_id,
+                        &query.table,
+                        &pks,
+                    );
+                }
+                estimated_rows = pks.len();
+                let mut materialized = Vec::with_capacity(pks.len());
+                for pk in pks {
+                    if let Some(row) = snapshot.get_row_by_encoded(
                         &exec_project_id,
                         &exec_scope_id,
                         &query.table,
@@ -398,30 +335,88 @@ fn execute_query_with_options_capturing_signed(
                     )? {
                         materialized.push(row.into_owned());
                     }
+                }
+                Box::new(materialized.into_iter())
             }
-            Box::new(materialized.into_iter())
-        } else {
-            if let Some(collector) = read_set {
-                collector.record_full_table_scan(
-                    snapshot,
+            None => {
+                if let Some(collector) = read_set {
+                    collector.record_full_table_scan(
+                        snapshot,
+                        &exec_project_id,
+                        &exec_scope_id,
+                        &query.table,
+                    );
+                }
+                let scanned = snapshot.tier_scan_rows(
                     &exec_project_id,
                     &exec_scope_id,
                     &query.table,
-                );
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Unbounded,
+                    usize::MAX,
+                )?;
+                estimated_rows = scanned.len();
+                let materialized: Vec<crate::catalog::types::Row> =
+                    scanned.into_iter().map(|(_, row)| row).collect();
+                Box::new(materialized.into_iter())
             }
-            let scanned = snapshot.tier_scan_rows(
+        }
+    } else if let Some(table) = table
+        && let Some(ordered_scan) = ordered_index_scan_for_query(OrderedIndexScanRequest {
+            catalog,
+            project_id: &exec_project_id,
+            scope_id: &exec_scope_id,
+            schema,
+            query: &query,
+            table,
+            offset: page_window.row_offset_count,
+            limit: page_window.page_read_limit,
+            has_cursor: cursor_state.is_some(),
+        })
+    {
+        row_source_satisfies_order = true;
+        row_source_applies_offset = true;
+        row_source_index_used = Some(ordered_scan.index_name);
+        if let Some(collector) = read_set {
+            collector.record_full_table_scan(
+                snapshot,
                 &exec_project_id,
                 &exec_scope_id,
                 &query.table,
-                std::ops::Bound::Unbounded,
-                std::ops::Bound::Unbounded,
-                usize::MAX,
-            )?;
-            estimated_rows = scanned.len();
-            let materialized: Vec<crate::catalog::types::Row> =
-                scanned.into_iter().map(|(_, row)| row).collect();
-            Box::new(materialized.into_iter())
-        };
+            );
+        }
+        estimated_rows = ordered_scan.pks.len();
+        let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
+        for pk in ordered_scan.pks {
+            if let Some(row) =
+                snapshot.get_row_by_encoded(&exec_project_id, &exec_scope_id, &query.table, &pk)?
+            {
+                materialized.push(row.into_owned());
+            }
+        }
+        Box::new(materialized.into_iter())
+    } else {
+        if let Some(collector) = read_set {
+            collector.record_full_table_scan(
+                snapshot,
+                &exec_project_id,
+                &exec_scope_id,
+                &query.table,
+            );
+        }
+        let scanned = snapshot.tier_scan_rows(
+            &exec_project_id,
+            &exec_scope_id,
+            &query.table,
+            std::ops::Bound::Unbounded,
+            std::ops::Bound::Unbounded,
+            usize::MAX,
+        )?;
+        estimated_rows = scanned.len();
+        let materialized: Vec<crate::catalog::types::Row> =
+            scanned.into_iter().map(|(_, row)| row).collect();
+        Box::new(materialized.into_iter())
+    };
 
     if estimated_rows > max_scan_rows
         && query_requires_full_evaluation(&query, cursor_state.is_some())

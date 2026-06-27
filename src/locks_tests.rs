@@ -165,7 +165,10 @@ fn lock_all_preserves_preexisting_holds_on_failure() {
         )
         .unwrap_err();
     assert!(matches!(err, AedbError::Timeout));
-    assert!(a.holds(&LockKey::global("x")), "pre-existing hold preserved");
+    assert!(
+        a.holds(&LockKey::global("x")),
+        "pre-existing hold preserved"
+    );
 }
 
 #[test]

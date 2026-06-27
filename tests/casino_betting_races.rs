@@ -174,7 +174,8 @@ async fn get_event_status(db: &AedbInstance, event_id: i64) -> String {
 #[tokio::test]
 async fn test_concurrent_bets_with_event_limit() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_betting_schema(&db).await;
 
     // Setup: Event with max_stake=10000, current_stake=9500
@@ -327,7 +328,8 @@ async fn test_concurrent_bets_with_event_limit() {
 #[tokio::test]
 async fn test_bet_during_settlement_lock() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_betting_schema(&db).await;
 
     // Setup: Event accepting bets

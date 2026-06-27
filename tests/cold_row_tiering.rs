@@ -50,9 +50,21 @@ async fn create_schema(db: &AedbInstance) {
         owner_id: None,
         if_not_exists: true,
         columns: vec![
-            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
-            ColumnDef { name: "tag".into(), col_type: ColumnType::Text, nullable: false },
-            ColumnDef { name: "n".into(), col_type: ColumnType::Integer, nullable: false },
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "tag".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "n".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
         ],
         primary_key: vec!["id".into()],
     }))
@@ -85,14 +97,23 @@ async fn create_schema(db: &AedbInstance) {
     .expect("n unique index");
 }
 
-async fn upsert(db: &AedbInstance, id: i64, tag: &str, n: i64) -> Result<(), aedb::error::AedbError> {
+async fn upsert(
+    db: &AedbInstance,
+    id: i64,
+    tag: &str,
+    n: i64,
+) -> Result<(), aedb::error::AedbError> {
     db.commit(Mutation::Upsert {
         project_id: "p".into(),
         scope_id: "app".into(),
         table_name: "items".into(),
         primary_key: vec![Value::Integer(id)],
         row: Row {
-            values: vec![Value::Integer(id), Value::Text(tag.into()), Value::Integer(n)],
+            values: vec![
+                Value::Integer(id),
+                Value::Text(tag.into()),
+                Value::Integer(n),
+            ],
         },
     })
     .await
@@ -103,8 +124,14 @@ async fn query_tag(db: &AedbInstance, tag: &str) -> usize {
     db.query_no_auth(
         "p",
         "app",
-        Query::select(&["id"]).from("items").where_(col("tag").eq(lit(tag))).limit(10_000),
-        QueryOptions { consistency: ConsistencyMode::AtLatest, ..QueryOptions::default() },
+        Query::select(&["id"])
+            .from("items")
+            .where_(col("tag").eq(lit(tag)))
+            .limit(10_000),
+        QueryOptions {
+            consistency: ConsistencyMode::AtLatest,
+            ..QueryOptions::default()
+        },
     )
     .await
     .expect("tag query")
@@ -117,7 +144,10 @@ async fn scan_count(db: &AedbInstance) -> usize {
         "p",
         "app",
         Query::select(&["id"]).from("items").limit(10_000),
-        QueryOptions { consistency: ConsistencyMode::AtLatest, ..QueryOptions::default() },
+        QueryOptions {
+            consistency: ConsistencyMode::AtLatest,
+            ..QueryOptions::default()
+        },
     )
     .await
     .expect("scan")
@@ -133,7 +163,9 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
     create_schema(&db).await;
 
     for i in 0..200i64 {
-        upsert(&db, i, &format!("tag{}", i % 5), i).await.expect("upsert");
+        upsert(&db, i, &format!("tag{}", i % 5), i)
+            .await
+            .expect("upsert");
     }
 
     // Eviction actually happened: resident memory is far below the full dataset.
@@ -149,8 +181,14 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
         .query_no_auth(
             "p",
             "app",
-            Query::select(&["n"]).from("items").where_(col("id").eq(lit(42i64))).limit(1),
-            QueryOptions { consistency: ConsistencyMode::AtLatest, ..QueryOptions::default() },
+            Query::select(&["n"])
+                .from("items")
+                .where_(col("id").eq(lit(42i64)))
+                .limit(1),
+            QueryOptions {
+                consistency: ConsistencyMode::AtLatest,
+                ..QueryOptions::default()
+            },
         )
         .await
         .expect("point query");
@@ -158,18 +196,31 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
     assert_eq!(one.rows[0].values[0], Value::Integer(42));
 
     assert_eq!(scan_count(&db).await, 200, "full scan returns evicted rows");
-    assert_eq!(query_tag(&db, "tag2").await, 40, "index query over evicted rows");
+    assert_eq!(
+        query_tag(&db, "tag2").await,
+        40,
+        "index query over evicted rows"
+    );
 
     // Update an evicted row's indexed column: old index entry must be removed.
     // Row 42 had tag = "tag2"; move it to a fresh tag.
-    upsert(&db, 42, "moved", 42).await.expect("update evicted row");
+    upsert(&db, 42, "moved", 42)
+        .await
+        .expect("update evicted row");
     assert_eq!(query_tag(&db, "tag2").await, 39, "old index entry removed");
     assert_eq!(query_tag(&db, "moved").await, 1, "new index entry added");
-    assert_eq!(scan_count(&db).await, 200, "no duplicate from updating evicted row");
+    assert_eq!(
+        scan_count(&db).await,
+        200,
+        "no duplicate from updating evicted row"
+    );
 
     // Unique constraint must see the evicted row: re-using n=99 (row 99) fails.
     let dup = upsert(&db, 9999, "dup", 99).await;
-    assert!(dup.is_err(), "unique violation against an evicted row must be rejected");
+    assert!(
+        dup.is_err(),
+        "unique violation against an evicted row must be rejected"
+    );
     assert_eq!(scan_count(&db).await, 200, "rejected insert did not land");
 
     // Delete an evicted row.
@@ -182,7 +233,11 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
     .await
     .expect("delete");
     assert_eq!(scan_count(&db).await, 199, "deleted evicted row is gone");
-    assert_eq!(query_tag(&db, "tag2").await, 38, "deleted row removed from index too");
+    assert_eq!(
+        query_tag(&db, "tag2").await,
+        38,
+        "deleted row removed from index too"
+    );
 
     // Build a NEW index after rows are already in the cold tier: the index
     // build must scan the cold rows too, or index lookups would miss them.
@@ -202,8 +257,14 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
         .query_no_auth(
             "p",
             "app",
-            Query::select(&["id"]).from("items").where_(col("n").eq(lit(150i64))).limit(10),
-            QueryOptions { consistency: ConsistencyMode::AtLatest, ..QueryOptions::default() },
+            Query::select(&["id"])
+                .from("items")
+                .where_(col("n").eq(lit(150i64)))
+                .limit(10),
+            QueryOptions {
+                consistency: ConsistencyMode::AtLatest,
+                ..QueryOptions::default()
+            },
         )
         .await
         .expect("query by new index");

@@ -83,7 +83,8 @@ async fn get_balance(db: &AedbInstance, account_id: i64) -> u64 {
 #[tokio::test]
 async fn test_concurrent_withdrawal_race() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_accounts_table(&db).await;
 
     // Setup: Account with balance = 1000
@@ -323,7 +324,8 @@ async fn test_multi_account_transfer_atomicity() {
 #[tokio::test]
 async fn test_idempotency_prevents_double_debit() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_accounts_table(&db).await;
 
     // Setup: Account balance = 1000
@@ -403,7 +405,8 @@ async fn test_idempotency_prevents_double_debit() {
 #[tokio::test]
 async fn test_withdrawal_during_concurrent_balance_query() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_accounts_table(&db).await;
 
     // Setup: Account balance = 500

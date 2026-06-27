@@ -24,7 +24,8 @@ async fn second_open_on_same_dir_is_rejected_while_first_is_alive() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().join("aedb");
 
-    let first = AedbInstance::open_anonymous(lock_test_config(), &dir).expect("first open succeeds");
+    let first =
+        AedbInstance::open_anonymous(lock_test_config(), &dir).expect("first open succeeds");
 
     match AedbInstance::open_anonymous(lock_test_config(), &dir) {
         Ok(_) => panic!("second concurrent open on the same dir must be rejected"),
@@ -41,7 +42,8 @@ async fn reopen_succeeds_after_first_instance_is_dropped() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().join("aedb");
 
-    let first = AedbInstance::open_anonymous(lock_test_config(), &dir).expect("first open succeeds");
+    let first =
+        AedbInstance::open_anonymous(lock_test_config(), &dir).expect("first open succeeds");
     drop(first); // releases the advisory lock (and joins the GC thread)
 
     // A fresh open on the same dir must now succeed.

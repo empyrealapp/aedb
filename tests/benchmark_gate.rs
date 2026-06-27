@@ -855,7 +855,8 @@ async fn benchmark_persistent_large_kv_values() {
 
     async fn setup_large_values(hot_cache_bytes: usize) -> (tempfile::TempDir, AedbInstance) {
         let dir = tempdir().expect("temp dir");
-        let db = AedbInstance::open_anonymous(disk_config(hot_cache_bytes), dir.path()).expect("open");
+        let db =
+            AedbInstance::open_anonymous(disk_config(hot_cache_bytes), dir.path()).expect("open");
         db.create_project(PROJECT_ID).await.expect("project");
         for i in 0..VALUE_COUNT {
             let value = vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES];
@@ -1437,7 +1438,8 @@ async fn benchmark_many_small_kv_batching() {
     let config = high_throughput_config();
 
     let individual_dir = tempdir().expect("individual temp dir");
-    let individual_db = AedbInstance::open_anonymous(config.clone(), individual_dir.path()).expect("open");
+    let individual_db =
+        AedbInstance::open_anonymous(config.clone(), individual_dir.path()).expect("open");
     individual_db
         .create_project(PROJECT_ID)
         .await

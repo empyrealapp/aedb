@@ -3926,7 +3926,15 @@ fn public_no_auth_and_unchecked_surface_is_intentional() {
             if trimmed.starts_with("pub ")
                 && (trimmed.contains("_no_auth") || trimmed.contains("unchecked"))
             {
-                exposed.push(format!("{rel}:{trimmed}"));
+                // Record only up to the opening paren so rustfmt reflowing the
+                // argument list (one line vs. several) does not change the
+                // recorded surface; the method name — the security-relevant
+                // part — always precedes `(`.
+                let sig = match trimmed.find('(') {
+                    Some(i) => &trimmed[..=i],
+                    None => trimmed,
+                };
+                exposed.push(format!("{rel}:{sig}"));
             }
         }
     }
@@ -4312,9 +4320,7 @@ async fn open_default_requires_authenticated_caller_for_writes() {
     // `open` is secure-by-default: anonymous writes/reads must be rejected.
     let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
 
-    let set = db
-        .kv_set("p", "app", b"k".to_vec(), b"v".to_vec())
-        .await;
+    let set = db.kv_set("p", "app", b"k".to_vec(), b"v".to_vec()).await;
     assert!(
         matches!(set, Err(AedbError::PermissionDenied(_))),
         "anonymous kv_set must be denied under secure-default open, got {set:?}"

@@ -53,7 +53,8 @@ async fn disk_backed_checkpoint_is_self_contained_when_value_file_is_missing() {
 
     fs::remove_file(dir.path().join("values.aedbdat")).expect("remove value store");
 
-    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen from checkpoint");
+    let reopened =
+        AedbInstance::open_anonymous(config, dir.path()).expect("reopen from checkpoint");
     let recovered = reopened
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -850,7 +851,8 @@ async fn checkpoint_now_in_batch_mode_flushes_wal_and_recovers_tail() {
 #[tokio::test]
 async fn checkpoint_now_allows_commits_while_running() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     // Build enough state to make checkpoint work measurable.
@@ -899,7 +901,8 @@ async fn checkpoint_now_allows_commits_while_running() {
 #[tokio::test]
 async fn checkpoint_now_serializes_checkpoint_writers() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
+    let db =
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSet {

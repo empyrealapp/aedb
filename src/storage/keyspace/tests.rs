@@ -1383,7 +1383,13 @@ fn cold_table_row_tier_evicts_and_pages_back_correctly() {
         .expect("get")
         .expect("present");
     assert_eq!(got.values[1], Value::Text("v7".into()));
-    assert_eq!(ks.snapshot().table("p", "app", "t").unwrap().version_of(&key7), None);
+    assert_eq!(
+        ks.snapshot()
+            .table("p", "app", "t")
+            .unwrap()
+            .version_of(&key7),
+        None
+    );
     assert_eq!(
         ks.snapshot().tier_row_version("p", "app", "t", &key7),
         8,
@@ -1405,7 +1411,11 @@ fn cold_table_row_tier_evicts_and_pages_back_correctly() {
         .expect("delete")
         .expect("returns the cold row");
     assert_eq!(deleted.values[0], Value::Integer(10));
-    assert!(ks.get_row("p", "app", "t", &[Value::Integer(10)]).unwrap().is_none());
+    assert!(
+        ks.get_row("p", "app", "t", &[Value::Integer(10)])
+            .unwrap()
+            .is_none()
+    );
     let scanned = ks
         .snapshot()
         .tier_scan_rows("p", "app", "t", Bound::Unbounded, Bound::Unbounded, 1000)
@@ -1443,5 +1453,8 @@ fn cold_table_row_tier_evicts_and_pages_back_correctly() {
     );
     let key5 = EncodedKey::from_values(&[Value::Integer(5)]);
     let stored5 = cp_table.rows.get(&key5).expect("row 5");
-    assert_eq!(stored5.resident().unwrap().values[1], Value::Text("v5-new".into()));
+    assert_eq!(
+        stored5.resident().unwrap().values[1],
+        Value::Text("v5-new".into())
+    );
 }

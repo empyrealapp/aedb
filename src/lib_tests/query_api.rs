@@ -965,8 +965,8 @@ async fn telemetry_sql_and_remote_adapter_paths_work() {
         &AedbConfig::default(),
     )
     .expect("restore remote");
-    let restored =
-        AedbInstance::open_anonymous(AedbConfig::default(), restored_dir.path()).expect("open restored");
+    let restored = AedbInstance::open_anonymous(AedbConfig::default(), restored_dir.path())
+        .expect("open restored");
     let restored_val = restored
         .kv_get_no_auth("p", "app", b"remote:test", ConsistencyMode::AtLatest)
         .await

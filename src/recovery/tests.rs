@@ -262,7 +262,10 @@ async fn recover_uses_checkpoint_and_replays_post_checkpoint_tail() {
     // checkpoint, then replays that post-checkpoint tail from the WAL — the
     // manifest's stale durable_seq no longer truncates it.
     let recovered = recover_with_config(dir.path(), &non_strict_config()).expect("recover");
-    assert_eq!(recovered.current_seq, final_seq, "post-checkpoint tail replayed");
+    assert_eq!(
+        recovered.current_seq, final_seq,
+        "post-checkpoint tail replayed"
+    );
     assert!(
         recovered
             .keyspace
@@ -342,7 +345,10 @@ async fn recover_replays_full_valid_wal_tail_past_manifest_durable_seq() {
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
 
     let recovered = recover_with_config(dir.path(), &non_strict_config()).expect("recover");
-    assert_eq!(recovered.current_seq, seq, "full WAL tail replayed, not capped");
+    assert_eq!(
+        recovered.current_seq, seq,
+        "full WAL tail replayed, not capped"
+    );
     // Both an in-durable-window row and a past-durable_seq row are present.
     assert!(
         recovered

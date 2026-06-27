@@ -338,6 +338,7 @@ fn write_legacy_archive_file<W: Write>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_chunked_archive_file<W: Write>(
     writer: &mut W,
     rel: &str,

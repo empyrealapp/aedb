@@ -301,8 +301,8 @@ async fn full_backup_of_disk_backed_values_is_self_contained() {
 
     AedbInstance::restore_from_backup(backup_dir.path(), disk_restore_dir.path(), &config)
         .expect("restore disk-backed");
-    let disk_restored =
-        AedbInstance::open_anonymous(config.clone(), disk_restore_dir.path()).expect("open disk restored");
+    let disk_restored = AedbInstance::open_anonymous(config.clone(), disk_restore_dir.path())
+        .expect("open disk restored");
     let disk_value = disk_restored
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -316,8 +316,8 @@ async fn full_backup_of_disk_backed_values_is_self_contained() {
     };
     AedbInstance::restore_from_backup(backup_dir.path(), memory_restore_dir.path(), &memory_config)
         .expect("restore in-memory");
-    let memory_restored =
-        AedbInstance::open_anonymous(memory_config, memory_restore_dir.path()).expect("open memory restored");
+    let memory_restored = AedbInstance::open_anonymous(memory_config, memory_restore_dir.path())
+        .expect("open memory restored");
     let memory_value = memory_restored
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
