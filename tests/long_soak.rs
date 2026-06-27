@@ -265,18 +265,13 @@ async fn long_soak_random_ops_with_crashes_and_verify() {
             db.checkpoint_now().await.expect("periodic checkpoint");
         }
 
-        // Simulate "checkpoint, then `kill -9`": flush a checkpoint (which
-        // advances the manifest's durable_seq — recovery's replay authority),
-        // then drop the instance with no shutdown. The store on disk must verify
-        // cleanly and recover to exactly the shadow model.
-        //
-        // Note on the contract being tested: the manifest's durable_seq, not the
-        // in-memory durable head, bounds recovery after an abrupt kill. A
-        // checkpoint persists it, so the post-kill state is a well-defined exact
-        // oracle. Without the checkpoint, recovery would still reach a
-        // *consistent* state, but a prefix that may trail the last few commits.
+        // Simulate a true `kill -9`: drop the instance with no shutdown and no
+        // pre-kill checkpoint. Under DurabilityMode::Full every acknowledged
+        // commit is fsynced to the WAL, and recovery replays the full validated
+        // WAL tail (not just up to the last checkpoint's manifest.durable_seq),
+        // so the recovered state must match the shadow model exactly — including
+        // every commit made since the most recent periodic checkpoint.
         if crash_every > 0 && i > 0 && i % crash_every == 0 {
-            db.checkpoint_now().await.expect("pre-kill checkpoint");
             drop(db);
 
             let report = offline::verify_database(dir.path(), &config);

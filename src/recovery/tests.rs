@@ -178,7 +178,7 @@ fn permissive_replay_skips_unknown_frame_and_recovers_later_frames() {
 }
 
 #[tokio::test]
-async fn recover_uses_checkpoint_and_replays_only_durable_tail() {
+async fn recover_uses_checkpoint_and_replays_post_checkpoint_tail() {
     let dir = tempdir().expect("temp");
     let exec = CommitExecutor::new(dir.path()).expect("executor");
     exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
@@ -255,20 +255,26 @@ async fn recover_uses_checkpoint_and_replays_only_durable_tail() {
         .await
         .expect("insert tail");
     }
+    let (_snapshot, _catalog, final_seq) = exec.snapshot_state().await;
 
+    // Commits made after the checkpoint (and after the manifest captured
+    // durable_seq) are appended to the active segment. Recovery loads the
+    // checkpoint, then replays that post-checkpoint tail from the WAL — the
+    // manifest's stale durable_seq no longer truncates it.
     let recovered = recover_with_config(dir.path(), &non_strict_config()).expect("recover");
-    assert_eq!(recovered.current_seq, seq);
+    assert_eq!(recovered.current_seq, final_seq, "post-checkpoint tail replayed");
     assert!(
         recovered
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(19)])
             .expect("get_row")
-            .is_none()
+            .is_some(),
+        "post-checkpoint commit must survive recovery"
     );
 }
 
 #[tokio::test]
-async fn recover_replays_only_through_manifest_durable_seq() {
+async fn recover_replays_full_valid_wal_tail_past_manifest_durable_seq() {
     let dir = tempdir().expect("temp");
     let exec = CommitExecutor::new(dir.path()).expect("executor");
     exec.submit(Mutation::Ddl(DdlOperation::CreateProject {
@@ -316,6 +322,9 @@ async fn recover_replays_only_through_manifest_durable_seq() {
     }
 
     let (_snapshot, _catalog, seq) = exec.snapshot_state().await;
+    // The manifest's durable_seq lags the WAL (it only advances at checkpoint).
+    // The WAL is the source of truth: recovery replays the full validated tail
+    // past durable_seq so no fsynced commit is silently dropped.
     let durable_seq = seq - 5;
     let manifest = Manifest {
         durable_seq,
@@ -333,7 +342,8 @@ async fn recover_replays_only_through_manifest_durable_seq() {
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
 
     let recovered = recover_with_config(dir.path(), &non_strict_config()).expect("recover");
-    assert_eq!(recovered.current_seq, durable_seq);
+    assert_eq!(recovered.current_seq, seq, "full WAL tail replayed, not capped");
+    // Both an in-durable-window row and a past-durable_seq row are present.
     assert!(
         recovered
             .keyspace
@@ -346,7 +356,8 @@ async fn recover_replays_only_through_manifest_durable_seq() {
             .keyspace
             .get_row("p", "app", "users", &[Value::Integer(9)])
             .expect("get_row")
-            .is_none()
+            .is_some(),
+        "commit past manifest durable_seq must survive recovery"
     );
 }
 
