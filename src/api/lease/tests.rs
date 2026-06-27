@@ -58,7 +58,11 @@ async fn reacquire_by_same_owner_is_allowed() {
 #[tokio::test]
 async fn expired_lease_taken_over_and_old_owner_fenced() {
     let (_dir, db) = open().await;
-    let l1 = held(db.lease_acquire("arcana", "app", "k", "w1", 0).await.unwrap());
+    let l1 = held(
+        db.lease_acquire("arcana", "app", "k", "w1", 0)
+            .await
+            .unwrap(),
+    );
     let l2 = held(
         db.lease_acquire("arcana", "app", "k", "w2", TTL)
             .await
@@ -91,7 +95,9 @@ async fn renew_extends_and_stale_token_is_lost() {
     }
     // A different token (e.g. an old holder) cannot renew.
     assert!(matches!(
-        db.lease_renew("arcana", "app", "k", 999, TTL).await.unwrap(),
+        db.lease_renew("arcana", "app", "k", 999, TTL)
+            .await
+            .unwrap(),
         RenewOutcome::LeaseLost
     ));
 }
@@ -105,7 +111,13 @@ async fn guarded_commit_applies_while_held() {
             .unwrap(),
     );
     let out = db
-        .lease_guarded_commit("arcana", "app", "k", l.fencing_token, vec![kv("counter", "42")])
+        .lease_guarded_commit(
+            "arcana",
+            "app",
+            "k",
+            l.fencing_token,
+            vec![kv("counter", "42")],
+        )
         .await
         .unwrap();
     assert!(matches!(out, FencedCommit::Applied(_)));

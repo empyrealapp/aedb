@@ -188,7 +188,10 @@ async fn fail_retries_then_dead_letters() {
         .task_id;
 
     // Attempt 1 -> fail -> requeued.
-    let c1 = db.queue_claim("arcana", "app", Q, "w1", LEASE, 1).await.unwrap();
+    let c1 = db
+        .queue_claim("arcana", "app", Q, "w1", LEASE, 1)
+        .await
+        .unwrap();
     let f1 = db
         .queue_fail("arcana", "app", Q, &id, c1[0].fencing_token, "boom".into())
         .await
@@ -205,7 +208,10 @@ async fn fail_retries_then_dead_letters() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     // Attempt 2 -> fail -> dead-lettered (attempts == max).
-    let c2 = db.queue_claim("arcana", "app", Q, "w1", LEASE, 1).await.unwrap();
+    let c2 = db
+        .queue_claim("arcana", "app", Q, "w1", LEASE, 1)
+        .await
+        .unwrap();
     assert_eq!(c2[0].attempts, 2);
     db.queue_fail("arcana", "app", Q, &id, c2[0].fencing_token, "boom2".into())
         .await
@@ -218,7 +224,14 @@ async fn fail_retries_then_dead_letters() {
     assert_eq!(dead.state, TaskState::Dead);
 
     let dlq = db
-        .queue_list("arcana", "app", Q, Some(TaskState::Dead), 10, ConsistencyMode::AtLatest)
+        .queue_list(
+            "arcana",
+            "app",
+            Q,
+            Some(TaskState::Dead),
+            10,
+            ConsistencyMode::AtLatest,
+        )
         .await
         .unwrap();
     assert_eq!(dlq.len(), 1);
@@ -229,18 +242,39 @@ async fn fail_retries_then_dead_letters() {
 async fn stale_fencing_token_is_rejected() {
     let (_dir, db) = open().await;
     let id = enqueue(&db, opts("t")).await;
-    let c = db.queue_claim("arcana", "app", Q, "w1", LEASE, 1).await.unwrap();
+    let c = db
+        .queue_claim("arcana", "app", Q, "w1", LEASE, 1)
+        .await
+        .unwrap();
     let good = c[0].fencing_token;
 
     // A zombie worker presenting a wrong token cannot complete.
     let lost = db
-        .queue_complete("arcana", "app", Q, &id, good + 7, "\"x\"".into(), vec![], vec![])
+        .queue_complete(
+            "arcana",
+            "app",
+            Q,
+            &id,
+            good + 7,
+            "\"x\"".into(),
+            vec![],
+            vec![],
+        )
         .await
         .unwrap();
     assert!(matches!(lost, FencedCommit::LeaseLost));
     // The legitimate owner still can.
     let ok = db
-        .queue_complete("arcana", "app", Q, &id, good, "\"x\"".into(), vec![], vec![])
+        .queue_complete(
+            "arcana",
+            "app",
+            Q,
+            &id,
+            good,
+            "\"x\"".into(),
+            vec![],
+            vec![],
+        )
         .await
         .unwrap();
     assert!(matches!(ok, FencedCommit::Applied(_)));
@@ -266,16 +300,25 @@ async fn expired_lease_is_reclaimed() {
         .task_id;
 
     // Claim with an already-expired lease; the worker "dies".
-    let c = db.queue_claim("arcana", "app", Q, "w1", 0, 1).await.unwrap();
+    let c = db
+        .queue_claim("arcana", "app", Q, "w1", 0, 1)
+        .await
+        .unwrap();
     assert_eq!(c.len(), 1);
 
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     // A later claim reclaims the abandoned task and serves it again.
-    let again = db.queue_claim("arcana", "app", Q, "w2", LEASE, 1).await.unwrap();
+    let again = db
+        .queue_claim("arcana", "app", Q, "w2", LEASE, 1)
+        .await
+        .unwrap();
     assert_eq!(again.len(), 1);
     assert_eq!(again[0].task_id, id);
-    assert_eq!(again[0].attempts, 2, "reclaim preserved progress, new claim bumped attempts");
+    assert_eq!(
+        again[0].attempts, 2,
+        "reclaim preserved progress, new claim bumped attempts"
+    );
 }
 
 #[tokio::test]
@@ -286,9 +329,15 @@ async fn enqueue_is_idempotent_with_a_key() {
         idempotency_key: Some("order-42".into()),
         ..Default::default()
     };
-    let first = db.queue_enqueue("arcana", "app", Q, o.clone(), vec![]).await.unwrap();
+    let first = db
+        .queue_enqueue("arcana", "app", Q, o.clone(), vec![])
+        .await
+        .unwrap();
     assert!(!first.deduplicated);
-    let second = db.queue_enqueue("arcana", "app", Q, o, vec![]).await.unwrap();
+    let second = db
+        .queue_enqueue("arcana", "app", Q, o, vec![])
+        .await
+        .unwrap();
     assert!(second.deduplicated);
     assert_eq!(second.task_id, first.task_id);
 
@@ -303,7 +352,10 @@ async fn enqueue_is_idempotent_with_a_key() {
 async fn heartbeat_records_progress_and_cancel_removes() {
     let (_dir, db) = open().await;
     let id = enqueue(&db, opts("t")).await;
-    let c = db.queue_claim("arcana", "app", Q, "w1", LEASE, 1).await.unwrap();
+    let c = db
+        .queue_claim("arcana", "app", Q, "w1", LEASE, 1)
+        .await
+        .unwrap();
     let hb = db
         .queue_heartbeat(
             "arcana",

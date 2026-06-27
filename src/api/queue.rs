@@ -473,16 +473,15 @@ impl AedbInstance {
             plan.mutations.extend(extra_mutations.clone());
             self.finalize_counters(project_id, scope_id, view, &mut plan);
 
-            match self
-                .commit_plan(caller.clone(), plan, base_seq)
-                .await
-            {
+            match self.commit_plan(caller.clone(), plan, base_seq).await {
                 Ok(_) => return Ok(outcome),
                 Err(err) if is_retryable_conflict(&err) => continue,
                 Err(err) => return Err(err),
             }
         }
-        Err(AedbError::Conflict("queue_enqueue exhausted retries".into()))
+        Err(AedbError::Conflict(
+            "queue_enqueue exhausted retries".into(),
+        ))
     }
 
     /// Claim up to `max` ready tasks for `owner_id`, leasing each for
@@ -499,8 +498,16 @@ impl AedbInstance {
         lease_micros: u64,
         max: usize,
     ) -> Result<Vec<ClaimedTask>, AedbError> {
-        self.queue_claim_inner(None, project_id, scope_id, queue, owner_id, lease_micros, max)
-            .await
+        self.queue_claim_inner(
+            None,
+            project_id,
+            scope_id,
+            queue,
+            owner_id,
+            lease_micros,
+            max,
+        )
+        .await
     }
 
     /// [`AedbInstance::queue_claim`] on behalf of `caller`.
@@ -556,7 +563,14 @@ impl AedbInstance {
         let mut claimed = Vec::with_capacity(max);
         while claimed.len() < max {
             match self
-                .try_claim_one(caller.clone(), project_id, scope_id, queue, owner_id, lease_micros)
+                .try_claim_one(
+                    caller.clone(),
+                    project_id,
+                    scope_id,
+                    queue,
+                    owner_id,
+                    lease_micros,
+                )
                 .await?
             {
                 Some(task) => claimed.push(task),
@@ -581,8 +595,7 @@ impl AedbInstance {
             let view = &lease.view.keyspace;
             let now = crate::system_now_micros();
 
-            let ready =
-                view.try_kv_scan_prefix(project_id, scope_id, &ready_prefix(queue), 1)?;
+            let ready = view.try_kv_scan_prefix(project_id, scope_id, &ready_prefix(queue), 1)?;
             let Some((ready_k, ready_entry)) = ready.into_iter().next() else {
                 return Ok(None);
             };
@@ -608,8 +621,7 @@ impl AedbInstance {
             task.lease_deadline_micros = now.saturating_add(lease_micros);
             task.updated_micros = now;
 
-            let inflight_k =
-                inflight_key(queue, task.lease_deadline_micros, task.seq, &task.id);
+            let inflight_k = inflight_key(queue, task.lease_deadline_micros, task.seq, &task.id);
             let mutations = vec![
                 set_mut(project_id, scope_id, pk.clone(), encode_task(&task)?),
                 del_mut(project_id, scope_id, ready_k),
@@ -776,7 +788,12 @@ impl AedbInstance {
                     task.id.as_bytes().to_vec(),
                 ));
             }
-            mutations.push(set_mut(project_id, scope_id, pk.clone(), encode_task(&task)?));
+            mutations.push(set_mut(
+                project_id,
+                scope_id,
+                pk.clone(),
+                encode_task(&task)?,
+            ));
             let assertions = vec![key_assertion(project_id, scope_id, &pk, Some(&primary))];
             let env = self.envelope(caller.clone(), mutations, assertions, base_seq);
             // Conflicts mean another worker reclaimed it; that's fine.
@@ -802,7 +819,14 @@ impl AedbInstance {
         extra_mutations: Vec<Mutation>,
     ) -> Result<FencedCommit, AedbError> {
         self.queue_complete_inner(
-            None, project_id, scope_id, queue, task_id, fencing_token, result_json, follow_ups,
+            None,
+            project_id,
+            scope_id,
+            queue,
+            task_id,
+            fencing_token,
+            result_json,
+            follow_ups,
             extra_mutations,
         )
         .await
@@ -823,8 +847,15 @@ impl AedbInstance {
         extra_mutations: Vec<Mutation>,
     ) -> Result<FencedCommit, AedbError> {
         self.queue_complete_inner(
-            Some(caller), project_id, scope_id, queue, task_id, fencing_token, result_json,
-            follow_ups, extra_mutations,
+            Some(caller),
+            project_id,
+            scope_id,
+            queue,
+            task_id,
+            fencing_token,
+            result_json,
+            follow_ups,
+            extra_mutations,
         )
         .await
     }
@@ -882,7 +913,9 @@ impl AedbInstance {
                 Err(err) => return Err(err),
             }
         }
-        Err(AedbError::Conflict("queue_complete exhausted retries".into()))
+        Err(AedbError::Conflict(
+            "queue_complete exhausted retries".into(),
+        ))
     }
 
     /// Report a failed attempt. If the attempt budget remains, the task is
@@ -898,8 +931,16 @@ impl AedbInstance {
         fencing_token: u64,
         error: String,
     ) -> Result<FencedCommit, AedbError> {
-        self.queue_fail_inner(None, project_id, scope_id, queue, task_id, fencing_token, error)
-            .await
+        self.queue_fail_inner(
+            None,
+            project_id,
+            scope_id,
+            queue,
+            task_id,
+            fencing_token,
+            error,
+        )
+        .await
     }
 
     /// [`AedbInstance::queue_fail`] on behalf of `caller`.
@@ -972,7 +1013,12 @@ impl AedbInstance {
                     task.id.as_bytes().to_vec(),
                 ));
             }
-            mutations.push(set_mut(project_id, scope_id, pk.clone(), encode_task(&task)?));
+            mutations.push(set_mut(
+                project_id,
+                scope_id,
+                pk.clone(),
+                encode_task(&task)?,
+            ));
             let assertions = vec![key_assertion(project_id, scope_id, &pk, Some(&primary))];
             let env = self.envelope(caller.clone(), mutations, assertions, base_seq);
             match self.commit_envelope(env).await {
@@ -1000,7 +1046,14 @@ impl AedbInstance {
         progress_json: Option<String>,
     ) -> Result<FencedCommit, AedbError> {
         self.queue_heartbeat_inner(
-            None, project_id, scope_id, queue, task_id, fencing_token, extend_micros, progress_json,
+            None,
+            project_id,
+            scope_id,
+            queue,
+            task_id,
+            fencing_token,
+            extend_micros,
+            progress_json,
         )
         .await
     }
@@ -1019,7 +1072,13 @@ impl AedbInstance {
         progress_json: Option<String>,
     ) -> Result<FencedCommit, AedbError> {
         self.queue_heartbeat_inner(
-            Some(caller), project_id, scope_id, queue, task_id, fencing_token, extend_micros,
+            Some(caller),
+            project_id,
+            scope_id,
+            queue,
+            task_id,
+            fencing_token,
+            extend_micros,
             progress_json,
         )
         .await
@@ -1053,15 +1112,13 @@ impl AedbInstance {
                 return Ok(FencedCommit::LeaseLost);
             }
             let now = crate::system_now_micros();
-            let old_inflight =
-                inflight_key(queue, task.lease_deadline_micros, task.seq, &task.id);
+            let old_inflight = inflight_key(queue, task.lease_deadline_micros, task.seq, &task.id);
             task.lease_deadline_micros = now.saturating_add(extend_micros);
             if let Some(p) = &progress_json {
                 task.progress_json = p.clone();
             }
             task.updated_micros = now;
-            let new_inflight =
-                inflight_key(queue, task.lease_deadline_micros, task.seq, &task.id);
+            let new_inflight = inflight_key(queue, task.lease_deadline_micros, task.seq, &task.id);
             let mut mutations = Vec::with_capacity(3);
             if new_inflight != old_inflight {
                 mutations.push(del_mut(project_id, scope_id, old_inflight));
@@ -1072,7 +1129,12 @@ impl AedbInstance {
                     task.id.as_bytes().to_vec(),
                 ));
             }
-            mutations.push(set_mut(project_id, scope_id, pk.clone(), encode_task(&task)?));
+            mutations.push(set_mut(
+                project_id,
+                scope_id,
+                pk.clone(),
+                encode_task(&task)?,
+            ));
             let assertions = vec![key_assertion(project_id, scope_id, &pk, Some(&primary))];
             let env = self.envelope(caller.clone(), mutations, assertions, base_seq);
             match self.commit_envelope(env).await {
@@ -1081,7 +1143,9 @@ impl AedbInstance {
                 Err(err) => return Err(err),
             }
         }
-        Err(AedbError::Conflict("queue_heartbeat exhausted retries".into()))
+        Err(AedbError::Conflict(
+            "queue_heartbeat exhausted retries".into(),
+        ))
     }
 
     /// Cancel a task by id, removing it and its index entry regardless of state.
@@ -1167,10 +1231,11 @@ impl AedbInstance {
             ));
         }
         let lease = self.acquire_snapshot(consistency).await?;
-        let Some(entry) = lease
-            .view
-            .keyspace
-            .kv_get(project_id, scope_id, &primary_key(queue, task_id))
+        let Some(entry) =
+            lease
+                .view
+                .keyspace
+                .kv_get(project_id, scope_id, &primary_key(queue, task_id))
         else {
             return Ok(None);
         };
