@@ -80,7 +80,7 @@ fn soak_config() -> AedbConfig {
 async fn reopen(config: &AedbConfig, dir: &Path) -> AedbInstance {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match AedbInstance::open(config.clone(), dir) {
+        match AedbInstance::open_anonymous(config.clone(), dir) {
             Ok(db) => return db,
             Err(AedbError::Unavailable { .. }) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -193,7 +193,7 @@ async fn long_soak_random_ops_with_crashes_and_verify() {
     let mut rng = Rng::new(seed);
     let mut model: BTreeMap<i64, i64> = BTreeMap::new();
 
-    let mut db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let mut db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     create_schema(&db).await;
 
     let started = Instant::now();

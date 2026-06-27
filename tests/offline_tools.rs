@@ -92,7 +92,7 @@ async fn verify_database_passes_on_clean_store_and_detects_corruption() {
     let data_dir = tempdir().expect("data");
     let config = AedbConfig::default();
 
-    let db = AedbInstance::open(config.clone(), data_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), data_dir.path()).expect("open");
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
         owner_id: None,
@@ -159,7 +159,7 @@ async fn verify_database_passes_on_clean_store_and_detects_corruption() {
 async fn verify_database_handles_empty_table_without_false_violation() {
     let data_dir = tempdir().expect("data");
     let config = AedbConfig::default();
-    let db = AedbInstance::open(config.clone(), data_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), data_dir.path()).expect("open");
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
         owner_id: None,

@@ -61,7 +61,7 @@ async fn insert_rows(db: &AedbInstance, range: std::ops::Range<i64>) {
 async fn keyspace_memory_metrics_are_populated_and_grow_with_rows() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig::default();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_table(&db).await;
 
     insert_rows(&db, 0..100).await;
