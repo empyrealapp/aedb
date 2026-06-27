@@ -7,6 +7,16 @@ use std::path::{Path, PathBuf};
 const WAL_SCAN_BUFFER_BYTES: usize = 1024 * 1024;
 
 pub fn scan_segments(data_dir: &Path) -> Result<Vec<PathBuf>, AedbError> {
+    Ok(scan_segment_entries(data_dir)?
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect())
+}
+
+/// Like [`scan_segments`] but keeps each segment's parsed sequence number,
+/// sorted ascending. Used by recovery to discover WAL segments created after
+/// the manifest was last written (post-checkpoint rotations).
+pub(crate) fn scan_segment_entries(data_dir: &Path) -> Result<Vec<(u64, PathBuf)>, AedbError> {
     let mut segments: Vec<(u64, PathBuf)> = fs::read_dir(data_dir)?
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
@@ -16,7 +26,7 @@ pub fn scan_segments(data_dir: &Path) -> Result<Vec<PathBuf>, AedbError> {
         })
         .collect();
     segments.sort_by_key(|(seq, _)| *seq);
-    Ok(segments.into_iter().map(|(_, path)| path).collect())
+    Ok(segments)
 }
 
 pub fn verify_hash_chain(paths: &[PathBuf]) -> Result<(), AedbError> {

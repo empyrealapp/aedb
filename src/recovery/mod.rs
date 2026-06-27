@@ -129,15 +129,16 @@ fn recover_with_optional_target(
 
 fn effective_replay_target(
     target_seq: Option<u64>,
-    manifest: &Manifest,
-    explicit_manifest: bool,
+    _manifest: &Manifest,
+    _explicit_manifest: bool,
 ) -> Option<u64> {
-    match (target_seq, explicit_manifest) {
-        (Some(target_seq), true) => Some(target_seq.min(manifest.durable_seq)),
-        (Some(target_seq), false) => Some(target_seq),
-        (None, true) => Some(manifest.durable_seq),
-        (None, false) => None,
-    }
+    // The WAL is the source of truth for the durable boundary. Recovery replays
+    // every CRC + hash-chain-valid frame past the checkpoint; the manifest's
+    // `durable_seq` (which only advances at checkpoint/shutdown) is no longer a
+    // hard replay cap, so a `DurabilityMode::Full` commit fsynced after the last
+    // checkpoint is never silently dropped. A point-in-time `target_seq` still
+    // bounds replay; an open-ended recovery replays the full valid tail.
+    target_seq
 }
 
 fn attach_configured_value_store(
@@ -306,12 +307,29 @@ fn segment_paths_for_replay(
         }
         let replay_limit_path = path.clone();
         segment_paths.push(path);
-        if segment.size_bytes > 0 {
+        // Sealed (non-active) segments are frozen at their recorded size, so the
+        // byte limit both bounds replay and detects truncation. The active
+        // segment, by contrast, keeps growing after the manifest was written:
+        // limiting it to the checkpoint-time size would drop every commit made
+        // since the last checkpoint. Read it to its physical end instead and let
+        // per-frame CRC + hash-chain validation stop cleanly at any torn tail.
+        if segment.size_bytes > 0 && !is_active_segment {
             replay_selection
                 .limits
                 .insert(replay_limit_path, segment.size_bytes);
         }
     }
+
+    // Discover WAL segments created after the manifest was last written
+    // (rotations that happened post-checkpoint). They carry no recorded
+    // integrity metadata, so they are trusted at the frame level (CRC +
+    // hash chain) and read to their physical end with no byte limit.
+    for (seq, path) in crate::recovery::scanner::scan_segment_entries(data_dir)? {
+        if seq > active_segment_seq && path.exists() {
+            segment_paths.push(path);
+        }
+    }
+
     Ok((segment_paths, replay_selection))
 }
 

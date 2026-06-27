@@ -334,6 +334,72 @@ async fn crash_matrix_full_durability_abrupt_restart_recovers_all_acknowledged_c
 }
 
 #[tokio::test]
+async fn crash_matrix_full_durability_commits_after_checkpoint_survive_abrupt_restart() {
+    // Regression: the manifest's durable_seq only advances at checkpoint, but
+    // recovery must replay the full fsynced WAL tail. A Full-durability commit
+    // made AFTER a checkpoint and before an abrupt crash must not be lost.
+    let dir = tempdir().expect("temp dir");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Full,
+        recovery_mode: RecoveryMode::Permissive,
+        hash_chain_required: false,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    seed_project(&db).await;
+
+    // Pre-checkpoint commits.
+    for i in 0..50u64 {
+        db.commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: format!("pre:{i}").into_bytes(),
+            value: i.to_string().into_bytes(),
+        })
+        .await
+        .expect("pre-checkpoint write");
+    }
+
+    // Checkpoint: this is the only thing that advances manifest.durable_seq.
+    db.checkpoint_now().await.expect("checkpoint");
+
+    // Post-checkpoint commits — acknowledged durable, but NOT reflected in the
+    // manifest's durable_seq. These are the ones the old cap dropped.
+    let mut last_post_seq = 0u64;
+    for i in 0..50u64 {
+        let committed = db
+            .commit(Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: format!("post:{i}").into_bytes(),
+                value: i.to_string().into_bytes(),
+            })
+            .await
+            .expect("post-checkpoint write");
+        assert_eq!(committed.durable_head_seq, committed.commit_seq);
+        last_post_seq = committed.commit_seq;
+    }
+
+    // Abrupt crash: drop with no shutdown (no further checkpoint/manifest flush).
+    drop(db);
+
+    let recovered = recover_with_config(dir.path(), &config).expect("recover");
+    assert_eq!(
+        recovered.current_seq, last_post_seq,
+        "recovery must reach the last durable commit, past the checkpoint"
+    );
+    assert!(recovered.keyspace.kv_get("p", "app", b"pre:0").is_some());
+    assert!(
+        recovered.keyspace.kv_get("p", "app", b"post:0").is_some(),
+        "first post-checkpoint commit survived"
+    );
+    assert!(
+        recovered.keyspace.kv_get("p", "app", b"post:49").is_some(),
+        "last post-checkpoint commit survived"
+    );
+}
+
+#[tokio::test]
 async fn crash_matrix_mid_checkpoint_tmp_file_is_ignored() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
@@ -355,20 +421,25 @@ async fn crash_matrix_mid_checkpoint_tmp_file_is_ignored() {
     )
     .expect("write tmp checkpoint");
 
-    db.commit(Mutation::KvSet {
-        project_id: "p".into(),
-        scope_id: "app".into(),
-        key: b"after".to_vec(),
-        value: b"2".to_vec(),
-    })
-    .await
-    .expect("after");
+    let after = db
+        .commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"after".to_vec(),
+            value: b"2".to_vec(),
+        })
+        .await
+        .expect("after");
     drop(db);
 
+    // The partial `.tmp` checkpoint must be ignored (not loaded as a real
+    // checkpoint); recovery anchors on the manifest checkpoint and replays the
+    // WAL forward, so the post-checkpoint `after` commit still survives.
     let recovered = recover_with_config(dir.path(), &config).expect("recover");
-    assert_eq!(recovered.current_seq, seq_before);
+    assert!(recovered.current_seq >= seq_before);
+    assert_eq!(recovered.current_seq, after.commit_seq);
     assert!(recovered.keyspace.kv_get("p", "app", b"before").is_some());
-    assert!(recovered.keyspace.kv_get("p", "app", b"after").is_none());
+    assert!(recovered.keyspace.kv_get("p", "app", b"after").is_some());
 }
 
 #[tokio::test]
@@ -540,7 +611,7 @@ async fn crash_matrix_mid_manifest_primary_corruption_falls_back_to_prev() {
 }
 
 #[tokio::test]
-async fn crash_matrix_after_checkpoint_before_manifest_respects_manifest_lower_bound() {
+async fn crash_matrix_after_checkpoint_replays_tail_and_ignores_unreferenced_checkpoint() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
     let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
@@ -577,9 +648,12 @@ async fn crash_matrix_after_checkpoint_before_manifest_respects_manifest_lower_b
     )
     .expect("write unreferenced checkpoint");
 
+    // The unreferenced checkpoint (not in the manifest) must be ignored;
+    // recovery anchors on the manifest checkpoint and replays the WAL tail, so
+    // the durable post-checkpoint `tail` commit survives.
     let recovered = recover_with_config(dir.path(), &config).expect("recover");
     assert!(recovered.keyspace.kv_get("p", "app", b"base").is_some());
-    assert!(recovered.keyspace.kv_get("p", "app", b"tail").is_none());
+    assert!(recovered.keyspace.kv_get("p", "app", b"tail").is_some());
 }
 
 #[tokio::test]
