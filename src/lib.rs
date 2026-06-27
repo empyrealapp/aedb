@@ -39,6 +39,12 @@ pub mod wal;
 
 mod api;
 
+// Public API types defined alongside their primitives to keep this module lean.
+pub use crate::api::lease::LeaseRecord;
+pub use crate::api::queue::{
+    ClaimedTask, EnqueueOptions, EnqueueOutcome, EnqueueSpec, TaskRecord, TaskState,
+};
+
 use crate::backup_chain::read_segments_for_checkpoint;
 use crate::catalog::namespace_key;
 use crate::catalog::schema::{AsyncIndexDef, IndexDef, TableSchema};
