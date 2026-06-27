@@ -13,7 +13,35 @@ use crate::query::operators::{AggregateOperator, Operator, ScanOperator, compile
 use crate::query::plan::{JoinType, Query, QueryOptions};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::KeyspaceSnapshot;
+use crate::storage::keyspace::memory_accounting::row_mem_cost;
 use std::collections::HashMap;
+
+/// Hard ceiling on the bytes of materialized rows a single join query may buffer
+/// in memory at once. Row-count limits (`max_scan_rows`) do not bound memory
+/// when rows are large (big Text/Json columns), so this guards the host — e.g.
+/// a WASM program — against OOM from a query that returns few but huge rows.
+const MAX_JOIN_MATERIALIZED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Estimate the resident byte cost of a materialized row set and reject it if it
+/// exceeds `max_bytes`. Enforced unconditionally (even under `allow_full_scan`):
+/// the scan-row override relaxes the row-count bound, not the host
+/// memory-safety ceiling.
+pub(super) fn enforce_materialization_budget(
+    rows: &[Row],
+    max_bytes: u64,
+) -> Result<(), QueryError> {
+    let mut total: u64 = 0;
+    for row in rows {
+        total = total.saturating_add(row_mem_cost(row) as u64);
+        if total > max_bytes {
+            return Err(QueryError::MaterializationBudgetExceeded {
+                estimated_bytes: total,
+                max_bytes,
+            });
+        }
+    }
+    Ok(())
+}
 
 pub(super) struct JoinQueryExecutionRequest<'a> {
     pub snapshot: &'a KeyspaceSnapshot,
@@ -89,6 +117,7 @@ pub(super) fn execute_join_query(
             rows.push(snapshot.materialize_row(stored)?.into_owned());
         }
     }
+    enforce_materialization_budget(&rows, MAX_JOIN_MATERIALIZED_BYTES)?;
 
     for join in &query.joins {
         let (jp, js, jt) = resolve_table_ref(project_id, scope_id, &join.table);
@@ -277,6 +306,7 @@ pub(super) fn execute_join_query(
             }
         }
         rows = joined;
+        enforce_materialization_budget(&rows, MAX_JOIN_MATERIALIZED_BYTES)?;
         if !options.allow_full_scan && rows.len() > max_scan_rows {
             return Err(QueryError::ScanBoundExceeded {
                 estimated_rows: rows.len() as u64,

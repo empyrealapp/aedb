@@ -494,6 +494,16 @@ pub struct OperationalMetrics {
     pub kv_segment_block_cache_misses: u64,
     /// Live (acquired, not-yet-released) read snapshots — reader pressure.
     pub active_snapshots: usize,
+    /// Estimated resident memory of the in-memory keyspace skeleton (keys,
+    /// index entries, row metadata; spilled payloads excluded). This is the
+    /// footprint that scales with row/key count, so it is the figure to watch
+    /// as a dataset grows.
+    pub keyspace_resident_bytes: u64,
+    /// Configured `max_memory_estimate_bytes` soft cap that drives spill-to-disk.
+    pub keyspace_memory_budget_bytes: u64,
+    /// `keyspace_resident_bytes / keyspace_memory_budget_bytes`, clamped to
+    /// `[0, 1+]`. Approaching `1.0` means spill pressure / headroom exhaustion.
+    pub keyspace_memory_used_fraction: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2930,6 +2940,14 @@ impl AedbInstance {
             kv_segment_block_cache_hits: runtime.kv_segment_block_cache_hits,
             kv_segment_block_cache_misses: runtime.kv_segment_block_cache_misses,
             active_snapshots: self.snapshot_manager.lock().live_count(),
+            keyspace_resident_bytes: runtime.keyspace_resident_bytes,
+            keyspace_memory_budget_bytes: runtime.keyspace_memory_budget_bytes,
+            keyspace_memory_used_fraction: if runtime.keyspace_memory_budget_bytes == 0 {
+                0.0
+            } else {
+                runtime.keyspace_resident_bytes as f64
+                    / runtime.keyspace_memory_budget_bytes as f64
+            },
         }
     }
 
