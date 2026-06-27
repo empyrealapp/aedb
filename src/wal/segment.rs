@@ -252,6 +252,19 @@ impl SegmentManager {
         Ok(())
     }
 
+    /// Clone the active segment's file handle so its data can be fsync'd while
+    /// an external lock (e.g. the executor state lock) is released. The returned
+    /// handle shares the underlying file description, so `sync_data`/`sync_all`
+    /// on it durably flush the same active segment that `sync_active` would.
+    ///
+    /// The clone is taken while the caller still holds the lock, immediately
+    /// after appending; a subsequent rotation cannot lose the appended frames
+    /// because they live in the file this handle refers to.
+    pub fn try_clone_active_file(&self) -> Result<File, SegmentError> {
+        let active = self.active.as_ref().ok_or(SegmentError::NotOpen)?;
+        Ok(active.file.try_clone()?)
+    }
+
     pub fn should_rotate(&self) -> Option<RotationReason> {
         self.should_rotate_at(Instant::now())
     }

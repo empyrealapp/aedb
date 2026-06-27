@@ -722,7 +722,23 @@ impl CommitExecutor {
                 let mut s = loop_state.lock().await;
                 let durable_before = s.durable_head_seq;
                 let epoch_started = Instant::now();
-                let epoch_result = process_commit_epoch(&mut s, epoch_requests);
+                let epoch_result = match prepare_commit_epoch(&mut s, epoch_requests) {
+                    EpochCommitStep::Done(result) => result,
+                    EpochCommitStep::NeedsSync { sync, finalize } => {
+                        // Release the executor state lock across the durability
+                        // fsync so other threads can read and prepare commits
+                        // while we wait on the disk, then re-acquire it to apply
+                        // and publish. The epoch is made visible only after the
+                        // fsync succeeds, preserving durable-before-visible; a
+                        // sync failure aborts the epoch without exposing it.
+                        drop(s);
+                        let sync_started = Instant::now();
+                        let sync_result = sync.run();
+                        let sync_micros = sync_started.elapsed().as_micros() as u64;
+                        s = loop_state.lock().await;
+                        finalize_after_durability_sync(&mut s, finalize, sync_result, sync_micros)
+                    }
+                };
                 group_commit.complete_flush();
                 loop_telemetry
                     .group_commit_complete_epochs
@@ -1854,10 +1870,12 @@ fn is_parallel_apply_timeout_error(err: &AedbError) -> bool {
 
 mod adaptive;
 mod coordinator;
+mod durability;
 mod global_index;
 mod group_commit;
 mod internals;
 mod parallel_runtime;
+use durability::{EpochCommitStep, finalize_after_durability_sync};
 use internals::*;
 
 #[cfg(test)]

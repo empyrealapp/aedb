@@ -4,6 +4,11 @@ pub(super) use partition_derivation::*;
 #[cfg(test)]
 use super::COORDINATOR_TEST_DELAY_MS;
 use super::coordinator::CoordinatorLockManager;
+use super::durability::{
+    EpochCommitStep, PendingFinalize, PreparedCommitEpoch, PreparedInlineKvEpoch, PreparedSync,
+    abort_general_epoch_after_durability_failure, abort_inline_kv_epoch_after_durability_failure,
+    finalize_committed_epoch, finalize_inline_kv_committed_epoch,
+};
 use super::global_index::GlobalUniqueIndexState;
 use super::parallel_runtime::ParallelApplyRuntime;
 use super::parallel_runtime::ParallelTask;
@@ -46,7 +51,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::warn;
 
-const MEMORY_ESTIMATE_INTERVAL_MICROS: u64 = 250_000;
+pub(super) const MEMORY_ESTIMATE_INTERVAL_MICROS: u64 = 250_000;
 const SINGLE_REQUEST_PARALLEL_APPLY_MUTATION_THRESHOLD: usize = 1024;
 
 #[derive(Clone, Default)]
@@ -1552,16 +1557,50 @@ fn kv_namespace_token_conflicts(namespace_token: &str, key_token: &str) -> bool 
     namespace == key_ns
 }
 
+/// Process an epoch entirely under the executor state lock, performing any
+/// durability fsync inline.
+///
+/// This is the synchronous driver used by tests and any caller that does not
+/// want to manage the lock-release dance. The apply loop instead calls
+/// [`prepare_commit_epoch`] directly so it can drop the executor state lock
+/// across the fsync; this wrapper produces an identical [`EpochProcessResult`]
+/// by running the sync in place.
+#[cfg(test)]
 pub(super) fn process_commit_epoch(
     state: &mut ExecutorState,
     requests: Vec<CommitRequest>,
 ) -> EpochProcessResult {
+    match prepare_commit_epoch(state, requests) {
+        EpochCommitStep::Done(result) => result,
+        EpochCommitStep::NeedsSync { sync, finalize } => {
+            let sync_started = Instant::now();
+            let sync_result = sync.run();
+            let sync_micros = sync_started.elapsed().as_micros() as u64;
+            super::durability::finalize_after_durability_sync(
+                state,
+                finalize,
+                sync_result,
+                sync_micros,
+            )
+        }
+    }
+}
+
+/// Prepare an epoch under the executor state lock, stopping at the durability
+/// boundary. Returns [`EpochCommitStep::Done`] when the epoch completed under
+/// the lock (no out-of-lock sync required, or it aborted before the sync), or
+/// [`EpochCommitStep::NeedsSync`] once the WAL has been appended and an fsync
+/// must run with the lock released before the epoch is finalized and published.
+pub(super) fn prepare_commit_epoch(
+    state: &mut ExecutorState,
+    requests: Vec<CommitRequest>,
+) -> EpochCommitStep {
     let process_started = Instant::now();
     if requests.is_empty() {
-        return EpochProcessResult::default();
+        return EpochCommitStep::Done(EpochProcessResult::default());
     }
     if inline_kv_set_epoch_fast_path_eligible(state, &requests) {
-        return process_inline_kv_set_epoch_fast_path(state, requests, process_started);
+        return prepare_inline_kv_set_epoch_fast_path(state, requests, process_started);
     }
 
     let epoch_request_count = requests.len();
@@ -1573,9 +1612,9 @@ pub(super) fn process_commit_epoch(
     let mut wal_append_ops = 0u64;
     let mut wal_append_bytes = 0u64;
     let mut wal_append_micros = 0u64;
-    let mut wal_sync_ops = 0u64;
-    let mut wal_sync_micros = 0u64;
-    let mut sync_executed = false;
+    let wal_sync_ops = 0u64;
+    let wal_sync_micros = 0u64;
+    let sync_executed = false;
     let mut working_keyspace = state.keyspace.clone();
     let mut working_catalog = state.catalog.clone();
     let mut working_idempotency: Option<HashMap<IdempotencyKey, IdempotencyRecord>> = None;
@@ -2013,7 +2052,7 @@ pub(super) fn process_commit_epoch(
     }
 
     if sequenced.is_empty() && internal_sequenced.is_empty() {
-        return EpochProcessResult {
+        return EpochCommitStep::Done(EpochProcessResult {
             outcomes,
             coordinator_apply_attempts,
             coordinator_apply_micros,
@@ -2028,7 +2067,7 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-        };
+        });
     }
 
     if !deferred_parallel_commits.is_empty() {
@@ -2070,7 +2109,7 @@ pub(super) fn process_commit_epoch(
                     post_apply_delta: None,
                 });
             }
-            return EpochProcessResult {
+            return EpochCommitStep::Done(EpochProcessResult {
                 outcomes,
                 coordinator_apply_attempts,
                 coordinator_apply_micros,
@@ -2085,7 +2124,7 @@ pub(super) fn process_commit_epoch(
                 wal_sync_micros,
                 sync_executed,
                 catalog_changed,
-            };
+            });
         }
     }
 
@@ -2148,7 +2187,7 @@ pub(super) fn process_commit_epoch(
                         post_apply_delta: None,
                     });
                 }
-                return EpochProcessResult {
+                return EpochCommitStep::Done(EpochProcessResult {
                     outcomes,
                     coordinator_apply_attempts,
                     coordinator_apply_micros,
@@ -2163,7 +2202,7 @@ pub(super) fn process_commit_epoch(
                     wal_sync_micros,
                     sync_executed,
                     catalog_changed,
-                };
+                });
             }
         };
     }
@@ -2187,7 +2226,7 @@ pub(super) fn process_commit_epoch(
                         post_apply_delta: None,
                     });
                 }
-                return EpochProcessResult {
+                return EpochCommitStep::Done(EpochProcessResult {
                     outcomes,
                     coordinator_apply_attempts,
                     coordinator_apply_micros,
@@ -2202,7 +2241,7 @@ pub(super) fn process_commit_epoch(
                     wal_sync_micros,
                     sync_executed,
                     catalog_changed,
-                };
+                });
             }
         };
     }
@@ -2228,7 +2267,7 @@ pub(super) fn process_commit_epoch(
                         post_apply_delta: None,
                     });
                 }
-                return EpochProcessResult {
+                return EpochCommitStep::Done(EpochProcessResult {
                     outcomes,
                     coordinator_apply_attempts,
                     coordinator_apply_micros,
@@ -2243,7 +2282,7 @@ pub(super) fn process_commit_epoch(
                     wal_sync_micros,
                     sync_executed,
                     catalog_changed,
-                };
+                });
             }
         };
     }
@@ -2265,7 +2304,7 @@ pub(super) fn process_commit_epoch(
                 post_apply_delta: None,
             });
         }
-        return EpochProcessResult {
+        return EpochCommitStep::Done(EpochProcessResult {
             outcomes,
             coordinator_apply_attempts,
             coordinator_apply_micros,
@@ -2280,7 +2319,7 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-        };
+        });
     }
     let append_started = Instant::now();
     if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
@@ -2299,7 +2338,7 @@ pub(super) fn process_commit_epoch(
                 post_apply_delta: None,
             });
         }
-        return EpochProcessResult {
+        return EpochCommitStep::Done(EpochProcessResult {
             outcomes,
             coordinator_apply_attempts,
             coordinator_apply_micros,
@@ -2314,7 +2353,7 @@ pub(super) fn process_commit_epoch(
             wal_sync_micros,
             sync_executed,
             catalog_changed,
-        };
+        });
     }
     if !wal_frames.is_empty() {
         wal_append_ops = wal_append_ops.saturating_add(1);
@@ -2322,206 +2361,20 @@ pub(super) fn process_commit_epoch(
         wal_append_micros =
             wal_append_micros.saturating_add(append_started.elapsed().as_micros() as u64);
     }
-    if requires_sync {
-        let sync_started = Instant::now();
-        if let Err(err) = working_keyspace.sync_persistent_value_store() {
-            overwrite_assertion_failures_with_wal_error(
-                &mut outcomes,
-                &err,
-                "epoch aborted during persistent value sync",
-            );
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during persistent value sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
-            }
-            return EpochProcessResult {
-                outcomes,
-                coordinator_apply_attempts,
-                coordinator_apply_micros,
-                parallel_apply_micros,
-                pre_wal_micros,
-                finalize_micros: 0,
-                read_set_conflicts,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                sync_executed,
-                catalog_changed,
-            };
-        }
-        if let Err(err) = state.wal.sync_active() {
-            let err = AedbError::Io(std::io::Error::other(err.to_string()));
-            overwrite_assertion_failures_with_wal_error(
-                &mut outcomes,
-                &err,
-                "epoch aborted during WAL sync",
-            );
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during WAL sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
-            }
-            return EpochProcessResult {
-                outcomes,
-                coordinator_apply_attempts,
-                coordinator_apply_micros,
-                parallel_apply_micros,
-                pre_wal_micros,
-                finalize_micros: 0,
-                read_set_conflicts,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                sync_executed,
-                catalog_changed,
-            };
-        }
-        wal_sync_ops = wal_sync_ops.saturating_add(1);
-        wal_sync_micros = wal_sync_micros.saturating_add(sync_started.elapsed().as_micros() as u64);
-        sync_executed = true;
-    }
-
-    let last_user_seq = sequenced.last().map(|c| c.seq).unwrap_or(state.current_seq);
-    let last_internal_seq = internal_sequenced
-        .last()
-        .map(|c| c.seq)
-        .unwrap_or(state.current_seq);
-    let last_seq = last_user_seq.max(last_internal_seq);
-    debug_assert!(
-        last_seq >= state.current_seq,
-        "commit seq must be monotonic across epochs"
-    );
-    state.keyspace = working_keyspace;
-    state.catalog = working_catalog;
-    state.global_unique_index = working_global_unique_index;
-    if let Some(updated) = working_idempotency {
-        state.idempotency = updated;
-    }
-    state.current_seq = last_seq;
-    state.visible_head_seq = last_seq;
-    match state.config.durability_mode {
-        DurabilityMode::Full => {
-            state.durable_head_seq = last_seq;
-            state.pending_batch_bytes = 0;
-            state.pending_batch_max_seq = state.durable_head_seq;
-        }
-        DurabilityMode::Batch => {
-            if requires_sync {
-                state.durable_head_seq = last_seq;
-                state.pending_batch_bytes = 0;
-                state.pending_batch_max_seq = state.durable_head_seq;
-            } else {
-                state.pending_batch_bytes = state
-                    .pending_batch_bytes
-                    .saturating_add(wal_payload_size_bytes);
-                state.pending_batch_max_seq = last_seq;
-                if state.pending_batch_bytes >= state.config.batch_max_bytes {
-                    let sync_started = Instant::now();
-                    if state.keyspace.sync_persistent_value_store().is_ok()
-                        && state.wal.sync_active().is_ok()
-                    {
-                        wal_sync_ops = wal_sync_ops.saturating_add(1);
-                        wal_sync_micros = wal_sync_micros
-                            .saturating_add(sync_started.elapsed().as_micros() as u64);
-                        sync_executed = true;
-                        state.durable_head_seq = state.pending_batch_max_seq;
-                        state.pending_batch_bytes = 0;
-                        state.pending_batch_max_seq = state.durable_head_seq;
-                    }
-                }
-            }
-        }
-        DurabilityMode::OsBuffered => {}
-    }
-    debug_assert!(
-        state.durable_head_seq <= state.visible_head_seq,
-        "durable head cannot exceed visible head"
-    );
-    prune_idempotency(state);
-
-    let forced_full_snapshot = state.version_store.publish_deltas(
-        sequenced
-            .iter()
-            .map(|commit| (commit.seq, Arc::clone(&commit.delta)))
-            .chain(
-                internal_sequenced
-                    .iter()
-                    .map(|commit| (commit.seq, Arc::clone(&commit.delta))),
-            ),
-    );
-    let snapshot_due = now_micros().saturating_sub(state.last_full_snapshot_micros)
-        >= state.config.max_snapshot_age_ms.saturating_mul(1000);
-    if snapshot_due || forced_full_snapshot {
-        state.version_store.publish_full(
-            state.visible_head_seq,
-            state.keyspace.snapshot(),
-            state.catalog.snapshot(),
-        );
-        state.last_full_snapshot_micros = now_micros();
-    }
-
-    let now_micros = now_micros();
-    if now_micros.saturating_sub(state.last_memory_estimate_micros)
-        >= MEMORY_ESTIMATE_INTERVAL_MICROS
-    {
-        state.last_memory_estimate_micros = now_micros;
-        let mem_estimate = state.keyspace.estimate_memory_bytes();
-        if mem_estimate > state.config.max_memory_estimate_bytes {
-            warn!(
-                mem_estimate,
-                max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
-                "aedb memory estimate exceeded threshold"
-            );
-        }
-    }
-    if let Some(reason) = state.wal.should_rotate()
-        && let Err(err) = state.wal.rotate()
-    {
-        // The epoch is already durable at this point, so a rotation failure does
-        // not invalidate the committed data. It must not be silent, though: a
-        // persistent failure lets the active segment grow unbounded and degrades
-        // recovery, so surface it for operators rather than dropping it.
-        warn!(
-            reason = ?reason,
-            error = %err,
-            "aedb WAL segment rotation failed; active segment will continue to grow"
-        );
-    }
-
-    let durable_head = state.durable_head_seq;
-    let finalize_started = Instant::now();
-    for commit in sequenced {
-        outcomes.push(EpochOutcome {
-            request: commit.request,
-            result: Ok(CommitResult {
-                commit_seq: commit.seq,
-                durable_head_seq: durable_head,
-                idempotency: IdempotencyOutcome::Applied,
-                canonical_commit_seq: commit.seq,
-            }),
-            post_apply_delta: Some(commit.delta),
-        });
-    }
-    EpochProcessResult {
+    let prepared = PreparedCommitEpoch {
         outcomes,
+        sequenced,
+        internal_sequenced,
+        working_keyspace,
+        working_catalog,
+        working_idempotency,
+        working_global_unique_index,
+        requires_sync,
+        wal_payload_size_bytes,
         coordinator_apply_attempts,
         coordinator_apply_micros,
         parallel_apply_micros,
         pre_wal_micros,
-        finalize_micros: finalize_started.elapsed().as_micros() as u64,
         read_set_conflicts,
         wal_append_ops,
         wal_append_bytes,
@@ -2530,7 +2383,40 @@ pub(super) fn process_commit_epoch(
         wal_sync_micros,
         sync_executed,
         catalog_changed,
+    };
+
+    if prepared.requires_sync {
+        // The WAL frames are appended but not yet durable. Capture cloned
+        // durability handles so the apply loop can release the executor state
+        // lock across the (potentially slow) fsync, then re-acquire it to apply
+        // and publish. Cloning the active WAL file here — under the lock,
+        // immediately after the append — guarantees the handle refers to the
+        // segment holding these frames even if a later rotation swaps the
+        // active file. Nothing is published until the fsync succeeds.
+        let wal_file = match state.wal.try_clone_active_file() {
+            Ok(file) => file,
+            Err(err) => {
+                let err = AedbError::Io(std::io::Error::other(err.to_string()));
+                return EpochCommitStep::Done(abort_general_epoch_after_durability_failure(
+                    prepared,
+                    &err,
+                    "epoch aborted during WAL sync",
+                ));
+            }
+        };
+        let sync = PreparedSync {
+            value_store: prepared.working_keyspace.persistent_value_store_arc(),
+            wal_file,
+        };
+        return EpochCommitStep::NeedsSync {
+            sync,
+            finalize: PendingFinalize::General(Box::new(prepared)),
+        };
     }
+
+    // No out-of-lock durability sync is required (OS-buffered, or a batch epoch
+    // below the flush threshold): finalize and publish directly under the lock.
+    EpochCommitStep::Done(finalize_committed_epoch(state, prepared, 0, false))
 }
 
 fn inline_kv_set_epoch_fast_path_eligible(
@@ -2575,11 +2461,17 @@ fn inline_kv_set_epoch_fast_path_eligible(
     true
 }
 
-fn process_inline_kv_set_epoch_fast_path(
+/// Prepare an inline-KV fast-path epoch under the executor state lock, stopping
+/// at the durability boundary. Mirrors [`prepare_commit_epoch`] for the
+/// anonymous KvSet hot path: in `DurabilityMode::Full` it appends the WAL and
+/// returns [`EpochCommitStep::NeedsSync`] so the apply loop can fsync with the
+/// lock released, then apply the in-memory KV writes and publish only once the
+/// data is durable.
+fn prepare_inline_kv_set_epoch_fast_path(
     state: &mut ExecutorState,
     requests: Vec<CommitRequest>,
     process_started: Instant,
-) -> EpochProcessResult {
+) -> EpochCommitStep {
     let mut outcomes = Vec::with_capacity(requests.len());
     let mut sequenced = Vec::with_capacity(requests.len());
     let mut next_seq = state.current_seq;
@@ -2621,11 +2513,11 @@ fn process_inline_kv_set_epoch_fast_path(
     }
 
     if sequenced.is_empty() {
-        return EpochProcessResult {
+        return EpochCommitStep::Done(EpochProcessResult {
             outcomes,
             pre_wal_micros: process_started.elapsed().as_micros() as u64,
             ..EpochProcessResult::default()
-        };
+        });
     }
 
     let mut wal_payload_size_bytes = 0usize;
@@ -2646,9 +2538,9 @@ fn process_inline_kv_set_epoch_fast_path(
     let mut wal_append_ops = 0u64;
     let mut wal_append_bytes = 0u64;
     let mut wal_append_micros = 0u64;
-    let mut wal_sync_ops = 0u64;
-    let mut wal_sync_micros = 0u64;
-    let mut sync_executed = false;
+    let wal_sync_ops = 0u64;
+    let wal_sync_micros = 0u64;
+    let sync_executed = false;
 
     if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
         let err = AedbError::Io(std::io::Error::other(err.to_string()));
@@ -2661,7 +2553,7 @@ fn process_inline_kv_set_epoch_fast_path(
                 post_apply_delta: None,
             });
         }
-        return EpochProcessResult {
+        return EpochCommitStep::Done(EpochProcessResult {
             outcomes,
             pre_wal_micros,
             wal_append_ops,
@@ -2670,191 +2562,60 @@ fn process_inline_kv_set_epoch_fast_path(
             wal_sync_ops,
             wal_sync_micros,
             ..EpochProcessResult::default()
-        };
+        });
     }
     wal_append_ops = 1;
     wal_append_bytes = wal_payload_size_bytes as u64;
     wal_append_micros = append_started.elapsed().as_micros() as u64;
 
-    if matches!(state.config.durability_mode, DurabilityMode::Full) {
-        let sync_started = Instant::now();
-        if let Err(err) = state.wal.sync_active() {
-            let err = AedbError::Io(std::io::Error::other(err.to_string()));
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during WAL sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
-            }
-            return EpochProcessResult {
-                outcomes,
-                pre_wal_micros,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                ..EpochProcessResult::default()
-            };
-        }
-        wal_sync_ops = 1;
-        wal_sync_micros = sync_started.elapsed().as_micros() as u64;
-        sync_executed = true;
-    }
-
-    if let Some((project_id, scope_id)) = inline_kv_set_epoch_namespace(&sequenced) {
-        state.keyspace.kv_set_many_inline_same_namespace_with_seq(
-            project_id,
-            scope_id,
-            sequenced.iter().flat_map(|commit| {
-                commit.delta.mutations.iter().map(move |mutation| {
-                    let Mutation::KvSet { key, value, .. } = mutation else {
-                        unreachable!("inline KV fast path only sequences KvSet commits");
-                    };
-                    (key, value, commit.seq)
-                })
-            }),
-        );
-    } else {
-        for commit in &sequenced {
-            for mutation in &commit.delta.mutations {
-                let Mutation::KvSet {
-                    project_id,
-                    scope_id,
-                    key,
-                    value,
-                } = mutation
-                else {
-                    unreachable!("inline KV fast path only sequences KvSet commits");
-                };
-                state.keyspace.kv_set_inline(
-                    project_id,
-                    scope_id,
-                    key.clone(),
-                    value.clone(),
-                    commit.seq,
-                );
-            }
-        }
-    }
-
-    let last_seq = sequenced
-        .last()
-        .map(|commit| commit.seq)
-        .unwrap_or(state.current_seq);
-    state.current_seq = last_seq;
-    state.visible_head_seq = last_seq;
-    match state.config.durability_mode {
-        DurabilityMode::Full => {
-            state.durable_head_seq = last_seq;
-            state.pending_batch_bytes = 0;
-            state.pending_batch_max_seq = state.durable_head_seq;
-        }
-        DurabilityMode::Batch => {
-            state.pending_batch_bytes = state
-                .pending_batch_bytes
-                .saturating_add(wal_payload_size_bytes);
-            state.pending_batch_max_seq = last_seq;
-            if state.pending_batch_bytes >= state.config.batch_max_bytes {
-                let sync_started = Instant::now();
-                if state.keyspace.sync_persistent_value_store().is_ok()
-                    && state.wal.sync_active().is_ok()
-                {
-                    wal_sync_ops = wal_sync_ops.saturating_add(1);
-                    wal_sync_micros =
-                        wal_sync_micros.saturating_add(sync_started.elapsed().as_micros() as u64);
-                    sync_executed = true;
-                    state.durable_head_seq = state.pending_batch_max_seq;
-                    state.pending_batch_bytes = 0;
-                    state.pending_batch_max_seq = state.durable_head_seq;
-                }
-            }
-        }
-        DurabilityMode::OsBuffered => {}
-    }
-    debug_assert!(
-        state.durable_head_seq <= state.visible_head_seq,
-        "durable head cannot exceed visible head"
-    );
-    prune_idempotency(state);
-
-    let forced_full_snapshot = state.version_store.publish_deltas(
-        sequenced
-            .iter()
-            .map(|commit| (commit.seq, Arc::clone(&commit.delta))),
-    );
-    let snapshot_due = now_micros().saturating_sub(state.last_full_snapshot_micros)
-        >= state.config.max_snapshot_age_ms.saturating_mul(1000);
-    if snapshot_due || forced_full_snapshot {
-        state.version_store.publish_full(
-            state.visible_head_seq,
-            state.keyspace.snapshot(),
-            state.catalog.snapshot(),
-        );
-        state.last_full_snapshot_micros = now_micros();
-    }
-
-    let now_micros = now_micros();
-    if now_micros.saturating_sub(state.last_memory_estimate_micros)
-        >= MEMORY_ESTIMATE_INTERVAL_MICROS
-    {
-        state.last_memory_estimate_micros = now_micros;
-        let mem_estimate = state.keyspace.estimate_memory_bytes();
-        if mem_estimate > state.config.max_memory_estimate_bytes {
-            warn!(
-                mem_estimate,
-                max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
-                "aedb memory estimate exceeded threshold"
-            );
-        }
-    }
-    if let Some(reason) = state.wal.should_rotate()
-        && let Err(err) = state.wal.rotate()
-    {
-        // The epoch is already durable at this point, so a rotation failure does
-        // not invalidate the committed data. It must not be silent, though: a
-        // persistent failure lets the active segment grow unbounded and degrades
-        // recovery, so surface it for operators rather than dropping it.
-        warn!(
-            reason = ?reason,
-            error = %err,
-            "aedb WAL segment rotation failed; active segment will continue to grow"
-        );
-    }
-
-    let durable_head = state.durable_head_seq;
-    let finalize_started = Instant::now();
-    for commit in sequenced {
-        outcomes.push(EpochOutcome {
-            request: commit.request,
-            result: Ok(CommitResult {
-                commit_seq: commit.seq,
-                durable_head_seq: durable_head,
-                idempotency: IdempotencyOutcome::Applied,
-                canonical_commit_seq: commit.seq,
-            }),
-            post_apply_delta: Some(commit.delta),
-        });
-    }
-
-    EpochProcessResult {
+    let prepared = PreparedInlineKvEpoch {
         outcomes,
+        sequenced,
+        wal_payload_size_bytes,
         pre_wal_micros,
-        finalize_micros: finalize_started.elapsed().as_micros() as u64,
         wal_append_ops,
         wal_append_bytes,
         wal_append_micros,
         wal_sync_ops,
         wal_sync_micros,
         sync_executed,
-        ..EpochProcessResult::default()
+    };
+
+    if matches!(state.config.durability_mode, DurabilityMode::Full) {
+        // WAL appended but not yet durable. Clone the active segment file under
+        // the lock so the apply loop can fsync with the lock released, then
+        // re-acquire it to apply the in-memory KV writes and publish. The fast
+        // path never touches the persistent value store (no spill), so only the
+        // WAL needs syncing. Nothing is published until the fsync succeeds.
+        let wal_file = match state.wal.try_clone_active_file() {
+            Ok(file) => file,
+            Err(err) => {
+                let err = AedbError::Io(std::io::Error::other(err.to_string()));
+                return EpochCommitStep::Done(abort_inline_kv_epoch_after_durability_failure(
+                    prepared,
+                    &err,
+                    "epoch aborted during WAL sync",
+                ));
+            }
+        };
+        let sync = PreparedSync {
+            value_store: None,
+            wal_file,
+        };
+        return EpochCommitStep::NeedsSync {
+            sync,
+            finalize: PendingFinalize::InlineKv(Box::new(prepared)),
+        };
     }
+
+    // Batch / OS-buffered: no out-of-lock sync, finalize directly under the lock
+    // (an opportunistic batch flush may still run inside the finalize).
+    EpochCommitStep::Done(finalize_inline_kv_committed_epoch(
+        state, prepared, 0, false,
+    ))
 }
 
-fn inline_kv_set_epoch_namespace(sequenced: &[SequencedCommit]) -> Option<(&str, &str)> {
+pub(super) fn inline_kv_set_epoch_namespace(sequenced: &[SequencedCommit]) -> Option<(&str, &str)> {
     let first_mutation = sequenced.first()?.delta.mutations.first()?;
     let Mutation::KvSet {
         project_id,
@@ -2882,7 +2643,7 @@ fn inline_kv_set_epoch_namespace(sequenced: &[SequencedCommit]) -> Option<(&str,
     Some((project_id, scope_id))
 }
 
-fn overwrite_assertion_failures_with_wal_error(
+pub(super) fn overwrite_assertion_failures_with_wal_error(
     outcomes: &mut [EpochOutcome],
     wal_error: &AedbError,
     context: &str,

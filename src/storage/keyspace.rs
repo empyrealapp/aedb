@@ -918,6 +918,14 @@ impl Keyspace {
         Ok(())
     }
 
+    /// Clone the persistent value-store handle, if one is attached, so it can be
+    /// fsync'd (`sync_all`) with the executor state lock released. The store is
+    /// shared by `Arc`, so syncing through the clone flushes the same backing
+    /// file `sync_persistent_value_store` would.
+    pub fn persistent_value_store_arc(&self) -> Option<Arc<PersistentValueStore>> {
+        self.value_store.clone()
+    }
+
     pub fn spill_kv_values(&mut self) -> Result<(), crate::error::AedbError> {
         let Some(store) = self.value_store.clone() else {
             return Ok(());
