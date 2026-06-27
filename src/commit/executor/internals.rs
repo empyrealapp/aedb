@@ -1570,7 +1570,7 @@ pub(super) fn prepare_commit_epoch(
         return EpochProcessResult::default();
     }
     if inline_kv_set_epoch_fast_path_eligible(state, &requests) {
-        return process_inline_kv_set_epoch_fast_path(state, requests, process_started);
+        return process_inline_kv_set_epoch_fast_path(state, requests, process_started, out_sync);
     }
 
     let epoch_request_count = requests.len();
@@ -2374,7 +2374,7 @@ pub(super) fn prepare_commit_epoch(
             }
         };
         *out_sync = Some(PreparedSync {
-            input,
+            input: PendingFinalize::General(Box::new(input)),
             handles: DurabilityHandles {
                 value_store,
                 wal_file,
@@ -2434,6 +2434,19 @@ impl DurabilityHandles {
                 .map_err(|err| (DurabilityStage::ValueStore, err))?;
         }
         if let Some(file) = &self.wal_file {
+            // Honor the `wal_sync` fail point here too: the off-lock durability
+            // sync flushes a cloned handle to the active segment, so it bypasses
+            // `SegmentManager::sync_active` (where the inline path trips this
+            // fault). Without this, injected WAL-sync faults would not fire for
+            // durable commits that fsync off-lock.
+            if crate::faults::any_armed() {
+                crate::faults::trip("wal_sync").map_err(|e| {
+                    (
+                        DurabilityStage::Wal,
+                        AedbError::Io(std::io::Error::other(e.to_string())),
+                    )
+                })?;
+            }
             file.sync_data().map_err(|err| {
                 (
                     DurabilityStage::Wal,
@@ -2448,8 +2461,16 @@ impl DurabilityHandles {
 /// The finalize inputs plus the durability handles needed to make the epoch
 /// durable off-lock. Produced by [`prepare_commit_epoch`] on the durable path.
 pub(super) struct PreparedSync {
-    pub(super) input: EpochFinalizeInput,
+    pub(super) input: PendingFinalize,
     pub(super) handles: DurabilityHandles,
+}
+
+/// Which finalize phase a durable epoch resumes into after its off-lock fsync.
+/// The general apply path and the inline-KV fast path keep different in-progress
+/// state, so they finalize through different functions.
+pub(super) enum PendingFinalize {
+    General(Box<EpochFinalizeInput>),
+    InlineKv(InlineKvFinalizeInput),
 }
 
 /// Resume a durable epoch after its off-lock fsync. On success the sync counters
@@ -2457,17 +2478,28 @@ pub(super) struct PreparedSync {
 /// aborted with per-commit errors and no state is swapped.
 pub(super) fn finalize_after_durability_sync(
     state: &mut ExecutorState,
-    mut input: EpochFinalizeInput,
+    input: PendingFinalize,
     sync_result: Result<u64, (DurabilityStage, AedbError)>,
 ) -> EpochProcessResult {
-    match sync_result {
-        Ok(sync_micros) => {
-            input.wal_sync_ops = input.wal_sync_ops.saturating_add(1);
-            input.wal_sync_micros = input.wal_sync_micros.saturating_add(sync_micros);
-            input.sync_executed = true;
-            finalize_committed_epoch(state, input)
-        }
-        Err((stage, err)) => build_sync_failure_result(input, stage, err),
+    match input {
+        PendingFinalize::General(mut input) => match sync_result {
+            Ok(sync_micros) => {
+                input.wal_sync_ops = input.wal_sync_ops.saturating_add(1);
+                input.wal_sync_micros = input.wal_sync_micros.saturating_add(sync_micros);
+                input.sync_executed = true;
+                finalize_committed_epoch(state, *input)
+            }
+            Err((stage, err)) => build_sync_failure_result(*input, stage, err),
+        },
+        PendingFinalize::InlineKv(mut input) => match sync_result {
+            Ok(sync_micros) => {
+                input.wal_sync_ops = input.wal_sync_ops.saturating_add(1);
+                input.wal_sync_micros = input.wal_sync_micros.saturating_add(sync_micros);
+                input.sync_executed = true;
+                finalize_inline_kv_committed_epoch(state, input)
+            }
+            Err((stage, err)) => build_inline_kv_sync_failure_result(input, stage, err),
+        },
     }
 }
 
@@ -2769,6 +2801,7 @@ fn process_inline_kv_set_epoch_fast_path(
     state: &mut ExecutorState,
     requests: Vec<CommitRequest>,
     process_started: Instant,
+    out_sync: &mut Option<PreparedSync>,
 ) -> EpochProcessResult {
     let mut outcomes = Vec::with_capacity(requests.len());
     let mut sequenced = Vec::with_capacity(requests.len());
@@ -2836,9 +2869,9 @@ fn process_inline_kv_set_epoch_fast_path(
     let mut wal_append_ops = 0u64;
     let mut wal_append_bytes = 0u64;
     let mut wal_append_micros = 0u64;
-    let mut wal_sync_ops = 0u64;
-    let mut wal_sync_micros = 0u64;
-    let mut sync_executed = false;
+    let wal_sync_ops = 0u64;
+    let wal_sync_micros = 0u64;
+    let sync_executed = false;
 
     if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
         let err = AedbError::Io(std::io::Error::other(err.to_string()));
@@ -2866,34 +2899,129 @@ fn process_inline_kv_set_epoch_fast_path(
     wal_append_bytes = wal_payload_size_bytes as u64;
     wal_append_micros = append_started.elapsed().as_micros() as u64;
 
+    let input = InlineKvFinalizeInput {
+        outcomes,
+        sequenced,
+        wal_payload_size_bytes,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        sync_executed,
+    };
+
     if matches!(state.config.durability_mode, DurabilityMode::Full) {
-        let sync_started = Instant::now();
-        if let Err(err) = state.wal.sync_active() {
-            let err = AedbError::Io(std::io::Error::other(err.to_string()));
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during WAL sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
+        // Hand the WAL fsync to the caller so it runs with the state lock
+        // released, then finalize on re-acquire. The fast path never spills to
+        // the persistent value store, so only the WAL segment needs syncing.
+        // Nothing is applied or published until the fsync succeeds, so the
+        // durable-before-visible invariant holds and a sync failure aborts the
+        // epoch without exposing it.
+        let wal_file = match state.wal.try_clone_active_file() {
+            Ok(file) => file,
+            Err(err) => {
+                return build_inline_kv_sync_failure_result(
+                    input,
+                    DurabilityStage::Wal,
+                    AedbError::Io(std::io::Error::other(err.to_string())),
+                );
             }
-            return EpochProcessResult {
-                outcomes,
-                pre_wal_micros,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                ..EpochProcessResult::default()
-            };
-        }
-        wal_sync_ops = 1;
-        wal_sync_micros = sync_started.elapsed().as_micros() as u64;
-        sync_executed = true;
+        };
+        *out_sync = Some(PreparedSync {
+            input: PendingFinalize::InlineKv(input),
+            handles: DurabilityHandles {
+                value_store: None,
+                wal_file,
+            },
+        });
+        return EpochProcessResult::default();
     }
+
+    // Batch / OS-buffered: no out-of-lock sync, finalize directly under the lock
+    // (an opportunistic batch flush may still run inside the finalize).
+    finalize_inline_kv_committed_epoch(state, input)
+}
+
+/// Abort an inline-KV epoch whose off-lock durability fsync failed: surface the
+/// error on every commit in the epoch and apply nothing, leaving the epoch
+/// invisible. The fast path carries no assertions, so there is nothing to
+/// overwrite.
+fn build_inline_kv_sync_failure_result(
+    input: InlineKvFinalizeInput,
+    stage: DurabilityStage,
+    err: AedbError,
+) -> EpochProcessResult {
+    let InlineKvFinalizeInput {
+        mut outcomes,
+        sequenced,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        ..
+    } = input;
+    let context = match stage {
+        DurabilityStage::ValueStore => "epoch aborted during persistent value sync",
+        DurabilityStage::Wal => "epoch aborted during WAL sync",
+    };
+    for failed in sequenced {
+        outcomes.push(EpochOutcome {
+            request: failed.request,
+            result: Err(AedbError::Validation(format!("{context}: {err}"))),
+            post_apply_delta: None,
+        });
+    }
+    EpochProcessResult {
+        outcomes,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        ..EpochProcessResult::default()
+    }
+}
+
+/// Owned inputs handed from the inline-KV WAL-append phase to its finalize
+/// phase, mirroring [`EpochFinalizeInput`] for the anonymous KvSet hot path.
+pub(super) struct InlineKvFinalizeInput {
+    outcomes: Vec<EpochOutcome>,
+    sequenced: Vec<SequencedCommit>,
+    wal_payload_size_bytes: usize,
+    pre_wal_micros: u64,
+    wal_append_ops: u64,
+    wal_append_bytes: u64,
+    wal_append_micros: u64,
+    wal_sync_ops: u64,
+    wal_sync_micros: u64,
+    sync_executed: bool,
+}
+
+/// Apply the inline-KV writes in memory, advance the durability/visibility
+/// heads, publish version deltas, and build the per-commit outcomes. The WAL
+/// frames have already been appended (and, on the `DurabilityMode::Full` path,
+/// fsynced off-lock) before this runs.
+fn finalize_inline_kv_committed_epoch(
+    state: &mut ExecutorState,
+    input: InlineKvFinalizeInput,
+) -> EpochProcessResult {
+    let InlineKvFinalizeInput {
+        mut outcomes,
+        sequenced,
+        wal_payload_size_bytes,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        mut wal_sync_ops,
+        mut wal_sync_micros,
+        mut sync_executed,
+    } = input;
 
     if let Some((project_id, scope_id)) = inline_kv_set_epoch_namespace(&sequenced) {
         state.keyspace.kv_set_many_inline_same_namespace_with_seq(
