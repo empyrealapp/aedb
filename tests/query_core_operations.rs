@@ -10,7 +10,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn integration_query_core_operations_filter_order_limit_aggregate_and_delete() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("qcore").await.expect("project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {

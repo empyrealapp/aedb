@@ -47,7 +47,7 @@ fn recovery_cache_prunes_expired_entries() {
 #[tokio::test]
 async fn existence_and_introspection_apis_report_catalog_state() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("project");
     db.create_scope("p", "s1").await.expect("scope");
@@ -121,7 +121,7 @@ async fn existence_and_introspection_apis_report_catalog_state() {
 #[tokio::test]
 async fn dependency_aware_ddl_batch_reorders_create_dependencies() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     let batch = db
         .commit_ddl_batch_dependency_aware(vec![
@@ -181,7 +181,7 @@ async fn dependency_aware_ddl_batch_reorders_create_dependencies() {
 #[tokio::test]
 async fn ddl_errors_expose_stable_error_codes() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
 
     let err = db
@@ -204,7 +204,7 @@ async fn ddl_errors_expose_stable_error_codes() {
 #[tokio::test]
 async fn snapshot_limit_enforced_on_read_path() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(
+    let db = AedbInstance::open_anonymous(
         AedbConfig {
             max_concurrent_snapshots: 1,
             ..AedbConfig::default()
@@ -257,7 +257,7 @@ async fn snapshot_limit_enforced_on_read_path() {
 #[tokio::test]
 async fn idempotent_retry_does_not_double_apply_non_idempotent_mutation() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let key = IdempotencyKey([42u8; 16]);
@@ -351,7 +351,7 @@ async fn benchmark_durability_knob_sweep() {
             ..AedbConfig::default()
         };
         config.manifest_hmac_key = None;
-        let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+        let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
         db.create_project("p").await.expect("project");
 
         for i in 0..8_000usize {
@@ -451,12 +451,12 @@ async fn strict_open_rejects_directory_previously_opened_in_non_strict_mode() {
     permissive.recovery_mode = RecoveryMode::Permissive;
     permissive.hash_chain_required = false;
 
-    let db = AedbInstance::open(permissive, dir.path()).expect("open permissive");
+    let db = AedbInstance::open_anonymous(permissive, dir.path()).expect("open permissive");
     db.shutdown().await.expect("shutdown permissive");
     drop(db); // release the data-directory lock before reopening
 
     let strict = AedbConfig::production([7u8; 32]);
-    let err = match AedbInstance::open(strict, dir.path()) {
+    let err = match AedbInstance::open_anonymous(strict, dir.path()) {
         Ok(db) => {
             db.shutdown().await.expect("shutdown unexpected strict db");
             panic!("strict open should fail closed");
@@ -476,7 +476,7 @@ async fn strict_open_rejects_tampered_trust_mode_marker() {
     permissive.recovery_mode = RecoveryMode::Permissive;
     permissive.hash_chain_required = false;
 
-    let db = AedbInstance::open(permissive, dir.path()).expect("open permissive");
+    let db = AedbInstance::open_anonymous(permissive, dir.path()).expect("open permissive");
     db.shutdown().await.expect("shutdown permissive");
     drop(db); // release the data-directory lock before reopening
 
@@ -486,7 +486,7 @@ async fn strict_open_rejects_tampered_trust_mode_marker() {
     )
     .expect("tamper trust mode marker");
 
-    let err = match AedbInstance::open(AedbConfig::production([9u8; 32]), dir.path()) {
+    let err = match AedbInstance::open_anonymous(AedbConfig::production([9u8; 32]), dir.path()) {
         Ok(db) => {
             db.shutdown().await.expect("shutdown unexpected strict db");
             panic!("tampered trust marker should fail closed");
@@ -502,7 +502,7 @@ async fn strict_open_rejects_tampered_trust_mode_marker() {
 #[tokio::test]
 async fn queries_reject_oversized_in_lists_and_like_patterns() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -561,7 +561,7 @@ async fn queries_reject_oversized_in_lists_and_like_patterns() {
 #[tokio::test]
 async fn managed_system_tables_reject_direct_user_mutations() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     let err = db
         .commit(Mutation::Upsert {

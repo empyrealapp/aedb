@@ -9,9 +9,17 @@
 
 ## 2. Authenticated Caller Model
 
-- Use `AedbInstance::open_secure(...)` (or `open_production(...)`) in production paths.
+- `AedbInstance::open(...)` is authenticated-by-default: anonymous
+  `commit`/`kv_set`/`query` and every `*_no_auth` helper are rejected. Use
+  `open_secure(...)` (or `open_production(...)`) in production paths for the
+  additional secure-config validation (e.g. a configured manifest HMAC key).
+- `AedbInstance::open_anonymous(...)` is the explicit opt-out that permits
+  unauthenticated operations. Use it only for trusted, non-exposed deployments.
 - Require all caller-facing operations to use authenticated `*_as` APIs.
-- Do not expose anonymous commit/query APIs in host application routes.
+- The anonymous read/write surface is intentionally limited to the explicit
+  `*_no_auth` twins (`commit_no_auth`, `kv_set_no_auth`, `kv_del_no_auth`,
+  `query_no_auth`, `kv_get_no_auth`, ...); these all error under `open`/secure
+  mode. Do not expose them in host application routes.
 - Grant minimum permissions only (project/scope/table/KV-prefix scoped).
 
 ## 3. Audit Logging
@@ -52,3 +60,38 @@
   - collect `operational_metrics()` snapshots,
   - reduce admission rate or shard workload by asset/project,
   - maintain durable-finality path for high-value transactions.
+
+## 6. Data-at-Rest Integrity Threat Model
+
+On-disk integrity is layered, and only the top layer is cryptographic. Know
+which guarantee each layer provides before relying on it:
+
+- **WAL frames** carry a per-frame CRC32C (`src/wal/frame.rs`). This detects
+  bit-rot and torn writes. It is **not** a security check: CRC32C is unkeyed and
+  trivially recomputable, so an attacker who can write the data directory can
+  forge a frame with a valid CRC.
+- **WAL segments** maintain a blake3 hash chain (`src/wal/segment.rs`). The chain
+  detects truncation and out-of-order/missing frames, but the hasher is
+  **unkeyed** — it is a strong corruption check, not a tamper-evidence check.
+  Anyone who can rewrite a segment can recompute a consistent chain.
+- **Checkpoints** are covered by unkeyed SHA-256 payload digests
+  (`src/checkpoint/writer.rs`) — again corruption detection, recomputable by a
+  writer.
+- **The manifest is the only cryptographic root of trust.** It is signed with
+  HMAC-SHA256, and the signature exists **only when an HMAC key is configured**
+  (`write_manifest_atomic_signed`, `src/manifest/atomic.rs`). The manifest
+  records the SHA-256 of every checkpoint/WAL file it references, so a valid
+  manifest HMAC transitively authenticates those files' digests.
+
+Consequence: **tamper-resistance of segments and checkpoints requires an HMAC
+key.** Without one (e.g. plain `AedbConfig::new`/`open` rather than
+`production`/`open_secure`), all on-disk checks degrade to corruption detection,
+and an adversary with write access to the data directory can substitute files and
+recompute every checksum undetectably. For any deployment with a meaningful
+disk-tampering threat model:
+
+- configure the manifest HMAC key (see §1) — this is what makes the strict
+  hash-chain restore drill in §4 actually tamper-*evident* rather than merely
+  corruption-detecting;
+- treat the HMAC key as the asset whose compromise breaks at-rest integrity, and
+  protect the data directory with OS-level permissions regardless.

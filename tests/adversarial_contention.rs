@@ -43,7 +43,7 @@ fn contention_config() -> AedbConfig {
 #[tokio::test]
 async fn test_single_row_thundering_herd() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -180,7 +180,7 @@ async fn test_single_row_thundering_herd() {
 #[tokio::test]
 async fn test_cross_partition_deadlock_prevention() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     // Setup: Create 4 tables in same scope (to test partition locking)
@@ -307,7 +307,7 @@ async fn test_cross_partition_deadlock_prevention() {
 #[tokio::test]
 async fn test_read_set_conflict_under_write_load() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -427,7 +427,7 @@ async fn test_read_set_conflict_under_write_load() {
 #[tokio::test]
 async fn test_high_concurrency_stress() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(contention_config(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(contention_config(), dir.path()).expect("open db"));
     db.create_project("casino").await.expect("create project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {

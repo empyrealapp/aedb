@@ -22,7 +22,7 @@ fn u64_be(v: u64) -> [u8; 8] {
 #[tokio::test]
 async fn compare_and_swap_enforces_expected_seq() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -88,7 +88,7 @@ async fn compare_and_swap_enforces_expected_seq() {
 #[tokio::test]
 async fn compare_and_dec_u256_enforces_expected_seq_and_updates_value() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -182,7 +182,7 @@ async fn compare_and_dec_u256_enforces_expected_seq_and_updates_value() {
 #[tokio::test]
 async fn kv_compare_and_swap_enforces_expected_seq() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -218,7 +218,7 @@ async fn kv_compare_and_swap_enforces_expected_seq() {
 #[tokio::test]
 async fn kv_compare_and_u256_ops_enforce_expected_seq_and_value() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -303,7 +303,7 @@ async fn kv_compare_and_u256_ops_enforce_expected_seq_and_value() {
 #[tokio::test]
 async fn kv_mutate_u256_supports_set_add_sub() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");
@@ -349,7 +349,7 @@ async fn kv_mutate_u256_supports_set_add_sub() {
 #[tokio::test]
 async fn kv_mutate_u64_supports_set_add_sub_and_expected_seq() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "app").await.expect("create scope");

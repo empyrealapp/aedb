@@ -17,7 +17,7 @@ fn sync_bridge_supports_envelope_assertions() {
     let dir = tempdir().expect("tempdir");
     let db = {
         let _guard = rt.enter();
-        Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"))
+        Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"))
     };
     let sync = AedbSync::new(Arc::clone(&db), rt.handle().clone());
 

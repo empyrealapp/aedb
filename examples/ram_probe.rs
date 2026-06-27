@@ -122,7 +122,7 @@ async fn main() {
 
     let rss_baseline = rss_bytes();
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project(PROJECT).await.expect("project");
     db.create_scope(PROJECT, SCOPE).await.expect("scope");
 

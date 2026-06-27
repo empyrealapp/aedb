@@ -118,7 +118,7 @@ async fn get_balance(db: &AedbInstance, account_id: i64) -> u64 {
 #[tokio::test]
 async fn test_settlement_atomicity_large_batch() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
     setup_settlement_schema(&db).await;
 
     // Setup: Create 100 winner records and accounts with initial balance 1000
@@ -242,7 +242,7 @@ async fn test_settlement_atomicity_large_batch() {
 #[tokio::test]
 async fn test_settlement_prevents_concurrent_ops() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_settlement_schema(&db).await;
 
     // Setup: Create 10 winners

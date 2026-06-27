@@ -105,7 +105,7 @@ async fn load_order_id(
 #[tokio::test]
 async fn post_only_rejects_crossing() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -163,7 +163,7 @@ async fn post_only_rejects_crossing() {
 #[tokio::test]
 async fn ioc_partial_fill_and_fok_rejection() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -249,7 +249,7 @@ async fn ioc_partial_fill_and_fok_rejection() {
 #[tokio::test]
 async fn cancel_replace_reduce_and_mass_cancel() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new(
@@ -314,7 +314,7 @@ async fn cancel_replace_reduce_and_mass_cancel() {
 #[tokio::test]
 async fn table_scoped_books_support_multi_asset_and_cancel_by_client_id() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.order_book_define_table("p", "app", "markets", OrderBookTableMode::MultiAsset)
         .await
@@ -379,7 +379,7 @@ async fn table_scoped_books_support_multi_asset_and_cancel_by_client_id() {
 #[tokio::test]
 async fn per_asset_table_mode_is_enforced() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.order_book_define_table("p", "app", "BTC-USD", OrderBookTableMode::PerAsset)
         .await
@@ -430,7 +430,7 @@ async fn per_asset_table_mode_is_enforced() {
 #[tokio::test]
 async fn market_order_without_liquidity_rejects() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let mut req = order_req(
@@ -454,7 +454,7 @@ async fn market_order_without_liquidity_rejects() {
 #[tokio::test]
 async fn self_trade_prevention_modes_apply() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_new("p", "app", {
@@ -569,7 +569,7 @@ async fn self_trade_prevention_modes_apply() {
 #[tokio::test]
 async fn instrument_config_and_halt_are_enforced() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.order_book_set_instrument_config(
@@ -635,7 +635,7 @@ async fn instrument_config_and_halt_are_enforced() {
 #[tokio::test]
 async fn execution_report_is_persisted() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.order_book_new(
         "p",

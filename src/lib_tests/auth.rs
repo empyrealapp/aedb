@@ -16,7 +16,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn permissions_enforced_at_preflight_commit_and_query() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -128,7 +128,7 @@ async fn permissions_enforced_at_preflight_commit_and_query() {
 #[tokio::test]
 async fn join_queries_require_permissions_for_all_referenced_tables() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project p");
     db.create_project("_global").await.expect("project global");
 
@@ -229,7 +229,7 @@ async fn join_queries_require_permissions_for_all_referenced_tables() {
 #[tokio::test]
 async fn permission_revocation_between_preflight_and_commit_is_caught() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -299,7 +299,7 @@ async fn permission_revocation_between_preflight_and_commit_is_caught() {
 #[tokio::test]
 async fn kv_query_apis_enforce_permissions_and_paginate() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let caller = CallerContext::new("alice");
@@ -398,7 +398,7 @@ async fn kv_query_apis_enforce_permissions_and_paginate() {
 #[tokio::test]
 async fn kv_permissions_scope_reads_and_writes_with_prefix_filters() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let caller = CallerContext::new("alice");
 
@@ -481,7 +481,7 @@ async fn kv_permissions_scope_reads_and_writes_with_prefix_filters() {
 #[tokio::test]
 async fn scoped_admin_permissions_bound_grant_revoke() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "s1").await.expect("scope s1");
     db.create_scope("p", "s2").await.expect("scope s2");
@@ -564,7 +564,7 @@ async fn scoped_admin_permissions_bound_grant_revoke() {
 #[tokio::test]
 async fn project_owner_and_delegable_grants_control_authz_delegation() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
@@ -658,7 +658,7 @@ async fn project_owner_and_delegable_grants_control_authz_delegation() {
 #[tokio::test]
 async fn permission_denied_messages_do_not_leak_table_names() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("prod").await.expect("project");
     create_table(
         &db,
@@ -696,7 +696,7 @@ async fn permission_denied_messages_do_not_leak_table_names() {
 #[tokio::test]
 async fn kv_permission_overlap_revoke_precedence_is_explicit() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "private")
         .await
@@ -786,7 +786,7 @@ async fn kv_permission_overlap_revoke_precedence_is_explicit() {
 #[tokio::test]
 async fn grant_metadata_tracks_actor_and_system_source() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
@@ -862,7 +862,7 @@ async fn grant_metadata_tracks_actor_and_system_source() {
 #[tokio::test]
 async fn grant_and_revoke_authorization_matrix_is_enforced() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
@@ -1037,7 +1037,7 @@ async fn grant_and_revoke_authorization_matrix_is_enforced() {
 #[tokio::test]
 async fn ownership_transfer_requires_owner_or_global_admin() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
         owner_id: Some("owner".into()),
@@ -1091,7 +1091,7 @@ async fn ownership_transfer_requires_owner_or_global_admin() {
 #[tokio::test]
 async fn authz_grant_revoke_events_are_persisted_in_system_audit_table() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
         owner_id: Some("owner".into()),
@@ -1238,7 +1238,7 @@ async fn authz_grant_revoke_events_are_persisted_in_system_audit_table() {
 #[tokio::test]
 async fn read_policies_filter_rows_for_caller_and_can_be_cleared() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -1337,7 +1337,7 @@ async fn read_policies_filter_rows_for_caller_and_can_be_cleared() {
 #[tokio::test]
 async fn read_policy_like_patterns_substitute_caller_id() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -1415,7 +1415,7 @@ async fn read_policy_like_patterns_substitute_caller_id() {
 #[tokio::test]
 async fn read_policy_applies_to_joined_tables() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -1545,7 +1545,7 @@ async fn read_policy_applies_to_joined_tables() {
 #[tokio::test]
 async fn table_policy_bypass_permission_skips_row_policy_filtering() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -1640,7 +1640,7 @@ async fn table_policy_bypass_permission_skips_row_policy_filtering() {
 #[tokio::test]
 async fn project_policy_bypass_permission_skips_joined_table_policies() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -1786,7 +1786,7 @@ async fn project_policy_bypass_permission_skips_joined_table_policies() {
 #[tokio::test]
 async fn join_query_rejects_duplicate_aliases_to_prevent_policy_binding_ambiguity() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -2017,7 +2017,7 @@ async fn secure_mode_requires_authenticated_apis() {
 #[tokio::test]
 async fn commit_as_rejects_empty_caller_id() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     let err = db
         .commit_as(
             CallerContext::new("   "),
@@ -2035,7 +2035,7 @@ async fn commit_as_rejects_empty_caller_id() {
 #[tokio::test]
 async fn query_as_rejects_empty_caller_id() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let caller = CallerContext::new("");
     let err = db
@@ -2316,7 +2316,7 @@ async fn async_index_query_requires_table_read_permission() {
 #[tokio::test]
 async fn no_auth_read_apis_work_in_non_secure_mode() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -2749,7 +2749,7 @@ async fn secure_multi_agent_user_perspective_invariants_hold() {
 #[tokio::test]
 async fn query_sql_read_only_respects_adapter_scan_policy() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -3127,7 +3127,7 @@ async fn secure_multi_agent_profile_identifies_core_shortcomings() {
 #[tokio::test]
 async fn project_and_scope_admin_grants_allow_table_writes() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -3195,7 +3195,7 @@ async fn project_and_scope_admin_grants_allow_table_writes() {
 #[tokio::test]
 async fn delete_where_respects_row_level_read_policy() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -3282,7 +3282,7 @@ async fn delete_where_respects_row_level_read_policy() {
 #[tokio::test]
 async fn idempotency_keys_are_scoped_to_caller() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for caller_id in ["alice", "bob"] {
@@ -3915,6 +3915,7 @@ fn public_no_auth_and_unchecked_surface_is_intentional() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut exposed = Vec::new();
     for rel in [
+        "src/lib.rs",
         "src/api/kv_api.rs",
         "src/api/query_api.rs",
         "src/sync_bridge.rs",
@@ -3933,10 +3934,13 @@ fn public_no_auth_and_unchecked_surface_is_intentional() {
     assert_eq!(
         exposed,
         vec![
+            "src/api/kv_api.rs:pub async fn kv_del_no_auth(".to_string(),
             "src/api/kv_api.rs:pub async fn kv_get_many_no_auth(".to_string(),
             "src/api/kv_api.rs:pub async fn kv_get_no_auth(".to_string(),
             "src/api/kv_api.rs:pub async fn kv_scan_prefix_no_auth(".to_string(),
+            "src/api/kv_api.rs:pub async fn kv_set_no_auth(".to_string(),
             "src/api/query_api.rs:pub async fn query_no_auth(".to_string(),
+            "src/lib.rs:pub async fn commit_no_auth(".to_string(),
             "src/sync_bridge.rs:pub fn query_no_auth(".to_string(),
         ],
         "public no_auth/unchecked API surface changed; update secure-mode tests and docs intentionally"
@@ -4300,4 +4304,70 @@ async fn secure_mode_denies_every_read_assertion_variant_before_evaluation() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn open_default_requires_authenticated_caller_for_writes() {
+    let dir = tempdir().expect("temp");
+    // `open` is secure-by-default: anonymous writes/reads must be rejected.
+    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+
+    let set = db
+        .kv_set("p", "app", b"k".to_vec(), b"v".to_vec())
+        .await;
+    assert!(
+        matches!(set, Err(AedbError::PermissionDenied(_))),
+        "anonymous kv_set must be denied under secure-default open, got {set:?}"
+    );
+
+    let commit = db
+        .commit(Mutation::KvSet {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            key: b"k".to_vec(),
+            value: b"v".to_vec(),
+        })
+        .await;
+    assert!(
+        matches!(commit, Err(AedbError::PermissionDenied(_))),
+        "anonymous commit must be denied under secure-default open, got {commit:?}"
+    );
+
+    // The explicit anonymous twins are also unavailable in secure mode.
+    let no_auth = db
+        .kv_set_no_auth("p", "app", b"k".to_vec(), b"v".to_vec())
+        .await;
+    assert!(
+        matches!(no_auth, Err(AedbError::PermissionDenied(_))),
+        "kv_set_no_auth must be denied under secure-default open, got {no_auth:?}"
+    );
+}
+
+#[tokio::test]
+async fn open_anonymous_allows_no_auth_write_twins() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.kv_set_no_auth("p", "app", b"k".to_vec(), b"v".to_vec())
+        .await
+        .expect("anonymous kv_set_no_auth should succeed");
+
+    let got = db
+        .kv_get_no_auth("p", "app", b"k", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv_get_no_auth")
+        .expect("value present");
+    assert_eq!(got.value, b"v".to_vec());
+
+    db.kv_del_no_auth("p", "app", b"k".to_vec())
+        .await
+        .expect("anonymous kv_del_no_auth should succeed");
+    assert!(
+        db.kv_get_no_auth("p", "app", b"k", ConsistencyMode::AtLatest)
+            .await
+            .expect("kv_get_no_auth")
+            .is_none(),
+        "key should be deleted after kv_del_no_auth"
+    );
 }

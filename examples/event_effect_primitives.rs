@@ -20,7 +20,7 @@ const S: &str = "app";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let dir = tempdir()?;
-    let db = AedbInstance::open(AedbConfig::default(), dir.path())?;
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path())?;
     db.create_project(P).await?;
     db.create_scope(P, S).await?;
 

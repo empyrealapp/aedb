@@ -88,7 +88,7 @@ impl<'a> SessionRepo<'a> {
 #[tokio::test]
 async fn example_session_repo_usage() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("create project");
     db.create_scope("p", "auth").await.expect("create scope");

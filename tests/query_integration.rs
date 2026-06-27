@@ -10,7 +10,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn integration_multi_index_queries_with_sort_directions_use_index_paths() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("int").await.expect("project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -134,7 +134,7 @@ async fn integration_multi_index_queries_with_sort_directions_use_index_paths() 
 #[tokio::test]
 async fn integration_join_and_upsert_with_multiple_indexes() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("int").await.expect("project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {

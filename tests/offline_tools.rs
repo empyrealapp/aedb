@@ -15,7 +15,7 @@ async fn snapshot_dump_restore_parity_and_invariants_are_deterministic() {
     let dump_path = dump_dir.path().join("snapshot_dump.json");
     let config = AedbConfig::default();
 
-    let db = AedbInstance::open(config.clone(), data_dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), data_dir.path()).expect("open");
     db.commit(Mutation::Ddl(DdlOperation::CreateProject {
         project_id: "p".into(),
         owner_id: None,

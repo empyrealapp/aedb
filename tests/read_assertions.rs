@@ -20,7 +20,7 @@ fn u256_be(value: u64) -> [u8; 32] {
 #[tokio::test]
 async fn integration_kv_keycompare_assertion_guards_debit() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"balance".to_vec(), u256_be(100).to_vec())
         .await
@@ -88,7 +88,7 @@ async fn integration_kv_keycompare_assertion_guards_debit() {
 #[tokio::test]
 async fn integration_rowversion_assertion_detects_stale_state() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -178,7 +178,7 @@ async fn integration_rowversion_assertion_detects_stale_state() {
 #[tokio::test]
 async fn integration_countcompare_assertion_enforces_capacity() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -253,7 +253,7 @@ async fn integration_countcompare_assertion_enforces_capacity() {
 #[tokio::test]
 async fn integration_sumcompare_assertion_blocks_over_budget() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -338,7 +338,7 @@ async fn integration_sumcompare_assertion_blocks_over_budget() {
 #[tokio::test]
 async fn integration_composite_any_assertion_short_circuit() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"a".to_vec(), b"1".to_vec())
         .await
@@ -383,7 +383,7 @@ async fn integration_composite_any_assertion_short_circuit() {
 #[tokio::test]
 async fn integration_failed_assertion_is_logged_to_system_audit_table() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"balance".to_vec(), u256_be(50).to_vec())
         .await
@@ -470,7 +470,7 @@ async fn integration_failed_assertion_is_logged_to_system_audit_table() {
 #[tokio::test]
 async fn integration_idempotent_retry_skips_assertion_re_evaluation() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"balance".to_vec(), u256_be(100).to_vec())
         .await

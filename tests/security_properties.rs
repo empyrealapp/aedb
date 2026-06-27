@@ -38,7 +38,7 @@ fn decode_u64(bytes: &[u8]) -> u64 {
 #[tokio::test]
 async fn security_atomicity_no_partial_apply_on_envelope_failure() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let err = db
@@ -83,7 +83,7 @@ async fn security_atomicity_no_partial_apply_on_envelope_failure() {
 #[tokio::test]
 async fn security_stale_kv_read_set_cannot_overwrite_key() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let seed = db
@@ -153,7 +153,7 @@ async fn security_stale_kv_read_set_cannot_overwrite_key() {
 #[tokio::test]
 async fn security_stale_table_preflight_plan_cannot_overwrite_row() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -237,7 +237,7 @@ async fn security_stale_table_preflight_plan_cannot_overwrite_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_parallel_asserted_state_transition_has_single_winner() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"machine:1".to_vec(), b"open".to_vec())
         .await
@@ -299,7 +299,7 @@ async fn security_parallel_asserted_state_transition_has_single_winner() {
 #[tokio::test]
 async fn security_multi_key_atomic_update_reverts_all_on_failure() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"from".to_vec(), u64_be(5).to_vec())
         .await
@@ -361,7 +361,7 @@ async fn security_multi_key_atomic_update_reverts_all_on_failure() {
 #[tokio::test]
 async fn security_postflight_check_reverts_prior_atomic_updates() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"balance".to_vec(), u64_be(5).to_vec())
         .await
@@ -432,7 +432,7 @@ async fn security_postflight_check_reverts_prior_atomic_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_parallel_atomic_adds_do_not_lose_updates() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"counter".to_vec(), u64_be(0).to_vec())
         .await
@@ -470,7 +470,7 @@ async fn security_parallel_atomic_adds_do_not_lose_updates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn security_hot_key_atomic_postflight_does_not_use_stale_precondition() {
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"balance".to_vec(), u64_be(32).to_vec())
         .await
@@ -540,7 +540,7 @@ async fn security_hot_key_atomic_postflight_does_not_use_stale_precondition() {
 async fn security_idempotency_survives_restart_exactly_once() {
     let dir = tempdir().expect("temp dir");
     let config = AedbConfig::production([7u8; 32]);
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let key = IdempotencyKey([4u8; 16]);
@@ -573,7 +573,7 @@ async fn security_idempotency_survives_restart_exactly_once() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let third = reopened
         .commit_envelope(envelope)
         .await
@@ -584,7 +584,7 @@ async fn security_idempotency_survives_restart_exactly_once() {
 #[tokio::test]
 async fn security_idempotency_rejects_same_key_for_different_request() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let key = IdempotencyKey([6u8; 16]);
@@ -631,7 +631,7 @@ async fn security_idempotency_rejects_same_key_for_different_request() {
 #[tokio::test]
 async fn security_idempotency_is_scoped_to_caller() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     for caller_id in ["alice", "bob"] {
         db.commit(Mutation::Ddl(
@@ -708,7 +708,7 @@ async fn security_replay_is_deterministic_via_snapshot_parity() {
     let dump_b_file = dump_b.path().join("state-b.aedbdump");
     let config = AedbConfig::production([8u8; 32]);
 
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     for i in 0..500u64 {
         db.commit(Mutation::KvSet {

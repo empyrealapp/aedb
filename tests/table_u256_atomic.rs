@@ -26,7 +26,7 @@ fn decode_u64_u256(bytes: &[u8; 32]) -> u64 {
 #[tokio::test]
 async fn integration_table_u256_atomic_inc_dec_and_underflow() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -340,7 +340,7 @@ async fn integration_table_u256_atomic_inc_dec_and_underflow() {
 #[tokio::test]
 async fn integration_envelope_reverts_when_condition_fails() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),
@@ -497,7 +497,7 @@ async fn integration_envelope_reverts_when_condition_fails() {
 #[tokio::test]
 async fn integration_table_u256_overflow_rejected() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: "p".into(),

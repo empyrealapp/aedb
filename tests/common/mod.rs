@@ -20,7 +20,7 @@ pub struct TestDb {
 
 pub fn open_db(config: AedbConfig) -> TestDb {
     let dir = tempfile::tempdir().expect("temp dir");
-    let db = AedbInstance::open(config, dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open db");
     TestDb { db, dir }
 }
 

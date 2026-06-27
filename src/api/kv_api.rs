@@ -520,6 +520,28 @@ impl AedbInstance {
         .await
     }
 
+    /// Set a KV entry without a caller identity.
+    ///
+    /// Explicit anonymous twin of [`Self::kv_set`], mirroring
+    /// [`Self::query_no_auth`]. Unavailable in secure mode (open the instance
+    /// with [`Self::open_anonymous`] to use it); prefer [`Self::kv_set_as`] in
+    /// services.
+    pub async fn kv_set_no_auth(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_no_auth(Mutation::KvSet {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+            value,
+        })
+        .await
+    }
+
     pub async fn kv_set_default_scope(
         &self,
         project_id: &str,
@@ -651,6 +673,26 @@ impl AedbInstance {
         key: Vec<u8>,
     ) -> Result<CommitResult, AedbError> {
         self.commit(Mutation::KvDel {
+            project_id: project_id.to_string(),
+            scope_id: scope_id.to_string(),
+            key,
+        })
+        .await
+    }
+
+    /// Delete a KV entry without a caller identity.
+    ///
+    /// Explicit anonymous twin of [`Self::kv_del`], mirroring
+    /// [`Self::query_no_auth`]. Unavailable in secure mode (open the instance
+    /// with [`Self::open_anonymous`] to use it); prefer [`Self::kv_del_as`] in
+    /// services.
+    pub async fn kv_del_no_auth(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        key: Vec<u8>,
+    ) -> Result<CommitResult, AedbError> {
+        self.commit_no_auth(Mutation::KvDel {
             project_id: project_id.to_string(),
             scope_id: scope_id.to_string(),
             key,

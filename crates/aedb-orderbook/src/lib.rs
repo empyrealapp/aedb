@@ -614,7 +614,7 @@ pub async fn run_hft_simulation_with_config(
     }
     .to_string();
     let dir = tempdir().map_err(AedbError::Io)?;
-    let db = Arc::new(AedbInstance::open(db_cfg, dir.path())?);
+    let db = Arc::new(AedbInstance::open_anonymous(db_cfg, dir.path())?);
     run_hft_simulation_impl(cfg, db, "p", "app", None, durability_mode_name).await
 }
 
@@ -1190,7 +1190,7 @@ mod tests {
     async fn simulation_can_run_on_existing_instance_without_tempdir_wrapper() {
         let dir = tempdir().expect("temp dir");
         let db = Arc::new(
-            AedbInstance::open(high_throughput_simulation_config(), dir.path()).expect("open db"),
+            AedbInstance::open_anonymous(high_throughput_simulation_config(), dir.path()).expect("open db"),
         );
         let report = run_hft_simulation_on_instance(
             SimulationConfig {
