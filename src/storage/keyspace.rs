@@ -78,6 +78,17 @@ pub struct TableData {
     /// drained as those rows are rewritten or normalized.
     #[serde(default)]
     pub row_versions: OrdMap<EncodedKey, u64>,
+    /// Cold tier: whole rows evicted from `rows` to sorted on-disk segments
+    /// under memory pressure. Runtime-only — re-inlined into `rows` before every
+    /// checkpoint (like KV segments and spilled payloads), so it never persists
+    /// and evicted rows are always recoverable from the checkpoint + WAL. Reads
+    /// page cold rows back through the segment store.
+    #[serde(skip)]
+    pub row_segments: Vec<KvSegmentMeta>,
+    /// Deletes of keys that exist only in `row_segments`. Maps the deleted key
+    /// to the commit seq of the delete. Runtime-only, alongside `row_segments`.
+    #[serde(skip)]
+    pub row_tombstones: OrdMap<EncodedKey, u64>,
     #[serde(default)]
     pub structural_version: u64,
     pub indexes: HashMap<String, SecondaryIndex>,
@@ -621,6 +632,161 @@ fn materialize_row<'a>(
 
 fn segment_may_contain_key(meta: &KvSegmentMeta, key: &[u8]) -> bool {
     key >= meta.min_key.as_slice() && key <= meta.max_key.as_slice()
+}
+
+/// Encode one evicted table row as a [`KvSegmentEntry`] for the cold tier: the
+/// key is the encoded primary key bytes, the value is the serialized row
+/// payload, and the version is carried on the entry.
+fn encode_row_segment_entry(
+    encoded_pk: &EncodedKey,
+    version: u64,
+    row: &Row,
+) -> Result<KvSegmentEntry, crate::error::AedbError> {
+    Ok(KvSegmentEntry {
+        key: encoded_pk.as_slice().to_vec(),
+        entry: KvEntry {
+            value: encode_row_payload(row)?,
+            version,
+            created_at: version,
+            value_ref: None,
+        },
+    })
+}
+
+fn encoded_key_bound_to_bytes(bound: &Bound<EncodedKey>) -> Bound<Vec<u8>> {
+    match bound {
+        Bound::Unbounded => Bound::Unbounded,
+        Bound::Included(k) => Bound::Included(k.as_slice().to_vec()),
+        Bound::Excluded(k) => Bound::Excluded(k.as_slice().to_vec()),
+    }
+}
+
+/// Tier-aware point read: resolve a single row by primary key, returning its
+/// version and materialized payload. Checks the hot `rows` map first, then the
+/// cold tier (tombstones, then row segments by highest version). `None` means
+/// the row does not exist.
+fn tier_get_table_row(
+    table: &TableData,
+    encoded_pk: &EncodedKey,
+    value_store: Option<&PersistentValueStore>,
+    segment_store: Option<&KvSegmentStore>,
+) -> Result<Option<(u64, Row)>, crate::error::AedbError> {
+    if let Some(stored) = table.rows.get(encoded_pk) {
+        let version = stored
+            .inline_version()
+            .or_else(|| table.row_versions.get(encoded_pk).copied())
+            .unwrap_or(0);
+        return Ok(Some((version, materialize_row(stored, value_store)?.into_owned())));
+    }
+    if table.row_segments.is_empty() {
+        return Ok(None);
+    }
+    let key_bytes = encoded_pk.as_slice();
+    let tombstone_version = table.row_tombstones.get(encoded_pk).copied();
+    let store = segment_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+        message: "row segment store is not attached".into(),
+    })?;
+    let start = Bound::Included(key_bytes.to_vec());
+    let end = Bound::Included(key_bytes.to_vec());
+    let mut best: Option<(u64, Row)> = None;
+    for segment in &table.row_segments {
+        if !segment_may_contain_key(segment, key_bytes) {
+            continue;
+        }
+        for item in store.scan_range(segment, &start, &end)? {
+            if item.key.as_slice() != key_bytes {
+                continue;
+            }
+            let version = item.entry.version;
+            if best.as_ref().map(|(v, _)| version > *v).unwrap_or(true) {
+                best = Some((version, decode_row_payload(&item.entry.value)?));
+            }
+        }
+    }
+    match (best, tombstone_version) {
+        (Some((version, _)), Some(tomb)) if tomb >= version => Ok(None),
+        (Some((version, row)), _) => Ok(Some((version, row))),
+        (None, _) => Ok(None),
+    }
+}
+
+/// Tier-aware range scan: merge the hot `rows` map with the cold row segments
+/// (minus tombstones), newest version winning, returning rows in key order up to
+/// `limit`.
+fn tier_scan_table_rows(
+    table: &TableData,
+    start: Bound<EncodedKey>,
+    end: Bound<EncodedKey>,
+    limit: usize,
+    value_store: Option<&PersistentValueStore>,
+    segment_store: Option<&KvSegmentStore>,
+) -> Result<Vec<(EncodedKey, Row)>, crate::error::AedbError> {
+    // Fast path: nothing cold — just the hot map.
+    if table.row_segments.is_empty() && table.row_tombstones.is_empty() {
+        let mut out = Vec::new();
+        for (key, stored) in table.rows.range((start, end)) {
+            if out.len() >= limit {
+                break;
+            }
+            out.push((key.clone(), materialize_row(stored, value_store)?.into_owned()));
+        }
+        return Ok(out);
+    }
+
+    // General merge. `None` payload marks a tombstoned key.
+    let mut merged: std::collections::BTreeMap<EncodedKey, (u64, Option<Row>)> =
+        std::collections::BTreeMap::new();
+    let byte_start = encoded_key_bound_to_bytes(&start);
+    let byte_end = encoded_key_bound_to_bytes(&end);
+    if !table.row_segments.is_empty() {
+        let store = segment_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+            message: "row segment store is not attached".into(),
+        })?;
+        for segment in &table.row_segments {
+            for item in store.scan_range(segment, &byte_start, &byte_end)? {
+                let key = EncodedKey::from_bytes(item.key);
+                let version = item.entry.version;
+                if merged
+                    .get(&key)
+                    .map(|(v, _)| version > *v)
+                    .unwrap_or(true)
+                {
+                    merged.insert(key, (version, Some(decode_row_payload(&item.entry.value)?)));
+                }
+            }
+        }
+    }
+    for (key, tomb_version) in table.row_tombstones.range((start.clone(), end.clone())) {
+        if merged
+            .get(key)
+            .map(|(v, _)| *tomb_version >= *v)
+            .unwrap_or(true)
+        {
+            merged.insert(key.clone(), (*tomb_version, None));
+        }
+    }
+    // Hot rows always win — they are the current committed values.
+    for (key, stored) in table.rows.range((start, end)) {
+        let version = stored
+            .inline_version()
+            .or_else(|| table.row_versions.get(key).copied())
+            .unwrap_or(0);
+        merged.insert(
+            key.clone(),
+            (version, Some(materialize_row(stored, value_store)?.into_owned())),
+        );
+    }
+
+    let mut out = Vec::new();
+    for (key, (_, payload)) in merged {
+        if out.len() >= limit {
+            break;
+        }
+        if let Some(row) = payload {
+            out.push((key, row));
+        }
+    }
+    Ok(out)
 }
 
 fn segments_are_sorted_non_overlapping(segments: &[KvSegmentMeta]) -> bool {
@@ -1288,6 +1454,100 @@ impl Keyspace {
         }
     }
 
+    /// Cold-tier eviction: move whole rows (key + value) out of the resident
+    /// `rows` map into sorted on-disk segments until the estimated resident
+    /// memory drops to `target_bytes`. Reads page evicted rows back through the
+    /// segment store; the cold tier is re-inlined before every checkpoint, so it
+    /// never persists and evicted rows stay recoverable from the WAL + last
+    /// checkpoint. The largest hot tables are evicted first.
+    pub fn flush_table_rows_to_segments_to_memory_target(
+        &mut self,
+        target_bytes: usize,
+    ) -> Result<usize, crate::error::AedbError> {
+        let mut memory_estimate = self.estimate_memory_bytes();
+        if memory_estimate <= target_bytes {
+            return Ok(memory_estimate);
+        }
+        let Some(store) = self.kv_segment_store.clone() else {
+            return Ok(memory_estimate);
+        };
+        let value_store = self.value_store.clone();
+
+        // Candidate (namespace, table) pairs ranked by resident hot-row cost.
+        // Only user-project tables are evicted; system/global operational tables
+        // stay hot (they are small and read on every commit).
+        let mut candidates: Vec<(NamespaceId, String, usize)> = Vec::new();
+        for (namespace_id, namespace) in self.namespaces.iter() {
+            let NamespaceId::Project(ns_key) = namespace_id else {
+                continue;
+            };
+            if ns_key.starts_with(crate::catalog::SYSTEM_PROJECT_ID) {
+                continue;
+            }
+            for (table_name, table) in namespace.tables.iter() {
+                if table.rows.is_empty() {
+                    continue;
+                }
+                let cost: usize = table.rows.values().map(stored_row_mem_cost).sum();
+                if cost > 0 {
+                    candidates.push((namespace_id.clone(), table_name.clone(), cost));
+                }
+            }
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.2)); // largest resident cost first
+
+        for (namespace_id, table_name, _cost) in candidates {
+            if memory_estimate <= target_bytes {
+                break;
+            }
+            let Some(table) = self
+                .namespaces
+                .get(&namespace_id)
+                .and_then(|ns| ns.tables.get(&table_name))
+            else {
+                continue;
+            };
+            // Materialize all hot rows into sorted segment entries. The `rows`
+            // OrdMap iterates in encoded-key (== byte) order, which the segment
+            // writer requires.
+            let mut entries: Vec<KvSegmentEntry> = Vec::with_capacity(table.rows.len());
+            let mut resident_cost: usize = 0;
+            for (key, stored) in table.rows.iter() {
+                resident_cost = resident_cost.saturating_add(stored_row_mem_cost(stored));
+                let version = stored
+                    .inline_version()
+                    .or_else(|| table.row_versions.get(key).copied())
+                    .unwrap_or(0);
+                let row = materialize_row(stored, value_store.as_deref())?.into_owned();
+                entries.push(encode_row_segment_entry(key, version, &row)?);
+            }
+            if entries.is_empty() {
+                continue;
+            }
+            let meta = store.write_segment(&format!("rowseg_{namespace_id:?}_{table_name}"), entries)?;
+            let filename = meta.filename.clone();
+            let meta_cost = kv_segment_meta_cost(&meta);
+            let Some(table) = self
+                .namespaces_mut()
+                .get_mut(&namespace_id)
+                .and_then(|ns| ns.tables.get_mut(&table_name))
+            else {
+                store.mark_segment_published(&filename);
+                continue;
+            };
+            table.rows.clear();
+            table.row_versions.clear();
+            table.row_segments.push(meta);
+            store.mark_segment_published(&filename);
+            self.mem_bytes = self
+                .mem_bytes
+                .saturating_sub(resident_cost)
+                .saturating_add(meta_cost);
+            memory_estimate = self.estimate_memory_bytes();
+        }
+        Ok(memory_estimate)
+    }
+
     pub fn flush_kv_to_segments_to_memory_target(
         &mut self,
         target_bytes: usize,
@@ -1672,6 +1932,11 @@ impl Keyspace {
             // parallel-map entry for this key so the redundant resident copy of
             // the primary key is released as data is rewritten.
             table.row_versions.remove(&encoded_pk);
+            // Re-inserting a key supersedes any tombstone from a prior delete of
+            // a cold copy; the new hot row wins over the (now stale) segment.
+            if !table.row_tombstones.is_empty() {
+                table.row_tombstones.remove(&encoded_pk);
+            }
             old_cost
         };
         self.mem_bytes = self
@@ -1698,14 +1963,51 @@ impl Keyspace {
         table_name: &str,
         encoded_pk: &EncodedKey,
     ) -> Result<Option<std::borrow::Cow<'_, Row>>, crate::error::AedbError> {
-        let stored = self
+        let Some(table) = self
             .namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.tables.get(table_name))
-            .and_then(|t| t.rows.get(encoded_pk));
-        match stored {
-            Some(stored) => Ok(Some(materialize_row(stored, self.value_store.as_deref())?)),
-            None => Ok(None),
+        else {
+            return Ok(None);
+        };
+        if table.row_segments.is_empty() {
+            return match table.rows.get(encoded_pk) {
+                Some(stored) => Ok(Some(materialize_row(stored, self.value_store.as_deref())?)),
+                None => Ok(None),
+            };
         }
+        Ok(tier_get_table_row(
+            table,
+            encoded_pk,
+            self.value_store.as_deref(),
+            self.kv_segment_store.as_deref(),
+        )?
+        .map(|(_, row)| std::borrow::Cow::Owned(row)))
+    }
+
+    /// Tier-aware range scan over a table (hot rows merged with the cold tier).
+    pub fn tier_scan_rows(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        start: Bound<EncodedKey>,
+        end: Bound<EncodedKey>,
+        limit: usize,
+    ) -> Result<Vec<(EncodedKey, Row)>, crate::error::AedbError> {
+        let Some(table) = self
+            .namespace(&NamespaceId::project_scope(project_id, scope_id))
+            .and_then(|ns| ns.tables.get(table_name))
+        else {
+            return Ok(Vec::new());
+        };
+        tier_scan_table_rows(
+            table,
+            start,
+            end,
+            limit,
+            self.value_store.as_deref(),
+            self.kv_segment_store.as_deref(),
+        )
     }
 
     /// Materializes a stored row using this keyspace's value store, paging in
@@ -1752,7 +2054,33 @@ impl Keyspace {
         encoded_pk: &EncodedKey,
         commit_seq: u64,
     ) -> Result<Option<Row>, crate::error::AedbError> {
-        let removed = {
+        // Resolve a cold-tier copy (if any) up front, while we only hold a
+        // shared borrow, so a delete of a row that lives only in a segment is
+        // not mistaken for "not found".
+        let cold_row = {
+            let table = self
+                .namespace(&NamespaceId::project_scope(project_id, scope_id))
+                .and_then(|ns| ns.tables.get(table_name));
+            match table {
+                None => return Ok(None),
+                Some(table) if table.row_segments.is_empty() => None,
+                Some(table) => {
+                    if table.rows.contains_key(encoded_pk) {
+                        None // hot copy wins; handled below
+                    } else {
+                        tier_get_table_row(
+                            table,
+                            encoded_pk,
+                            self.value_store.as_deref(),
+                            self.kv_segment_store.as_deref(),
+                        )?
+                        .map(|(_, row)| row)
+                    }
+                }
+            }
+        };
+
+        let (removed_hot, had_segments) = {
             let table = match self
                 .namespace_mut(NamespaceId::project_scope(project_id, scope_id))
                 .tables
@@ -1763,18 +2091,26 @@ impl Keyspace {
             };
             table.row_versions.remove(encoded_pk);
             let removed = table.rows.remove(encoded_pk);
-            if removed.is_some() {
+            let had_segments = !table.row_segments.is_empty();
+            if removed.is_some() || cold_row.is_some() {
                 table.structural_version = commit_seq;
             }
-            removed
+            // Tombstone any cold copy so future reads see the delete; harmless if
+            // no segment holds the key (cleared at the next checkpoint re-inline).
+            if had_segments && (removed.is_some() || cold_row.is_some()) {
+                table.row_tombstones.insert(encoded_pk.clone(), commit_seq);
+            }
+            (removed, had_segments)
         };
-        match removed {
+        let _ = had_segments;
+
+        match removed_hot {
             Some(stored) => {
                 self.mem_bytes = self.mem_bytes.saturating_sub(stored_row_mem_cost(&stored));
                 let row = materialize_row(&stored, self.value_store.as_deref())?.into_owned();
                 Ok(Some(row))
             }
-            None => Ok(None),
+            None => Ok(cold_row),
         }
     }
 
@@ -2963,13 +3299,76 @@ impl KeyspaceSnapshot {
         table_name: &str,
         encoded_pk: &EncodedKey,
     ) -> Result<Option<std::borrow::Cow<'_, Row>>, crate::error::AedbError> {
-        match self
-            .table(project_id, scope_id, table_name)
-            .and_then(|t| t.rows.get(encoded_pk))
-        {
-            Some(stored) => Ok(Some(self.materialize_row(stored)?)),
-            None => Ok(None),
+        let Some(table) = self.table(project_id, scope_id, table_name) else {
+            return Ok(None);
+        };
+        // Hot fast path returns a borrow; cold rows page in as owned.
+        if table.row_segments.is_empty() {
+            return match table.rows.get(encoded_pk) {
+                Some(stored) => Ok(Some(self.materialize_row(stored)?)),
+                None => Ok(None),
+            };
         }
+        Ok(tier_get_table_row(
+            table,
+            encoded_pk,
+            self.value_store.as_deref(),
+            self.kv_segment_store.as_deref(),
+        )?
+        .map(|(_, row)| std::borrow::Cow::Owned(row)))
+    }
+
+    /// Tier-aware MVCC version of a row by primary key (hot map or cold tier).
+    /// `0` if the row does not exist.
+    pub fn tier_row_version(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        encoded_pk: &EncodedKey,
+    ) -> u64 {
+        let Some(table) = self.table(project_id, scope_id, table_name) else {
+            return 0;
+        };
+        if let Some(version) = table.version_of(encoded_pk) {
+            return version;
+        }
+        if table.row_segments.is_empty() {
+            return 0;
+        }
+        tier_get_table_row(
+            table,
+            encoded_pk,
+            self.value_store.as_deref(),
+            self.kv_segment_store.as_deref(),
+        )
+        .ok()
+        .flatten()
+        .map(|(version, _)| version)
+        .unwrap_or(0)
+    }
+
+    /// Tier-aware range scan over a table, merging hot rows with the cold tier.
+    pub fn tier_scan_rows(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        start: Bound<EncodedKey>,
+        end: Bound<EncodedKey>,
+        limit: usize,
+    ) -> Result<Vec<(EncodedKey, Row)>, crate::error::AedbError> {
+        let Some(table) = self.table(project_id, scope_id, table_name) else {
+            return Ok(Vec::new());
+        };
+        tier_scan_table_rows(
+            table,
+            start,
+            end,
+            limit,
+            self.value_store.as_deref(),
+            self.kv_segment_store.as_deref(),
+        )
     }
 
     pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
@@ -3173,6 +3572,68 @@ impl KeyspaceSnapshot {
                 }
             }
         }
+
+        // Re-inline the cold row-segment tier so the checkpoint is
+        // self-contained (the cold tier is runtime-only and never persisted).
+        let segment_store = self.kv_segment_store.as_deref();
+        let cold_namespace_ids: Vec<NamespaceId> = self
+            .namespaces
+            .iter()
+            .filter(|(_, namespace)| {
+                namespace
+                    .tables
+                    .values()
+                    .any(|table| !table.row_segments.is_empty())
+            })
+            .map(|(namespace_id, _)| namespace_id.clone())
+            .collect();
+        for namespace_id in cold_namespace_ids {
+            let Some(namespace) = Arc::make_mut(&mut out.namespaces).get_mut(&namespace_id) else {
+                continue;
+            };
+            let table_names: Vec<String> = namespace.tables.keys().cloned().collect();
+            for table_name in table_names {
+                let Some(table) = namespace.tables.get_mut(&table_name) else {
+                    continue;
+                };
+                if table.row_segments.is_empty() {
+                    continue;
+                }
+                let store = segment_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+                    message: "row segment store is not attached".into(),
+                })?;
+                let hot_keys: std::collections::HashSet<EncodedKey> =
+                    table.rows.keys().cloned().collect();
+                let mut new_rows = table.rows.clone();
+                for segment in &table.row_segments {
+                    for item in
+                        store.scan_range(segment, &Bound::Unbounded, &Bound::Unbounded)?
+                    {
+                        let key = EncodedKey::from_bytes(item.key);
+                        if hot_keys.contains(&key) {
+                            continue; // hot copy always wins
+                        }
+                        let version = item.entry.version;
+                        if let Some(tomb) = table.row_tombstones.get(&key)
+                            && *tomb >= version
+                        {
+                            continue; // deleted after this segment was written
+                        }
+                        if let Some(existing) = new_rows.get(&key)
+                            && existing.inline_version().map(|v| v >= version).unwrap_or(false)
+                        {
+                            continue; // a newer segment already provided this key
+                        }
+                        let row = decode_row_payload(&item.entry.value)?;
+                        new_rows.insert(key, StoredRow::resident_versioned(version, row));
+                    }
+                }
+                table.rows = new_rows;
+                table.row_segments.clear();
+                table.row_tombstones.clear();
+            }
+        }
+
         out.value_store = None;
         out.kv_segment_store = None;
         out.persistent_value_inline_threshold_bytes = usize::MAX;

@@ -125,6 +125,15 @@ pub struct AedbConfig {
     /// through the value store's hot cache. Keys, indexes, and row versions
     /// remain resident. No effect in `StorageMode::InMemory`.
     pub table_row_spill_enabled: bool,
+    /// When enabled (and a KV segment store is attached), whole cold table rows
+    /// — key and value — are evicted from the resident `rows` map to sorted
+    /// on-disk segments under memory pressure, going beyond payload spill to
+    /// release the resident primary keys too. Evicted rows page back in on read
+    /// through the segment store and are re-inlined before every checkpoint.
+    ///
+    /// Off by default: it is only safe to enable once every table-row read path
+    /// is tier-aware. No effect in `StorageMode::InMemory`.
+    pub table_row_segment_eviction_enabled: bool,
     /// Capacity of the public commit-delta broadcast channel
     /// exposed via `AedbInstance::subscribe_commits`. Subscribers
     /// that fall behind beyond this many buffered deltas will
@@ -196,6 +205,7 @@ impl Default for AedbConfig {
             hash_chain_required: true,
             primary_index_backend: PrimaryIndexBackend::OrdMap,
             table_row_spill_enabled: true,
+            table_row_segment_eviction_enabled: false,
             commit_broadcast_capacity: 1024,
         }
     }

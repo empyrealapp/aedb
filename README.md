@@ -247,6 +247,12 @@ Error handling:
 - `faults` module: deterministic fail-point injection (`wal_append`, `wal_sync`,
   `manifest_write`, `checkpoint_write`) for crash/corruption-path testing;
   disarmed in production with single-atomic-load overhead
+- Cold-row tiering (opt-in `table_row_segment_eviction_enabled`): under memory
+  pressure, whole cold user-table rows — key and value — are evicted from the
+  resident map to sorted on-disk segments and paged back in on read, so the
+  in-memory footprint stays bounded as a table grows beyond RAM. Reads,
+  index/constraint maintenance, assertions, and recovery are all tier-aware; the
+  cold tier is runtime-only (re-inlined before every checkpoint, never persisted)
 
 CLI helper (`src/bin/aedb.rs`) includes offline dump/parity/invariant tooling and
 a full integrity verifier:

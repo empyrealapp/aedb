@@ -211,7 +211,6 @@ fn execute_query_with_options_capturing_signed(
     if let Some(result) = try_primary_key_point_query(PrimaryKeyPointQueryRequest {
         snapshot,
         schema,
-        table,
         project_id: &exec_project_id,
         scope_id: &exec_scope_id,
         query: &query,
@@ -284,9 +283,14 @@ fn execute_query_with_options_capturing_signed(
             estimated_rows = ordered_scan.pks.len();
             let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
             for pk in ordered_scan.pks {
-                if let Some(stored) = table.rows.get(&pk) {
-                    materialized.push(snapshot.materialize_row(stored)?.into_owned());
-                }
+                if let Some(row) = snapshot.get_row_by_encoded(
+                        &exec_project_id,
+                        &exec_scope_id,
+                        &query.table,
+                        &pk,
+                    )? {
+                        materialized.push(row.into_owned());
+                    }
             }
             Box::new(materialized.into_iter())
         } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
@@ -325,9 +329,14 @@ fn execute_query_with_options_capturing_signed(
                     estimated_rows = pks.len();
                     let mut materialized = Vec::with_capacity(pks.len());
                     for pk in pks {
-                        if let Some(stored) = table.rows.get(&pk) {
-                            materialized.push(snapshot.materialize_row(stored)?.into_owned());
-                        }
+                        if let Some(row) = snapshot.get_row_by_encoded(
+                        &exec_project_id,
+                        &exec_scope_id,
+                        &query.table,
+                        &pk,
+                    )? {
+                        materialized.push(row.into_owned());
+                    }
                     }
                     Box::new(materialized.into_iter())
                 }
@@ -340,11 +349,17 @@ fn execute_query_with_options_capturing_signed(
                             &query.table,
                         );
                     }
-                    estimated_rows = table.rows.len();
-                    let mut materialized = Vec::with_capacity(table.rows.len());
-                    for stored in table.rows.values() {
-                        materialized.push(snapshot.materialize_row(stored)?.into_owned());
-                    }
+                    let scanned = snapshot.tier_scan_rows(
+                        &exec_project_id,
+                        &exec_scope_id,
+                        &query.table,
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Unbounded,
+                        usize::MAX,
+                    )?;
+                    estimated_rows = scanned.len();
+                    let materialized: Vec<crate::catalog::types::Row> =
+                        scanned.into_iter().map(|(_, row)| row).collect();
                     Box::new(materialized.into_iter())
                 }
             }
@@ -375,9 +390,14 @@ fn execute_query_with_options_capturing_signed(
             estimated_rows = ordered_scan.pks.len();
             let mut materialized = Vec::with_capacity(ordered_scan.pks.len());
             for pk in ordered_scan.pks {
-                if let Some(stored) = table.rows.get(&pk) {
-                    materialized.push(snapshot.materialize_row(stored)?.into_owned());
-                }
+                if let Some(row) = snapshot.get_row_by_encoded(
+                        &exec_project_id,
+                        &exec_scope_id,
+                        &query.table,
+                        &pk,
+                    )? {
+                        materialized.push(row.into_owned());
+                    }
             }
             Box::new(materialized.into_iter())
         } else {
@@ -389,14 +409,17 @@ fn execute_query_with_options_capturing_signed(
                     &query.table,
                 );
             }
-            estimated_rows = table.map_or(0, |t| t.rows.len());
-            let mut materialized = Vec::new();
-            if let Some(t) = table {
-                materialized.reserve(t.rows.len());
-                for stored in t.rows.values() {
-                    materialized.push(snapshot.materialize_row(stored)?.into_owned());
-                }
-            }
+            let scanned = snapshot.tier_scan_rows(
+                &exec_project_id,
+                &exec_scope_id,
+                &query.table,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                usize::MAX,
+            )?;
+            estimated_rows = scanned.len();
+            let materialized: Vec<crate::catalog::types::Row> =
+                scanned.into_iter().map(|(_, row)| row).collect();
             Box::new(materialized.into_iter())
         };
 

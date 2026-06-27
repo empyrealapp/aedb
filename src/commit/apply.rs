@@ -1088,10 +1088,14 @@ fn apply_table_u256_arithmetic(
         .position(|c| c.name == column)
         .ok_or_else(|| AedbError::Validation(format!("column not found: {column}")))?;
     let current_row = keyspace
-        .table_by_namespace_key(&namespace_key(project_id, scope_id), table_name)
-        .and_then(|t| t.rows.get(&EncodedKey::from_values(primary_key)))
-        .ok_or_else(|| AedbError::Validation("row not found".into()))?;
-    let current_row = keyspace.materialize_row(current_row)?.into_owned();
+        .get_row_by_encoded(
+            project_id,
+            scope_id,
+            table_name,
+            &EncodedKey::from_values(primary_key),
+        )?
+        .ok_or_else(|| AedbError::Validation("row not found".into()))?
+        .into_owned();
     let current_value = match current_row.values.get(column_idx) {
         Some(Value::U256(bytes)) => U256::from_big_endian(bytes.as_slice()),
         _ => {
@@ -2340,10 +2344,11 @@ fn lookup_existing_by_unique_index(
     let Some(encoded_pk) = index.unique_existing(&lookup_key) else {
         return Ok(None);
     };
-    let existing = match table.rows.get(&encoded_pk) {
-        Some(stored) => Some(keyspace.materialize_row(stored)?.into_owned()),
-        None => None,
-    };
+    // Drop the `table` borrow before the tier-aware read (it may page a cold row
+    // back from the segment store).
+    let existing = keyspace
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)?
+        .map(|row| row.into_owned());
     Ok(existing.map(|row| (encoded_pk, row)))
 }
 
@@ -2709,20 +2714,27 @@ fn apply_delete_where_internal(
         catalog, &schema, project_id, scope_id, table_name, predicate, caller,
     )?;
     let mut to_delete: Vec<EncodedKey> = Vec::new();
-    if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (scanned_rows, (encoded_pk, stored)) in table.rows.iter().enumerate() {
-            ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
-            let row = keyspace.materialize_row(stored)?;
-            if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(&row))?;
-            }
-            if !eval_compiled_expr_public(&compiled, &row) {
-                continue;
-            }
-            to_delete.push(encoded_pk.clone());
-            if limit.is_some_and(|max| to_delete.len() >= max) {
-                break;
-            }
+    // Tier-aware: includes rows in the cold segment tier. `tier_scan_rows`
+    // takes the hot-only fast path when no segments are present.
+    let scanned_table = keyspace.tier_scan_rows(
+        project_id,
+        scope_id,
+        table_name,
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        usize::MAX,
+    )?;
+    for (scanned_rows, (encoded_pk, row)) in scanned_table.iter().enumerate() {
+        ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+        if let Some(budget) = read_bytes.as_deref_mut() {
+            budget.charge(row_byte_size(row))?;
+        }
+        if !eval_compiled_expr_public(&compiled, row) {
+            continue;
+        }
+        to_delete.push(encoded_pk.clone());
+        if limit.is_some_and(|max| to_delete.len() >= max) {
+            break;
         }
     }
     for encoded_pk in to_delete {
@@ -2780,20 +2792,25 @@ fn apply_update_where_internal(
         update_indices.push((column_index, value.clone()));
     }
     let mut staged: Vec<Row> = Vec::new();
-    if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (scanned_rows, stored) in table.rows.values().enumerate() {
-            ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
-            let row = keyspace.materialize_row(stored)?;
-            if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(&row))?;
-            }
-            if !eval_compiled_expr_public(&compiled, &row) {
-                continue;
-            }
-            staged.push(row.into_owned());
-            if limit.is_some_and(|max| staged.len() >= max) {
-                break;
-            }
+    let scanned_table = keyspace.tier_scan_rows(
+        project_id,
+        scope_id,
+        table_name,
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        usize::MAX,
+    )?;
+    for (scanned_rows, (_, row)) in scanned_table.into_iter().enumerate() {
+        ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+        if let Some(budget) = read_bytes.as_deref_mut() {
+            budget.charge(row_byte_size(&row))?;
+        }
+        if !eval_compiled_expr_public(&compiled, &row) {
+            continue;
+        }
+        staged.push(row);
+        if limit.is_some_and(|max| staged.len() >= max) {
+            break;
         }
     }
     for old_row in staged {
@@ -2876,20 +2893,25 @@ fn apply_update_where_expr_internal(
         update_indices.push((column_index, resolved));
     }
     let mut staged: Vec<Row> = Vec::new();
-    if let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) {
-        for (scanned_rows, stored) in table.rows.values().enumerate() {
-            ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
-            let row = keyspace.materialize_row(stored)?;
-            if let Some(budget) = read_bytes.as_deref_mut() {
-                budget.charge(row_byte_size(&row))?;
-            }
-            if !eval_compiled_expr_public(&compiled, &row) {
-                continue;
-            }
-            staged.push(row.into_owned());
-            if limit.is_some_and(|max| staged.len() >= max) {
-                break;
-            }
+    let scanned_table = keyspace.tier_scan_rows(
+        project_id,
+        scope_id,
+        table_name,
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        usize::MAX,
+    )?;
+    for (scanned_rows, (_, row)) in scanned_table.into_iter().enumerate() {
+        ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
+        if let Some(budget) = read_bytes.as_deref_mut() {
+            budget.charge(row_byte_size(&row))?;
+        }
+        if !eval_compiled_expr_public(&compiled, &row) {
+            continue;
+        }
+        staged.push(row);
+        if limit.is_some_and(|max| staged.len() >= max) {
+            break;
         }
     }
     for old_row in staged {
@@ -3689,40 +3711,48 @@ fn prevalidate_ddl_with_data(
                 .ok_or_else(|| AedbError::Validation("table missing".into()))?;
             match alteration {
                 crate::catalog::schema::TableAlteration::AddConstraint(constraint) => {
-                    if let Some(table) = keyspace
-                        .table_by_namespace_key(&namespace_key(project_id, scope_id), table_name)
-                    {
-                        for stored in table.rows.values() {
-                            let row = keyspace.materialize_row(stored)?;
-                            let pk = extract_primary_key_from_row(schema, &row)?;
-                            let mut tmp_schema = schema.clone();
-                            tmp_schema.constraints.push(constraint.clone());
-                            validate_row_constraints(
-                                catalog,
-                                keyspace,
-                                &tmp_schema,
-                                project_id,
-                                scope_id,
-                                table_name,
-                                &pk,
-                                &row,
-                                None,
-                            )?;
-                        }
+                    // Tier-aware: validate the new constraint against every row,
+                    // including those in the cold segment tier.
+                    let rows = keyspace.tier_scan_rows(
+                        project_id,
+                        scope_id,
+                        table_name,
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Unbounded,
+                        usize::MAX,
+                    )?;
+                    for (_, row) in &rows {
+                        let pk = extract_primary_key_from_row(schema, row)?;
+                        let mut tmp_schema = schema.clone();
+                        tmp_schema.constraints.push(constraint.clone());
+                        validate_row_constraints(
+                            catalog,
+                            keyspace,
+                            &tmp_schema,
+                            project_id,
+                            scope_id,
+                            table_name,
+                            &pk,
+                            row,
+                            None,
+                        )?;
                     }
                     Ok(())
                 }
                 crate::catalog::schema::TableAlteration::AddForeignKey(fk) => {
                     validate_foreign_key_definition(catalog, project_id, fk)?;
-                    if let Some(table) = keyspace
-                        .table_by_namespace_key(&namespace_key(project_id, scope_id), table_name)
-                    {
-                        let mut tmp_schema = schema.clone();
-                        tmp_schema.foreign_keys.push(fk.clone());
-                        for stored in table.rows.values() {
-                            let row = keyspace.materialize_row(stored)?;
-                            validate_foreign_keys(catalog, keyspace, &tmp_schema, &row, None)?;
-                        }
+                    let mut tmp_schema = schema.clone();
+                    tmp_schema.foreign_keys.push(fk.clone());
+                    let rows = keyspace.tier_scan_rows(
+                        project_id,
+                        scope_id,
+                        table_name,
+                        std::ops::Bound::Unbounded,
+                        std::ops::Bound::Unbounded,
+                        usize::MAX,
+                    )?;
+                    for (_, row) in &rows {
+                        validate_foreign_keys(catalog, keyspace, &tmp_schema, row, None)?;
                     }
                     Ok(())
                 }
@@ -3915,20 +3945,18 @@ fn rebuild_index_for_table(
         .unwrap_or(&crate::catalog::schema::IndexType::BTree);
     let columns_bitmask = idx_def.map(|d| d.columns_bitmask).unwrap_or(0);
     let partial_filter = idx_def.and_then(|d| d.partial_filter.clone());
-    // Materialize all rows up front (paging in spilled payloads) so the index
-    // build below can hold a mutable borrow of the table without conflicting
-    // with the value store read path.
-    let materialized_rows: Vec<(EncodedKey, Row)> =
-        match keyspace.table_by_namespace_key(&ns, table_name) {
-            Some(table) => {
-                let mut rows = Vec::with_capacity(table.rows.len());
-                for (pk, stored) in &table.rows {
-                    rows.push((pk.clone(), keyspace.materialize_row(stored)?.into_owned()));
-                }
-                rows
-            }
-            None => Vec::new(),
-        };
+    // Materialize all rows up front (tier-aware: includes rows in the cold
+    // segment tier, so an index built after eviction covers every row) so the
+    // index build below can hold a mutable borrow of the table without
+    // conflicting with the value store read path.
+    let materialized_rows: Vec<(EncodedKey, Row)> = keyspace.tier_scan_rows(
+        project_id,
+        scope_id,
+        table_name,
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        usize::MAX,
+    )?;
 
     let table = keyspace.table_mut_by_namespace_key(&ns, table_name);
 

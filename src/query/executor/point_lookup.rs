@@ -8,12 +8,11 @@ use crate::catalog::types::Row;
 use crate::query::error::QueryError;
 use crate::query::plan::Query;
 use crate::storage::encoded_key::EncodedKey;
-use crate::storage::keyspace::{KeyspaceSnapshot, TableData};
+use crate::storage::keyspace::KeyspaceSnapshot;
 
 pub(super) struct PrimaryKeyPointQueryRequest<'a, 'r> {
     pub snapshot: &'a KeyspaceSnapshot,
     pub schema: &'a TableSchema,
-    pub table: Option<&'a TableData>,
     pub project_id: &'a str,
     pub scope_id: &'a str,
     pub query: &'a Query,
@@ -68,12 +67,16 @@ pub(super) fn try_primary_key_point_query(
 
     let selected_indices = resolve_selected_indices(request.schema, request.query)?;
     let encoded_pk = EncodedKey::from_values(&primary_key);
-    let maybe_row = request.table.and_then(|t| t.rows.get(&encoded_pk));
+    // Tier-aware: pages the row back from the cold segment tier if it was
+    // evicted from the resident map.
+    let maybe_row = request.snapshot.get_row_by_encoded(
+        request.project_id,
+        request.scope_id,
+        &request.query.table,
+        &encoded_pk,
+    )?;
     let rows = match maybe_row {
-        Some(stored) => {
-            let row = request.snapshot.materialize_row(stored)?;
-            vec![project_selected_row(&row, selected_indices.as_deref())]
-        }
+        Some(row) => vec![project_selected_row(&row, selected_indices.as_deref())],
         None => Vec::new(),
     };
 
