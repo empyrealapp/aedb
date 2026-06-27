@@ -2062,12 +2062,9 @@ impl AedbInstance {
                 .keyspace
                 .table(project_id, scope_id, table_name)
                 .and_then(|table| {
-                    table
-                        .row_versions
-                        .get(&crate::storage::encoded_key::EncodedKey::from_values(
-                            &primary_key,
-                        ))
-                        .copied()
+                    table.version_of(&crate::storage::encoded_key::EncodedKey::from_values(
+                        &primary_key,
+                    ))
                 })
                 .unwrap_or(0);
             if expected_seq == 0 {
