@@ -35,9 +35,12 @@ pub(crate) fn row_mem_cost(row: &Row) -> usize {
 /// memory (plus its key entry overhead), so it is accounted like a spilled KV
 /// value rather than its full payload.
 pub(crate) fn stored_row_mem_cost(stored: &StoredRow) -> usize {
-    match stored {
-        StoredRow::Resident(row) => row_mem_cost(row),
-        StoredRow::Spilled(value_ref) => persistent_value_ref_cost(value_ref),
+    if let Some(row) = stored.resident() {
+        row_mem_cost(row)
+    } else if let Some(value_ref) = stored.value_ref() {
+        persistent_value_ref_cost(value_ref)
+    } else {
+        0
     }
 }
 

@@ -345,7 +345,7 @@ async fn crash_matrix_full_durability_commits_after_checkpoint_survive_abrupt_re
         hash_chain_required: false,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     // Pre-checkpoint commits.

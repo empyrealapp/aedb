@@ -43,7 +43,7 @@ async fn injected_wal_sync_failure_aborts_commit_and_store_stays_consistent() {
 
     let dir = tempdir().expect("temp");
     let config = durable_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed(&db).await;
 
     // Fail every WAL fsync. The commit that needs durability must error.
@@ -87,7 +87,7 @@ async fn injected_manifest_write_failure_surfaces_on_checkpoint() {
 
     let dir = tempdir().expect("temp");
     let config = durable_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed(&db).await;
 
     faults::arm("manifest_write", FaultPlan::Once);
