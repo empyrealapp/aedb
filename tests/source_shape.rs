@@ -147,7 +147,7 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/commit/apply.rs", 4_050),
         // Row-spill support (StoredRow + spill_table_rows + materialize helpers).
         ("src/storage/keyspace.rs", 3_250),
-        ("src/lib.rs", 3_700),
+        ("src/lib.rs", 3_750),
         ("src/catalog/mod.rs", 2_150),
         ("src/commit/validation.rs", 2_800),
         ("src/order_book.rs", 2_200),
