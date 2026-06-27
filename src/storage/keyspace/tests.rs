@@ -1,8 +1,9 @@
 use super::{
-    Keyspace, KvData, KvEntry, NamespaceId, SmallKvEntry, collect_hot_kv_segment_entries,
-    compact_kv_key, first_segment_position_for_start, get_sorted_segment_for_key,
-    hot_kv_resident_cost, kv_entry_cost, persistent_value_ref_resident_cost, scan_kv_entries,
-    segment_starts_after_end, segments_are_sorted_non_overlapping, small_kv_entry_cost,
+    Keyspace, KvData, KvEntry, NamespaceId, SmallKvEntry, StoredRow, TableData,
+    collect_hot_kv_segment_entries, compact_kv_key, first_segment_position_for_start,
+    get_sorted_segment_for_key, hot_kv_resident_cost, kv_entry_cost,
+    persistent_value_ref_resident_cost, scan_kv_entries, segment_starts_after_end,
+    segments_are_sorted_non_overlapping, small_kv_entry_cost,
 };
 use crate::catalog::types::{Row, Value};
 use crate::commit::validation::KvIntegerMissingPolicy;
@@ -1270,4 +1271,77 @@ fn snapshot_taken_before_row_spill_still_reads_resident_rows() {
             .values[1],
         Value::Text("a".repeat(256).into())
     );
+}
+
+#[test]
+fn stored_row_inline_version_and_accessors() {
+    let row = Row {
+        values: vec![Value::Integer(1)],
+    };
+    let versioned = StoredRow::resident_versioned(7, row.clone());
+    assert_eq!(versioned.inline_version(), Some(7));
+    assert_eq!(versioned.resident(), Some(&row));
+    assert!(!versioned.is_spilled());
+
+    // Legacy variant carries no inline version.
+    let legacy = StoredRow::Resident(row.clone());
+    assert_eq!(legacy.inline_version(), None);
+    assert_eq!(legacy.resident(), Some(&row));
+}
+
+#[test]
+fn table_version_of_prefers_inline_then_legacy_map() {
+    let key_new = EncodedKey::from_values(&[Value::Integer(1)]);
+    let key_legacy = EncodedKey::from_values(&[Value::Integer(2)]);
+
+    let mut table = TableData::default();
+    // New-form row: version inline, no parallel-map entry.
+    table.rows.insert(
+        key_new.clone(),
+        StoredRow::resident_versioned(
+            11,
+            Row {
+                values: vec![Value::Integer(1)],
+            },
+        ),
+    );
+    // Legacy-form row: bare variant + parallel-map version (as an old
+    // checkpoint would deserialize).
+    table.rows.insert(
+        key_legacy.clone(),
+        StoredRow::Resident(Row {
+            values: vec![Value::Integer(2)],
+        }),
+    );
+    table.row_versions.insert(key_legacy.clone(), 5);
+
+    assert_eq!(table.version_of(&key_new), Some(11));
+    assert_eq!(table.version_of(&key_legacy), Some(5));
+    assert_eq!(table.max_version(), 11);
+}
+
+#[test]
+fn legacy_table_data_round_trips_and_resolves_versions() {
+    // Build a TableData in the legacy on-disk shape (bare Resident variant +
+    // parallel row_versions map). Because the legacy variants are preserved at
+    // their original positions, serializing this with the current code produces
+    // the same bytes an older build wrote.
+    let key = EncodedKey::from_values(&[Value::Integer(42)]);
+    let mut table = TableData::default();
+    table.rows.insert(
+        key.clone(),
+        StoredRow::Resident(Row {
+            values: vec![Value::Integer(42), Value::Text("legacy".into())],
+        }),
+    );
+    table.row_versions.insert(key.clone(), 99);
+
+    let bytes = rmp_serde::to_vec(&table).expect("encode legacy table");
+    let decoded: TableData = rmp_serde::from_slice(&bytes).expect("decode legacy table");
+
+    assert_eq!(decoded.version_of(&key), Some(99));
+    assert!(matches!(
+        decoded.rows.get(&key),
+        Some(StoredRow::Resident(_))
+    ));
 }

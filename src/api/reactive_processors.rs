@@ -439,8 +439,7 @@ impl AedbInstance {
             )));
         }
         let checkpoint_version = checkpoint_table
-            .and_then(|table| table.row_versions.get(&checkpoint_pk))
-            .copied()
+            .and_then(|table| table.version_of(&checkpoint_pk))
             .unwrap_or(0);
         let primary_key = vec![checkpoint_key.clone()];
         let read_set = ReadSet {

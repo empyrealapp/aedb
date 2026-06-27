@@ -40,7 +40,7 @@ impl ReadSetCollector {
         let encoded = EncodedKey::from_values(&primary_key);
         let version_at_read = snapshot
             .table(project_id, scope_id, table_name)
-            .and_then(|t| t.row_versions.get(&encoded).copied())
+            .and_then(|t| t.version_of(&encoded))
             .unwrap_or(0);
         self.set.points.push(ReadSetEntry {
             key: ReadKey::TableRow {
@@ -69,9 +69,7 @@ impl ReadSetCollector {
         let table = snapshot.table(project_id, scope_id, table_name);
         let pk_column_indices = pk_column_indices_in_schema(schema);
         for pk in pks {
-            let version_at_read = table
-                .and_then(|t| t.row_versions.get(pk).copied())
-                .unwrap_or(0);
+            let version_at_read = table.and_then(|t| t.version_of(pk)).unwrap_or(0);
             let primary_key = extract_pk_values(snapshot, table, pk, &pk_column_indices);
             self.set.points.push(ReadSetEntry {
                 key: ReadKey::TableRow {
@@ -97,10 +95,7 @@ impl ReadSetCollector {
     ) {
         let table = snapshot.table(project_id, scope_id, table_name);
         let (max_version, structural_version) = match table {
-            Some(t) => (
-                t.row_versions.values().copied().max().unwrap_or(0),
-                t.structural_version,
-            ),
+            Some(t) => (t.max_version(), t.structural_version),
             None => (0, 0),
         };
         self.set.ranges.push(ReadRangeEntry {

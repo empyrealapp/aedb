@@ -644,11 +644,7 @@ pub fn preflight_plan_with_config(
         } => {
             let version = snapshot
                 .table(project_id, scope_id, table_name)
-                .and_then(|t| {
-                    t.row_versions
-                        .get(&EncodedKey::from_values(primary_key))
-                        .copied()
-                })
+                .and_then(|t| t.version_of(&EncodedKey::from_values(primary_key)))
                 .unwrap_or(0);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::TableRow {
@@ -688,11 +684,7 @@ pub fn preflight_plan_with_config(
                     }
                     let version = snapshot
                         .table(project_id, scope_id, table_name)
-                        .and_then(|t| {
-                            t.row_versions
-                                .get(&EncodedKey::from_values(&primary_key))
-                                .copied()
-                        })
+                        .and_then(|t| t.version_of(&EncodedKey::from_values(&primary_key)))
                         .unwrap_or(0);
                     read_set.points.push(ReadSetEntry {
                         key: ReadKey::TableRow {
@@ -733,10 +725,7 @@ pub fn preflight_plan_with_config(
             let (max_version, structural_version) = snapshot
                 .table(project_id, scope_id, table_name)
                 .map(|t| {
-                    (
-                        t.row_versions.values().copied().max().unwrap_or(0),
-                        t.structural_version,
-                    )
+                    (t.max_version(), t.structural_version)
                 })
                 .unwrap_or((0, 0));
             read_set.ranges.push(ReadRangeEntry {
@@ -905,11 +894,7 @@ pub fn preflight_plan_with_config(
         } => {
             let version = snapshot
                 .table(project_id, scope_id, table_name)
-                .and_then(|t| {
-                    t.row_versions
-                        .get(&EncodedKey::from_values(primary_key))
-                        .copied()
-                })
+                .and_then(|t| t.version_of(&EncodedKey::from_values(primary_key)))
                 .unwrap_or(0);
             read_set.points.push(ReadSetEntry {
                 key: ReadKey::TableRow {
