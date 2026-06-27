@@ -232,11 +232,19 @@ impl SegmentManager {
         }
         let encoded_size_bytes = encoded_frames.len() as u64;
 
+        if crate::faults::any_armed() {
+            crate::faults::trip("wal_append")
+                .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
+        }
         active.file.write_all(&encoded_frames)?;
         active.hasher.update(&encoded_frames);
         active.size_bytes = active.size_bytes.saturating_add(encoded_size_bytes);
 
         if sync {
+            if crate::faults::any_armed() {
+                crate::faults::trip("wal_sync")
+                    .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
+            }
             active.file.flush()?;
             active.file.sync_data()?;
         }
@@ -248,6 +256,10 @@ impl SegmentManager {
 
     pub fn sync_active(&mut self) -> Result<(), SegmentError> {
         let active = self.active.as_mut().ok_or(SegmentError::NotOpen)?;
+        if crate::faults::any_armed() {
+            crate::faults::trip("wal_sync")
+                .map_err(|e| SegmentError::Io(std::io::Error::other(e.to_string())))?;
+        }
         active.file.sync_data()?;
         Ok(())
     }

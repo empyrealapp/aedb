@@ -17,6 +17,34 @@ fn entry(value: u8, version: u64) -> KvEntry {
 }
 
 #[test]
+fn block_cache_hit_and_miss_counters_track_segment_reads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = KvSegmentStore::open(dir.path()).expect("open store");
+    let meta = store
+        .write_segment(
+            "test",
+            vec![KvSegmentEntry {
+                key: b"key".to_vec(),
+                entry: entry(1, 1),
+            }],
+        )
+        .expect("write segment");
+
+    assert_eq!(store.block_cache_hits(), 0);
+    assert_eq!(store.block_cache_misses(), 0);
+
+    // First read populates the cache (miss).
+    store.read_segment(&meta).expect("first read");
+    assert_eq!(store.block_cache_misses(), 1);
+    assert_eq!(store.block_cache_hits(), 0);
+
+    // Second read is served from the block cache (hit).
+    store.read_segment(&meta).expect("second read");
+    assert_eq!(store.block_cache_hits(), 1);
+    assert_eq!(store.block_cache_misses(), 1);
+}
+
+#[test]
 fn reclaim_skips_pending_publish_segment_until_published() {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = KvSegmentStore::open(dir.path()).expect("open store");

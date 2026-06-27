@@ -67,6 +67,15 @@ impl SnapshotManager {
         }
     }
 
+    /// Number of live (acquired, not-yet-released) snapshots. Released-but-not-
+    /// yet-GC'd handles are excluded so this reflects real reader pressure.
+    pub fn live_count(&self) -> usize {
+        self.active_snapshots
+            .values()
+            .filter(|s| !s.released)
+            .count()
+    }
+
     pub fn gc(&mut self) -> GcResult {
         let before = self.active_snapshots.len();
         self.active_snapshots.retain(|_, s| !s.released);

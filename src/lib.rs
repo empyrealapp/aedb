@@ -9,7 +9,9 @@ mod ddl_lifecycle;
 pub mod declarative;
 pub mod engine_interface;
 pub mod error;
+pub mod faults;
 mod lib_helpers;
+pub mod locks;
 #[cfg(test)]
 #[allow(deprecated)]
 mod lib_tests;
@@ -123,6 +125,11 @@ pub struct AedbInstance {
     startup_recovered_seq: u64,
     wal_gc_shutdown: Arc<AtomicBool>,
     wal_gc_thread: Option<std::thread::JoinHandle<()>>,
+    /// In-memory, transaction-scoped object lock registry. Holds no durable
+    /// state: it starts empty after every restart and is never written to the
+    /// WAL or checkpoints. See [`locks`] for the serialization primitives the
+    /// runtime layers on top of MVCC.
+    locks: Arc<crate::locks::LockManager>,
     /// Exclusive advisory lock on the data directory, held for the lifetime of
     /// the instance. Prevents a second `AedbInstance` from opening the same
     /// directory concurrently, which would race two writers (and two WAL-GC
@@ -479,8 +486,14 @@ pub struct OperationalMetrics {
     pub persistent_value_store_bytes: u64,
     pub persistent_value_hot_cache_bytes: usize,
     pub persistent_value_hot_cache_capacity_bytes: usize,
+    pub persistent_value_hot_cache_hits: u64,
+    pub persistent_value_hot_cache_misses: u64,
     pub kv_segment_block_cache_bytes: usize,
     pub kv_segment_block_cache_capacity_bytes: usize,
+    pub kv_segment_block_cache_hits: u64,
+    pub kv_segment_block_cache_misses: u64,
+    /// Live (acquired, not-yet-released) read snapshots — reader pressure.
+    pub active_snapshots: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1413,6 +1426,7 @@ impl AedbInstance {
             startup_recovered_seq,
             wal_gc_shutdown,
             wal_gc_thread: Some(wal_gc_thread),
+            locks: Arc::new(crate::locks::LockManager::default()),
             _dir_lock: dir_lock,
         })
     }
@@ -1484,6 +1498,26 @@ impl AedbInstance {
         &self,
     ) -> tokio::sync::broadcast::Receiver<Arc<crate::version_store::CommitDelta>> {
         self.executor.subscribe_commits()
+    }
+
+    /// Begin a transaction-scoped lock set for serializing modifications to
+    /// logical objects (see the [`locks`] module for full semantics and
+    /// examples).
+    ///
+    /// Acquire one or more [`locks::LockKey`]s on the returned
+    /// [`locks::TxLockSet`], perform the guarded reads/writes with the normal
+    /// commit and query APIs, then call `commit()` / `rollback()` (or drop the
+    /// set) to release them. Locks are exclusive while held, never block MVCC
+    /// snapshot readers, and are discarded on restart.
+    pub fn lock_scope(&self) -> crate::locks::TxLockSet {
+        self.locks.begin()
+    }
+
+    /// Direct handle to the in-memory object lock registry. Most callers should
+    /// use [`lock_scope`](Self::lock_scope); this is exposed for inspection and
+    /// for sharing the registry with a co-located runtime.
+    pub fn lock_manager(&self) -> &Arc<crate::locks::LockManager> {
+        &self.locks
     }
 
     async fn commit_prevalidated_internal(
@@ -2795,6 +2829,7 @@ impl AedbInstance {
                 active_segment_seq,
                 checkpoints,
                 segments,
+                ..Default::default()
             };
             write_manifest_atomic_signed(&manifest, &dir, manifest_hmac_key.as_deref())?;
             // Manifest is durable (including a dir fsync) before we remove the
@@ -2888,8 +2923,13 @@ impl AedbInstance {
             persistent_value_hot_cache_bytes: runtime.persistent_value_hot_cache_bytes,
             persistent_value_hot_cache_capacity_bytes: runtime
                 .persistent_value_hot_cache_capacity_bytes,
+            persistent_value_hot_cache_hits: runtime.persistent_value_hot_cache_hits,
+            persistent_value_hot_cache_misses: runtime.persistent_value_hot_cache_misses,
             kv_segment_block_cache_bytes: runtime.kv_segment_block_cache_bytes,
             kv_segment_block_cache_capacity_bytes: runtime.kv_segment_block_cache_capacity_bytes,
+            kv_segment_block_cache_hits: runtime.kv_segment_block_cache_hits,
+            kv_segment_block_cache_misses: runtime.kv_segment_block_cache_misses,
+            active_snapshots: self.snapshot_manager.lock().live_count(),
         }
     }
 

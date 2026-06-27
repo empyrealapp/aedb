@@ -57,6 +57,7 @@ fn single_segment_manifest(
             sha256_hex,
             size_bytes,
         }],
+        ..Default::default()
     }
 }
 
@@ -237,6 +238,7 @@ async fn recover_uses_checkpoint_and_replays_only_durable_tail() {
             sha256_hex: String::new(),
             size_bytes: 0,
         }],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
 
@@ -326,6 +328,7 @@ async fn recover_replays_only_through_manifest_durable_seq() {
             sha256_hex: String::new(),
             size_bytes: 0,
         }],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
 
@@ -416,6 +419,7 @@ async fn recover_falls_back_to_older_checkpoint_when_latest_is_corrupt() {
             sha256_hex: String::new(),
             size_bytes: 0,
         }],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
 
@@ -511,6 +515,7 @@ async fn strict_recovery_fails_when_all_referenced_checkpoints_are_corrupt() {
         active_segment_seq: 1,
         checkpoints: vec![cp],
         segments: vec![],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
     let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
@@ -541,6 +546,7 @@ async fn strict_recovery_fails_on_manifest_checkpoint_sha_mismatch() {
         active_segment_seq: 1,
         checkpoints: vec![cp],
         segments: vec![],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
     let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
@@ -578,6 +584,7 @@ async fn strict_recovery_fails_on_manifest_segment_sha_mismatch() {
             sha256_hex: "00".repeat(32),
             size_bytes: segment_size,
         }],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
     let err = recover_with_config(dir.path(), &strict_config()).expect_err("strict fail");
@@ -715,6 +722,7 @@ async fn permissive_recovery_can_continue_without_valid_checkpoint() {
         active_segment_seq: 1,
         checkpoints: vec![cp],
         segments: vec![],
+        ..Default::default()
     };
     write_manifest_atomic(&manifest, dir.path()).expect("manifest");
     let recovered = recover_with_config(dir.path(), &non_strict_config()).expect("recover");

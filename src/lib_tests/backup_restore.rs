@@ -630,6 +630,7 @@ fn wal_segment_gc_reclaims_checkpoint_covered_segments() {
             key_id: None,
         }],
         segments: Vec::new(),
+        ..Default::default()
     };
     crate::manifest::atomic::write_manifest_atomic_signed(&manifest, dir.path(), None)
         .expect("write manifest");

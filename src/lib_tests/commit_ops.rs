@@ -1391,6 +1391,7 @@ async fn profile_end_to_end_pipeline_breakdown() {
         active_segment_seq,
         checkpoints: vec![checkpoint.clone()],
         segments: segments.clone(),
+        ..Default::default()
     };
     crate::manifest::atomic::write_manifest_atomic_signed(
         &manifest,

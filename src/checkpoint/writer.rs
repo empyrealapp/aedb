@@ -99,6 +99,7 @@ pub fn write_checkpoint_with_key(
     idempotency: HashMap<IdempotencyKey, IdempotencyRecord>,
     compression_level: i32,
 ) -> Result<CheckpointMeta, AedbError> {
+    crate::faults::trip("checkpoint_write")?;
     fs::create_dir_all(dir)?;
     let snapshot = snapshot.materialized_for_checkpoint()?;
     let checkpoint = CheckpointData {

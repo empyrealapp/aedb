@@ -10,6 +10,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
 
@@ -56,6 +57,10 @@ pub struct KvSegmentStore {
     dir: PathBuf,
     block_cache_capacity_bytes: usize,
     block_cache: Mutex<KvSegmentBlockCache>,
+    /// Cumulative block-cache lookups served from memory.
+    block_cache_hits: AtomicU64,
+    /// Cumulative block-cache lookups that fell through to a segment read.
+    block_cache_misses: AtomicU64,
     pending_publish_filenames: Mutex<HashSet<String>>,
 }
 
@@ -82,12 +87,24 @@ impl KvSegmentStore {
             dir,
             block_cache_capacity_bytes,
             block_cache: Mutex::new(KvSegmentBlockCache::new(block_cache_capacity_bytes)),
+            block_cache_hits: AtomicU64::new(0),
+            block_cache_misses: AtomicU64::new(0),
             pending_publish_filenames: Mutex::new(HashSet::new()),
         })
     }
 
     pub fn block_cache_resident_bytes(&self) -> usize {
         self.block_cache.lock().resident_bytes()
+    }
+
+    /// Cumulative block-cache hits since the store was opened.
+    pub fn block_cache_hits(&self) -> u64 {
+        self.block_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative block-cache misses since the store was opened.
+    pub fn block_cache_misses(&self) -> u64 {
+        self.block_cache_misses.load(Ordering::Relaxed)
     }
 
     pub fn block_cache_capacity_bytes(&self) -> usize {
@@ -244,10 +261,12 @@ impl KvSegmentStore {
             let block_entries = if populate_block_cache
                 && let Some(cached) = self.block_cache.lock().get(&cache_key)
             {
+                self.block_cache_hits.fetch_add(1, Ordering::Relaxed);
                 cached
             } else {
                 let decoded = read_block_entries_from_open_file(block, &mut file)?;
                 if populate_block_cache {
+                    self.block_cache_misses.fetch_add(1, Ordering::Relaxed);
                     self.block_cache
                         .lock()
                         .insert(cache_key, Arc::clone(&decoded));

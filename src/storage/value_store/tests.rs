@@ -23,6 +23,39 @@ fn hot_cache_keeps_recent_values_and_evicts_cold_values() {
 }
 
 #[test]
+fn hot_cache_hit_and_miss_counters_track_lookups() {
+    let dir = tempdir().expect("temp");
+    let store =
+        PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 1024).expect("open store");
+    // Cold append does not populate the hot cache.
+    let refs = store.append_many_cold(&[b"alpha".to_vec()]).expect("append");
+    let value_ref = refs[0].clone();
+
+    assert_eq!(store.hot_cache_hits(), 0);
+    assert_eq!(store.hot_cache_misses(), 0);
+
+    // First read: miss (then populates the cache).
+    store.read(&value_ref).expect("first read");
+    assert_eq!(store.hot_cache_misses(), 1);
+    assert_eq!(store.hot_cache_hits(), 0);
+
+    // Second read: hit.
+    store.read(&value_ref).expect("second read");
+    assert_eq!(store.hot_cache_hits(), 1);
+    assert_eq!(store.hot_cache_misses(), 1);
+}
+
+#[test]
+fn hot_cache_counters_stay_zero_when_disabled() {
+    let dir = tempdir().expect("temp");
+    let store = PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 0).expect("open store");
+    let value_ref = store.append(b"cold-only").expect("append");
+    store.read(&value_ref).expect("read");
+    assert_eq!(store.hot_cache_hits(), 0);
+    assert_eq!(store.hot_cache_misses(), 0);
+}
+
+#[test]
 fn hot_cache_can_be_disabled() {
     let dir = tempdir().expect("temp");
     let store = PersistentValueStore::open_with_hot_cache_bytes(dir.path(), 0).expect("open store");

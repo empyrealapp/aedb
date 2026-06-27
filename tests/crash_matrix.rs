@@ -713,6 +713,7 @@ async fn crash_matrix_segment_deletion_breaks_hash_chain() {
                 size_bytes: fs::metadata(path).expect("segment metadata").len(),
             })
             .collect(),
+        ..Default::default()
     };
     write_manifest_atomic_signed(&manifest, dir.path(), config.hmac_key()).expect("manifest");
 
