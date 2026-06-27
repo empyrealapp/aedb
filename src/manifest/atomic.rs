@@ -17,13 +17,17 @@ pub fn write_manifest_atomic_signed(
     dir: &Path,
     signing_key: Option<&[u8]>,
 ) -> Result<(), AedbError> {
+    crate::faults::trip("manifest_write")?;
     fs::create_dir_all(dir)?;
     let primary = dir.join("manifest.json");
     let prev = dir.join("manifest.json.prev");
     let sig = dir.join("manifest.hmac");
     let sig_prev = dir.join("manifest.hmac.prev");
+    // Self-describe every persisted manifest with the current format header.
+    let mut manifest = manifest.clone();
+    manifest.stamp_current_header();
     let bytes =
-        serde_json::to_vec_pretty(manifest).map_err(|e| AedbError::Encode(e.to_string()))?;
+        serde_json::to_vec_pretty(&manifest).map_err(|e| AedbError::Encode(e.to_string()))?;
     let signature = signing_key.map(|key| hmac_hex(key, &bytes)).transpose()?;
 
     if primary.exists() {
@@ -74,11 +78,17 @@ pub fn load_manifest_signed_mode(
 ) -> Result<Manifest, AedbError> {
     let primary = dir.join("manifest.json");
     if let Ok(m) = try_read_manifest_signed(dir, &primary, signing_key) {
+        // A readable manifest with an invalid format header (wrong magic or a
+        // version newer than this build) must be refused outright, not silently
+        // reconstructed — reconstruction would discard a manifest we simply
+        // cannot interpret.
+        m.validate_header()?;
         return Ok(m);
     }
 
     let prev = dir.join("manifest.json.prev");
     if let Ok(m) = try_read_manifest_signed(dir, &prev, signing_key) {
+        m.validate_header()?;
         return Ok(m);
     }
 

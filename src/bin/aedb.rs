@@ -36,6 +36,7 @@ fn run() -> Result<(), String> {
             Some(other) => Err(format!("unknown check command: {other}")),
             None => Err("missing check subcommand".into()),
         },
+        "verify" => cmd_verify(&args[2..]),
         other => {
             print_usage();
             Err(format!("unknown top-level command: {other}"))
@@ -161,6 +162,36 @@ fn cmd_check_invariants(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn cmd_verify(args: &[String]) -> Result<(), String> {
+    let data_dir = parse_flag_value(args, "--data-dir").ok_or("--data-dir is required")?;
+    let config = parse_recovery_config(args)?;
+    let report = offline::verify_database(Path::new(&data_dir), &config);
+    println!(
+        "{}\tseq={}\ttables={}\trows={}\tkv={}",
+        if report.ok { "ok" } else { "FAILED" },
+        report.current_seq,
+        report.table_count,
+        report.table_rows,
+        report.kv_entries
+    );
+    for check in &report.checks {
+        println!(
+            "check\t{}\t{}\t{}",
+            if check.ok { "ok" } else { "FAILED" },
+            check.name,
+            check.detail
+        );
+    }
+    for violation in &report.violations {
+        println!("violation\t{violation}");
+    }
+    if report.ok {
+        Ok(())
+    } else {
+        Err("integrity verification failed".into())
+    }
+}
+
 fn parse_flag_value(args: &[String], flag: &str) -> Option<String> {
     for arg_index in 0..args.len() {
         if args[arg_index] == flag {
@@ -206,5 +237,8 @@ fn print_usage() {
     );
     eprintln!(
         "  aedb check invariants --data-dir <aedb-dir> [--hmac-key-hex <hex>] [--permissive]"
+    );
+    eprintln!(
+        "  aedb verify --data-dir <aedb-dir> [--hmac-key-hex <hex>] [--permissive]"
     );
 }

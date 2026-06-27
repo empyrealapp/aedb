@@ -330,6 +330,7 @@ impl AedbInstance {
             active_segment_seq: restored_seq + 1,
             checkpoints: vec![cp],
             segments: Vec::new(),
+            ..Default::default()
         };
         write_manifest_atomic_signed(&restored_manifest, data_dir, config.hmac_key())?;
         Ok(restored_seq)
@@ -492,6 +493,7 @@ impl AedbInstance {
             active_segment_seq: merged_seq + 1,
             checkpoints: vec![cp],
             segments: Vec::new(),
+            ..Default::default()
         };
         write_manifest_atomic_signed(&manifest, data_dir, config.hmac_key())?;
         Ok(merged_seq)

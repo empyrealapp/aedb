@@ -470,8 +470,12 @@ pub struct ExecutorRuntimeState {
     pub persistent_value_store_bytes: u64,
     pub persistent_value_hot_cache_bytes: usize,
     pub persistent_value_hot_cache_capacity_bytes: usize,
+    pub persistent_value_hot_cache_hits: u64,
+    pub persistent_value_hot_cache_misses: u64,
     pub kv_segment_block_cache_bytes: usize,
     pub kv_segment_block_cache_capacity_bytes: usize,
+    pub kv_segment_block_cache_hits: u64,
+    pub kv_segment_block_cache_misses: u64,
 }
 
 impl CommitExecutor {
@@ -1761,23 +1765,19 @@ impl CommitExecutor {
     }
 
     pub async fn runtime_state_metrics(&self) -> ExecutorRuntimeState {
-        let (
-            persistent_value_store_bytes,
-            persistent_value_hot_cache_bytes,
-            persistent_value_hot_cache_capacity_bytes,
-            kv_segment_block_cache_bytes,
-            kv_segment_block_cache_capacity_bytes,
-        ) = {
+        let (value_metrics, segment_metrics) = {
             let state = self.state.lock().await;
             let value_metrics = state
                 .keyspace
                 .value_store
                 .as_ref()
-                .map_or((0, 0, 0), |store| {
+                .map_or((0, 0, 0, 0, 0), |store| {
                     (
                         store.len_bytes(),
-                        store.hot_cache_resident_bytes(),
-                        store.hot_cache_capacity_bytes(),
+                        store.hot_cache_resident_bytes() as u64,
+                        store.hot_cache_capacity_bytes() as u64,
+                        store.hot_cache_hits(),
+                        store.hot_cache_misses(),
                     )
                 });
             let segment_metrics =
@@ -1785,30 +1785,30 @@ impl CommitExecutor {
                     .keyspace
                     .kv_segment_store
                     .as_ref()
-                    .map_or((0, 0), |store| {
+                    .map_or((0, 0, 0, 0), |store| {
                         (
-                            store.block_cache_resident_bytes(),
-                            store.block_cache_capacity_bytes(),
+                            store.block_cache_resident_bytes() as u64,
+                            store.block_cache_capacity_bytes() as u64,
+                            store.block_cache_hits(),
+                            store.block_cache_misses(),
                         )
                     });
-            (
-                value_metrics.0,
-                value_metrics.1,
-                value_metrics.2,
-                segment_metrics.0,
-                segment_metrics.1,
-            )
+            (value_metrics, segment_metrics)
         };
         ExecutorRuntimeState {
             current_seq: self.current_seq.load(Ordering::Acquire),
             visible_head_seq: self.visible_head_seq.load(Ordering::Acquire),
             durable_head_seq: self.durable_head_seq.load(Ordering::Acquire),
             last_full_snapshot_micros: self.last_full_snapshot_micros.load(Ordering::Acquire),
-            persistent_value_store_bytes,
-            persistent_value_hot_cache_bytes,
-            persistent_value_hot_cache_capacity_bytes,
-            kv_segment_block_cache_bytes,
-            kv_segment_block_cache_capacity_bytes,
+            persistent_value_store_bytes: value_metrics.0,
+            persistent_value_hot_cache_bytes: value_metrics.1 as usize,
+            persistent_value_hot_cache_capacity_bytes: value_metrics.2 as usize,
+            persistent_value_hot_cache_hits: value_metrics.3,
+            persistent_value_hot_cache_misses: value_metrics.4,
+            kv_segment_block_cache_bytes: segment_metrics.0 as usize,
+            kv_segment_block_cache_capacity_bytes: segment_metrics.1 as usize,
+            kv_segment_block_cache_hits: segment_metrics.2,
+            kv_segment_block_cache_misses: segment_metrics.3,
         }
     }
 }

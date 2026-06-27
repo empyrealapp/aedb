@@ -121,6 +121,32 @@ may include one mutation or a set of mutations that must publish atomically.
 - `CommitFinality::Visible` waits for publication to readers; `CommitFinality::Durable`
   waits for the durable head.
 
+### Object locks
+
+`AedbInstance::lock_scope` returns a transaction-scoped, in-memory exclusive
+lock over a logical object (a program instance, document, or workflow). It lets
+a higher-level runtime serialize *modifications* to one object while leaving
+MVCC snapshot reads and unrelated writes fully concurrent. AEDB provides only
+the locking mechanism — it does not schedule execution, queue work, or decide
+which transaction runs next.
+
+```rust
+use aedb::locks::LockKey;
+
+let mut tx = db.lock_scope();
+tx.lock(LockKey::global("program:42"))?; // exclusive while held
+// ... read current state, run logic, commit the new state via the normal APIs ...
+tx.commit(); // releases the lock (so does rollback() or dropping `tx`)
+```
+
+- Exclusive while held; snapshot readers never block on a lock.
+- Transaction-scoped: every key is released on commit, rollback, or drop.
+- Deadlock-free multi-key acquisition via `lock_all` (deterministic ordering);
+  blocking single acquisition honours a finite timeout.
+- Purely in-memory: locks are never written to the WAL and are discarded on
+  restart. After recovery the runtime re-acquires whatever it needs as execution
+  resumes from the recovered committed state.
+
 ### Operational Features
 
 AEDB includes operational APIs for checkpointing, backup/restore, event streams,
@@ -211,16 +237,27 @@ Error handling:
 ## Operational APIs
 
 - `checkpoint_now()` to force a fuzzy checkpoint (does not block commit/query traffic)
-- `backup_full(...)` / restore helpers for backup workflows
-- `operational_metrics()` for commit latency, queue depth, durable head lag, and more
+- `backup_full(...)` / restore helpers for backup workflows (full + incremental chains)
+- `operational_metrics()` for commit latency, queue depth, durable head lag, cache
+  hit/miss counters, active snapshot count, and more
+- `faults` module: deterministic fail-point injection (`wal_append`, `wal_sync`,
+  `manifest_write`, `checkpoint_write`) for crash/corruption-path testing;
+  disarmed in production with single-atomic-load overhead
 
-CLI helper (`src/bin/aedb.rs`) includes offline dump/parity/invariant tooling:
+CLI helper (`src/bin/aedb.rs`) includes offline dump/parity/invariant tooling and
+a full integrity verifier:
 
 ```bash
 cargo run --bin aedb -- dump export --data-dir /tmp/aedb-data --out /tmp/aedb-dump.aedbdump
 cargo run --bin aedb -- dump parity --dump /tmp/aedb-dump.aedbdump --data-dir /tmp/aedb-data
 cargo run --bin aedb -- check invariants --data-dir /tmp/aedb-data
+# Full verification: WAL CRCs, manifest HMAC, segment hash chain, checkpoint
+# integrity (via recovery) plus index/FK/catalog consistency.
+cargo run --bin aedb -- verify --data-dir /tmp/aedb-data
 ```
+
+`aedb verify` runs against a stopped instance, a restored backup, or a copy of
+the data directory; the programmatic core is `offline::verify_database`.
 
 Explorer CLI crate (`crates/aedb-explorer`) provides read-only inspection of projects/scopes/tables, schema, and sample rows:
 

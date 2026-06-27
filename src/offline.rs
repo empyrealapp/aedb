@@ -121,6 +121,7 @@ pub fn restore_snapshot_dump(
         active_segment_seq: envelope.state.current_seq.saturating_add(1),
         checkpoints: vec![checkpoint],
         segments: vec![],
+        ..Default::default()
     };
     write_manifest_atomic_signed(&manifest, data_dir, config.hmac_key())?;
 
@@ -167,6 +168,100 @@ pub fn invariant_report(
 ) -> Result<InvariantReport, AedbError> {
     let recovered = recover_with_config(data_dir, config)?;
     Ok(check_invariants(&recovered))
+}
+
+/// Outcome of one named check within [`verify_database`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Aggregate result of [`verify_database`] — the engine's `aedb verify`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseVerificationReport {
+    /// True only when every check passed.
+    pub ok: bool,
+    pub current_seq: u64,
+    pub table_count: u64,
+    pub table_rows: u64,
+    pub kv_entries: u64,
+    pub checks: Vec<VerificationCheck>,
+    /// Flattened detail of every logical-consistency violation found.
+    pub violations: Vec<String>,
+}
+
+/// Full integrity verification of a data directory.
+///
+/// This is the programmatic core of the `aedb verify` CLI. It runs the two
+/// integrity layers AEDB already enforces and reports each as a named check
+/// instead of failing on the first problem:
+///
+/// 1. **Durability layer** — a full recovery, which replays the WAL (per-frame
+///    CRC32C + truncated-frame detection), verifies the manifest HMAC, walks
+///    the segment hash chain, and loads/decrypts checkpoints. A failure here
+///    means on-disk bytes are corrupt or tampered.
+/// 2. **Logical layer** — [`check_invariants`] over the recovered state:
+///    secondary-index ↔ row consistency, foreign-key referential integrity,
+///    catalog/object references, and row-version cardinality.
+///
+/// The directory must not be open by a live `AedbInstance` (recovery acquires
+/// the data); run it against a stopped instance, a restored backup, or a copy.
+pub fn verify_database(data_dir: &Path, config: &AedbConfig) -> DatabaseVerificationReport {
+    let mut checks = Vec::new();
+
+    let recovered = match recover_with_config(data_dir, config) {
+        Ok(recovered) => {
+            checks.push(VerificationCheck {
+                name: "wal_checkpoint_manifest_integrity".into(),
+                ok: true,
+                detail: format!("recovered to seq {}", recovered.current_seq),
+            });
+            recovered
+        }
+        Err(err) => {
+            // Recovery failing closed is itself the durability check failing;
+            // surface it as a structured result rather than panicking.
+            let detail = err.to_string();
+            checks.push(VerificationCheck {
+                name: "wal_checkpoint_manifest_integrity".into(),
+                ok: false,
+                detail: detail.clone(),
+            });
+            return DatabaseVerificationReport {
+                ok: false,
+                current_seq: 0,
+                table_count: 0,
+                table_rows: 0,
+                kv_entries: 0,
+                checks,
+                violations: vec![detail],
+            };
+        }
+    };
+
+    let invariants = check_invariants(&recovered);
+    checks.push(VerificationCheck {
+        name: "catalog_index_referential_consistency".into(),
+        ok: invariants.ok,
+        detail: if invariants.ok {
+            "no violations".into()
+        } else {
+            format!("{} violation(s)", invariants.violations.len())
+        },
+    });
+
+    let ok = checks.iter().all(|check| check.ok);
+    DatabaseVerificationReport {
+        ok,
+        current_seq: recovered.current_seq,
+        table_count: invariants.table_count,
+        table_rows: invariants.table_rows,
+        kv_entries: invariants.kv_entries,
+        checks,
+        violations: invariants.violations,
+    }
 }
 
 fn summarize_state(state: &SnapshotDumpState, parity_checksum_hex: String) -> SnapshotDumpReport {
@@ -522,18 +617,11 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
     }
 
     for ((namespace, table_name), schema) in &recovered.catalog.tables {
-        let ns_id = NamespaceId::Project(namespace.clone());
-        let Some(ns) = recovered.keyspace.namespaces.get(&ns_id) else {
-            violations.push(format!(
-                "catalog table missing namespace: {namespace}.{table_name}"
-            ));
-            continue;
-        };
-        if !ns.tables.contains_key(table_name) {
-            violations.push(format!(
-                "catalog table missing keyspace rows: {namespace}.{table_name}"
-            ));
-        }
+        // A catalog table with no materialized keyspace namespace/table is NOT
+        // a violation: empty tables are materialized lazily on first write, so
+        // an empty table legitimately has a catalog entry and no keyspace rows.
+        // (The reverse direction — keyspace tables without a catalog entry — is
+        // the orphan check that actually detects corruption.)
         let expected_ns = crate::catalog::namespace_key(&schema.project_id, &schema.scope_id);
         if expected_ns != *namespace {
             violations.push(format!(

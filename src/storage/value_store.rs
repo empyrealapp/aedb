@@ -27,6 +27,10 @@ pub struct PersistentValueStore {
     mmap: RwLock<Mmap>,
     hot_cache_capacity_bytes: usize,
     hot_cache: Mutex<HotValueCache>,
+    /// Cumulative hot-cache lookups served from memory.
+    hot_cache_hits: AtomicU64,
+    /// Cumulative hot-cache lookups that fell through to an mmap/file read.
+    hot_cache_misses: AtomicU64,
     len: AtomicU64,
     dirty: AtomicBool,
 }
@@ -80,6 +84,8 @@ impl PersistentValueStore {
             mmap: RwLock::new(mmap),
             hot_cache_capacity_bytes,
             hot_cache: Mutex::new(HotValueCache::new(hot_cache_capacity_bytes)),
+            hot_cache_hits: AtomicU64::new(0),
+            hot_cache_misses: AtomicU64::new(0),
             len: AtomicU64::new(file_len),
             dirty: AtomicBool::new(false),
         })
@@ -247,7 +253,11 @@ impl PersistentValueStore {
         if self.hot_cache_capacity_bytes > 0
             && let Some(value) = { self.hot_cache.lock().get(value_ref) }
         {
+            self.hot_cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(value.as_ref().to_vec());
+        }
+        if self.hot_cache_capacity_bytes > 0 {
+            self.hot_cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
         let end = value_ref.offset.checked_add(value_ref.len).ok_or_else(|| {
@@ -315,6 +325,16 @@ impl PersistentValueStore {
 
     pub fn hot_cache_resident_bytes(&self) -> usize {
         self.hot_cache.lock().resident_bytes()
+    }
+
+    /// Cumulative hot-cache hits since the store was opened.
+    pub fn hot_cache_hits(&self) -> u64 {
+        self.hot_cache_hits.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative hot-cache misses since the store was opened.
+    pub fn hot_cache_misses(&self) -> u64 {
+        self.hot_cache_misses.load(Ordering::Relaxed)
     }
 
     pub fn hot_cache_capacity_bytes(&self) -> usize {
