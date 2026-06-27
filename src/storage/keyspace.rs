@@ -72,10 +72,46 @@ pub struct SecondaryIndex {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TableData {
     pub rows: OrdMap<EncodedKey, StoredRow>,
+    /// Legacy parallel map of per-row MVCC versions. New writes carry the
+    /// version inline in [`StoredRow::Versioned`] and leave this empty; it is
+    /// only populated when loading a pre-inline-version checkpoint, and is
+    /// drained as those rows are rewritten or normalized.
+    #[serde(default)]
     pub row_versions: OrdMap<EncodedKey, u64>,
     #[serde(default)]
     pub structural_version: u64,
     pub indexes: HashMap<String, SecondaryIndex>,
+}
+
+impl TableData {
+    /// The MVCC version (commit seq) of a row: the inline version when present,
+    /// otherwise the legacy parallel-map entry. Returns `None` if the key is
+    /// absent.
+    pub fn version_of(&self, key: &EncodedKey) -> Option<u64> {
+        self.rows
+            .get(key)
+            .and_then(StoredRow::inline_version)
+            .or_else(|| self.row_versions.get(key).copied())
+    }
+
+    /// Highest MVCC version across all rows (inline or legacy-map). `0` if empty.
+    pub fn max_version(&self) -> u64 {
+        self.rows
+            .iter()
+            .map(|(key, stored)| {
+                stored
+                    .inline_version()
+                    .or_else(|| self.row_versions.get(key).copied())
+                    .unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Convenience: a row's version as a `u64`, defaulting to `0` when absent.
+fn table_row_version(table: &TableData, key: &EncodedKey) -> u64 {
+    table.version_of(key).unwrap_or(0)
 }
 
 /// A table row that is either resident in memory or spilled to the persistent
@@ -84,15 +120,46 @@ pub struct TableData {
 /// through the value store's hot cache. This mirrors the inline/spilled model
 /// used by `KvEntry` so table-heavy workloads can grow beyond RAM instead of
 /// having writes rejected at the memory ceiling.
+/// The payload half of a [`StoredRow`]: either resident in memory or spilled to
+/// the persistent value store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StoredRow {
+pub enum StoredRowPayload {
     Resident(Row),
     Spilled(PersistentValueRef),
 }
 
+/// A table row that is either resident in memory or spilled to the persistent
+/// value store. Spilled rows keep only a `PersistentValueRef` (offset/len/hash)
+/// in the in-memory keyspace tree; the payload bytes are materialized on demand
+/// through the value store's hot cache.
+///
+/// The MVCC version (commit seq) is carried inline by the `Versioned` variant.
+/// The bare `Resident`/`Spilled` variants are **legacy**: they were written
+/// before the version was inlined, when it lived in a parallel
+/// `TableData::row_versions` map. They remain the first two variants so existing
+/// checkpoints deserialize unchanged; their version is read from that map until
+/// the row is rewritten or normalized into a `Versioned` form. New writes always
+/// produce `Versioned`, eliminating the redundant second resident copy of every
+/// primary key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredRow {
+    /// Legacy resident row (version in `TableData::row_versions`).
+    Resident(Row),
+    /// Legacy spilled row (version in `TableData::row_versions`).
+    Spilled(PersistentValueRef),
+    /// Current form: payload plus its inline MVCC version.
+    Versioned {
+        version: u64,
+        payload: StoredRowPayload,
+    },
+}
+
 impl Default for StoredRow {
     fn default() -> Self {
-        StoredRow::Resident(Row { values: Vec::new() })
+        StoredRow::Versioned {
+            version: 0,
+            payload: StoredRowPayload::Resident(Row { values: Vec::new() }),
+        }
     }
 }
 
@@ -103,23 +170,67 @@ impl From<Row> for StoredRow {
 }
 
 impl StoredRow {
+    /// A resident row carrying its inline version.
+    pub fn resident_versioned(version: u64, row: Row) -> Self {
+        StoredRow::Versioned {
+            version,
+            payload: StoredRowPayload::Resident(row),
+        }
+    }
+
+    /// A spilled row carrying its inline version.
+    pub fn spilled_versioned(version: u64, value_ref: PersistentValueRef) -> Self {
+        StoredRow::Versioned {
+            version,
+            payload: StoredRowPayload::Spilled(value_ref),
+        }
+    }
+
     /// Returns the row payload only if it is currently resident in memory.
     pub fn resident(&self) -> Option<&Row> {
         match self {
-            StoredRow::Resident(row) => Some(row),
-            StoredRow::Spilled(_) => None,
+            StoredRow::Resident(row)
+            | StoredRow::Versioned {
+                payload: StoredRowPayload::Resident(row),
+                ..
+            } => Some(row),
+            _ => None,
         }
     }
 
     pub fn value_ref(&self) -> Option<&PersistentValueRef> {
         match self {
-            StoredRow::Resident(_) => None,
-            StoredRow::Spilled(value_ref) => Some(value_ref),
+            StoredRow::Spilled(value_ref)
+            | StoredRow::Versioned {
+                payload: StoredRowPayload::Spilled(value_ref),
+                ..
+            } => Some(value_ref),
+            _ => None,
         }
     }
 
     pub fn is_spilled(&self) -> bool {
-        matches!(self, StoredRow::Spilled(_))
+        self.value_ref().is_some()
+    }
+
+    /// The inline MVCC version, if this row carries one. Legacy variants return
+    /// `None` (their version lives in `TableData::row_versions`).
+    pub fn inline_version(&self) -> Option<u64> {
+        match self {
+            StoredRow::Versioned { version, .. } => Some(*version),
+            _ => None,
+        }
+    }
+
+    /// Rebuild this row in `Versioned` form with the given version, preserving
+    /// the payload. Used to normalize legacy rows after a checkpoint load.
+    pub fn into_versioned(self, version: u64) -> Self {
+        let payload = match self {
+            StoredRow::Resident(row) => StoredRowPayload::Resident(row),
+            StoredRow::Spilled(value_ref) => StoredRowPayload::Spilled(value_ref),
+            StoredRow::Versioned { payload, .. } => payload,
+        };
+        StoredRow::Versioned { version, payload }
     }
 }
 
@@ -494,15 +605,17 @@ fn materialize_row<'a>(
     stored: &'a StoredRow,
     value_store: Option<&PersistentValueStore>,
 ) -> Result<std::borrow::Cow<'a, Row>, crate::error::AedbError> {
-    match stored {
-        StoredRow::Resident(row) => Ok(std::borrow::Cow::Borrowed(row)),
-        StoredRow::Spilled(value_ref) => {
-            let store = value_store.ok_or_else(|| crate::error::AedbError::Unavailable {
-                message: "persistent value store is not attached".into(),
-            })?;
-            let bytes = store.read(value_ref)?;
-            Ok(std::borrow::Cow::Owned(decode_row_payload(&bytes)?))
-        }
+    if let Some(row) = stored.resident() {
+        Ok(std::borrow::Cow::Borrowed(row))
+    } else if let Some(value_ref) = stored.value_ref() {
+        let store = value_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+            message: "persistent value store is not attached".into(),
+        })?;
+        let bytes = store.read(value_ref)?;
+        Ok(std::borrow::Cow::Owned(decode_row_payload(&bytes)?))
+    } else {
+        // Unreachable: every StoredRow is either resident or spilled.
+        Ok(std::borrow::Cow::Owned(Row { values: Vec::new() }))
     }
 }
 
@@ -1080,7 +1193,7 @@ impl Keyspace {
         for (namespace_id, namespace) in self.namespaces.iter() {
             for (table_name, table) in namespace.tables.iter() {
                 for (key, stored) in table.rows.iter() {
-                    let StoredRow::Resident(row) = stored else {
+                    let Some(row) = stored.resident() else {
                         continue;
                     };
                     let old_cost = row_mem_cost(row);
@@ -1088,7 +1201,7 @@ impl Keyspace {
                         continue;
                     }
                     let memory_reduction_bytes = old_cost - new_cost;
-                    let version = table.row_versions.get(key).copied().unwrap_or(0);
+                    let version = table_row_version(table, key);
                     let candidate_index = candidates.len();
                     candidates.push((
                         namespace_id.clone(),
@@ -1161,12 +1274,13 @@ impl Keyspace {
             let Some(stored) = table.rows.get(&key) else {
                 continue;
             };
-            let StoredRow::Resident(row) = stored else {
+            let Some(row) = stored.resident() else {
                 continue;
             };
             let old_cost = row_mem_cost(row);
             let new_cost = persistent_value_ref_cost(&value_ref);
-            table.rows.insert(key, StoredRow::Spilled(value_ref));
+            let version = table_row_version(table, &key);
+            table.rows.insert(key, StoredRow::spilled_versioned(version, value_ref));
             self.mem_bytes = self
                 .mem_bytes
                 .saturating_add(new_cost)
@@ -1553,8 +1667,11 @@ impl Keyspace {
             }
             table
                 .rows
-                .insert(encoded_pk.clone(), StoredRow::Resident(row));
-            table.row_versions.insert(encoded_pk.clone(), commit_seq);
+                .insert(encoded_pk.clone(), StoredRow::resident_versioned(commit_seq, row));
+            // The version is now carried inline by the row. Clear any legacy
+            // parallel-map entry for this key so the redundant resident copy of
+            // the primary key is released as data is rewritten.
+            table.row_versions.remove(&encoded_pk);
             old_cost
         };
         self.mem_bytes = self
@@ -1765,7 +1882,7 @@ impl Keyspace {
         let encoded_pk = EncodedKey::from_values(pk);
         self.namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.tables.get(table_name))
-            .and_then(|t| t.row_versions.get(&encoded_pk).copied())
+            .and_then(|t| t.version_of(&encoded_pk))
             .unwrap_or(0)
     }
 
@@ -1780,9 +1897,16 @@ impl Keyspace {
         self.namespace(&NamespaceId::project_scope(project_id, scope_id))
             .and_then(|ns| ns.tables.get(table_name))
             .map(|t| {
-                t.row_versions
+                // Versions are carried inline on rows (with a legacy-map
+                // fallback), so range over the rows themselves.
+                t.rows
                     .range((start, end))
-                    .map(|(_, version)| *version)
+                    .map(|(key, stored)| {
+                        stored
+                            .inline_version()
+                            .or_else(|| t.row_versions.get(key).copied())
+                            .unwrap_or(0)
+                    })
                     .max()
                     .unwrap_or(0)
             })
@@ -3038,8 +3162,13 @@ impl KeyspaceSnapshot {
                     .collect();
                 for key in spilled_keys {
                     if let Some(stored) = table.rows.get(&key) {
+                        let version = stored.inline_version();
                         let row = materialize_row(stored, value_store)?.into_owned();
-                        table.rows.insert(key, StoredRow::Resident(row));
+                        let restored = match version {
+                            Some(version) => StoredRow::resident_versioned(version, row),
+                            None => StoredRow::Resident(row),
+                        };
+                        table.rows.insert(key, restored);
                     }
                 }
             }

@@ -664,8 +664,7 @@ impl AedbInstance {
                 None => 0,
             };
         let checkpoint_version = checkpoint_table
-            .and_then(|table| table.row_versions.get(&checkpoint_pk))
-            .copied()
+            .and_then(|table| table.version_of(&checkpoint_pk))
             .unwrap_or(0);
         let head_seq = lease.view.seq;
 
@@ -940,7 +939,7 @@ fn keyed_state_snapshot_from_table(
         None => None,
     };
     let version = table
-        .and_then(|table| table.row_versions.get(&encoded).copied())
+        .and_then(|table| table.version_of(&encoded))
         .unwrap_or(0);
     Ok(KeyedStateSnapshot {
         row,

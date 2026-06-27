@@ -342,10 +342,18 @@ fn checksum_state(state: &SnapshotDumpState) -> Result<String, AedbError> {
                 hash_encoded(&mut h, &*row)?;
             }
 
+            // Versions are carried inline on rows now (legacy map as fallback).
+            // Iterating rows in key order reproduces the same (pk, version)
+            // pairs the old parallel-map digest produced for legacy data, while
+            // also covering inline-versioned rows.
             hash_label(&mut h, "row_versions");
-            for (pk, version) in table.row_versions.iter() {
+            for (pk, stored) in table.rows.iter() {
+                let version = stored
+                    .inline_version()
+                    .or_else(|| table.row_versions.get(pk).copied())
+                    .unwrap_or(0);
                 hash_bytes(&mut h, pk.as_slice());
-                hash_encoded(&mut h, version)?;
+                hash_encoded(&mut h, &version)?;
             }
 
             hash_label(&mut h, "indexes");
@@ -519,9 +527,16 @@ fn check_invariants(recovered: &RecoveredState) -> InvariantReport {
         for (table_name, table_data) in &ns.tables {
             table_count = table_count.saturating_add(1);
             table_rows = table_rows.saturating_add(table_data.rows.len() as u64);
-            if table_data.rows.len() != table_data.row_versions.len() {
+            // Every row must resolve a version (inline on the row, or via the
+            // legacy parallel map). A row that resolves none has lost its
+            // version metadata.
+            if table_data
+                .rows
+                .keys()
+                .any(|key| table_data.version_of(key).is_none())
+            {
                 violations.push(format!(
-                    "row_versions cardinality mismatch in namespace={:?} table={table_name}",
+                    "row missing version metadata in namespace={:?} table={table_name}",
                     ns_id
                 ));
             }
