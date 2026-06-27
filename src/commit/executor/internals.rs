@@ -2256,6 +2256,47 @@ pub(super) fn prepare_commit_epoch(
             }
         };
     }
+    if state.config.table_row_segment_eviction_enabled
+        && pre_wal_memory_estimate > state.config.max_memory_estimate_bytes
+    {
+        pre_wal_memory_estimate = match working_keyspace
+            .flush_table_rows_to_segments_to_memory_target(state.config.max_memory_estimate_bytes)
+        {
+            Ok(memory_estimate) => memory_estimate,
+            Err(err) => {
+                overwrite_assertion_failures_with_wal_error(
+                    &mut outcomes,
+                    &err,
+                    "epoch aborted during table row eviction",
+                );
+                for failed in sequenced {
+                    outcomes.push(EpochOutcome {
+                        request: failed.request,
+                        result: Err(AedbError::Validation(format!(
+                            "epoch aborted during table row eviction: {err}"
+                        ))),
+                        post_apply_delta: None,
+                    });
+                }
+                return EpochProcessResult {
+                    outcomes,
+                    coordinator_apply_attempts,
+                    coordinator_apply_micros,
+                    parallel_apply_micros,
+                    pre_wal_micros,
+                    finalize_micros: 0,
+                    read_set_conflicts,
+                    wal_append_ops,
+                    wal_append_bytes,
+                    wal_append_micros,
+                    wal_sync_ops,
+                    wal_sync_micros,
+                    sync_executed,
+                    catalog_changed,
+                };
+            }
+        };
+    }
     if pre_wal_memory_estimate > state.config.max_memory_estimate_bytes {
         let err_message = format!(
             "memory estimate exceeded before WAL commit: memory_estimate_bytes={}, max_memory_estimate_bytes={}",

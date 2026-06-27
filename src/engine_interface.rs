@@ -445,8 +445,13 @@ impl AedbInstance {
 
         let mut out = Vec::new();
         for pk in pks {
-            if let Some(stored) = table.rows.get(&pk) {
-                out.push(lease.view.keyspace.materialize_row(stored)?.into_owned());
+            if let Some(row) =
+                lease
+                    .view
+                    .keyspace
+                    .get_row_by_encoded(project_id, scope_id, keyed_state, &pk)?
+            {
+                out.push(row.into_owned());
             }
         }
         Ok(out)
@@ -933,14 +938,10 @@ fn keyed_state_snapshot_from_table(
     key: Value,
 ) -> Result<KeyedStateSnapshot, AedbError> {
     let encoded = EncodedKey::from_values(std::slice::from_ref(&key));
-    let table = keyspace.table(project_id, scope_id, keyed_state);
-    let row = match table.and_then(|table| table.rows.get(&encoded)) {
-        Some(stored) => Some(keyspace.materialize_row(stored)?.into_owned()),
-        None => None,
-    };
-    let version = table
-        .and_then(|table| table.version_of(&encoded))
-        .unwrap_or(0);
+    let row = keyspace
+        .get_row_by_encoded(project_id, scope_id, keyed_state, &encoded)?
+        .map(|row| row.into_owned());
+    let version = keyspace.tier_row_version(project_id, scope_id, keyed_state, &encoded);
     Ok(KeyedStateSnapshot {
         row,
         version,

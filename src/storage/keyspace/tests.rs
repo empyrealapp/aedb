@@ -1345,3 +1345,103 @@ fn legacy_table_data_round_trips_and_resolves_versions() {
         Some(StoredRow::Resident(_))
     ));
 }
+
+#[test]
+fn cold_table_row_tier_evicts_and_pages_back_correctly() {
+    use crate::storage::encoded_key::EncodedKey;
+    let dir = tempdir().expect("temp dir");
+    let segment_store = Arc::new(KvSegmentStore::open(dir.path()).expect("open segment store"));
+    let mut ks = Keyspace::default();
+    ks.attach_kv_segment_store(Arc::clone(&segment_store));
+
+    for i in 0..64i64 {
+        ks.upsert_row(
+            "p",
+            "app",
+            "t",
+            vec![Value::Integer(i)],
+            row(vec![Value::Integer(i), Value::Text(format!("v{i}").into())]),
+            (i + 1) as u64,
+        );
+    }
+    let before = ks.estimate_memory_bytes();
+
+    // Evict the whole table to the cold tier.
+    let after = ks
+        .flush_table_rows_to_segments_to_memory_target(0)
+        .expect("evict rows");
+    assert!(after < before, "eviction must reduce resident memory");
+    let snap = ks.snapshot();
+    let table = snap.table("p", "app", "t").expect("table");
+    assert!(table.rows.is_empty(), "hot rows evicted");
+    assert!(!table.row_segments.is_empty(), "cold segment written");
+
+    // Point read pages a cold row back, with the right value and version.
+    let key7 = EncodedKey::from_values(&[Value::Integer(7)]);
+    let got = ks
+        .get_row("p", "app", "t", &[Value::Integer(7)])
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.values[1], Value::Text("v7".into()));
+    assert_eq!(ks.snapshot().table("p", "app", "t").unwrap().version_of(&key7), None);
+    assert_eq!(
+        ks.snapshot().tier_row_version("p", "app", "t", &key7),
+        8,
+        "cold row version paged back"
+    );
+
+    // Full tier-aware scan returns every row in key order.
+    let scanned = ks
+        .snapshot()
+        .tier_scan_rows("p", "app", "t", Bound::Unbounded, Bound::Unbounded, 1000)
+        .expect("scan");
+    assert_eq!(scanned.len(), 64);
+    assert_eq!(scanned[0].1.values[0], Value::Integer(0));
+    assert_eq!(scanned[63].1.values[0], Value::Integer(63));
+
+    // Delete an evicted-only row -> tombstoned -> invisible to read and scan.
+    let deleted = ks
+        .delete_row("p", "app", "t", &[Value::Integer(10)], 100)
+        .expect("delete")
+        .expect("returns the cold row");
+    assert_eq!(deleted.values[0], Value::Integer(10));
+    assert!(ks.get_row("p", "app", "t", &[Value::Integer(10)]).unwrap().is_none());
+    let scanned = ks
+        .snapshot()
+        .tier_scan_rows("p", "app", "t", Bound::Unbounded, Bound::Unbounded, 1000)
+        .expect("scan");
+    assert_eq!(scanned.len(), 63, "deleted cold row excluded");
+
+    // Re-upsert an evicted key -> hot copy wins over the stale segment.
+    ks.upsert_row(
+        "p",
+        "app",
+        "t",
+        vec![Value::Integer(5)],
+        row(vec![Value::Integer(5), Value::Text("v5-new".into())]),
+        200,
+    );
+    let got = ks
+        .get_row("p", "app", "t", &[Value::Integer(5)])
+        .expect("get")
+        .expect("present");
+    assert_eq!(got.values[1], Value::Text("v5-new".into()));
+
+    // Checkpoint re-inlines the cold tier: every live row resident, segments gone.
+    let checkpoint = ks
+        .snapshot()
+        .materialized_for_checkpoint()
+        .expect("checkpoint");
+    let cp_table = checkpoint.table("p", "app", "t").expect("cp table");
+    assert!(cp_table.row_segments.is_empty(), "cold tier re-inlined");
+    assert_eq!(cp_table.rows.len(), 63, "all live rows resident");
+    assert!(
+        !cp_table
+            .rows
+            .contains_key(&EncodedKey::from_values(&[Value::Integer(10)])),
+        "deleted row stays deleted after re-inline"
+    );
+    let key5 = EncodedKey::from_values(&[Value::Integer(5)]);
+    let stored5 = cp_table.rows.get(&key5).expect("row 5");
+    assert_eq!(stored5.resident().unwrap().values[1], Value::Text("v5-new".into()));
+}

@@ -301,10 +301,13 @@ fn evaluate_assertion(
             primary_key,
             expected,
         } => {
-            let ns = namespace_key(project_id, scope_id);
             let exists = keyspace
-                .table_by_namespace_key(&ns, table_name)
-                .and_then(|table| table.rows.get(&EncodedKey::from_values(primary_key)))
+                .get_row_by_encoded(
+                    project_id,
+                    scope_id,
+                    table_name,
+                    &EncodedKey::from_values(primary_key),
+                )?
                 .is_some();
             if exists == *expected {
                 Ok(None)
@@ -325,14 +328,15 @@ fn evaluate_assertion(
             let Some(column_idx) = schema.columns.iter().position(|c| c.name == *column) else {
                 return Err(AedbError::Validation(format!("column not found: {column}")));
             };
-            let ns = namespace_key(project_id, scope_id);
-            let Some(table) = keyspace.table_by_namespace_key(&ns, table_name) else {
+            let Some(row) = keyspace.get_row_by_encoded(
+                project_id,
+                scope_id,
+                table_name,
+                &EncodedKey::from_values(primary_key),
+            )?
+            else {
                 return Ok(Some(AssertionActual::Missing));
             };
-            let Some(stored) = table.rows.get(&EncodedKey::from_values(primary_key)) else {
-                return Ok(Some(AssertionActual::Missing));
-            };
-            let row = keyspace.materialize_row(stored)?;
             if let Some(budget) = read_bytes.as_deref_mut() {
                 budget.charge(row_byte_size(&row))?;
             }
@@ -355,20 +359,26 @@ fn evaluate_assertion(
         } => {
             let schema = table_schema(catalog, project_id, scope_id, table_name)?;
             let ns = namespace_key(project_id, scope_id);
-            let count = keyspace
-                .table_by_namespace_key(&ns, table_name)
-                .map(|table| {
-                    count_matching_rows(
-                        table.rows.values(),
-                        keyspace,
-                        schema,
-                        filter,
-                        max_scan_rows,
-                        read_bytes.as_deref_mut(),
-                    )
-                })
-                .transpose()?
-                .unwrap_or(0);
+            let cold = tier_assertion_rows(keyspace, project_id, scope_id, table_name, max_scan_rows)?;
+            let count = match (cold, keyspace.table_by_namespace_key(&ns, table_name)) {
+                (Some(stored), _) => count_matching_rows(
+                    stored.iter(),
+                    keyspace,
+                    schema,
+                    filter,
+                    max_scan_rows,
+                    read_bytes.as_deref_mut(),
+                )?,
+                (None, Some(table)) => count_matching_rows(
+                    table.rows.values(),
+                    keyspace,
+                    schema,
+                    filter,
+                    max_scan_rows,
+                    read_bytes.as_deref_mut(),
+                )?,
+                (None, None) => 0,
+            };
             if compare_ord(count.cmp(threshold), *op) {
                 Ok(None)
             } else {
@@ -389,9 +399,18 @@ fn evaluate_assertion(
                 return Err(AedbError::Validation(format!("column not found: {column}")));
             };
             let ns = namespace_key(project_id, scope_id);
-            let sum = match keyspace.table_by_namespace_key(&ns, table_name) {
-                None => zero_for_threshold(threshold),
-                Some(table) => sum_rows_for_column(
+            let cold = tier_assertion_rows(keyspace, project_id, scope_id, table_name, max_scan_rows)?;
+            let sum = match (cold, keyspace.table_by_namespace_key(&ns, table_name)) {
+                (Some(stored), _) => sum_rows_for_column(
+                    stored.iter(),
+                    keyspace,
+                    schema,
+                    column_idx,
+                    filter,
+                    max_scan_rows,
+                    read_bytes.as_deref_mut(),
+                )?,
+                (None, Some(table)) => sum_rows_for_column(
                     table.rows.values(),
                     keyspace,
                     schema,
@@ -400,6 +419,7 @@ fn evaluate_assertion(
                     max_scan_rows,
                     read_bytes.as_deref_mut(),
                 )?,
+                (None, None) => zero_for_threshold(threshold),
             };
             if compare_values(&sum, threshold, *op) {
                 Ok(None)
@@ -662,6 +682,40 @@ fn sum_rows_for_column<'a>(
             "unsupported column type for SumCompare".into(),
         )),
     }
+}
+
+/// When a table has rows in the cold segment tier, materialize the full merged
+/// row set (hot + cold − tombstones) so aggregate assertions see every row.
+/// Returns `None` when there is no cold tier, signalling the fast hot-only path.
+fn tier_assertion_rows(
+    keyspace: &Keyspace,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    max_scan_rows: usize,
+) -> Result<Option<Vec<StoredRow>>, AedbError> {
+    let ns = namespace_key(project_id, scope_id);
+    let has_cold = keyspace
+        .table_by_namespace_key(&ns, table_name)
+        .map(|table| !table.row_segments.is_empty())
+        .unwrap_or(false);
+    if !has_cold {
+        return Ok(None);
+    }
+    let scanned = keyspace.tier_scan_rows(
+        project_id,
+        scope_id,
+        table_name,
+        std::ops::Bound::Unbounded,
+        std::ops::Bound::Unbounded,
+        max_scan_rows.saturating_add(1),
+    )?;
+    Ok(Some(
+        scanned
+            .into_iter()
+            .map(|(_, row)| StoredRow::Resident(row))
+            .collect(),
+    ))
 }
 
 fn count_matching_rows<'a>(

@@ -20,6 +20,7 @@ fn check_invariants_detects_secondary_index_mismatch() {
         row_versions: OrdMap::new(),
         structural_version: 0,
         indexes: ImHashMap::new(),
+        ..Default::default()
     };
     table.rows.insert(pk.clone(), row.clone().into());
     table.row_versions.insert(pk.clone(), 1);
