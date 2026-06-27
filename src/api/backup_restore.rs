@@ -151,8 +151,14 @@ impl AedbInstance {
         let temp_path = temp.path().to_path_buf();
         let backup_file = backup_file.to_path_buf();
         let checkpoint_key = self._config.checkpoint_key().copied();
+        let compression_level = self._config.checkpoint_compression_level;
         tokio::task::spawn_blocking(move || {
-            write_backup_archive(&temp_path, &backup_file, checkpoint_key.as_ref())
+            write_backup_archive(
+                &temp_path,
+                &backup_file,
+                checkpoint_key.as_ref(),
+                compression_level,
+            )
         })
         .await
         .map_err(|e| AedbError::Io(std::io::Error::other(e.to_string())))??;

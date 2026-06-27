@@ -84,7 +84,7 @@ fn high_throughput_config() -> AedbConfig {
 
 async fn setup(config: AedbConfig, rows: i64) -> (tempfile::TempDir, AedbInstance) {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -855,7 +855,7 @@ async fn benchmark_persistent_large_kv_values() {
 
     async fn setup_large_values(hot_cache_bytes: usize) -> (tempfile::TempDir, AedbInstance) {
         let dir = tempdir().expect("temp dir");
-        let db = AedbInstance::open(disk_config(hot_cache_bytes), dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(disk_config(hot_cache_bytes), dir.path()).expect("open");
         db.create_project(PROJECT_ID).await.expect("project");
         for i in 0..VALUE_COUNT {
             let value = vec![u8::try_from(i % 251).expect("byte"); VALUE_BYTES];
@@ -872,7 +872,7 @@ async fn benchmark_persistent_large_kv_values() {
     }
 
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(disk_config(0), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(disk_config(0), dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
     let mut large_set_lat = Vec::new();
     for i in 0..VALUE_COUNT {
@@ -1061,7 +1061,7 @@ fn benchmark_single_file_archive_large_page_file_streaming() {
 
     let key = [13u8; 32];
     let write_start = Instant::now();
-    write_backup_archive(src.path(), &archive, Some(&key)).expect("write archive");
+    write_backup_archive(src.path(), &archive, Some(&key), 3).expect("write archive");
     let write_ms = write_start.elapsed().as_millis();
 
     let extract_start = Instant::now();
@@ -1110,7 +1110,7 @@ async fn benchmark_small_kv_memory_pressure_spill() {
         ..AedbConfig::default()
     };
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
 
     let mut set_lat = Vec::new();
@@ -1213,7 +1213,7 @@ async fn benchmark_many_small_kv_no_pressure() {
         ..AedbConfig::default()
     };
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
 
     for i in 0..SEED_COUNT {
@@ -1293,7 +1293,7 @@ async fn benchmark_many_u256_sized_kv_no_pressure() {
         ..AedbConfig::default()
     };
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
 
     for i in 0..SEED_COUNT {
@@ -1394,7 +1394,7 @@ async fn benchmark_durability_profile_write_matrix() {
 
     for (name, config) in profiles {
         let dir = tempdir().expect("temp dir");
-        let db = AedbInstance::open(config, dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
         db.create_project(PROJECT_ID).await.expect("project");
 
         let mut latencies = Vec::with_capacity(OPS);
@@ -1437,7 +1437,7 @@ async fn benchmark_many_small_kv_batching() {
     let config = high_throughput_config();
 
     let individual_dir = tempdir().expect("individual temp dir");
-    let individual_db = AedbInstance::open(config.clone(), individual_dir.path()).expect("open");
+    let individual_db = AedbInstance::open_anonymous(config.clone(), individual_dir.path()).expect("open");
     individual_db
         .create_project(PROJECT_ID)
         .await
@@ -1458,7 +1458,7 @@ async fn benchmark_many_small_kv_batching() {
     let individual_ops_per_sec = (INDIVIDUAL_OPS as f64 / individual_secs) as u64;
 
     let batch_dir = tempdir().expect("batch temp dir");
-    let batch_db = AedbInstance::open(config, batch_dir.path()).expect("open");
+    let batch_db = AedbInstance::open_anonymous(config, batch_dir.path()).expect("open");
     batch_db.create_project(PROJECT_ID).await.expect("project");
     let batch_start = Instant::now();
     for batch in 0..BATCHES {
@@ -1510,7 +1510,7 @@ async fn benchmark_spilled_kv_hot_cold_read_mix() {
         ..AedbConfig::default()
     };
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project(PROJECT_ID).await.expect("project");
     for i in 0..KEYS {
         db.commit(Mutation::KvSet {
@@ -1585,7 +1585,7 @@ async fn benchmark_checkpoint_and_backup_under_spilled_write_load() {
     };
     let dir = tempdir().expect("temp dir");
     let backup_dir = tempdir().expect("backup dir");
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project(PROJECT_ID).await.expect("project");
     for i in 0..SEED_VALUES {
         db.commit(Mutation::KvSet {

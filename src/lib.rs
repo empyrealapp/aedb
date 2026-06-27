@@ -1220,7 +1220,27 @@ impl AedbInstance {
         Self::open_internal(config, dir, true)
     }
 
+    /// Open an instance that requires an authenticated caller for every
+    /// caller-facing operation (the secure default).
+    ///
+    /// Anonymous `commit`/`kv_set`/`query` and the `*_no_auth` helpers are
+    /// rejected; use the `*_as` APIs with a [`CallerContext`]. Unlike
+    /// [`Self::open_secure`], this does not additionally enforce the full
+    /// secure-config validation (e.g. a configured manifest HMAC key) — it only
+    /// flips the authenticated-caller guard on.
+    ///
+    /// To intentionally allow anonymous access, use [`Self::open_anonymous`].
     pub fn open(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
+        Self::open_internal(config, dir, true)
+    }
+
+    /// Open an instance that permits anonymous (unauthenticated) operations.
+    ///
+    /// This is the explicit opt-out from the authenticated-caller default of
+    /// [`Self::open`]. Anonymous `commit`/`kv_set`/`query` and the `*_no_auth`
+    /// helpers are allowed. Prefer [`Self::open`] (or [`Self::open_secure`]) for
+    /// any deployment exposed to untrusted callers.
+    pub fn open_anonymous(config: AedbConfig, dir: &Path) -> Result<Self, AedbError> {
         Self::open_internal(config, dir, false)
     }
 
@@ -1437,6 +1457,39 @@ impl AedbInstance {
         let result = self.executor.submit_kv_sizes_prechecked(mutation).await;
         if let Some(started) = started {
             self.emit_commit_telemetry("commit", started, &result);
+        }
+        let result = result?;
+        self.dispatch_lifecycle_events_for_commit(result.commit_seq)
+            .await;
+        Ok(result)
+    }
+
+    /// Commit a mutation without a caller identity.
+    ///
+    /// This is the explicit anonymous write path, mirroring
+    /// [`Self::query_no_auth`] on the read side. It is unavailable for instances
+    /// opened with [`Self::open`], [`Self::open_secure`], or
+    /// [`Self::open_production`]; prefer [`Self::commit_as`] in services. Open
+    /// the instance with [`Self::open_anonymous`] to use this path.
+    pub async fn commit_no_auth(
+        &self,
+        mutation: Mutation,
+    ) -> Result<CommitResult, AedbError> {
+        if self.require_authenticated_calls {
+            return Err(AedbError::PermissionDenied(
+                "commit_no_auth is unavailable in secure mode; use commit_as".into(),
+            ));
+        }
+        let started = self
+            .telemetry_hooks_present
+            .load(Ordering::Acquire)
+            .then(Instant::now);
+        // Early size validation to prevent DoS via oversized keys/values
+        crate::commit::validation::validate_kv_sizes_early(&mutation, &self._config)?;
+
+        let result = self.executor.submit_kv_sizes_prechecked(mutation).await;
+        if let Some(started) = started {
+            self.emit_commit_telemetry("commit_no_auth", started, &result);
         }
         let result = result?;
         self.dispatch_lifecycle_events_for_commit(result.commit_seq)

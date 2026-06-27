@@ -245,7 +245,7 @@ fn open_db(opts: &GlobalOptions) -> Result<AedbInstance, String> {
     if opts.secure {
         AedbInstance::open_secure(config, &opts.data_dir).map_err(|e| e.to_string())
     } else {
-        AedbInstance::open(config, &opts.data_dir).map_err(|e| e.to_string())
+        AedbInstance::open_anonymous(config, &opts.data_dir).map_err(|e| e.to_string())
     }
 }
 

@@ -70,7 +70,7 @@ async fn envelope_read_bytes_budget_passes_for_tiny_envelope() {
         max_read_bytes_per_envelope: 1024,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit_envelope(TransactionEnvelope {
@@ -106,7 +106,7 @@ async fn envelope_read_bytes_budget_rejects_large_scan() {
         max_read_bytes_per_envelope: 512,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -183,7 +183,7 @@ async fn envelope_read_bytes_budget_rejects_large_scan() {
 #[tokio::test]
 async fn commit_ddl_batch_is_atomic_and_reports_per_op_results() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
 
     let failed = db
@@ -298,7 +298,7 @@ async fn commit_ddl_batch_is_atomic_and_reports_per_op_results() {
 #[tokio::test]
 async fn commit_ddl_batch_supports_dependent_ddl_ordering() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     let batch = db
         .commit_ddl_batch(vec![
@@ -359,7 +359,7 @@ async fn commit_ddl_batch_supports_dependent_ddl_ordering() {
 #[tokio::test]
 async fn idempotency_prunes_by_commit_window() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(
+    let db = AedbInstance::open_anonymous(
         AedbConfig {
             idempotency_window_commits: 1,
             ..AedbConfig::default()
@@ -426,7 +426,7 @@ async fn idempotency_prunes_by_commit_window() {
 #[tokio::test]
 async fn idempotency_prunes_by_time_window() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(
+    let db = AedbInstance::open_anonymous(
         AedbConfig {
             idempotency_window_commits: 100,
             idempotency_window_seconds: 1,
@@ -502,7 +502,7 @@ fn open_rejects_invalid_config() {
         batch_interval_ms: 0,
         ..AedbConfig::default()
     };
-    let err = AedbInstance::open(bad, dir.path())
+    let err = AedbInstance::open_anonymous(bad, dir.path())
         .err()
         .expect("invalid config");
     assert!(matches!(err, crate::error::AedbError::InvalidConfig { .. }));
@@ -511,7 +511,7 @@ fn open_rejects_invalid_config() {
         max_transaction_bytes: crate::wal::frame::MAX_FRAME_BODY_BYTES + 1,
         ..AedbConfig::default()
     };
-    let err = AedbInstance::open(too_large_txn, dir.path())
+    let err = AedbInstance::open_anonymous(too_large_txn, dir.path())
         .err()
         .expect("oversized transaction bound");
     assert!(matches!(err, crate::error::AedbError::InvalidConfig { .. }));
@@ -521,7 +521,7 @@ fn open_rejects_invalid_config() {
         coordinator_locking_enabled: false,
         ..AedbConfig::default()
     };
-    let err = AedbInstance::open(deadlock_unsafe, dir.path())
+    let err = AedbInstance::open_anonymous(deadlock_unsafe, dir.path())
         .err()
         .expect("strict mode must require coordinator locking");
     assert!(matches!(err, crate::error::AedbError::InvalidConfig { .. }));
@@ -530,7 +530,7 @@ fn open_rejects_invalid_config() {
 #[tokio::test]
 async fn metrics_surface_reflects_commits() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let m = db.metrics();
     assert!(m.commits_total >= 1);
@@ -550,7 +550,7 @@ async fn commit_with_visible_finality_can_return_before_durable_head_in_batch_mo
         batch_max_bytes: usize::MAX,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let result = db
@@ -581,7 +581,7 @@ async fn commit_with_durable_finality_waits_until_durable_head_catches_up() {
         batch_max_bytes: usize::MAX,
         ..AedbConfig::default()
     };
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let fsync_db = Arc::clone(&db);
@@ -624,7 +624,7 @@ async fn finality_profile_visible_vs_durable_low_latency_mode() {
         ops: usize,
     ) -> (u64, u64, u64, crate::OperationalMetrics) {
         let dir = tempdir().expect("temp");
-        let db = AedbInstance::open(config, dir.path()).expect("open");
+        let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
         db.create_project("p").await.expect("project");
         let started = Instant::now();
         let mut lat_sum = 0u128;
@@ -750,7 +750,7 @@ async fn finality_profile_visible_vs_durable_low_latency_mode() {
 #[tokio::test]
 async fn commit_success_is_observable_at_its_commit_seq() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let result = db
@@ -779,7 +779,7 @@ async fn commit_success_is_observable_at_its_commit_seq() {
 #[tokio::test]
 async fn failed_multi_mutation_envelope_is_atomic_and_has_no_partial_effects() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let before = db.head_state().await.visible_head_seq;
@@ -838,7 +838,7 @@ async fn failed_multi_mutation_envelope_is_atomic_and_has_no_partial_effects() {
 #[tokio::test]
 async fn action_envelope_applied_once() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let result = db
@@ -880,7 +880,7 @@ async fn action_envelope_applied_once() {
 #[tokio::test]
 async fn action_envelope_duplicate_returns_duplicate_outcome() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let req = ActionEnvelopeRequest {
@@ -926,7 +926,7 @@ async fn action_envelope_duplicate_returns_duplicate_outcome() {
 #[tokio::test]
 async fn single_envelope_atomicity() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
@@ -993,7 +993,7 @@ async fn retry_idempotency_is_exactly_once_under_commit_pressure() {
         commit_timeout_ms: 1,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let key = IdempotencyKey([91u8; 16]);
@@ -1106,7 +1106,7 @@ async fn multi_update_transaction_envelope_updates_table_and_kv() {
         batch_max_bytes: usize::MAX,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -1294,7 +1294,7 @@ async fn profile_end_to_end_pipeline_breakdown() {
         ..AedbConfig::default()
     };
     config.manifest_hmac_key = None;
-    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     for i in 0..20_000usize {
@@ -1409,7 +1409,7 @@ async fn profile_end_to_end_pipeline_breakdown() {
 
     drop(db);
     let reopen_started = Instant::now();
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let reopen_elapsed = reopen_started.elapsed();
     let reopen_metrics = reopened.operational_metrics().await;
 
@@ -1460,7 +1460,7 @@ async fn preflight_uses_instance_config_limits() {
         max_kv_value_bytes: 4,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let result = db
@@ -1479,7 +1479,7 @@ async fn preflight_uses_instance_config_limits() {
 #[tokio::test]
 async fn subscribe_commits_delivers_delta_after_commit() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
 
     db.create_project("p").await.expect("project");
     // Subscribe AFTER setup so we observe only the deltas under test.
@@ -1532,7 +1532,7 @@ async fn subscribe_commits_lagged_subscriber_can_resume() {
         ..AedbConfig::default()
     };
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
 
     let mut rx = db.subscribe_commits();
     db.create_project("p").await.expect("project");

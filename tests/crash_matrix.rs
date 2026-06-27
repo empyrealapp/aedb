@@ -30,7 +30,7 @@ use tempfile::tempdir;
 async fn reopen_after_simulated_crash(config: AedbConfig, dir: &Path) -> AedbInstance {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match AedbInstance::open(config.clone(), dir) {
+        match AedbInstance::open_anonymous(config.clone(), dir) {
             Ok(db) => return db,
             Err(AedbError::Unavailable { .. }) if Instant::now() < deadline => {
                 // Yield via the runtime (not a blocking sleep) so the detached
@@ -111,7 +111,7 @@ fn env_or_u64(default: u64, var: &str) -> u64 {
 }
 
 async fn setup_a17_cycle_table(dir: &Path, writer_config: &AedbConfig) {
-    let bootstrap = AedbInstance::open(writer_config.clone(), dir).expect("open");
+    let bootstrap = AedbInstance::open_anonymous(writer_config.clone(), dir).expect("open");
     seed_project(&bootstrap).await;
     bootstrap
         .commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -144,7 +144,7 @@ async fn setup_a17_cycle_table(dir: &Path, writer_config: &AedbConfig) {
 }
 
 async fn a17_write_cycle(dir: &Path, writer_config: &AedbConfig, cycle: u64) {
-    let db = AedbInstance::open(writer_config.clone(), dir).expect("reopen");
+    let db = AedbInstance::open_anonymous(writer_config.clone(), dir).expect("reopen");
     let cycle_i64 = i64::try_from(cycle).expect("cycle must fit i64");
     db.commit(Mutation::Upsert {
         project_id: "p".into(),
@@ -161,7 +161,7 @@ async fn a17_write_cycle(dir: &Path, writer_config: &AedbConfig, cycle: u64) {
 
 async fn assert_a17_cycle_row(dir: &Path, writer_config: &AedbConfig, cycle: u64) {
     let cycle_i64 = i64::try_from(cycle).expect("cycle must fit i64");
-    let verify = AedbInstance::open(writer_config.clone(), dir)
+    let verify = AedbInstance::open_anonymous(writer_config.clone(), dir)
         .unwrap_or_else(|e| panic!("reopen verify failed at cycle {cycle}: {e}"));
     let row = verify
         .query(
@@ -210,7 +210,7 @@ async fn wait_for_processor_checkpoint(
 async fn crash_matrix_baseline_graceful_shutdown_recovers_all_commits() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     for i in 0..1_000u64 {
@@ -236,7 +236,7 @@ async fn crash_matrix_baseline_graceful_shutdown_recovers_all_commits() {
 async fn crash_matrix_mid_commit_economic_survives_restart() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     let result = db
@@ -274,7 +274,7 @@ async fn crash_matrix_mid_commit_economic_survives_restart() {
 async fn crash_matrix_mid_commit_batch_loses_unflushed_tail() {
     let dir = tempdir().expect("temp dir");
     let config = batch_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     for i in 0..64u64 {
@@ -305,7 +305,7 @@ async fn crash_matrix_full_durability_abrupt_restart_recovers_all_acknowledged_c
         hash_chain_required: false,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     let mut last_commit_seq = 1u64; // project + app scope bootstrap writes
@@ -345,7 +345,7 @@ async fn crash_matrix_full_durability_commits_after_checkpoint_survive_abrupt_re
         hash_chain_required: false,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     // Pre-checkpoint commits.
@@ -403,7 +403,7 @@ async fn crash_matrix_full_durability_commits_after_checkpoint_survive_abrupt_re
 async fn crash_matrix_mid_checkpoint_tmp_file_is_ignored() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
@@ -448,7 +448,7 @@ async fn crash_matrix_reactive_processor_registry_and_checkpoint_resume_after_cr
     let mut config = production_config();
     config.recovery_mode = RecoveryMode::Permissive;
     config.hash_chain_required = false;
-    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open"));
     seed_project(&db).await;
     db.create_scope("p", "app").await.expect("scope");
 
@@ -517,7 +517,7 @@ async fn crash_matrix_reactive_processor_dlq_survives_crash_recovery() {
     let mut config = production_config();
     config.recovery_mode = RecoveryMode::Permissive;
     config.hash_chain_required = false;
-    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open"));
     seed_project(&db).await;
     db.create_scope("p", "app").await.expect("scope");
 
@@ -585,7 +585,7 @@ async fn crash_matrix_reactive_processor_dlq_survives_crash_recovery() {
 async fn crash_matrix_mid_manifest_primary_corruption_falls_back_to_prev() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     db.checkpoint_now().await.expect("checkpoint 1");
     db.commit(Mutation::KvSet {
@@ -602,7 +602,7 @@ async fn crash_matrix_mid_manifest_primary_corruption_falls_back_to_prev() {
     fs::write(dir.path().join("manifest.json"), b"{corrupt").expect("corrupt primary manifest");
     fs::write(dir.path().join("manifest.hmac"), "deadbeef").expect("corrupt primary hmac");
 
-    let reopened = AedbInstance::open(config.clone(), dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("reopen");
     let seq = reopened
         .snapshot_probe(ConsistencyMode::AtLatest)
         .await
@@ -614,7 +614,7 @@ async fn crash_matrix_mid_manifest_primary_corruption_falls_back_to_prev() {
 async fn crash_matrix_after_checkpoint_replays_tail_and_ignores_unreferenced_checkpoint() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
@@ -660,7 +660,7 @@ async fn crash_matrix_after_checkpoint_replays_tail_and_ignores_unreferenced_che
 async fn crash_matrix_corrupt_wal_frame_fails_closed() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     for i in 0..20u64 {
         db.commit(Mutation::KvSet {
@@ -678,7 +678,7 @@ async fn crash_matrix_corrupt_wal_frame_fails_closed() {
     let seg = segment_paths(dir.path()).pop().expect("segment");
     corrupt_file_byte(&seg, 96);
 
-    let reopen = AedbInstance::open(config, dir.path());
+    let reopen = AedbInstance::open_anonymous(config, dir.path());
     assert!(reopen.is_err());
 }
 
@@ -687,7 +687,7 @@ async fn crash_matrix_corrupt_wal_frame_fails_closed_in_permissive_mode() {
     let dir = tempdir().expect("temp dir");
     let mut config = AedbConfig::development();
     config.durability_mode = DurabilityMode::Full;
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     for i in 0..20u64 {
         db.commit(Mutation::KvSet {
@@ -705,7 +705,7 @@ async fn crash_matrix_corrupt_wal_frame_fails_closed_in_permissive_mode() {
     let seg = segment_paths(dir.path()).pop().expect("segment");
     corrupt_file_byte(&seg, 96);
 
-    let reopen = AedbInstance::open(config, dir.path());
+    let reopen = AedbInstance::open_anonymous(config, dir.path());
     assert!(reopen.is_err());
 }
 
@@ -713,13 +713,13 @@ async fn crash_matrix_corrupt_wal_frame_fails_closed_in_permissive_mode() {
 async fn crash_matrix_corrupt_manifest_hmac_fails_closed() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     db.checkpoint_now().await.expect("checkpoint");
     drop(db);
 
     fs::write(dir.path().join("manifest.hmac"), "00").expect("tamper hmac");
-    let reopen = AedbInstance::open(config, dir.path());
+    let reopen = AedbInstance::open_anonymous(config, dir.path());
     assert!(reopen.is_err());
 }
 
@@ -728,7 +728,7 @@ async fn crash_matrix_segment_deletion_breaks_hash_chain() {
     let dir = tempdir().expect("temp dir");
     let mut config = production_config();
     config.max_segment_bytes = 256;
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     let mut durable_seq = 0u64;
     for i in 0..200u64 {
@@ -803,7 +803,7 @@ async fn crash_matrix_segment_deletion_breaks_hash_chain() {
     write_manifest_atomic_signed(&manifest, dir.path(), config.hmac_key())
         .expect("updated manifest");
 
-    let reopen = AedbInstance::open(config, dir.path());
+    let reopen = AedbInstance::open_anonymous(config, dir.path());
     assert!(reopen.is_err());
 }
 
@@ -811,7 +811,7 @@ async fn crash_matrix_segment_deletion_breaks_hash_chain() {
 async fn crash_matrix_idempotency_survives_restart() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     let envelope = TransactionEnvelope {
@@ -837,7 +837,7 @@ async fn crash_matrix_idempotency_survives_restart() {
     db.checkpoint_now().await.expect("manifest before restart");
     drop(db);
 
-    let reopened = AedbInstance::open(config.clone(), dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("reopen");
     let second = reopened
         .commit_envelope(envelope)
         .await
@@ -850,7 +850,7 @@ async fn crash_matrix_idempotency_survives_restart() {
 async fn crash_matrix_coordinator_timeout_recovery_has_no_partial_writes() {
     let dir = tempdir().expect("temp dir");
     let config = timeout_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     db.commit(Mutation::Ddl(DdlOperation::CreateScope {
         owner_id: None,
@@ -910,7 +910,7 @@ async fn crash_matrix_coordinator_timeout_recovery_has_no_partial_writes() {
 async fn crash_matrix_parallel_epoch_timeout_recovery_has_no_partial_writes() {
     let dir = tempdir().expect("temp dir");
     let config = timeout_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
 
     let base_seq = db.head_state().await.visible_head_seq;
@@ -955,7 +955,7 @@ async fn crash_matrix_parallel_epoch_timeout_recovery_has_no_partial_writes() {
 async fn crash_matrix_manifest_tamper_detected_with_prev_missing() {
     let dir = tempdir().expect("temp dir");
     let config = production_config();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     seed_project(&db).await;
     db.checkpoint_now().await.expect("checkpoint");
     drop(db);
@@ -965,7 +965,7 @@ async fn crash_matrix_manifest_tamper_detected_with_prev_missing() {
     let _ = fs::remove_file(dir.path().join("manifest.json.prev"));
     let _ = fs::remove_file(dir.path().join("manifest.hmac.prev"));
 
-    let reopen = AedbInstance::open(config.clone(), dir.path());
+    let reopen = AedbInstance::open_anonymous(config.clone(), dir.path());
     assert!(reopen.is_err());
 
     let manifest = load_manifest_signed(dir.path(), config.hmac_key());
@@ -987,7 +987,7 @@ async fn crash_matrix_a17a_strict_restarts_fail_closed() {
     for cycle in 1..=cycles {
         a17_write_cycle(dir.path(), &writer_config, cycle).await;
 
-        match AedbInstance::open(strict_config.clone(), dir.path()) {
+        match AedbInstance::open_anonymous(strict_config.clone(), dir.path()) {
             Ok(strict) => {
                 strict.shutdown().await.expect("strict shutdown");
                 panic!("strict open unexpectedly succeeded at cycle {cycle}");
@@ -1015,7 +1015,7 @@ async fn crash_matrix_a17b_thousand_crash_cycles_preserve_state() {
     for cycle in 1..=cycles {
         a17_write_cycle(dir.path(), &writer_config, cycle).await;
 
-        match AedbInstance::open(strict_config.clone(), dir.path()) {
+        match AedbInstance::open_anonymous(strict_config.clone(), dir.path()) {
             Ok(strict) => {
                 strict.shutdown().await.expect("strict shutdown");
             }
@@ -1025,7 +1025,7 @@ async fn crash_matrix_a17b_thousand_crash_cycles_preserve_state() {
         assert_a17_cycle_row(dir.path(), &writer_config, cycle).await;
     }
 
-    let final_db = AedbInstance::open(writer_config.clone(), dir.path()).expect("final open");
+    let final_db = AedbInstance::open_anonymous(writer_config.clone(), dir.path()).expect("final open");
     let final_rows = final_db
         .query(
             "p",

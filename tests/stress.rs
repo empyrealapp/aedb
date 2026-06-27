@@ -184,7 +184,7 @@ async fn arcana_l1_balance_conservation_under_load() {
     const MAX_RETRIES: usize = 12;
 
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(stress_config(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(stress_config(), dir.path()).expect("open"));
     db.create_project("l1").await.expect("project");
 
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -413,7 +413,7 @@ async fn arcana_l1_balance_conservation_under_load() {
 #[ignore = "long-running stress test"]
 async fn stress_write_throughput() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(stress_config(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -457,7 +457,7 @@ async fn stress_write_throughput() {
 #[ignore = "long-running stress test"]
 async fn stress_read_under_write() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(stress_config(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -536,7 +536,7 @@ async fn stress_read_under_write() {
 #[ignore = "long-running stress test"]
 async fn stress_multi_project_isolation() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(stress_config(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("open");
 
     for p in 0..scaled(5) {
         let project = format!("p{p}");
@@ -607,7 +607,7 @@ async fn stress_multi_project_isolation() {
 #[ignore = "long-running stress test"]
 async fn stress_large_state_checkpoint_recovery() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(stress_config(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("open");
     db.create_project("bulk").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -649,7 +649,7 @@ async fn stress_large_state_checkpoint_recovery() {
     }
     db.shutdown().await.expect("shutdown");
 
-    let reopened = AedbInstance::open(stress_config(), dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("reopen");
     let rows = reopened
         .query(
             "bulk",
@@ -677,7 +677,7 @@ async fn stress_effective_tps_independent_scopes() {
     );
 
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(stress_config(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(stress_config(), dir.path()).expect("open"));
 
     for project_idx in 0..project_count {
         let project_id = format!("{PROJECT_PREFIX}-{project_idx}");
@@ -946,7 +946,7 @@ async fn stress_effective_tps_independent_scopes() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(stress_config(), dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("reopen");
     for project_idx in 0..project_count {
         let project_id = format!("{PROJECT_PREFIX}-{project_idx}");
         let accounts = reopened
@@ -1005,7 +1005,7 @@ async fn stress_mixed_ops_independent_scopes() {
     config.max_scan_rows = 1_000_000;
 
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open"));
 
     for project_idx in 0..project_count {
         let project_id = format!("{PROJECT_PREFIX}-{project_idx}");
@@ -1289,7 +1289,7 @@ async fn stress_realistic_user_load_multi_scope_tps() {
     config.max_scan_rows = 1_000_000;
 
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     let reader_caller = CallerContext::new("realbench_reader");
 
     let mut scopes = Vec::new();

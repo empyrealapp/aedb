@@ -48,7 +48,7 @@ async fn setup_accounts_table(db: &AedbInstance) {
 #[tokio::test]
 async fn test_u256_boundary_values() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
     setup_accounts_table(&db).await;
 
     // Test U256::MAX boundary
@@ -165,7 +165,7 @@ async fn test_u256_boundary_values() {
 #[tokio::test]
 async fn test_balance_wrapping_attack_prevention() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
     setup_accounts_table(&db).await;
 
     // Setup: Balance near MAX
@@ -279,7 +279,7 @@ async fn test_balance_wrapping_attack_prevention() {
 #[tokio::test]
 async fn test_large_value_precision() {
     let dir = tempdir().expect("temp dir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
     setup_accounts_table(&db).await;
 
     // Test with various large values
@@ -353,7 +353,7 @@ async fn test_concurrent_boundary_operations() {
     use tokio::task::JoinSet;
 
     let dir = tempdir().expect("temp dir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
     setup_accounts_table(&db).await;
 
     // Setup: Account at boundary

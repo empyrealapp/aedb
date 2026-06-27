@@ -1552,16 +1552,25 @@ fn kv_namespace_token_conflicts(namespace_token: &str, key_token: &str) -> bool 
     namespace == key_ns
 }
 
-pub(super) fn process_commit_epoch(
+/// Apply an epoch and append its WAL frames under the caller-held state lock.
+///
+/// For the durable (`requires_sync`) path this does NOT fsync: it bundles the
+/// finalize inputs plus cloned durability handles into `*out_sync` and returns a
+/// placeholder result. The caller is then expected to release the state lock,
+/// run [`DurabilityHandles::sync`] off-lock, re-acquire the lock, and call
+/// [`finalize_after_durability_sync`]. For terminal/error/no-sync cases it runs
+/// finalize inline and returns the real result with `*out_sync` left `None`.
+pub(super) fn prepare_commit_epoch(
     state: &mut ExecutorState,
     requests: Vec<CommitRequest>,
+    out_sync: &mut Option<PreparedSync>,
 ) -> EpochProcessResult {
     let process_started = Instant::now();
     if requests.is_empty() {
         return EpochProcessResult::default();
     }
     if inline_kv_set_epoch_fast_path_eligible(state, &requests) {
-        return process_inline_kv_set_epoch_fast_path(state, requests, process_started);
+        return process_inline_kv_set_epoch_fast_path(state, requests, process_started, out_sync);
     }
 
     let epoch_request_count = requests.len();
@@ -1573,9 +1582,9 @@ pub(super) fn process_commit_epoch(
     let mut wal_append_ops = 0u64;
     let mut wal_append_bytes = 0u64;
     let mut wal_append_micros = 0u64;
-    let mut wal_sync_ops = 0u64;
-    let mut wal_sync_micros = 0u64;
-    let mut sync_executed = false;
+    let wal_sync_ops = 0u64;
+    let wal_sync_micros = 0u64;
+    let sync_executed = false;
     let mut working_keyspace = state.keyspace.clone();
     let mut working_catalog = state.catalog.clone();
     let mut working_idempotency: Option<HashMap<IdempotencyKey, IdempotencyRecord>> = None;
@@ -2363,77 +2372,290 @@ pub(super) fn process_commit_epoch(
         wal_append_micros =
             wal_append_micros.saturating_add(append_started.elapsed().as_micros() as u64);
     }
+    let input = EpochFinalizeInput {
+        working_keyspace,
+        working_catalog,
+        working_global_unique_index,
+        working_idempotency,
+        sequenced,
+        internal_sequenced,
+        outcomes,
+        wal_payload_size_bytes,
+        requires_sync,
+        catalog_changed,
+        coordinator_apply_attempts,
+        coordinator_apply_micros,
+        parallel_apply_micros,
+        pre_wal_micros,
+        read_set_conflicts,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        sync_executed,
+    };
+
     if requires_sync {
-        let sync_started = Instant::now();
-        if let Err(err) = working_keyspace.sync_persistent_value_store() {
-            overwrite_assertion_failures_with_wal_error(
-                &mut outcomes,
-                &err,
-                "epoch aborted during persistent value sync",
-            );
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during persistent value sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
+        // Hand the durability fsync to the caller so it can run with the state
+        // lock released. We clone the value-store Arc and the active WAL segment
+        // file handle (both syncable through a shared reference); finalize is
+        // deferred until the fsync completes, so until then no state is swapped
+        // or published — readers still observe the pre-epoch snapshot, and a
+        // sync failure aborts the epoch without ever exposing it.
+        let value_store = input.working_keyspace.value_store.clone();
+        let wal_file = match state.wal.try_clone_active_file() {
+            Ok(file) => file,
+            Err(err) => {
+                return build_sync_failure_result(
+                    input,
+                    DurabilityStage::Wal,
+                    AedbError::Io(std::io::Error::other(err.to_string())),
+                );
             }
-            return EpochProcessResult {
-                outcomes,
-                coordinator_apply_attempts,
-                coordinator_apply_micros,
-                parallel_apply_micros,
-                pre_wal_micros,
-                finalize_micros: 0,
-                read_set_conflicts,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                sync_executed,
-                catalog_changed,
-            };
-        }
-        if let Err(err) = state.wal.sync_active() {
-            let err = AedbError::Io(std::io::Error::other(err.to_string()));
-            overwrite_assertion_failures_with_wal_error(
-                &mut outcomes,
-                &err,
-                "epoch aborted during WAL sync",
-            );
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during WAL sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
-            }
-            return EpochProcessResult {
-                outcomes,
-                coordinator_apply_attempts,
-                coordinator_apply_micros,
-                parallel_apply_micros,
-                pre_wal_micros,
-                finalize_micros: 0,
-                read_set_conflicts,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                sync_executed,
-                catalog_changed,
-            };
-        }
-        wal_sync_ops = wal_sync_ops.saturating_add(1);
-        wal_sync_micros = wal_sync_micros.saturating_add(sync_started.elapsed().as_micros() as u64);
-        sync_executed = true;
+        };
+        *out_sync = Some(PreparedSync {
+            input: PendingFinalize::General(Box::new(input)),
+            handles: DurabilityHandles {
+                value_store,
+                wal_file,
+            },
+        });
+        return EpochProcessResult::default();
     }
+
+    finalize_committed_epoch(state, input)
+}
+
+/// Synchronous epoch processing used by tests: runs the durability fsync inline
+/// (state lock conceptually held throughout), preserving the original
+/// single-call semantics. The apply loop uses [`prepare_commit_epoch`] +
+/// [`finalize_after_durability_sync`] to fsync off-lock instead.
+#[cfg(test)]
+pub(super) fn process_commit_epoch(
+    state: &mut ExecutorState,
+    requests: Vec<CommitRequest>,
+) -> EpochProcessResult {
+    let mut pending = None;
+    let result = prepare_commit_epoch(state, requests, &mut pending);
+    match pending {
+        None => result,
+        Some(PreparedSync { input, handles }) => {
+            let sync_started = Instant::now();
+            let sync_result = handles
+                .sync()
+                .map(|()| sync_started.elapsed().as_micros() as u64);
+            finalize_after_durability_sync(state, input, sync_result)
+        }
+    }
+}
+
+/// Cloned handles that make the just-appended epoch durable. Both can be synced
+/// through a shared reference, so this can be moved onto a blocking thread while
+/// the executor state lock is released.
+pub(super) struct DurabilityHandles {
+    value_store: Option<Arc<crate::storage::value_store::PersistentValueStore>>,
+    wal_file: Option<std::fs::File>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DurabilityStage {
+    ValueStore,
+    Wal,
+}
+
+impl DurabilityHandles {
+    /// Flush the persistent value store and the active WAL segment. Mirrors the
+    /// order of the original inline sync (value store first, then WAL) so error
+    /// attribution is unchanged.
+    pub(super) fn sync(&self) -> Result<(), (DurabilityStage, AedbError)> {
+        if let Some(store) = &self.value_store {
+            store
+                .sync_all()
+                .map_err(|err| (DurabilityStage::ValueStore, err))?;
+        }
+        if let Some(file) = &self.wal_file {
+            // Honor the `wal_sync` fail point here too: the off-lock durability
+            // sync flushes a cloned handle to the active segment, so it bypasses
+            // `SegmentManager::sync_active` (where the inline path trips this
+            // fault). Without this, injected WAL-sync faults would not fire for
+            // durable commits that fsync off-lock.
+            if crate::faults::any_armed() {
+                crate::faults::trip("wal_sync").map_err(|e| {
+                    (
+                        DurabilityStage::Wal,
+                        AedbError::Io(std::io::Error::other(e.to_string())),
+                    )
+                })?;
+            }
+            file.sync_data().map_err(|err| {
+                (
+                    DurabilityStage::Wal,
+                    AedbError::Io(std::io::Error::other(err.to_string())),
+                )
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The finalize inputs plus the durability handles needed to make the epoch
+/// durable off-lock. Produced by [`prepare_commit_epoch`] on the durable path.
+pub(super) struct PreparedSync {
+    pub(super) input: PendingFinalize,
+    pub(super) handles: DurabilityHandles,
+}
+
+/// Which finalize phase a durable epoch resumes into after its off-lock fsync.
+/// The general apply path and the inline-KV fast path keep different in-progress
+/// state, so they finalize through different functions.
+pub(super) enum PendingFinalize {
+    General(Box<EpochFinalizeInput>),
+    InlineKv(InlineKvFinalizeInput),
+}
+
+/// Resume a durable epoch after its off-lock fsync. On success the sync counters
+/// are recorded and finalize swaps/publishes the epoch; on failure the epoch is
+/// aborted with per-commit errors and no state is swapped.
+pub(super) fn finalize_after_durability_sync(
+    state: &mut ExecutorState,
+    input: PendingFinalize,
+    sync_result: Result<u64, (DurabilityStage, AedbError)>,
+) -> EpochProcessResult {
+    match input {
+        PendingFinalize::General(mut input) => match sync_result {
+            Ok(sync_micros) => {
+                input.wal_sync_ops = input.wal_sync_ops.saturating_add(1);
+                input.wal_sync_micros = input.wal_sync_micros.saturating_add(sync_micros);
+                input.sync_executed = true;
+                finalize_committed_epoch(state, *input)
+            }
+            Err((stage, err)) => build_sync_failure_result(*input, stage, err),
+        },
+        PendingFinalize::InlineKv(mut input) => match sync_result {
+            Ok(sync_micros) => {
+                input.wal_sync_ops = input.wal_sync_ops.saturating_add(1);
+                input.wal_sync_micros = input.wal_sync_micros.saturating_add(sync_micros);
+                input.sync_executed = true;
+                finalize_inline_kv_committed_epoch(state, input)
+            }
+            Err((stage, err)) => build_inline_kv_sync_failure_result(input, stage, err),
+        },
+    }
+}
+
+/// Abort an epoch whose durability fsync failed: surface the error on every
+/// commit in the epoch and discard the working copies without swapping state.
+fn build_sync_failure_result(
+    input: EpochFinalizeInput,
+    stage: DurabilityStage,
+    err: AedbError,
+) -> EpochProcessResult {
+    let EpochFinalizeInput {
+        mut outcomes,
+        sequenced,
+        coordinator_apply_attempts,
+        coordinator_apply_micros,
+        parallel_apply_micros,
+        pre_wal_micros,
+        read_set_conflicts,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        catalog_changed,
+        ..
+    } = input;
+    let context = match stage {
+        DurabilityStage::ValueStore => "epoch aborted during persistent value sync",
+        DurabilityStage::Wal => "epoch aborted during WAL sync",
+    };
+    overwrite_assertion_failures_with_wal_error(&mut outcomes, &err, context);
+    for failed in sequenced {
+        outcomes.push(EpochOutcome {
+            request: failed.request,
+            result: Err(AedbError::Validation(format!("{context}: {err}"))),
+            post_apply_delta: None,
+        });
+    }
+    EpochProcessResult {
+        outcomes,
+        coordinator_apply_attempts,
+        coordinator_apply_micros,
+        parallel_apply_micros,
+        pre_wal_micros,
+        finalize_micros: 0,
+        read_set_conflicts,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        sync_executed: false,
+        catalog_changed,
+    }
+}
+
+/// Owned inputs handed from the apply/WAL-append phase to the post-durability
+/// finalize phase. Bundling them lets the finalize step run as its own function
+/// — either inline (synchronous callers) or after the apply loop has released
+/// the state lock and performed the durability fsync off-lock.
+pub(super) struct EpochFinalizeInput {
+    working_keyspace: Keyspace,
+    working_catalog: Catalog,
+    working_global_unique_index: GlobalUniqueIndexState,
+    working_idempotency: Option<HashMap<IdempotencyKey, IdempotencyRecord>>,
+    sequenced: Vec<SequencedCommit>,
+    internal_sequenced: Vec<InternalSequencedCommit>,
+    outcomes: Vec<EpochOutcome>,
+    wal_payload_size_bytes: usize,
+    requires_sync: bool,
+    catalog_changed: bool,
+    coordinator_apply_attempts: u64,
+    coordinator_apply_micros: u64,
+    parallel_apply_micros: u64,
+    pre_wal_micros: u64,
+    read_set_conflicts: u64,
+    wal_append_ops: u64,
+    wal_append_bytes: u64,
+    wal_append_micros: u64,
+    wal_sync_ops: u64,
+    wal_sync_micros: u64,
+    sync_executed: bool,
+}
+
+/// Apply the in-memory swap, advance the durability/visibility heads, publish
+/// version deltas, and build the per-commit outcomes. The WAL frames have
+/// already been appended (and, for the `requires_sync` path, fsynced) before
+/// this runs.
+fn finalize_committed_epoch(
+    state: &mut ExecutorState,
+    input: EpochFinalizeInput,
+) -> EpochProcessResult {
+    let EpochFinalizeInput {
+        working_keyspace,
+        working_catalog,
+        working_global_unique_index,
+        working_idempotency,
+        sequenced,
+        internal_sequenced,
+        mut outcomes,
+        wal_payload_size_bytes,
+        requires_sync,
+        catalog_changed,
+        coordinator_apply_attempts,
+        coordinator_apply_micros,
+        parallel_apply_micros,
+        pre_wal_micros,
+        read_set_conflicts,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        mut wal_sync_ops,
+        mut wal_sync_micros,
+        mut sync_executed,
+    } = input;
 
     let last_user_seq = sequenced.last().map(|c| c.seq).unwrap_or(state.current_seq);
     let last_internal_seq = internal_sequenced
@@ -2620,6 +2842,7 @@ fn process_inline_kv_set_epoch_fast_path(
     state: &mut ExecutorState,
     requests: Vec<CommitRequest>,
     process_started: Instant,
+    out_sync: &mut Option<PreparedSync>,
 ) -> EpochProcessResult {
     let mut outcomes = Vec::with_capacity(requests.len());
     let mut sequenced = Vec::with_capacity(requests.len());
@@ -2687,9 +2910,9 @@ fn process_inline_kv_set_epoch_fast_path(
     let mut wal_append_ops = 0u64;
     let mut wal_append_bytes = 0u64;
     let mut wal_append_micros = 0u64;
-    let mut wal_sync_ops = 0u64;
-    let mut wal_sync_micros = 0u64;
-    let mut sync_executed = false;
+    let wal_sync_ops = 0u64;
+    let wal_sync_micros = 0u64;
+    let sync_executed = false;
 
     if let Err(err) = state.wal.append_frames_with_sync(&wal_frames, false) {
         let err = AedbError::Io(std::io::Error::other(err.to_string()));
@@ -2717,34 +2940,129 @@ fn process_inline_kv_set_epoch_fast_path(
     wal_append_bytes = wal_payload_size_bytes as u64;
     wal_append_micros = append_started.elapsed().as_micros() as u64;
 
+    let input = InlineKvFinalizeInput {
+        outcomes,
+        sequenced,
+        wal_payload_size_bytes,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        sync_executed,
+    };
+
     if matches!(state.config.durability_mode, DurabilityMode::Full) {
-        let sync_started = Instant::now();
-        if let Err(err) = state.wal.sync_active() {
-            let err = AedbError::Io(std::io::Error::other(err.to_string()));
-            for failed in sequenced {
-                outcomes.push(EpochOutcome {
-                    request: failed.request,
-                    result: Err(AedbError::Validation(format!(
-                        "epoch aborted during WAL sync: {err}"
-                    ))),
-                    post_apply_delta: None,
-                });
+        // Hand the WAL fsync to the caller so it runs with the state lock
+        // released, then finalize on re-acquire. The fast path never spills to
+        // the persistent value store, so only the WAL segment needs syncing.
+        // Nothing is applied or published until the fsync succeeds, so the
+        // durable-before-visible invariant holds and a sync failure aborts the
+        // epoch without exposing it.
+        let wal_file = match state.wal.try_clone_active_file() {
+            Ok(file) => file,
+            Err(err) => {
+                return build_inline_kv_sync_failure_result(
+                    input,
+                    DurabilityStage::Wal,
+                    AedbError::Io(std::io::Error::other(err.to_string())),
+                );
             }
-            return EpochProcessResult {
-                outcomes,
-                pre_wal_micros,
-                wal_append_ops,
-                wal_append_bytes,
-                wal_append_micros,
-                wal_sync_ops,
-                wal_sync_micros,
-                ..EpochProcessResult::default()
-            };
-        }
-        wal_sync_ops = 1;
-        wal_sync_micros = sync_started.elapsed().as_micros() as u64;
-        sync_executed = true;
+        };
+        *out_sync = Some(PreparedSync {
+            input: PendingFinalize::InlineKv(input),
+            handles: DurabilityHandles {
+                value_store: None,
+                wal_file,
+            },
+        });
+        return EpochProcessResult::default();
     }
+
+    // Batch / OS-buffered: no out-of-lock sync, finalize directly under the lock
+    // (an opportunistic batch flush may still run inside the finalize).
+    finalize_inline_kv_committed_epoch(state, input)
+}
+
+/// Abort an inline-KV epoch whose off-lock durability fsync failed: surface the
+/// error on every commit in the epoch and apply nothing, leaving the epoch
+/// invisible. The fast path carries no assertions, so there is nothing to
+/// overwrite.
+fn build_inline_kv_sync_failure_result(
+    input: InlineKvFinalizeInput,
+    stage: DurabilityStage,
+    err: AedbError,
+) -> EpochProcessResult {
+    let InlineKvFinalizeInput {
+        mut outcomes,
+        sequenced,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        ..
+    } = input;
+    let context = match stage {
+        DurabilityStage::ValueStore => "epoch aborted during persistent value sync",
+        DurabilityStage::Wal => "epoch aborted during WAL sync",
+    };
+    for failed in sequenced {
+        outcomes.push(EpochOutcome {
+            request: failed.request,
+            result: Err(AedbError::Validation(format!("{context}: {err}"))),
+            post_apply_delta: None,
+        });
+    }
+    EpochProcessResult {
+        outcomes,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        wal_sync_ops,
+        wal_sync_micros,
+        ..EpochProcessResult::default()
+    }
+}
+
+/// Owned inputs handed from the inline-KV WAL-append phase to its finalize
+/// phase, mirroring [`EpochFinalizeInput`] for the anonymous KvSet hot path.
+pub(super) struct InlineKvFinalizeInput {
+    outcomes: Vec<EpochOutcome>,
+    sequenced: Vec<SequencedCommit>,
+    wal_payload_size_bytes: usize,
+    pre_wal_micros: u64,
+    wal_append_ops: u64,
+    wal_append_bytes: u64,
+    wal_append_micros: u64,
+    wal_sync_ops: u64,
+    wal_sync_micros: u64,
+    sync_executed: bool,
+}
+
+/// Apply the inline-KV writes in memory, advance the durability/visibility
+/// heads, publish version deltas, and build the per-commit outcomes. The WAL
+/// frames have already been appended (and, on the `DurabilityMode::Full` path,
+/// fsynced off-lock) before this runs.
+fn finalize_inline_kv_committed_epoch(
+    state: &mut ExecutorState,
+    input: InlineKvFinalizeInput,
+) -> EpochProcessResult {
+    let InlineKvFinalizeInput {
+        mut outcomes,
+        sequenced,
+        wal_payload_size_bytes,
+        pre_wal_micros,
+        wal_append_ops,
+        wal_append_bytes,
+        wal_append_micros,
+        mut wal_sync_ops,
+        mut wal_sync_micros,
+        mut sync_executed,
+    } = input;
 
     if let Some((project_id, scope_id)) = inline_kv_set_epoch_namespace(&sequenced) {
         state.keyspace.kv_set_many_inline_same_namespace_with_seq(

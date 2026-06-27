@@ -26,7 +26,7 @@ fn user_state_columns() -> Vec<ColumnDef> {
 #[tokio::test(flavor = "current_thread")]
 async fn processor_commit_rejects_stale_checkpoint_row_version() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");

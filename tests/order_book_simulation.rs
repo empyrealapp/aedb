@@ -216,7 +216,7 @@ async fn run_simulation(
 ) -> Result<(Arc<AedbInstance>, ChaosMetrics), AedbError> {
     let started = std::time::Instant::now();
     let dir = tempdir().map_err(AedbError::Io)?;
-    let db = Arc::new(AedbInstance::open(config, dir.path())?);
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path())?);
     setup_books(&db, &assets).await?;
 
     let mut tasks = Vec::with_capacity(traders);

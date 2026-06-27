@@ -731,7 +731,31 @@ impl CommitExecutor {
                 let mut s = loop_state.lock().await;
                 let durable_before = s.durable_head_seq;
                 let epoch_started = Instant::now();
-                let epoch_result = process_commit_epoch(&mut s, epoch_requests);
+                let mut pending_sync = None;
+                let prepared_result =
+                    prepare_commit_epoch(&mut s, epoch_requests, &mut pending_sync);
+                let epoch_result = match pending_sync {
+                    // Terminal/error/no-sync epoch: finalize already ran under the
+                    // lock, use its result directly.
+                    None => prepared_result,
+                    // Durable epoch: release the state lock so reads proceed
+                    // while the fsync runs, then re-acquire and finalize. The
+                    // fsync runs inline on this dedicated apply task (which
+                    // already performs the WAL write syscall inline); the point
+                    // is to not hold the state lock across it. Nothing is
+                    // published until the fsync succeeds, so the
+                    // durable-before-visible invariant holds and a sync failure
+                    // aborts the epoch without exposing it.
+                    Some(PreparedSync { input, handles }) => {
+                        drop(s);
+                        let sync_started = Instant::now();
+                        let sync_result = handles
+                            .sync()
+                            .map(|()| sync_started.elapsed().as_micros() as u64);
+                        s = loop_state.lock().await;
+                        finalize_after_durability_sync(&mut s, input, sync_result)
+                    }
+                };
                 group_commit.complete_flush();
                 loop_telemetry
                     .group_commit_complete_epochs

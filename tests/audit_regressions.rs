@@ -14,7 +14,7 @@ async fn open_db(project: &str) -> AedbInstance {
     let dir = tempdir().expect("temp");
     // Leak the tempdir so the data directory outlives the instance for the test.
     let path = Box::leak(Box::new(dir)).path().to_path_buf();
-    let db = AedbInstance::open(Default::default(), &path).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), &path).expect("open");
     db.create_project(project).await.expect("project");
     db
 }

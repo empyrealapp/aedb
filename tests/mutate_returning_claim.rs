@@ -48,7 +48,7 @@ async fn setup_jobs(db: &AedbInstance) {
 #[tokio::test]
 async fn update_where_expr_supports_add_and_coalesce() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     setup_jobs(&db).await;
 
     db.commit(Mutation::Upsert {
@@ -115,7 +115,7 @@ async fn update_where_expr_supports_add_and_coalesce() {
 #[tokio::test]
 async fn mutate_where_returning_returns_before_and_after() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     setup_jobs(&db).await;
 
     db.commit(Mutation::Upsert {
@@ -165,7 +165,7 @@ async fn mutate_where_returning_returns_before_and_after() {
 async fn claim_one_is_atomic_under_contention() {
     let dir = tempdir().expect("tempdir");
     let db =
-        std::sync::Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+        std::sync::Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     setup_jobs(db.as_ref()).await;
 
     db.commit(Mutation::Upsert {

@@ -24,7 +24,7 @@ async fn main() {
     let measure: i64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(2_000);
 
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project(PROJECT).await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         project_id: PROJECT.into(),

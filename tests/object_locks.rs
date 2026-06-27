@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 async fn open(dir: &std::path::Path) -> Arc<AedbInstance> {
-    let db = AedbInstance::open(Default::default(), dir).expect("open");
+    let db = AedbInstance::open_anonymous(Default::default(), dir).expect("open");
     Arc::new(db)
 }
 
@@ -24,7 +24,7 @@ async fn open(dir: &std::path::Path) -> Arc<AedbInstance> {
 async fn reopen(config: AedbConfig, dir: &std::path::Path) -> Arc<AedbInstance> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match AedbInstance::open(config.clone(), dir) {
+        match AedbInstance::open_anonymous(config.clone(), dir) {
             Ok(db) => return Arc::new(db),
             Err(AedbError::Unavailable { .. }) if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(20)).await;

@@ -70,7 +70,7 @@ fn backup_archive_roundtrip_plain_and_encrypted() {
     std::fs::write(src.path().join("wal_tail/segment_1.aedbwal"), b"segment").expect("wal");
     std::fs::write(src.path().join("pages/rows.aedbpg"), b"page-data").expect("page store file");
 
-    write_backup_archive(src.path(), &archive_plain, None).expect("write plain");
+    write_backup_archive(src.path(), &archive_plain, None, 3).expect("write plain");
     extract_backup_archive(&archive_plain, dst_plain.path(), None).expect("extract plain");
     assert_eq!(
         std::fs::read(dst_plain.path().join("backup_manifest.json")).expect("read manifest"),
@@ -78,7 +78,7 @@ fn backup_archive_roundtrip_plain_and_encrypted() {
     );
 
     let key = [9u8; 32];
-    write_backup_archive(src.path(), &archive_enc, Some(&key)).expect("write enc");
+    write_backup_archive(src.path(), &archive_enc, Some(&key), 3).expect("write enc");
     extract_backup_archive(&archive_enc, dst_enc.path(), Some(&key)).expect("extract enc");
     assert_eq!(
         std::fs::read(dst_enc.path().join("wal_tail/segment_1.aedbwal")).expect("read wal"),
@@ -118,7 +118,7 @@ fn backup_archive_streams_large_page_file_in_encrypted_chunks() {
     std::fs::write(&page_path, &large_page).expect("large page file");
 
     let key = [11u8; 32];
-    write_backup_archive(src.path(), &archive, Some(&key)).expect("write archive");
+    write_backup_archive(src.path(), &archive, Some(&key), 3).expect("write archive");
     let archive_bytes = std::fs::read(&archive).expect("read archive");
     assert!(
         archive_bytes.contains(&BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE),

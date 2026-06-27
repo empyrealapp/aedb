@@ -17,7 +17,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn kv_write_helpers_respect_scope_boundaries() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "private").await.expect("scope");
 
@@ -101,7 +101,7 @@ async fn kv_write_helpers_respect_scope_boundaries() {
 #[tokio::test]
 async fn kv_set_many_atomic_writes_all_entries_in_one_commit() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let result = db
@@ -155,7 +155,7 @@ async fn kv_set_many_atomic_writes_all_entries_in_one_commit() {
 #[tokio::test]
 async fn kv_projection_table_materializes_kv_state() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.enable_kv_projection("p", "app")
         .await
@@ -214,7 +214,7 @@ async fn kv_projection_table_materializes_kv_state() {
 #[tokio::test]
 async fn kv_projection_table_is_managed_and_read_only() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.enable_kv_projection("p", "app")
         .await
@@ -245,7 +245,7 @@ async fn kv_projection_table_is_managed_and_read_only() {
 #[tokio::test]
 async fn kv_query_apis_are_scope_aware() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "tenant1").await.expect("scope");
 
@@ -298,7 +298,7 @@ async fn kv_query_apis_are_scope_aware() {
 #[tokio::test]
 async fn kv_scan_all_scopes_requires_project_wide_read() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "s1").await.expect("scope s1");
     db.create_scope("p", "s2").await.expect("scope s2");
@@ -401,7 +401,7 @@ async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
     };
     let value: Vec<u8> = (0..128 * 1024).map(|i| (i % 251) as u8).collect();
 
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"blob".to_vec(), value.clone())
         .await
@@ -443,7 +443,7 @@ async fn disk_backed_kv_values_spill_and_recover_after_reopen() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let recovered = reopened
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -481,7 +481,7 @@ async fn disk_backed_spilled_value_corruption_fails_closed_for_reads_and_commit_
         ..AedbConfig::default()
     };
     let value = vec![7u8; 128 * 1024];
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"blob".to_vec(), value)
         .await
@@ -543,7 +543,7 @@ async fn disk_backed_spilled_value_corruption_fails_closed_for_reads_and_commit_
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let recovered = reopened
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -564,7 +564,7 @@ async fn disk_backed_kv_segment_corruption_fails_closed_for_point_prefix_and_sec
         max_memory_estimate_bytes: 10 * 1024,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set_many_atomic(
         "p",
@@ -629,7 +629,7 @@ async fn disk_backed_kv_segment_corruption_fails_closed_for_point_prefix_and_sec
 async fn production_profile_spills_all_kv_payloads_by_default() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig::production([7u8; 32]);
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"tiny".to_vec(), b"x".to_vec())
         .await
@@ -649,7 +649,7 @@ async fn production_profile_spills_all_kv_payloads_by_default() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let recovered = reopened
         .kv_get_no_auth("p", "app", b"tiny", ConsistencyMode::AtLatest)
         .await
@@ -670,7 +670,7 @@ async fn unused_kv_segment_reclaim_keeps_live_disk_state() {
         max_memory_estimate_bytes: 10 * 1024,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     for generation_number in 0..5u8 {
         let entries = (0..512u16)
@@ -767,7 +767,7 @@ async fn disk_backed_small_kv_values_spill_under_memory_pressure() {
         ..AedbConfig::default()
     };
 
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     for i in 0..32u8 {
         db.kv_set(
@@ -802,7 +802,7 @@ async fn disk_backed_small_kv_values_spill_under_memory_pressure() {
     db.shutdown().await.expect("shutdown");
     drop(db);
 
-    let reopened = AedbInstance::open(config.clone(), dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("reopen");
     let recovered_memory_estimate = reopened.estimated_memory_bytes().await;
     assert!(
         recovered_memory_estimate <= config.max_memory_estimate_bytes,
@@ -834,7 +834,7 @@ async fn disk_backed_kv_spilled_versions_remain_snapshot_consistent() {
     let first_value: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
     let second_value: Vec<u8> = (0..96 * 1024).map(|i| 255 - (i % 251) as u8).collect();
 
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let first = db
         .kv_set("p", "app", b"blob".to_vec(), first_value.clone())
@@ -874,7 +874,7 @@ async fn disk_backed_kv_spilled_versions_remain_snapshot_consistent() {
 #[tokio::test]
 async fn kv_sub_u256_soft_noop() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSubU256Ex {
@@ -901,7 +901,7 @@ async fn kv_sub_u256_soft_noop() {
 #[tokio::test]
 async fn kv_sub_u256_strict_reject() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let before = db.head_state().await.visible_head_seq;
@@ -929,7 +929,7 @@ async fn kv_sub_u256_strict_reject() {
 #[tokio::test]
 async fn kv_max_min_u256() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSet {
@@ -975,7 +975,7 @@ async fn kv_max_min_u256() {
 #[tokio::test]
 async fn kv_sub_u64_soft_noop() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSubU64Ex {
@@ -1002,7 +1002,7 @@ async fn kv_sub_u64_soft_noop() {
 #[tokio::test]
 async fn kv_sub_u64_strict_reject() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let before = db.head_state().await.visible_head_seq;
@@ -1030,7 +1030,7 @@ async fn kv_sub_u64_strict_reject() {
 #[tokio::test]
 async fn kv_sub_int_ex_supports_u64() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSet {
@@ -1065,7 +1065,7 @@ async fn kv_sub_int_ex_supports_u64() {
 #[tokio::test]
 async fn kv_sub_int_ex_supports_u256_noop_on_underflow() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSubIntEx {
@@ -1089,7 +1089,7 @@ async fn kv_sub_int_ex_supports_u256_noop_on_underflow() {
 #[tokio::test]
 async fn kv_max_min_u64() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSet {
@@ -1133,7 +1133,7 @@ async fn kv_max_min_u64() {
 #[tokio::test]
 async fn counter_add_and_read_sharded_respects_snapshot_consistency() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for shard_hint in 0..32u32 {
@@ -1185,7 +1185,7 @@ async fn counter_add_and_read_sharded_respects_snapshot_consistency() {
 #[tokio::test]
 async fn counter_shard_count_validation_is_enforced() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let err_zero = db
@@ -1217,7 +1217,7 @@ async fn counter_shard_count_validation_is_enforced() {
 #[tokio::test]
 async fn transaction_envelope_can_commit_table_kv_and_integer_atomically() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -1380,7 +1380,7 @@ async fn commit_rejects_oversized_kv_before_enqueue() {
         max_kv_value_bytes: 4,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let err = db
@@ -1397,7 +1397,7 @@ async fn batch_mutations_respect_max_batch_rows() {
         max_batch_rows: 3,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1451,7 +1451,7 @@ async fn memory_limit_is_enforced_before_wal_commit() {
         table_row_spill_enabled: false,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1542,7 +1542,7 @@ async fn row_spill_lets_table_grow_beyond_memory_budget_and_persists() {
         table_row_spill_enabled: true,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.create_scope("p", "app").await.expect("scope");
     create_table(
@@ -1598,7 +1598,7 @@ async fn row_spill_lets_table_grow_beyond_memory_budget_and_persists() {
     drop(db);
 
     // Spilled-row payloads survive recovery.
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let recovered = reopened
         .query_with_options(
             "p",

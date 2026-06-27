@@ -27,7 +27,7 @@ fn user_state_columns() -> Vec<ColumnDef> {
 #[tokio::test(flavor = "current_thread")]
 async fn effect_batch_validation_rejects_without_side_effects() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");
@@ -87,7 +87,7 @@ async fn effect_batch_validation_rejects_without_side_effects() {
 #[tokio::test(flavor = "current_thread")]
 async fn processor_pull_commit_and_context_commit_work() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");
@@ -185,7 +185,7 @@ async fn processor_pull_commit_and_context_commit_work() {
 #[tokio::test(flavor = "current_thread")]
 async fn keyed_state_operations_reject_non_single_pk_tables() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");
@@ -254,7 +254,7 @@ async fn keyed_state_operations_reject_non_single_pk_tables() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn keyed_state_update_rejects_concurrent_overwrite() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(AedbInstance::open(Default::default(), dir.path()).expect("open db"));
+    let db = Arc::new(AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db"));
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");
@@ -349,7 +349,7 @@ async fn keyed_state_update_rejects_concurrent_overwrite() {
 #[tokio::test(flavor = "current_thread")]
 async fn processor_context_update_uses_pending_row_state() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");
@@ -400,7 +400,7 @@ async fn processor_context_update_uses_pending_row_state() {
 #[tokio::test(flavor = "current_thread")]
 async fn keyed_state_write_rejects_row_key_mismatch() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");
@@ -432,7 +432,7 @@ async fn keyed_state_write_rejects_row_key_mismatch() {
 #[tokio::test(flavor = "current_thread")]
 async fn processor_context_commit_rejects_row_key_mismatch() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = AedbInstance::open(Default::default(), dir.path()).expect("open db");
+    let db = AedbInstance::open_anonymous(Default::default(), dir.path()).expect("open db");
 
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "game").await.expect("scope");

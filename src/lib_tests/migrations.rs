@@ -6,7 +6,7 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn migrations_are_idempotent_and_checksum_guarded() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let migration = Migration {
         version: 1,
@@ -63,7 +63,7 @@ async fn migrations_are_idempotent_and_checksum_guarded() {
 #[tokio::test]
 async fn run_migrations_reports_applied_and_skipped_versions() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let migration = Migration {
@@ -115,7 +115,7 @@ async fn run_migrations_reports_applied_and_skipped_versions() {
 #[tokio::test]
 async fn concurrent_apply_migration_converges_idempotently() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let migration = Migration {

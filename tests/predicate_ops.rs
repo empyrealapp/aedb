@@ -38,7 +38,7 @@ async fn setup_users(db: &AedbInstance) {
 #[tokio::test]
 async fn delete_where_deletes_matching_rows_with_limit() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     setup_users(&db).await;
 
     for (id, status) in [
@@ -89,7 +89,7 @@ async fn delete_where_deletes_matching_rows_with_limit() {
 #[tokio::test]
 async fn update_where_updates_matching_rows() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     setup_users(&db).await;
 
     for (id, status) in [(1, "expired"), (2, "expired"), (3, "active")] {
@@ -135,7 +135,7 @@ async fn update_where_updates_matching_rows() {
 #[tokio::test]
 async fn commit_many_atomic_applies_mutation_set() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     setup_users(&db).await;
 
     let result = db
@@ -176,7 +176,7 @@ async fn commit_many_atomic_applies_mutation_set() {
 #[tokio::test]
 async fn query_page_stable_uses_pk_order_for_cursor_paging() {
     let dir = tempdir().expect("tempdir");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     setup_users(&db).await;
 
     for id in [3, 1, 2] {

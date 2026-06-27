@@ -25,6 +25,37 @@ const BACKUP_ARCHIVE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
 const BACKUP_ARCHIVE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Upper bound on zstd worker threads used while compressing archive payloads.
+/// Mirrors the checkpoint writer cap so a backup never monopolizes the host.
+const MAX_BACKUP_COMPRESSION_WORKERS: u32 = 4;
+
+fn resolve_backup_compression_workers() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() as u32).min(MAX_BACKUP_COMPRESSION_WORKERS))
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Compress an in-memory block with zstd at the configured level, using multiple
+/// worker threads when the host has spare parallelism. zstd transparently falls
+/// back to single-threaded work for blocks too small to split, so this is safe
+/// for the per-chunk and small-file paths as well.
+fn compress_block(raw: &[u8], compression_level: i32) -> Result<Vec<u8>, AedbError> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), compression_level)
+        .map_err(|e| AedbError::Encode(e.to_string()))?;
+    let workers = resolve_backup_compression_workers();
+    if workers > 1 {
+        // Best-effort: a build without multithread support just stays serial.
+        let _ = encoder.multithread(workers);
+    }
+    encoder
+        .write_all(raw)
+        .map_err(|e| AedbError::Encode(e.to_string()))?;
+    encoder
+        .finish()
+        .map_err(|e| AedbError::Encode(e.to_string()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupManifest {
     pub backup_id: String,
@@ -99,6 +130,7 @@ pub fn write_backup_archive(
     dir: &Path,
     archive_path: &Path,
     encryption_key: Option<&[u8; 32]>,
+    compression_level: i32,
 ) -> Result<(), AedbError> {
     if !dir.exists() {
         return Err(AedbError::Validation(
@@ -137,6 +169,7 @@ pub fn write_backup_archive(
                 &salt,
                 entry_index as u64,
                 encryption_key,
+                compression_level,
             )?;
         } else {
             write_legacy_archive_file(
@@ -146,6 +179,7 @@ pub fn write_backup_archive(
                 &salt,
                 entry_index as u64,
                 encryption_key,
+                compression_level,
             )?;
         }
     }
@@ -280,12 +314,13 @@ fn write_legacy_archive_file<W: Write>(
     salt: &[u8; 16],
     entry_index: u64,
     encryption_key: Option<&[u8; 32]>,
+    compression_level: i32,
 ) -> Result<(), AedbError> {
     validate_archive_path_len(rel)?;
-    let file = fs::File::open(resolved)?;
-    let reader = BufReader::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, file);
-    let compressed =
-        zstd::stream::encode_all(reader, 3).map_err(|e| AedbError::Encode(e.to_string()))?;
+    // Files reaching this path are below the chunking threshold, so reading the
+    // whole payload into memory to feed the multithreaded encoder is bounded.
+    let raw = fs::read(resolved)?;
+    let compressed = compress_block(&raw, compression_level)?;
 
     let payload = if let Some(key) = encryption_key {
         let nonce = derive_archive_nonce(salt, entry_index, rel);
@@ -311,6 +346,7 @@ fn write_chunked_archive_file<W: Write>(
     salt: &[u8; 16],
     entry_index: u64,
     encryption_key: Option<&[u8; 32]>,
+    compression_level: i32,
 ) -> Result<(), AedbError> {
     validate_archive_path_len(rel)?;
     write_u8(writer, BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE)?;
@@ -328,8 +364,7 @@ fn write_chunked_archive_file<W: Write>(
             break;
         }
         let raw = &buf[..n];
-        let compressed =
-            zstd::stream::encode_all(raw, 3).map_err(|e| AedbError::Encode(e.to_string()))?;
+        let compressed = compress_block(raw, compression_level)?;
         let payload = if let Some(key) = encryption_key {
             let nonce = derive_archive_chunk_nonce(salt, entry_index, chunk_index, rel);
             encrypt_archive_payload(&compressed, key, &nonce)?

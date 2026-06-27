@@ -129,7 +129,7 @@ async fn scan_count(db: &AedbInstance) -> usize {
 async fn cold_row_tiering_keeps_all_read_paths_correct() {
     let dir = tempdir().expect("temp");
     let config = tiering_config();
-    let db = Arc::new(AedbInstance::open(config.clone(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open"));
     create_schema(&db).await;
 
     for i in 0..200i64 {
@@ -213,7 +213,7 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
     // Recovery restores every live row with correct values and indexes.
     db.shutdown().await.expect("shutdown");
     drop(db);
-    let db2 = AedbInstance::open(config, dir.path()).expect("reopen");
+    let db2 = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     assert_eq!(scan_count(&db2).await, 199, "all live rows recovered");
     assert_eq!(query_tag(&db2, "moved").await, 1, "index recovered");
 }

@@ -42,7 +42,7 @@ async fn disk_backed_checkpoint_is_self_contained_when_value_file_is_missing() {
     };
     let value: Vec<u8> = (0..128 * 1024).map(|i| (i % 199) as u8).collect();
 
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.kv_set("p", "app", b"blob".to_vec(), value.clone())
         .await
@@ -53,7 +53,7 @@ async fn disk_backed_checkpoint_is_self_contained_when_value_file_is_missing() {
 
     fs::remove_file(dir.path().join("values.aedbdat")).expect("remove value store");
 
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen from checkpoint");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen from checkpoint");
     let recovered = reopened
         .kv_get_no_auth("p", "app", b"blob", ConsistencyMode::AtLatest)
         .await
@@ -66,7 +66,7 @@ async fn disk_backed_checkpoint_is_self_contained_when_value_file_is_missing() {
 #[tokio::test]
 async fn event_outbox_and_reactive_processor_checkpoint_lag_work() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -146,7 +146,7 @@ async fn event_outbox_and_reactive_processor_checkpoint_lag_work() {
 #[tokio::test]
 async fn reactive_processor_checkpoint_ack_batches_by_watermark() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -237,7 +237,7 @@ async fn reactive_processor_checkpoint_ack_batches_by_watermark() {
 #[tokio::test]
 async fn reactive_processor_checkpoint_ack_rejects_regression() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -309,7 +309,7 @@ async fn reactive_processor_checkpoint_ack_rejects_regression() {
 #[tokio::test]
 async fn reactive_processor_checkpoint_batched_rejects_stale_persist_after_concurrent_advance() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
@@ -386,7 +386,7 @@ async fn reactive_processor_checkpoint_batched_rejects_stale_persist_after_concu
 #[tokio::test]
 async fn reactive_processor_checkpoint_batched_as_isolated_by_caller() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.emit_event("arcana", "app", "bootstrap", "evt-1".into(), "{}".into())
@@ -467,7 +467,7 @@ async fn reactive_processor_checkpoint_batched_as_isolated_by_caller() {
 #[tokio::test]
 async fn reactive_processor_checkpoint_batched_as_does_not_poison_cache_on_permission_failure() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.emit_event("arcana", "app", "bootstrap", "evt-1".into(), "{}".into())
@@ -546,7 +546,7 @@ async fn reactive_processor_checkpoint_batched_as_does_not_poison_cache_on_permi
 #[tokio::test]
 async fn reactive_processor_checkpoint_batched_cache_is_bounded() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("project");
     db.create_scope("arcana", "app").await.expect("scope");
     db.emit_event("arcana", "app", "bootstrap", "evt-1".into(), "{}".into())
@@ -650,7 +650,7 @@ fn wal_segment_gc_reclaims_checkpoint_covered_segments() {
 #[tokio::test]
 async fn checkpoint_now_enables_clean_restart() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -692,7 +692,7 @@ async fn checkpoint_now_enables_clean_restart() {
     // Release the exclusive data-directory lock before reopening the same dir.
     drop(db);
 
-    let reopened = AedbInstance::open(AedbConfig::default(), dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     let rows = reopened
         .query(
             "p",
@@ -710,7 +710,7 @@ async fn checkpoint_now_enables_clean_restart() {
 async fn checkpoint_retention_keeps_recent_checkpoints_and_prunes_older_files() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig::default().with_checkpoint_retention_count(2);
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     // Drive several checkpoints, each at a strictly higher seq.
@@ -750,7 +750,7 @@ async fn checkpoint_retention_keeps_recent_checkpoints_and_prunes_older_files() 
 
     // A clean reopen still recovers the latest state.
     drop(db);
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let entry = reopened
         .kv_get_no_auth("p", "app", b"k3", ConsistencyMode::AtLatest)
         .await
@@ -763,7 +763,7 @@ async fn checkpoint_retention_keeps_recent_checkpoints_and_prunes_older_files() 
 async fn checkpoint_does_not_prune_older_checkpoints_when_prior_manifest_unreadable() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig::production([7u8; 32]).with_checkpoint_retention_count(3);
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     for i in 0..2u64 {
         db.commit(Mutation::KvSet {
@@ -819,7 +819,7 @@ async fn checkpoint_now_in_batch_mode_flushes_wal_and_recovers_tail() {
         batch_max_bytes: usize::MAX,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
@@ -850,7 +850,7 @@ async fn checkpoint_now_in_batch_mode_flushes_wal_and_recovers_tail() {
 #[tokio::test]
 async fn checkpoint_now_allows_commits_while_running() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     // Build enough state to make checkpoint work measurable.
@@ -899,7 +899,7 @@ async fn checkpoint_now_allows_commits_while_running() {
 #[tokio::test]
 async fn checkpoint_now_serializes_checkpoint_writers() {
     let dir = tempdir().expect("temp");
-    let db = Arc::new(AedbInstance::open(AedbConfig::default(), dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     db.commit(Mutation::KvSet {
@@ -925,7 +925,7 @@ async fn checkpoint_now_serializes_checkpoint_writers() {
 async fn checkpoint_captures_transaction_all_or_none() {
     let dir = tempdir().expect("temp");
     let config = AedbConfig::default();
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let base_seq = db
@@ -996,7 +996,7 @@ async fn checkpoint_manifest_trims_fully_covered_segments() {
         max_segment_bytes: 4096,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     for i in 0..400u32 {
@@ -1110,7 +1110,7 @@ async fn benchmark_commit_latency_during_checkpoint() {
 
     let dir = tempdir().expect("temp");
     let config = AedbConfig::default();
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let (base_tps, base_p50, base_p99) = run_phase(&db, 0, 800, false).await;
@@ -1217,7 +1217,7 @@ async fn benchmark_parallel_commit_throughput_during_checkpoint() {
         ..AedbConfig::default()
     };
     config.manifest_hmac_key = None;
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     // Seed state so the checkpoint has meaningful work.
@@ -1342,7 +1342,7 @@ async fn benchmark_parallel_checkpoint_compression_levels() {
         };
         config.manifest_hmac_key = None;
         config.checkpoint_compression_level = level;
-        let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+        let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
         db.create_project("p").await.expect("project");
         seed(&db).await;
 
@@ -1376,7 +1376,7 @@ async fn benchmark_parallel_checkpoint_compression_levels() {
 #[tokio::test]
 async fn snapshot_probe_returns_snapshot_seq() {
     let dir = tempdir().expect("temp");
-    let db = AedbInstance::open(AedbConfig::default(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     let seq = db
         .snapshot_probe(ConsistencyMode::AtLatest)
@@ -1392,7 +1392,7 @@ async fn snapshot_probe_does_not_consume_snapshot_slot() {
         max_concurrent_snapshots: 1,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
 
     let _lease = db
@@ -1414,7 +1414,7 @@ async fn snapshot_probe_remains_live_under_snapshot_capacity_pressure() {
         max_concurrent_snapshots: 1,
         ..AedbConfig::default()
     };
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let _lease = db
@@ -1455,7 +1455,7 @@ async fn checkpoint_now_completes_under_hot_load() {
         batch_max_bytes: usize::MAX,
         ..AedbConfig::default()
     };
-    let db = Arc::new(AedbInstance::open(config, dir.path()).expect("open"));
+    let db = Arc::new(AedbInstance::open_anonymous(config, dir.path()).expect("open"));
     db.create_project("p").await.expect("project");
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1534,7 +1534,7 @@ async fn at_checkpoint_falls_back_when_version_evicted() {
         version_gc_interval_ms: 1,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config, dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::KvSet {
         project_id: "p".into(),
@@ -1568,7 +1568,7 @@ async fn strict_restore_rejects_older_backup_version() {
     let dir = tempdir().expect("data dir");
     let backup_dir = tempdir().expect("backup dir");
     let config = AedbConfig::production([7u8; 32]);
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("create project");
     db.create_scope("arcana", "app")
         .await
@@ -1600,7 +1600,7 @@ async fn restore_at_time_rejects_backup_wal_with_invalid_hash_chain() {
     let backup_dir = tempdir().expect("backup dir");
     let restore_dir = tempdir().expect("restore dir");
     let config = AedbConfig::production([8u8; 32]);
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("arcana").await.expect("create project");
     db.create_scope("arcana", "app")
         .await
@@ -1657,7 +1657,7 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
         table_row_spill_enabled: true,
         ..AedbConfig::default()
     };
-    let db = AedbInstance::open(config.clone(), dir.path()).expect("open");
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
     db.create_project("p").await.expect("project");
     db.commit(Mutation::Ddl(DdlOperation::CreateTable {
         owner_id: None,
@@ -1707,7 +1707,7 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
     drop(db);
 
     // Restore from the checkpoint and confirm every spilled row round-tripped.
-    let reopened = AedbInstance::open(config, dir.path()).expect("reopen");
+    let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let rows = reopened
         .query(
             "p",
