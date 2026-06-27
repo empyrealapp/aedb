@@ -252,6 +252,18 @@ impl SegmentManager {
         Ok(())
     }
 
+    /// Clone the active segment's file handle so the durability fsync can run
+    /// without holding the executor state lock. `sync_data` only needs a shared
+    /// `&File`, and the clone points at the same underlying file description, so
+    /// syncing the clone is equivalent to `sync_active`. Returns `None` when no
+    /// segment is open.
+    pub(crate) fn try_clone_active_file(&self) -> Result<Option<File>, SegmentError> {
+        match &self.active {
+            Some(active) => Ok(Some(active.file.try_clone()?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn should_rotate(&self) -> Option<RotationReason> {
         self.should_rotate_at(Instant::now())
     }

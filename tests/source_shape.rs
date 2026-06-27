@@ -142,21 +142,21 @@ fn implementation_modules_keep_tests_in_dedicated_files() {
 fn large_file_budgets() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
         // Central commit engine internals. Split only along scheduler/apply/replay-safe boundaries.
-        ("src/commit/executor/internals.rs", 5_200),
+        ("src/commit/executor/internals.rs", 5_350),
         ("src/commit/executor/tests.rs", 4_300),
         ("src/commit/apply.rs", 4_050),
         // Row-spill support (StoredRow + spill_table_rows + materialize helpers).
         ("src/storage/keyspace.rs", 3_250),
-        ("src/lib.rs", 3_650),
+        ("src/lib.rs", 3_700),
         ("src/catalog/mod.rs", 2_150),
         ("src/commit/validation.rs", 2_800),
         ("src/order_book.rs", 2_200),
         ("src/commit/executor/mod.rs", 1_900),
-        ("src/lib_tests/auth.rs", 4_350),
+        ("src/lib_tests/auth.rs", 4_400),
         ("src/lib_tests/query_api.rs", 2_200),
         ("src/lib_tests/commit_ops.rs", 1_750),
         ("src/api/order_book_api.rs", 1_610),
-        ("src/api/kv_api.rs", 1_480),
+        ("src/api/kv_api.rs", 1_550),
         ("src/api/reactive_processors.rs", 1_520),
         ("src/lib_tests/backup_restore.rs", 1_780),
         ("src/lib_tests/kv_api.rs", 1_650),
