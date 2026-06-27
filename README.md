@@ -239,7 +239,11 @@ Error handling:
 - `checkpoint_now()` to force a fuzzy checkpoint (does not block commit/query traffic)
 - `backup_full(...)` / restore helpers for backup workflows (full + incremental chains)
 - `operational_metrics()` for commit latency, queue depth, durable head lag, cache
-  hit/miss counters, active snapshot count, and more
+  hit/miss counters, active snapshot count, in-memory keyspace resident bytes vs
+  budget (`keyspace_memory_used_fraction`), and more
+- Joins enforce both a row-count bound (`max_scan_rows`) and a hard materialized-byte
+  ceiling, so a query returning few but very large rows cannot OOM the host
+  (returns `QueryError::MaterializationBudgetExceeded`)
 - `faults` module: deterministic fail-point injection (`wal_append`, `wal_sync`,
   `manifest_write`, `checkpoint_write`) for crash/corruption-path testing;
   disarmed in production with single-atomic-load overhead

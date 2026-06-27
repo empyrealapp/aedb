@@ -1,8 +1,44 @@
 use super::execute_query_with_options;
+use super::join::enforce_materialization_budget;
 use super::tests::{execute_query, setup};
 use crate::catalog::schema::ColumnDef;
 use crate::catalog::types::{ColumnType, Row, Value};
+use crate::query::error::QueryError;
 use crate::query::plan::{Aggregate, Expr, Order, Query, QueryOptions};
+
+#[test]
+fn materialization_budget_rejects_oversized_row_set() {
+    let rows: Vec<Row> = (0..1000)
+        .map(|i| Row {
+            values: vec![Value::Integer(i), Value::Text("x".repeat(256).into())],
+        })
+        .collect();
+
+    // A generous budget admits the set.
+    assert!(enforce_materialization_budget(&rows, u64::MAX).is_ok());
+
+    // A tiny budget rejects it with a structured, machine-readable error.
+    let err = enforce_materialization_budget(&rows, 64).unwrap_err();
+    match err {
+        QueryError::MaterializationBudgetExceeded {
+            estimated_bytes,
+            max_bytes,
+        } => {
+            assert_eq!(max_bytes, 64);
+            assert!(estimated_bytes > 64);
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
+fn materialization_budget_admits_empty_and_small_sets() {
+    assert!(enforce_materialization_budget(&[], 0).is_ok());
+    let small = vec![Row {
+        values: vec![Value::Integer(1)],
+    }];
+    assert!(enforce_materialization_budget(&small, 1024).is_ok());
+}
 
 fn add_profiles_table(catalog: &mut crate::catalog::Catalog, primary_key: Vec<String>) {
     catalog

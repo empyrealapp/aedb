@@ -1,4 +1,4 @@
-mod memory_accounting;
+pub(crate) mod memory_accounting;
 pub(crate) use memory_accounting::{
     kv_entry_cost, kv_inline_entry_cost, kv_segment_meta_cost, kv_tombstone_cost,
     namespace_mem_cost, persistent_value_ref_cost, persistent_value_ref_resident_cost,

@@ -476,6 +476,11 @@ pub struct ExecutorRuntimeState {
     pub kv_segment_block_cache_capacity_bytes: usize,
     pub kv_segment_block_cache_hits: u64,
     pub kv_segment_block_cache_misses: u64,
+    /// Estimated resident memory of the in-memory keyspace skeleton (keys,
+    /// index entries, row metadata; spilled payloads excluded).
+    pub keyspace_resident_bytes: u64,
+    /// Configured soft cap (`max_memory_estimate_bytes`) that drives spill.
+    pub keyspace_memory_budget_bytes: u64,
 }
 
 impl CommitExecutor {
@@ -1765,8 +1770,9 @@ impl CommitExecutor {
     }
 
     pub async fn runtime_state_metrics(&self) -> ExecutorRuntimeState {
-        let (value_metrics, segment_metrics) = {
+        let (value_metrics, segment_metrics, keyspace_resident_bytes) = {
             let state = self.state.lock().await;
+            let keyspace_resident_bytes = state.keyspace.mem_bytes as u64;
             let value_metrics = state
                 .keyspace
                 .value_store
@@ -1793,7 +1799,7 @@ impl CommitExecutor {
                             store.block_cache_misses(),
                         )
                     });
-            (value_metrics, segment_metrics)
+            (value_metrics, segment_metrics, keyspace_resident_bytes)
         };
         ExecutorRuntimeState {
             current_seq: self.current_seq.load(Ordering::Acquire),
@@ -1809,6 +1815,8 @@ impl CommitExecutor {
             kv_segment_block_cache_capacity_bytes: segment_metrics.1 as usize,
             kv_segment_block_cache_hits: segment_metrics.2,
             kv_segment_block_cache_misses: segment_metrics.3,
+            keyspace_resident_bytes,
+            keyspace_memory_budget_bytes: self.config.max_memory_estimate_bytes as u64,
         }
     }
 }

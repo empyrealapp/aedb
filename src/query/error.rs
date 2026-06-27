@@ -7,6 +7,7 @@ pub enum QueryErrorCode {
     ColumnNotFound,
     TypeMismatch,
     ScanBoundExceeded,
+    MaterializationBudgetExceeded,
     InvalidQuery,
     PermissionDenied,
     SeqNotYetVisible,
@@ -40,6 +41,7 @@ impl QueryErrorCode {
             QueryErrorCode::ColumnNotFound => "column_not_found",
             QueryErrorCode::TypeMismatch => "type_mismatch",
             QueryErrorCode::ScanBoundExceeded => "scan_bound_exceeded",
+            QueryErrorCode::MaterializationBudgetExceeded => "materialization_budget_exceeded",
             QueryErrorCode::InvalidQuery => "invalid_query",
             QueryErrorCode::PermissionDenied => "permission_denied",
             QueryErrorCode::SeqNotYetVisible => "seq_not_yet_visible",
@@ -59,7 +61,8 @@ impl QueryErrorCode {
             | QueryErrorCode::SnapshotExpired
             | QueryErrorCode::SnapshotLimitReached => QueryErrorClass::Retryable,
             QueryErrorCode::PermissionDenied => QueryErrorClass::Permission,
-            QueryErrorCode::ScanBoundExceeded => QueryErrorClass::Unavailable,
+            QueryErrorCode::ScanBoundExceeded
+            | QueryErrorCode::MaterializationBudgetExceeded => QueryErrorClass::Unavailable,
             QueryErrorCode::InternalError => QueryErrorClass::Integrity,
             QueryErrorCode::TableNotFound
             | QueryErrorCode::ColumnNotFound
@@ -93,6 +96,13 @@ pub enum QueryError {
     ScanBoundExceeded {
         estimated_rows: u64,
         max_scan_rows: u64,
+    },
+    /// A query (currently joins) would buffer more bytes of materialized rows
+    /// than the configured ceiling allows. Guards the host against OOM from a
+    /// query that returns few but very large rows.
+    MaterializationBudgetExceeded {
+        estimated_bytes: u64,
+        max_bytes: u64,
     },
     InvalidQuery {
         reason: String,
@@ -156,6 +166,13 @@ impl fmt::Display for QueryError {
                 f,
                 "scan bound exceeded: estimated_rows={estimated_rows}, max_scan_rows={max_scan_rows}"
             ),
+            QueryError::MaterializationBudgetExceeded {
+                estimated_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "materialization budget exceeded: estimated_bytes={estimated_bytes}, max_bytes={max_bytes}"
+            ),
             QueryError::InvalidQuery { reason } => write!(f, "invalid query: {reason}"),
             QueryError::PermissionDenied { .. } => {
                 write!(f, "permission denied: permission denied")
@@ -195,6 +212,9 @@ impl QueryError {
             QueryError::ColumnNotFound { .. } => QueryErrorCode::ColumnNotFound,
             QueryError::TypeMismatch { .. } => QueryErrorCode::TypeMismatch,
             QueryError::ScanBoundExceeded { .. } => QueryErrorCode::ScanBoundExceeded,
+            QueryError::MaterializationBudgetExceeded { .. } => {
+                QueryErrorCode::MaterializationBudgetExceeded
+            }
             QueryError::InvalidQuery { .. } => QueryErrorCode::InvalidQuery,
             QueryError::PermissionDenied { .. } => QueryErrorCode::PermissionDenied,
             QueryError::SeqNotYetVisible { .. } => QueryErrorCode::SeqNotYetVisible,
