@@ -3586,6 +3586,8 @@ impl ReadTx<'_> {
             aggregates: vec![crate::query::plan::Aggregate::Count],
             having: None,
             use_index: query.use_index.clone(),
+            distinct: false,
+            computed: Vec::new(),
         };
         let count_result = self
             .query_with_options(project_id, scope_id, count_query, QueryOptions::default())

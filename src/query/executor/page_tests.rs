@@ -190,7 +190,41 @@ fn limit_offset_uses_index_candidate_window() {
 
     assert_eq!(result.rows.len(), 1);
     assert_eq!(result.rows[0].values[0], Value::Integer(52));
-    assert_eq!(result.rows_examined, 2);
+    // The exact-index OFFSET fast path drops the skipped primary key before
+    // materializing, so only the single returned row is paged in (not offset+1).
+    assert_eq!(result.rows_examined, 1);
+}
+
+#[test]
+fn deep_offset_on_exact_index_does_not_materialize_skipped_rows() {
+    // `age >= 18` matches all 100 rows via the ordered `by_age` index and is an
+    // exact predicate with no ORDER BY, so the deep-OFFSET fast path engages:
+    // a large offset must not materialize the skipped rows. `rows_examined`
+    // should reflect only the returned page (plus the lookahead row), not the
+    // offset.
+    let (keyspace, catalog) = super::tests::setup();
+    let snapshot = keyspace.snapshot();
+    let result = super::tests::execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .where_(col("age").gte(lit(18)))
+            .limit(5)
+            .offset(90),
+    )
+    .expect("deep offset page");
+
+    assert_eq!(result.rows.len(), 5);
+    // 5 returned + 1 lookahead row; crucially far below the 95 a scan-and-skip
+    // implementation would have paged in.
+    assert!(
+        result.rows_examined <= 6,
+        "expected deep offset to skip materialization, examined {}",
+        result.rows_examined
+    );
 }
 
 #[test]
