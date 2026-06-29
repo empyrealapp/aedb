@@ -1,7 +1,9 @@
 use super::{
-    AsyncProjectionData, INLINE_KV_VALUE_MAX_BYTES, KvData, Namespace, StoredRow, TableData,
+    AsyncProjectionData, INLINE_KV_VALUE_MAX_BYTES, KvData, Namespace, SecondaryIndex,
+    SecondaryIndexStore, StoredRow, TableData,
 };
 use crate::catalog::types::{Row, Value};
+use crate::storage::encoded_key::EncodedKey;
 use crate::storage::kv_segment::KvSegmentMeta;
 use crate::storage::value_store::PersistentValueRef;
 
@@ -102,8 +104,102 @@ pub(crate) fn kv_segment_meta_cost(meta: &KvSegmentMeta) -> usize {
         .saturating_add(96)
 }
 
+/// Resident cost of one posting in a secondary index: the primary key bytes a
+/// `BTree`/`Hash`/`UniqueHash` store holds for an index entry, plus structural
+/// overhead for the persistent-map/set node.
+///
+/// `pub(crate)` so the incremental delta math in [`crate::storage::index`] can
+/// stay in lockstep with the full recompute here; the two must always agree to
+/// preserve the `mem_bytes == recompute_memory_bytes_full()` invariant.
+pub(crate) const INDEX_POSTING_OVERHEAD_BYTES: usize = 32;
+
+/// Resident cost of one distinct indexed value in a secondary index: the index
+/// key bytes plus the per-value map node and (for multi-valued stores) the
+/// `OrdSet` header.
+pub(crate) const INDEX_VALUE_OVERHEAD_BYTES: usize = 32;
+
+fn index_postings_set_cost(values: &im::OrdSet<EncodedKey>) -> usize {
+    values
+        .iter()
+        .map(|pk| {
+            pk.as_slice()
+                .len()
+                .saturating_add(INDEX_POSTING_OVERHEAD_BYTES)
+        })
+        .sum()
+}
+
+/// Resident memory held by a single secondary index. Index postings grow 1:1
+/// with indexed rows, so they must be counted against the keyspace budget
+/// alongside the rows themselves; otherwise an index-heavy table can grow the
+/// resident footprint without the spill cascade ever observing the pressure.
+/// Resident cost of just the in-memory posting store (excluding cold-tier
+/// segment metadata and tombstones). This is the amount freed when the resident
+/// postings are evicted to a segment.
+pub(crate) fn secondary_index_store_cost(index: &SecondaryIndex) -> usize {
+    match &index.store {
+        SecondaryIndexStore::BTree(map) => map
+            .iter()
+            .map(|(value, pks)| {
+                value
+                    .as_slice()
+                    .len()
+                    .saturating_add(INDEX_VALUE_OVERHEAD_BYTES)
+                    .saturating_add(index_postings_set_cost(pks))
+            })
+            .sum(),
+        SecondaryIndexStore::Hash(map) => map
+            .iter()
+            .map(|(value, pks)| {
+                value
+                    .as_slice()
+                    .len()
+                    .saturating_add(INDEX_VALUE_OVERHEAD_BYTES)
+                    .saturating_add(index_postings_set_cost(pks))
+            })
+            .sum(),
+        SecondaryIndexStore::UniqueHash(map) => map
+            .iter()
+            .map(|(value, pk)| {
+                value
+                    .as_slice()
+                    .len()
+                    .saturating_add(pk.as_slice().len())
+                    .saturating_add(INDEX_VALUE_OVERHEAD_BYTES)
+            })
+            .sum(),
+    }
+}
+
+/// Total resident memory held by a single secondary index: the in-memory
+/// posting store plus runtime-only cold-tier bookkeeping (segment metadata that
+/// stays resident even when the postings are evicted, and tombstones for
+/// postings that live only in segments).
+pub(crate) fn secondary_index_mem_cost(index: &SecondaryIndex) -> usize {
+    let segment_cost: usize = index.segments.iter().map(kv_segment_meta_cost).sum();
+    let tombstone_cost: usize = index
+        .segment_tombstones
+        .keys()
+        .map(|key| key.as_slice().len().saturating_add(16))
+        .sum();
+    secondary_index_store_cost(index)
+        .saturating_add(segment_cost)
+        .saturating_add(tombstone_cost)
+}
+
 pub(crate) fn table_data_mem_cost(t: &TableData) -> usize {
-    t.rows.values().map(stored_row_mem_cost).sum::<usize>()
+    let rows = t.rows.values().map(stored_row_mem_cost).sum::<usize>();
+    // Secondary index postings grow 1:1 with indexed rows and are fully
+    // resident, so they must be counted against the keyspace budget alongside
+    // the rows. `row_versions`/`row_tombstones`/`row_segments` are deliberately
+    // excluded here: versions are inline on new rows, and the cold-tier
+    // bookkeeping is key-only and tracked separately by the eviction paths.
+    let indexes = t
+        .indexes
+        .values()
+        .map(secondary_index_mem_cost)
+        .sum::<usize>();
+    rows.saturating_add(indexes)
 }
 
 pub(crate) fn kv_data_mem_cost(kv: &KvData) -> usize {

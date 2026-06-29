@@ -1,6 +1,7 @@
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
 use crate::catalog::schema::{IndexType, TableSchema};
+use crate::query::error::QueryError;
 use crate::query::plan::{Expr, Order, Query};
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::keyspace::TableData;
@@ -24,6 +25,7 @@ pub(super) struct OrderedIndexScanRequest<'a> {
     pub schema: &'a TableSchema,
     pub query: &'a Query,
     pub table: &'a TableData,
+    pub segment_store: Option<&'a crate::storage::kv_segment::KvSegmentStore>,
     pub offset: usize,
     pub limit: usize,
     pub has_cursor: bool,
@@ -37,6 +39,7 @@ pub(super) struct OrderedPredicateIndexScanRequest<'a> {
     pub query: &'a Query,
     pub table: &'a TableData,
     pub predicate: &'a Expr,
+    pub segment_store: Option<&'a crate::storage::kv_segment::KvSegmentStore>,
     pub offset: usize,
     pub limit: usize,
     pub has_cursor: bool,
@@ -60,8 +63,8 @@ struct OrderedIndexSelectionWithOrder<'a> {
 
 pub(super) fn ordered_index_scan_for_query(
     request: OrderedIndexScanRequest<'_>,
-) -> Option<OrderedIndexScan> {
-    let selection = ordered_index_selection_for_query_with_order(
+) -> Result<Option<OrderedIndexScan>, QueryError> {
+    let Some(selection) = ordered_index_selection_for_query_with_order(
         request.catalog,
         request.project_id,
         request.scope_id,
@@ -69,17 +72,22 @@ pub(super) fn ordered_index_scan_for_query(
         request.query,
         request.table,
         request.has_cursor,
-    )?;
-    let secondary_index = request.table.indexes.get(selection.index_name)?;
-    Some(OrderedIndexScan {
+    ) else {
+        return Ok(None);
+    };
+    let Some(secondary_index) = request.table.indexes.get(selection.index_name) else {
+        return Ok(None);
+    };
+    Ok(Some(OrderedIndexScan {
         index_name: selection.index_name.to_string(),
-        pks: secondary_index.scan_prefix_window_ordered(
+        pks: secondary_index.tier_scan_prefix_window_ordered(
             None,
             request.offset,
             request.limit,
             matches!(selection.order, Order::Desc),
-        ),
-    })
+            request.segment_store,
+        )?,
+    }))
 }
 
 pub(super) fn ordered_index_selection_for_query<'a>(
@@ -101,8 +109,8 @@ pub(super) fn ordered_index_selection_for_query<'a>(
 
 pub(super) fn ordered_predicate_index_scan_for_query(
     request: OrderedPredicateIndexScanRequest<'_>,
-) -> Option<OrderedIndexScan> {
-    let selection =
+) -> Result<Option<OrderedIndexScan>, QueryError> {
+    let Some(selection) =
         ordered_predicate_index_selection_for_query(OrderedPredicateIndexSelectionRequest {
             catalog: request.catalog,
             project_id: request.project_id,
@@ -112,29 +120,38 @@ pub(super) fn ordered_predicate_index_scan_for_query(
             table: request.table,
             predicate: request.predicate,
             has_cursor: request.has_cursor,
-        })?;
-    let secondary_index = request.table.indexes.get(selection.index_name)?;
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(secondary_index) = request.table.indexes.get(selection.index_name) else {
+        return Ok(None);
+    };
     let reverse = matches!(selection.order, Order::Desc);
+    let store = request.segment_store;
     let pks = match selection.lookup {
-        OrderedPredicateLookup::Eq(key) => secondary_index.scan_range_window_ordered(
+        OrderedPredicateLookup::Eq(key) => secondary_index.tier_scan_range_window_ordered(
             Bound::Included(key.clone()),
             Bound::Included(key),
             request.offset,
             request.limit,
             reverse,
-        ),
-        OrderedPredicateLookup::Range(start, end) => secondary_index.scan_range_window_ordered(
-            start,
-            end,
-            request.offset,
-            request.limit,
-            reverse,
-        ),
+            store,
+        )?,
+        OrderedPredicateLookup::Range(start, end) => secondary_index
+            .tier_scan_range_window_ordered(
+                start,
+                end,
+                request.offset,
+                request.limit,
+                reverse,
+                store,
+            )?,
     };
-    Some(OrderedIndexScan {
+    Ok(Some(OrderedIndexScan {
         index_name: selection.index_name.to_string(),
         pks,
-    })
+    }))
 }
 
 pub(super) fn ordered_predicate_index_selection_name_for_query<'a>(

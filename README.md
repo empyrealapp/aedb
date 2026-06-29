@@ -253,6 +253,22 @@ Error handling:
   in-memory footprint stays bounded as a table grows beyond RAM. Reads,
   index/constraint maintenance, assertions, and recovery are all tier-aware; the
   cold tier is runtime-only (re-inlined before every checkpoint, never persisted)
+- Cold secondary-index tiering (opt-in `index_segment_eviction_enabled`): the same
+  mechanism for secondary indexes — cold index postings are evicted to sorted
+  on-disk segments (keyed by `index_value‖primary_key`) and paged back on read, so
+  a table's indexes can also grow beyond RAM. Equality/range/prefix lookups,
+  unique-constraint and foreign-key checks all merge the resident and cold tiers
+  (a duplicate hiding in a cold segment is still rejected), and the tier is
+  runtime-only like the row tier. The accompanying memory accounting counts index
+  postings against the budget whether or not eviction is enabled, so an
+  index-heavy workload back-pressures instead of silently exhausting memory.
+  Current limitations: the cross-namespace global unique index is not yet tiered
+  (stays resident); cold segments are not compacted (they accumulate per
+  memory-pressure breach, so point/bounded lookups stay cheap but an *unbounded*
+  ordered scan over a large evicted index materializes the scanned range — prefer
+  bounded predicates, or keep such indexes resident). Like the row tier, calling
+  `reclaim_unused_kv_segments()` is safe while cold data exists: live row and index
+  segment files are protected from reclamation.
 
 CLI helper (`src/bin/aedb.rs`) includes offline dump/parity/invariant tooling and
 a full integrity verifier:

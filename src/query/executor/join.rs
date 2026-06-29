@@ -934,6 +934,7 @@ fn indexed_base_rows(req: IndexedBaseRowsRequest<'_>) -> Result<Option<Vec<Row>>
         req.scope_id,
         req.table_name,
         table,
+        req.snapshot.kv_segment_store.as_deref(),
         &bare,
         None,
     )?

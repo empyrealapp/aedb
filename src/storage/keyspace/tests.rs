@@ -484,6 +484,226 @@ fn disjoint_segment_point_get_finds_only_possible_range() {
 }
 
 #[test]
+fn index_postings_evict_to_segments_and_reinline_round_trips() {
+    use super::{SecondaryIndex, SecondaryIndexStore};
+    use crate::catalog::namespace_key;
+
+    let dir = tempdir().expect("temp dir");
+    let segment_store = Arc::new(KvSegmentStore::open(dir.path()).expect("open segment store"));
+    let mut ks = Keyspace::default();
+    ks.attach_kv_segment_store(Arc::clone(&segment_store));
+
+    let ns = namespace_key("p", "app");
+    // Seed rows so the table/namespace exist.
+    for i in 0..32_i64 {
+        ks.upsert_row(
+            "p",
+            "app",
+            "users",
+            vec![Value::Integer(i)],
+            row(vec![Value::Integer(i), Value::Integer(i % 4)]),
+            i as u64 + 1,
+        );
+    }
+    // Build a resident BTree index on the second column (value = i % 4).
+    {
+        let table = ks
+            .table_by_namespace_key_mut(&ns, "users")
+            .expect("users table");
+        let mut secondary_index = SecondaryIndex {
+            store: SecondaryIndexStore::BTree(im::OrdMap::new()),
+            columns_bitmask: 0b10,
+            partial_filter: None,
+            ..Default::default()
+        };
+        for i in 0..32_i64 {
+            secondary_index.insert(
+                EncodedKey::from_values(&[Value::Integer(i % 4)]),
+                EncodedKey::from_values(&[Value::Integer(i)]),
+            );
+        }
+        table.indexes.insert("by_bucket".into(), secondary_index);
+    }
+    ks.refresh_mem_bytes();
+
+    let expected: Vec<(EncodedKey, EncodedKey)> = ks
+        .table_by_namespace_key(&ns, "users")
+        .and_then(|t| t.indexes.get("by_bucket"))
+        .expect("index present")
+        .resident_postings();
+    assert_eq!(expected.len(), 32);
+
+    // Evict the index postings to a cold segment.
+    ks.flush_index_postings_to_segments_to_memory_target(0, 100)
+        .expect("evict index postings");
+    {
+        let evicted = ks
+            .table_by_namespace_key(&ns, "users")
+            .and_then(|t| t.indexes.get("by_bucket"))
+            .expect("index present after evict");
+        assert!(
+            evicted.resident_store_is_empty(),
+            "resident postings should be evicted"
+        );
+        assert!(evicted.has_cold_segments(), "a cold segment should exist");
+        // The cold index segment file must be in the protected set, or segment
+        // reclamation would delete it and corrupt the cold postings.
+        let protected = ks.kv_segment_filenames();
+        let index_seg = ks
+            .table_by_namespace_key(&ns, "users")
+            .and_then(|t| t.indexes.get("by_bucket"))
+            .expect("index")
+            .segments[0]
+            .filename
+            .clone();
+        assert!(
+            protected.contains(&index_seg),
+            "cold index segment must be protected from reclamation"
+        );
+    }
+    // The running counter must still match a full recompute after eviction.
+    assert_eq!(ks.mem_bytes, ks.recompute_memory_bytes_full());
+
+    // Re-inlining for a checkpoint restores the full resident index and drops
+    // the runtime-only cold tier.
+    let materialized = ks
+        .snapshot()
+        .materialized_for_checkpoint()
+        .expect("materialize");
+    let reinlined = materialized
+        .table_by_namespace_key(&ns, "users")
+        .and_then(|t| t.indexes.get("by_bucket"))
+        .expect("index present after reinline");
+    assert!(
+        !reinlined.has_cold_segments(),
+        "cold tier must be re-inlined for the checkpoint"
+    );
+    assert_eq!(
+        reinlined.resident_postings(),
+        expected,
+        "re-inlined index must match the original postings exactly"
+    );
+    assert_eq!(
+        materialized.mem_bytes,
+        materialized.recompute_memory_bytes_full()
+    );
+}
+
+#[test]
+fn tier_reads_match_resident_after_index_eviction() {
+    use super::{SecondaryIndex, SecondaryIndexStore};
+    use crate::catalog::namespace_key;
+    use crate::storage::keyspace::index_segment_composite_key;
+
+    let dir = tempdir().expect("temp dir");
+    let segment_store = Arc::new(KvSegmentStore::open(dir.path()).expect("open segment store"));
+    let mut ks = Keyspace::default();
+    ks.attach_kv_segment_store(Arc::clone(&segment_store));
+
+    let ns = namespace_key("p", "app");
+    for i in 0..40_i64 {
+        ks.upsert_row(
+            "p",
+            "app",
+            "users",
+            vec![Value::Integer(i)],
+            row(vec![Value::Integer(i), Value::Integer(i % 5)]),
+            i as u64 + 1,
+        );
+    }
+    {
+        let table = ks
+            .table_by_namespace_key_mut(&ns, "users")
+            .expect("users table");
+        let mut secondary_index = SecondaryIndex {
+            store: SecondaryIndexStore::BTree(im::OrdMap::new()),
+            columns_bitmask: 0b10,
+            partial_filter: None,
+            ..Default::default()
+        };
+        for i in 0..40_i64 {
+            secondary_index.insert(
+                EncodedKey::from_values(&[Value::Integer(i % 5)]),
+                EncodedKey::from_values(&[Value::Integer(i)]),
+            );
+        }
+        table.indexes.insert("by_bucket".into(), secondary_index);
+    }
+    ks.refresh_mem_bytes();
+
+    let bucket2 = EncodedKey::from_values(&[Value::Integer(2)]);
+    let range_lo = EncodedKey::from_values(&[Value::Integer(1)]);
+    let range_hi = EncodedKey::from_values(&[Value::Integer(3)]);
+
+    // Capture resident-only results before eviction.
+    let (expected_eq, expected_range, expected_prefix) = {
+        let resident = ks
+            .table_by_namespace_key(&ns, "users")
+            .and_then(|t| t.indexes.get("by_bucket"))
+            .expect("index");
+        (
+            resident.scan_eq(&bucket2),
+            resident.scan_range(
+                Bound::Included(range_lo.clone()),
+                Bound::Included(range_hi.clone()),
+            ),
+            resident.scan_prefix_window_ordered(None, 5, 10, true),
+        )
+    };
+
+    ks.flush_index_postings_to_segments_to_memory_target(0, 100)
+        .expect("evict");
+    let store: Option<&KvSegmentStore> = Some(segment_store.as_ref());
+
+    let evicted = ks
+        .table_by_namespace_key(&ns, "users")
+        .and_then(|t| t.indexes.get("by_bucket"))
+        .expect("index after evict");
+    assert!(evicted.has_cold_segments());
+    assert!(evicted.resident_store_is_empty());
+
+    // Every read path must return identical results once postings are cold.
+    assert_eq!(
+        evicted
+            .tier_scan_eq_limit(&bucket2, usize::MAX, store)
+            .unwrap(),
+        expected_eq
+    );
+    assert_eq!(
+        evicted
+            .tier_scan_range_limit(
+                Bound::Included(range_lo.clone()),
+                Bound::Included(range_hi.clone()),
+                usize::MAX,
+                store,
+            )
+            .unwrap(),
+        expected_range
+    );
+    assert_eq!(
+        evicted
+            .tier_scan_prefix_window_ordered(None, 5, 10, true, store)
+            .unwrap(),
+        expected_prefix
+    );
+
+    // A tombstone (the delete-after-eviction signal) must suppress the posting
+    // in every read path; here pk=2 (bucket 2) is deleted at a later seq.
+    let pk2 = EncodedKey::from_values(&[Value::Integer(2)]);
+    let composite = EncodedKey::from_bytes(index_segment_composite_key(&bucket2, &pk2));
+    let mut tombstoned = evicted.clone();
+    tombstoned.segment_tombstones.insert(composite, 200);
+    let eq_after_delete = tombstoned
+        .tier_scan_eq_limit(&bucket2, usize::MAX, store)
+        .unwrap();
+    assert!(
+        !eq_after_delete.contains(&pk2),
+        "tombstoned posting must not be returned"
+    );
+    assert_eq!(eq_after_delete.len(), expected_eq.len() - 1);
+}
+
+#[test]
 fn sorted_segment_range_helpers_detect_common_append_layout() {
     let dir = tempdir().expect("temp dir");
     let segment_store = Arc::new(KvSegmentStore::open(dir.path()).expect("open segment store"));

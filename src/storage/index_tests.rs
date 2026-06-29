@@ -2,11 +2,90 @@ use super::{extract_index_key, extract_index_key_encoded};
 use crate::catalog::schema::{ColumnDef, TableSchema};
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::storage::encoded_key::EncodedKey;
-use crate::storage::keyspace::SecondaryIndex;
+use crate::storage::keyspace::memory_accounting::secondary_index_mem_cost;
+use crate::storage::keyspace::{SecondaryIndex, SecondaryIndexStore};
 use std::ops::Bound;
 
 fn encoded(values: &[Value]) -> EncodedKey {
     EncodedKey::from_values(values)
+}
+
+/// The signed deltas returned by `insert`/`remove` must always sum to exactly
+/// what `secondary_index_mem_cost` reports, or the keyspace `mem_bytes` running
+/// counter drifts from `recompute_memory_bytes_full()` and the checkpoint
+/// loader's consistency assert fails. Exercise all three store kinds with
+/// inserts, duplicate inserts, partial and full removals, and no-op removals.
+fn assert_delta_tracks_cost(mut index: SecondaryIndex) {
+    let key = |n: i64| EncodedKey::from_values(&[Value::Integer(n)]);
+    let pk = |n: i64| EncodedKey::from_values(&[Value::Integer(1000 + n)]);
+
+    let mut running: i64 = 0;
+    let mut step = |index: &mut SecondaryIndex, delta: i64| {
+        running += delta;
+        assert_eq!(
+            running,
+            secondary_index_mem_cost(index) as i64,
+            "running delta diverged from recomputed cost"
+        );
+    };
+
+    // Distinct values, each with one posting.
+    for n in 0..8 {
+        let d = index.insert(key(n), pk(n));
+        step(&mut index, d);
+    }
+    // Second posting under an existing value (multi-valued stores only grow;
+    // UniqueHash overwrites).
+    for n in 0..8 {
+        let d = index.insert(key(n), pk(n + 100));
+        step(&mut index, d);
+    }
+    // Duplicate insert of an existing (value, pk) must be a no-op (delta 0).
+    let d = index.insert(key(0), pk(0));
+    step(&mut index, d);
+    // Remove a posting that may or may not exist.
+    for n in 0..8 {
+        let d = index.remove(&key(n), &pk(n));
+        step(&mut index, d);
+    }
+    // No-op remove of an already-gone posting.
+    let d = index.remove(&key(0), &pk(0));
+    step(&mut index, d);
+    // Remove the remaining postings, draining the index back toward empty.
+    for n in 0..8 {
+        let d = index.remove(&key(n), &pk(n + 100));
+        step(&mut index, d);
+    }
+}
+
+#[test]
+fn index_mem_delta_tracks_recomputed_cost_btree() {
+    assert_delta_tracks_cost(SecondaryIndex {
+        store: SecondaryIndexStore::BTree(im::OrdMap::new()),
+        columns_bitmask: 0,
+        partial_filter: None,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn index_mem_delta_tracks_recomputed_cost_hash() {
+    assert_delta_tracks_cost(SecondaryIndex {
+        store: SecondaryIndexStore::Hash(im::HashMap::new()),
+        columns_bitmask: 0,
+        partial_filter: None,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn index_mem_delta_tracks_recomputed_cost_unique_hash() {
+    assert_delta_tracks_cost(SecondaryIndex {
+        store: SecondaryIndexStore::UniqueHash(im::HashMap::new()),
+        columns_bitmask: 0,
+        partial_filter: None,
+        ..Default::default()
+    });
 }
 
 #[test]

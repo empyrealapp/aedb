@@ -22,7 +22,10 @@ use crate::query::operators::{compile_expr, eval_compiled_expr_public};
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
 use crate::storage::index::extract_index_key_encoded;
-use crate::storage::keyspace::{Keyspace, NamespaceId, SecondaryIndex, SecondaryIndexStore};
+use crate::storage::keyspace::{
+    Keyspace, NamespaceId, SecondaryIndex, SecondaryIndexStore, index_segment_composite_key,
+    secondary_index_mem_cost,
+};
 use primitive_types::U256;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -347,9 +350,13 @@ pub fn apply_mutation_with_read_budget(
                     ..
                 } => {
                     let ns = namespace_key(&project_id, &scope_id);
-                    if let Some(table) = keyspace.table_by_namespace_key_mut(&ns, &table_name) {
-                        table.indexes.remove(&index_name);
+                    let mut removed_cost = 0i64;
+                    if let Some(table) = keyspace.table_by_namespace_key_mut(&ns, &table_name)
+                        && let Some(removed) = table.indexes.remove(&index_name)
+                    {
+                        removed_cost = secondary_index_mem_cost(&removed) as i64;
                     }
+                    keyspace.apply_mem_bytes_delta(-removed_cost);
                 }
                 crate::catalog::DdlOperation::AlterTable {
                     project_id,
@@ -372,15 +379,18 @@ pub fn apply_mutation_with_read_budget(
                     }
                     crate::catalog::schema::TableAlteration::DropConstraint { name } => {
                         let ns = namespace_key(&project_id, &scope_id);
+                        let mut removed_cost = 0i64;
                         if !catalog.indexes.contains_key(&(
                             ns.clone(),
                             table_name.clone(),
                             name.clone(),
                         )) && let Some(table) =
                             keyspace.table_by_namespace_key_mut(&ns, &table_name)
+                            && let Some(removed) = table.indexes.remove(&name)
                         {
-                            table.indexes.remove(&name);
+                            removed_cost = secondary_index_mem_cost(&removed) as i64;
                         }
+                        keyspace.apply_mem_bytes_delta(-removed_cost);
                     }
                     _ => {}
                 },
@@ -2008,6 +2018,7 @@ fn apply_upsert_trusted_fast_with_schema(
         &encoded_pk,
         old_row.as_ref(),
         Some(&row),
+        commit_seq,
     )?;
     Ok(())
 }
@@ -2191,6 +2202,7 @@ fn apply_upsert_once_with_schema_and_old_row(
         &encoded_pk,
         old_row.as_ref(),
         Some(&row),
+        commit_seq,
     )?;
     keyspace.upsert_row_by_encoded_pk(
         project_id, scope_id, table_name, encoded_pk, row, commit_seq,
@@ -2341,7 +2353,9 @@ fn lookup_existing_by_unique_index(
     let Some(index) = table.indexes.get(index_name) else {
         return Ok(None);
     };
-    let Some(encoded_pk) = index.unique_existing(&lookup_key) else {
+    let Some(encoded_pk) =
+        index.tier_unique_existing(&lookup_key, keyspace.kv_segment_store.as_deref())?
+    else {
         return Ok(None);
     };
     // Drop the `table` borrow before the tier-aware read (it may page a cold row
@@ -2468,11 +2482,21 @@ fn validate_unique_constraint(
                 )
         })
         .map(|((_, _, idx_name), _)| idx_name.clone());
-    if let Some(index_name) = maybe_index
+    // Tier-aware unique probe (a conflicting key may live only in a cold
+    // segment). Computed up front because `?` cannot appear inside a let-chain.
+    let unique_conflict = if let Some(index_name) = maybe_index.as_ref()
         && let Some(table) = keyspace.table_by_namespace_key(&ns, table_name)
-        && let Some(index) = table.indexes.get(&index_name)
-        && let Some(existing) = index.unique_existing(&lookup_key)
-        && existing != pk_encoded
+        && let Some(index) = table.indexes.get(index_name)
+    {
+        index
+            .tier_unique_existing(&lookup_key, keyspace.kv_segment_store.as_deref())?
+            .filter(|existing| *existing != pk_encoded)
+            .is_some()
+    } else {
+        false
+    };
+    if let Some(index_name) = maybe_index
+        && unique_conflict
     {
         return Err(AedbError::UniqueViolation {
             table: table_name.to_string(),
@@ -2597,7 +2621,7 @@ fn validate_foreign_keys(
                     ),
                 })?;
             if reference_unique_index
-                .unique_existing(&lookup_key)
+                .tier_unique_existing(&lookup_key, keyspace.kv_segment_store.as_deref())?
                 .is_none()
             {
                 return Err(AedbError::ForeignKeyViolation {
@@ -2683,6 +2707,7 @@ fn apply_delete_internal_with_schema(
         &encoded_pk,
         removed.as_ref(),
         None,
+        commit_seq,
     )?;
     Ok(())
 }
@@ -3294,6 +3319,7 @@ fn apply_delete_internal_encoded_with_schema(
         primary_key,
         removed.as_ref(),
         None,
+        commit_seq,
     )?;
     Ok(())
 }
@@ -3409,6 +3435,7 @@ fn apply_upsert_on_conflict_once(
                 &existing_pk,
                 Some(&existing_row),
                 Some(&final_row),
+                commit_seq,
             )?;
             keyspace.upsert_row_by_encoded_pk(
                 &project_id,
@@ -3443,6 +3470,7 @@ fn apply_upsert_on_conflict_once(
             &proposed_encoded_pk,
             None,
             Some(&row),
+            commit_seq,
         )?;
         keyspace.upsert_row_by_encoded_pk(
             &project_id,
@@ -3847,8 +3875,13 @@ fn maintain_secondary_indexes(
     encoded_pk: &EncodedKey,
     old_row: Option<&crate::catalog::types::Row>,
     new_row: Option<&crate::catalog::types::Row>,
+    seq: u64,
 ) -> Result<(), AedbError> {
     let ns = namespace_key(project_id, scope_id);
+    // Clone the segment-store handle before borrowing the table mutably so the
+    // tier-aware unique check can page in cold postings while the table is held.
+    let segment_store = keyspace.kv_segment_store.clone();
+    let store = segment_store.as_deref();
     let table = keyspace
         .table_by_namespace_key_mut(&ns, table_name)
         .ok_or_else(|| AedbError::NotFound {
@@ -3857,6 +3890,7 @@ fn maintain_secondary_indexes(
         })?;
     let modified_columns_mask = calculate_modified_columns_bitmask(schema, old_row, new_row);
 
+    let mut mem_delta: i64 = 0;
     for ((p, t, idx_name), idx_def) in &catalog.indexes {
         if p != &ns || t != table_name {
             continue;
@@ -3887,12 +3921,27 @@ fn maintain_secondary_indexes(
                     },
                     columns_bitmask: idx_def.columns_bitmask,
                     partial_filter: idx_def.partial_filter.clone(),
+                    ..Default::default()
                 });
         if let Some(before) = old_row
             && secondary_index.should_include_row(before, schema, table_name)?
         {
             let old_key = extract_index_key_encoded(before, schema, &idx_def.columns)?;
-            secondary_index.remove(&old_key, encoded_pk);
+            mem_delta += secondary_index.remove(&old_key, encoded_pk);
+            // If a copy of this posting may live in the cold tier, tombstone it
+            // so the evicted copy is suppressed on read and re-inline.
+            if secondary_index.has_cold_segments() {
+                let composite =
+                    EncodedKey::from_bytes(index_segment_composite_key(&old_key, encoded_pk));
+                let tombstone_cost = composite.as_slice().len() as i64 + 16;
+                if secondary_index
+                    .segment_tombstones
+                    .insert(composite, seq)
+                    .is_none()
+                {
+                    mem_delta += tombstone_cost;
+                }
+            }
         }
         if let Some(after) = new_row
             && secondary_index.should_include_row(after, schema, table_name)?
@@ -3909,16 +3958,32 @@ fn maintain_secondary_indexes(
                 idx_def.index_type,
                 crate::catalog::schema::IndexType::UniqueHash
             ) && secondary_index
-                .unique_existing(&new_key)
+                .tier_unique_existing(&new_key, store)?
                 .is_some_and(|existing| existing.as_slice() != encoded_pk.as_slice())
             {
                 return Err(AedbError::Validation(format!(
                     "unique index violation on {idx_name}"
                 )));
             }
-            secondary_index.insert(new_key, encoded_pk.clone());
+            // Clear any stale tombstone for this posting before re-inserting it.
+            if secondary_index.has_cold_segments() {
+                let composite =
+                    EncodedKey::from_bytes(index_segment_composite_key(&new_key, encoded_pk));
+                let tombstone_cost = composite.as_slice().len() as i64 + 16;
+                if secondary_index
+                    .segment_tombstones
+                    .remove(&composite)
+                    .is_some()
+                {
+                    mem_delta -= tombstone_cost;
+                }
+            }
+            mem_delta += secondary_index.insert(new_key, encoded_pk.clone());
         }
     }
+    // Apply the accumulated index-posting memory delta after the table borrow
+    // ends so the keyspace running counter tracks index growth/shrinkage.
+    keyspace.apply_mem_bytes_delta(mem_delta);
     Ok(())
 }
 
@@ -3974,7 +4039,9 @@ fn rebuild_index_for_table(
         },
         columns_bitmask,
         partial_filter,
+        ..Default::default()
     };
+    let mut new_cost: i64 = 0;
     for (pk, row) in &materialized_rows {
         if secondary_index.should_include_row(row, schema, table_name)? {
             if matches!(index_type, crate::catalog::schema::IndexType::UniqueHash)
@@ -3992,12 +4059,16 @@ fn rebuild_index_for_table(
                     "unique index violation on {index_name}"
                 )));
             }
-            secondary_index.insert(index_key, pk.clone());
+            new_cost += secondary_index.insert(index_key, pk.clone());
         }
     }
-    table
+    // Replacing any prior index of this name: account for the new index's
+    // postings and drop the cost of the one we replaced.
+    let replaced = table
         .indexes
         .insert(index_name.to_string(), secondary_index);
+    let old_cost = replaced.as_ref().map(secondary_index_mem_cost).unwrap_or(0) as i64;
+    keyspace.apply_mem_bytes_delta(new_cost - old_cost);
     Ok(())
 }
 

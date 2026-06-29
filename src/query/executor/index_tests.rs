@@ -104,6 +104,7 @@ fn exact_index_predicate_limit_caps_candidate_materialization() {
         "app",
         "users",
         table,
+        snapshot.kv_segment_store.as_deref(),
         &Expr::Eq("age".into(), Value::Integer(42)),
         Some(7),
     )
@@ -118,6 +119,7 @@ fn exact_index_predicate_limit_caps_candidate_materialization() {
         "app",
         "users",
         table,
+        snapshot.kv_segment_store.as_deref(),
         &Expr::Eq("age".into(), Value::Integer(42))
             .and(Expr::Eq("email".into(), Value::Text("missing".into()))),
         Some(7),
@@ -144,6 +146,7 @@ fn non_exact_like_index_predicate_keeps_residual_filter() {
         "app",
         "users",
         table,
+        snapshot.kv_segment_store.as_deref(),
         &predicate,
         Some(1),
     )
