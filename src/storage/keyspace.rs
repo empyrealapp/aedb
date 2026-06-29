@@ -2,8 +2,8 @@ pub(crate) mod memory_accounting;
 pub(crate) use memory_accounting::{
     kv_entry_cost, kv_inline_entry_cost, kv_segment_meta_cost, kv_tombstone_cost,
     namespace_mem_cost, persistent_value_ref_cost, persistent_value_ref_resident_cost,
-    projection_data_mem_cost, row_mem_cost, small_kv_entry_cost, stored_row_mem_cost,
-    table_data_mem_cost,
+    projection_data_mem_cost, row_mem_cost, secondary_index_mem_cost, secondary_index_store_cost,
+    small_kv_entry_cost, stored_row_mem_cost, table_data_mem_cost,
 };
 
 use crate::catalog::namespace_key;
@@ -67,6 +67,19 @@ pub struct SecondaryIndex {
     pub store: SecondaryIndexStore,
     pub columns_bitmask: u128,
     pub partial_filter: Option<Expr>,
+    /// Cold tier: postings evicted from `store` to sorted on-disk segments under
+    /// memory pressure. Runtime-only — re-inlined into `store` before every
+    /// checkpoint (like `TableData::row_segments`), so it never persists and
+    /// evicted postings are always recoverable from the checkpoint + WAL. Each
+    /// segment entry has a composite key `index_value ‖ primary_key` and carries
+    /// the posting's MVCC version for tombstone resolution on read.
+    #[serde(skip)]
+    pub segments: Vec<KvSegmentMeta>,
+    /// Deletes of postings that exist only in `segments`. Maps the composite
+    /// `index_value ‖ primary_key` key to the commit seq of the delete.
+    /// Runtime-only, alongside `segments`.
+    #[serde(skip)]
+    pub segment_tombstones: OrdMap<EncodedKey, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -651,6 +664,107 @@ fn encode_row_segment_entry(
             value_ref: None,
         },
     })
+}
+
+/// Composite segment key for a secondary-index posting: the index value bytes
+/// followed by the primary key bytes. Because `EncodedKey` values are
+/// self-delimiting and prefix-free (fixed-width tags or NUL-terminated text), no
+/// complete index value is a prefix of a different one, so this concatenation
+/// sorts first by index value and then by primary key, and all postings for a
+/// given index value `V` occupy the contiguous prefix range
+/// `[V, prefix_successor(V))`.
+pub(crate) fn index_segment_composite_key(index_value: &EncodedKey, pk: &EncodedKey) -> Vec<u8> {
+    let mut out = Vec::with_capacity(index_value.as_slice().len() + pk.as_slice().len());
+    out.extend_from_slice(index_value.as_slice());
+    out.extend_from_slice(pk.as_slice());
+    out
+}
+
+/// Encode one evicted index posting as a [`KvSegmentEntry`]. The key is the
+/// composite `index_value ‖ pk`, the value carries the primary-key bytes (so the
+/// posting can be reconstructed on read-back without parsing the composite), and
+/// the version is the MVCC seq used for tombstone resolution.
+fn encode_index_segment_entry(
+    index_value: &EncodedKey,
+    pk: &EncodedKey,
+    version: u64,
+) -> KvSegmentEntry {
+    KvSegmentEntry {
+        key: index_segment_composite_key(index_value, pk),
+        entry: KvEntry {
+            value: pk.as_slice().to_vec(),
+            version,
+            created_at: version,
+            value_ref: None,
+        },
+    }
+}
+
+/// Split a composite index-segment key back into `(index_value, pk)` given the
+/// primary-key bytes recovered from the entry value.
+pub(crate) fn decode_index_segment_entry(
+    composite: &[u8],
+    pk_bytes: &[u8],
+) -> (EncodedKey, EncodedKey) {
+    let split = composite.len().saturating_sub(pk_bytes.len());
+    let index_value = EncodedKey::from_bytes(composite[..split].to_vec());
+    let pk = EncodedKey::from_bytes(pk_bytes.to_vec());
+    (index_value, pk)
+}
+
+/// Re-inline a secondary index's cold-tier segments back into its resident
+/// store, then clear the cold tier. Merge rules mirror the row tier: among
+/// segment copies of the same posting the highest version wins; a tombstone
+/// with `seq >= version` suppresses the posting; and a posting already resident
+/// (re-inserted after eviction) always wins. After this the index is fully
+/// resident with empty `segments`/`segment_tombstones`, so the checkpoint is
+/// self-contained and never persists the runtime-only cold tier.
+fn reinline_index_segments(
+    index: &mut SecondaryIndex,
+    store: &KvSegmentStore,
+) -> Result<(), crate::error::AedbError> {
+    if index.segments.is_empty() {
+        index.segment_tombstones = OrdMap::new();
+        return Ok(());
+    }
+    // Postings already resident win and must not be overwritten by stale segment
+    // copies.
+    let hot: HashSet<(Vec<u8>, Vec<u8>)> = index
+        .resident_postings()
+        .into_iter()
+        .map(|(value, pk)| (value.as_slice().to_vec(), pk.as_slice().to_vec()))
+        .collect();
+    // Highest-versioned live segment copy of each composite key.
+    let mut best: std::collections::BTreeMap<Vec<u8>, (u64, EncodedKey, EncodedKey)> =
+        std::collections::BTreeMap::new();
+    for segment in &index.segments {
+        for item in store.scan_range(segment, &Bound::Unbounded, &Bound::Unbounded)? {
+            let version = item.entry.version;
+            if best
+                .get(&item.key)
+                .map(|(v, _, _)| version > *v)
+                .unwrap_or(true)
+            {
+                let (value, pk) = decode_index_segment_entry(&item.key, &item.entry.value);
+                best.insert(item.key.clone(), (version, value, pk));
+            }
+        }
+    }
+    for (composite, (version, value, pk)) in best {
+        let composite_key = EncodedKey::from_bytes(composite);
+        if let Some(tomb) = index.segment_tombstones.get(&composite_key)
+            && *tomb >= version
+        {
+            continue; // deleted after this segment was written
+        }
+        if hot.contains(&(value.as_slice().to_vec(), pk.as_slice().to_vec())) {
+            continue; // resident copy already current
+        }
+        index.insert(value, pk);
+    }
+    index.segments.clear();
+    index.segment_tombstones = OrdMap::new();
+    Ok(())
 }
 
 fn encoded_key_bound_to_bytes(bound: &Bound<EncodedKey>) -> Bound<Vec<u8>> {
@@ -1546,6 +1660,107 @@ impl Keyspace {
             table.rows.clear();
             table.row_versions.clear();
             table.row_segments.push(meta);
+            store.mark_segment_published(&filename);
+            self.mem_bytes = self
+                .mem_bytes
+                .saturating_sub(resident_cost)
+                .saturating_add(meta_cost);
+            memory_estimate = self.estimate_memory_bytes();
+        }
+        Ok(memory_estimate)
+    }
+
+    /// Evict cold secondary-index postings to sorted on-disk segments until the
+    /// resident estimate drops to `target_bytes`, mirroring
+    /// [`flush_table_rows_to_segments_to_memory_target`] for index stores.
+    ///
+    /// Indexes are ranked by resident posting cost (largest first); for each the
+    /// whole resident store is serialized to one segment (composite key
+    /// `index_value ‖ pk`, stamped with `current_seq` for tombstone resolution),
+    /// then cleared. The cold tier is runtime-only: postings page back in on read
+    /// and are re-inlined before every checkpoint. Only user-project indexes are
+    /// evicted; small system tables stay hot.
+    pub fn flush_index_postings_to_segments_to_memory_target(
+        &mut self,
+        target_bytes: usize,
+        current_seq: u64,
+    ) -> Result<usize, crate::error::AedbError> {
+        let mut memory_estimate = self.estimate_memory_bytes();
+        if memory_estimate <= target_bytes {
+            return Ok(memory_estimate);
+        }
+        let Some(store) = self.kv_segment_store.clone() else {
+            return Ok(memory_estimate);
+        };
+
+        let mut candidates: Vec<(NamespaceId, String, String, usize)> = Vec::new();
+        for (namespace_id, namespace) in self.namespaces.iter() {
+            let NamespaceId::Project(ns_key) = namespace_id else {
+                continue;
+            };
+            if ns_key.starts_with(crate::catalog::SYSTEM_PROJECT_ID) {
+                continue;
+            }
+            for (table_name, table) in namespace.tables.iter() {
+                for (index_name, index) in table.indexes.iter() {
+                    if index.resident_store_is_empty() {
+                        continue;
+                    }
+                    let cost = secondary_index_store_cost(index);
+                    if cost > 0 {
+                        candidates.push((
+                            namespace_id.clone(),
+                            table_name.clone(),
+                            index_name.clone(),
+                            cost,
+                        ));
+                    }
+                }
+            }
+        }
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.3)); // largest resident cost first
+
+        for (namespace_id, table_name, index_name, _cost) in candidates {
+            if memory_estimate <= target_bytes {
+                break;
+            }
+            let Some(index) = self
+                .namespaces
+                .get(&namespace_id)
+                .and_then(|ns| ns.tables.get(&table_name))
+                .and_then(|t| t.indexes.get(&index_name))
+            else {
+                continue;
+            };
+            let resident_cost = secondary_index_store_cost(index);
+            let mut entries: Vec<KvSegmentEntry> = index
+                .resident_postings()
+                .into_iter()
+                .map(|(value, pk)| encode_index_segment_entry(&value, &pk, current_seq))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            // The segment writer requires entries in ascending key order; Hash and
+            // UniqueHash stores iterate unordered, so sort the composites.
+            entries.sort_by(|a, b| a.key.cmp(&b.key));
+            let meta = store.write_segment(
+                &format!("idxseg_{namespace_id:?}_{table_name}_{index_name}"),
+                entries,
+            )?;
+            let filename = meta.filename.clone();
+            let meta_cost = kv_segment_meta_cost(&meta);
+            let Some(index) = self
+                .namespaces_mut()
+                .get_mut(&namespace_id)
+                .and_then(|ns| ns.tables.get_mut(&table_name))
+                .and_then(|t| t.indexes.get_mut(&index_name))
+            else {
+                store.mark_segment_published(&filename);
+                continue;
+            };
+            index.clear_resident_store();
+            index.segments.push(meta);
             store.mark_segment_published(&filename);
             self.mem_bytes = self
                 .mem_bytes
@@ -3245,6 +3460,18 @@ impl Keyspace {
     pub fn refresh_mem_bytes(&mut self) {
         self.mem_bytes = self.recompute_memory_bytes_full();
     }
+
+    /// Applies a signed delta to the running `mem_bytes` counter, saturating at
+    /// zero. Index maintenance mutates posting stores directly (outside the row
+    /// mutation helpers), so it reports its byte delta here to keep the running
+    /// counter in lockstep with `recompute_memory_bytes_full()`.
+    pub fn apply_mem_bytes_delta(&mut self, delta: i64) {
+        if delta >= 0 {
+            self.mem_bytes = self.mem_bytes.saturating_add(delta as usize);
+        } else {
+            self.mem_bytes = self.mem_bytes.saturating_sub(delta.unsigned_abs() as usize);
+        }
+    }
 }
 
 impl KeyspaceSnapshot {
@@ -3258,8 +3485,24 @@ fn collect_kv_segment_filenames<'a>(
 ) -> HashSet<String> {
     let mut filenames = HashSet::new();
     for namespace in namespaces {
+        // KV cold tier.
         for segment in &namespace.kv.segments {
             filenames.insert(segment.filename.clone());
+        }
+        for table in namespace.tables.values() {
+            // Cold table-row tier.
+            for segment in &table.row_segments {
+                filenames.insert(segment.filename.clone());
+            }
+            // Cold secondary-index tier. These share the `kvseg_*.aedbkv`
+            // namespace and naming with KV/row segments, so they MUST be listed
+            // here or `reclaim_unreferenced_segments` would delete live index
+            // segment files and corrupt cold postings.
+            for secondary_index in table.indexes.values() {
+                for segment in &secondary_index.segments {
+                    filenames.insert(segment.filename.clone());
+                }
+            }
         }
     }
     filenames
@@ -3641,6 +3884,45 @@ impl KeyspaceSnapshot {
                 table.rows = new_rows;
                 table.row_segments.clear();
                 table.row_tombstones.clear();
+            }
+        }
+
+        // Re-inline the cold secondary-index segment tier so the checkpoint is
+        // self-contained (also runtime-only, never persisted).
+        let index_cold_namespace_ids: Vec<NamespaceId> = self
+            .namespaces
+            .iter()
+            .filter(|(_, namespace)| {
+                namespace.tables.values().any(|table| {
+                    table
+                        .indexes
+                        .values()
+                        .any(SecondaryIndex::has_cold_segments)
+                })
+            })
+            .map(|(namespace_id, _)| namespace_id.clone())
+            .collect();
+        for namespace_id in index_cold_namespace_ids {
+            let store = segment_store.ok_or_else(|| crate::error::AedbError::Unavailable {
+                message: "row segment store is not attached".into(),
+            })?;
+            let Some(namespace) = Arc::make_mut(&mut out.namespaces).get_mut(&namespace_id) else {
+                continue;
+            };
+            let table_names: Vec<String> = namespace.tables.keys().cloned().collect();
+            for table_name in table_names {
+                let Some(table) = namespace.tables.get_mut(&table_name) else {
+                    continue;
+                };
+                let index_names: Vec<String> = table.indexes.keys().cloned().collect();
+                for index_name in index_names {
+                    let Some(index) = table.indexes.get_mut(&index_name) else {
+                        continue;
+                    };
+                    if index.has_cold_segments() {
+                        reinline_index_segments(index, store)?;
+                    }
+                }
             }
         }
 

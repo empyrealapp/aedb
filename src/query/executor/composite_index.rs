@@ -47,7 +47,8 @@ pub(super) fn composite_prefix_index_lookup(
         selection.prefix_cols,
         selection.index_cols,
         candidate_limit,
-    );
+        context.segment_store,
+    )?;
     Ok(Some(IndexLookupResult {
         pks,
         selected_indexes: selected_indexes_if_diagnostic(
@@ -148,12 +149,15 @@ fn scan_composite_prefix(
     prefix_cols: usize,
     index_cols: usize,
     candidate_limit: Option<usize>,
-) -> Vec<EncodedKey> {
+    store: Option<&crate::storage::kv_segment::KvSegmentStore>,
+) -> Result<Vec<EncodedKey>, QueryError> {
     if prefix_cols == index_cols {
-        return index.scan_eq_limit(encoded_prefix, candidate_limit.unwrap_or(usize::MAX));
+        return Ok(index.tier_scan_eq_limit(
+            encoded_prefix,
+            candidate_limit.unwrap_or(usize::MAX),
+            store,
+        )?);
     }
-    match candidate_limit {
-        Some(limit) => index.scan_prefix_window(Some(encoded_prefix), 0, limit),
-        None => index.scan_prefix(encoded_prefix),
-    }
+    let limit = candidate_limit.unwrap_or(usize::MAX);
+    Ok(index.tier_scan_prefix_window(Some(encoded_prefix), 0, limit, store)?)
 }

@@ -283,10 +283,11 @@ fn execute_query_with_options_capturing_signed(
                 query: &query,
                 table,
                 predicate,
+                segment_store: snapshot.kv_segment_store.as_deref(),
                 offset: source_offset,
                 limit: source_limit,
                 has_cursor: cursor_state.is_some(),
-            })
+            })?
     {
         has_residual_filter = false;
         row_source_satisfies_order = true;
@@ -329,6 +330,7 @@ fn execute_query_with_options_capturing_signed(
             &exec_scope_id,
             &query.table,
             table,
+            snapshot.kv_segment_store.as_deref(),
             predicate,
             candidate_limit,
         )?;
@@ -407,10 +409,11 @@ fn execute_query_with_options_capturing_signed(
             schema,
             query: &query,
             table,
+            segment_store: snapshot.kv_segment_store.as_deref(),
             offset: source_offset,
             limit: source_limit,
             has_cursor: cursor_state.is_some(),
-        })
+        })?
     {
         row_source_satisfies_order = true;
         row_source_applies_offset = true;

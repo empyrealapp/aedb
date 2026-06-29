@@ -30,6 +30,7 @@ fn check_invariants_detects_secondary_index_mismatch() {
             store: SecondaryIndexStore::BTree(OrdMap::new()),
             columns_bitmask: 0,
             partial_filter: None,
+            ..Default::default()
         },
     );
 

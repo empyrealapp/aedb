@@ -134,6 +134,18 @@ pub struct AedbConfig {
     /// Off by default: it is only safe to enable once every table-row read path
     /// is tier-aware. No effect in `StorageMode::InMemory`.
     pub table_row_segment_eviction_enabled: bool,
+    /// When enabled (and a KV segment store is attached), cold secondary-index
+    /// postings are evicted from the resident index stores to sorted on-disk
+    /// segments under memory pressure, so a table's indexes can grow beyond RAM
+    /// just like its rows. Evicted postings page back in on read through the
+    /// segment store and are re-inlined before every checkpoint (the index cold
+    /// tier is runtime-only and never persisted).
+    ///
+    /// Off by default: it is only safe to enable once every secondary-index read
+    /// path — equality lookups, ordered range scans, and unique-constraint
+    /// checks (including the global unique index) — is tier-aware. No effect in
+    /// `StorageMode::InMemory`.
+    pub index_segment_eviction_enabled: bool,
     /// Capacity of the public commit-delta broadcast channel
     /// exposed via `AedbInstance::subscribe_commits`. Subscribers
     /// that fall behind beyond this many buffered deltas will
@@ -206,6 +218,7 @@ impl Default for AedbConfig {
             primary_index_backend: PrimaryIndexBackend::OrdMap,
             table_row_spill_enabled: true,
             table_row_segment_eviction_enabled: false,
+            index_segment_eviction_enabled: false,
             commit_broadcast_capacity: 1024,
         }
     }

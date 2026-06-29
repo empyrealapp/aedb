@@ -21,6 +21,7 @@ pub(super) struct IndexLookupContext<'a> {
     pub(super) scope_id: &'a str,
     pub(super) table_name: &'a str,
     pub(super) table: &'a crate::storage::keyspace::TableData,
+    pub(super) segment_store: Option<&'a crate::storage::kv_segment::KvSegmentStore>,
     pub(super) include_diagnostics: bool,
 }
 
@@ -32,12 +33,14 @@ pub(super) struct IndexLookupResult {
     pub predicate_exact: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn indexed_pks_for_predicate_limited(
     catalog: &Catalog,
     project_id: &str,
     scope_id: &str,
     table_name: &str,
     table: &crate::storage::keyspace::TableData,
+    segment_store: Option<&crate::storage::kv_segment::KvSegmentStore>,
     predicate: &crate::query::plan::Expr,
     candidate_limit: Option<usize>,
 ) -> Result<Option<IndexLookupResult>, QueryError> {
@@ -47,6 +50,7 @@ pub(super) fn indexed_pks_for_predicate_limited(
         scope_id,
         table_name,
         table,
+        segment_store,
         include_diagnostics: false,
     };
     indexed_pks_for_predicate_inner(&context, predicate, candidate_limit)
@@ -58,6 +62,7 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
     scope_id: &str,
     table_name: &str,
     table: &crate::storage::keyspace::TableData,
+    segment_store: Option<&crate::storage::kv_segment::KvSegmentStore>,
     predicate: &crate::query::plan::Expr,
 ) -> Result<Option<IndexLookupResult>, QueryError> {
     let context = IndexLookupContext {
@@ -66,6 +71,7 @@ pub(super) fn indexed_pks_for_predicate_with_trace(
         scope_id,
         table_name,
         table,
+        segment_store,
         include_diagnostics: true,
     };
     indexed_pks_for_predicate_inner(&context, predicate, None)
@@ -236,14 +242,19 @@ fn indexed_pks_for_predicate_uncapped(
     } else {
         None
     };
+    let store = context.segment_store;
     let pks = match lookup {
-        IndexLookup::Range { bounds, .. } => {
-            index.scan_range_limit(bounds.0, bounds.1, lookup_limit.unwrap_or(usize::MAX))
-        }
-        IndexLookup::Eq { value, .. } => index.scan_eq_limit(
+        IndexLookup::Range { bounds, .. } => index.tier_scan_range_limit(
+            bounds.0,
+            bounds.1,
+            lookup_limit.unwrap_or(usize::MAX),
+            store,
+        )?,
+        IndexLookup::Eq { value, .. } => index.tier_scan_eq_limit(
             &EncodedKey::from_values(std::slice::from_ref(value)),
             lookup_limit.unwrap_or(usize::MAX),
-        ),
+            store,
+        )?,
         IndexLookup::In { values, .. } => {
             let limit = lookup_limit.unwrap_or(usize::MAX);
             let mut pks = Vec::new();
@@ -252,10 +263,11 @@ fn indexed_pks_for_predicate_uncapped(
                 if remaining == 0 {
                     break;
                 }
-                pks.extend(index.scan_eq_limit(
+                pks.extend(index.tier_scan_eq_limit(
                     &EncodedKey::from_values(std::slice::from_ref(value)),
                     remaining,
-                ));
+                    store,
+                )?);
             }
             pks
         }

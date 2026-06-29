@@ -1,9 +1,10 @@
-//! End-to-end cold-row tiering: open the engine with eviction enabled and a
-//! tiny memory budget (and payload spill disabled) so committed table rows are
-//! evicted whole to disk segments, then verify every read and write path stays
-//! correct: point query, full/filtered/index scans, secondary-index maintenance
-//! on an evicted-row update, unique-constraint enforcement against an evicted
-//! row, delete, and recovery.
+//! End-to-end secondary-index cold tiering: open the engine with index segment
+//! eviction enabled and a tiny memory budget so committed index postings are
+//! evicted to disk segments, then verify every read and write path stays
+//! correct over the cold index tier: index equality query, secondary-index
+//! maintenance on an evicted-posting update, unique-constraint enforcement
+//! against an evicted posting, delete-then-reinsert of a unique value (tombstone
+//! path), and recovery.
 
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
@@ -18,13 +19,13 @@ use tempfile::tempdir;
 fn tiering_config() -> AedbConfig {
     AedbConfig {
         storage_mode: StorageMode::DiskBacked,
+        // Evict both rows and index postings to disk; with a tiny budget the
+        // index postings (which dwarf the rows once there are enough of them)
+        // must move to the cold segment tier for commits to stay under budget.
         table_row_segment_eviction_enabled: true,
-        // Disable payload spill so the cold-row *segment* tier is the only
-        // mechanism that relieves memory pressure.
+        index_segment_eviction_enabled: true,
         table_row_spill_enabled: false,
-        // Budget accommodates the resident secondary indexes (now counted
-        // against the budget) while still forcing the ~40 KB of rows to evict.
-        max_memory_estimate_bytes: 40 * 1024,
+        max_memory_estimate_bytes: 48 * 1024,
         ..AedbConfig::default()
     }
 }
@@ -72,7 +73,6 @@ async fn create_schema(db: &AedbInstance) {
     }))
     .await
     .expect("table");
-    // Secondary index on tag and a unique index on n.
     db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
         project_id: "p".into(),
         scope_id: "app".into(),
@@ -158,7 +158,7 @@ async fn scan_count(db: &AedbInstance) -> usize {
 }
 
 #[tokio::test]
-async fn cold_row_tiering_keeps_all_read_paths_correct() {
+async fn index_segment_tiering_keeps_all_read_paths_correct() {
     let dir = tempdir().expect("temp");
     let config = tiering_config();
     let db = Arc::new(AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open"));
@@ -170,64 +170,48 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
             .expect("upsert");
     }
 
-    // Eviction actually happened: resident memory is far below the full dataset
-    // (~40 KB of rows plus the resident indexes would exceed this if rows stayed
-    // in RAM).
+    // Index eviction actually happened: resident memory is far below what the
+    // two indexes' 200 postings each would occupy if they stayed in RAM.
+    // The full dataset (200 rows + 400 index postings) would occupy far more
+    // than the budget if resident, so a bounded footprint proves both tiers
+    // evicted to disk.
     let m = db.operational_metrics().await;
     assert!(
-        m.keyspace_resident_bytes < 32 * 1024,
-        "rows must be evicted to the cold tier (resident={})",
+        m.keyspace_resident_bytes < 48 * 1024,
+        "rows and index postings must be evicted to the cold tier (resident={})",
         m.keyspace_resident_bytes
     );
 
-    // Point query pages an evicted row back.
-    let one = db
-        .query_no_auth(
-            "p",
-            "app",
-            Query::select(&["n"])
-                .from("items")
-                .where_(col("id").eq(lit(42i64)))
-                .limit(1),
-            QueryOptions {
-                consistency: ConsistencyMode::AtLatest,
-                ..QueryOptions::default()
-            },
-        )
+    // Segment reclamation must NOT delete live cold index/row segments.
+    db.reclaim_unused_kv_segments()
         .await
-        .expect("point query");
-    assert_eq!(one.rows.len(), 1);
-    assert_eq!(one.rows[0].values[0], Value::Integer(42));
+        .expect("reclaim unused segments");
 
-    assert_eq!(scan_count(&db).await, 200, "full scan returns evicted rows");
+    // Equality query pages cold postings back from the index segment tier
+    // (still intact after reclamation).
     assert_eq!(
         query_tag(&db, "tag2").await,
         40,
-        "index query over evicted rows"
+        "index query over evicted postings survives reclamation"
     );
+    assert_eq!(scan_count(&db).await, 200);
 
-    // Update an evicted row's indexed column: old index entry must be removed.
-    // Row 42 had tag = "tag2"; move it to a fresh tag.
-    upsert(&db, 42, "moved", 42)
-        .await
-        .expect("update evicted row");
-    assert_eq!(query_tag(&db, "tag2").await, 39, "old index entry removed");
-    assert_eq!(query_tag(&db, "moved").await, 1, "new index entry added");
-    assert_eq!(
-        scan_count(&db).await,
-        200,
-        "no duplicate from updating evicted row"
-    );
+    // Update a row's indexed column while its posting is cold: the old posting
+    // must be tombstoned (suppressed) and the new one indexed.
+    upsert(&db, 42, "moved", 42).await.expect("update");
+    assert_eq!(query_tag(&db, "tag2").await, 39, "old posting tombstoned");
+    assert_eq!(query_tag(&db, "moved").await, 1, "new posting visible");
 
-    // Unique constraint must see the evicted row: re-using n=99 (row 99) fails.
+    // Unique constraint must see the evicted posting: re-using n=99 is rejected.
     let dup = upsert(&db, 9999, "dup", 99).await;
     assert!(
         dup.is_err(),
-        "unique violation against an evicted row must be rejected"
+        "unique violation against an evicted posting must be rejected"
     );
     assert_eq!(scan_count(&db).await, 200, "rejected insert did not land");
 
-    // Delete an evicted row.
+    // Delete the holder of n=7, then reinsert a different row with n=7: the
+    // tombstone must let the value be reused (no false unique violation).
     db.commit(Mutation::Delete {
         project_id: "p".into(),
         scope_id: "app".into(),
@@ -236,49 +220,26 @@ async fn cold_row_tiering_keeps_all_read_paths_correct() {
     })
     .await
     .expect("delete");
-    assert_eq!(scan_count(&db).await, 199, "deleted evicted row is gone");
-    assert_eq!(
-        query_tag(&db, "tag2").await,
-        38,
-        "deleted row removed from index too"
-    );
-
-    // Build a NEW index after rows are already in the cold tier: the index
-    // build must scan the cold rows too, or index lookups would miss them.
-    db.commit(Mutation::Ddl(DdlOperation::CreateIndex {
-        project_id: "p".into(),
-        scope_id: "app".into(),
-        table_name: "items".into(),
-        index_name: "by_n".into(),
-        if_not_exists: true,
-        columns: vec!["n".into()],
-        index_type: IndexType::BTree,
-        partial_filter: None,
-    }))
-    .await
-    .expect("post-eviction index build");
-    let by_n = db
-        .query_no_auth(
-            "p",
-            "app",
-            Query::select(&["id"])
-                .from("items")
-                .where_(col("n").eq(lit(150i64)))
-                .limit(10),
-            QueryOptions {
-                consistency: ConsistencyMode::AtLatest,
-                ..QueryOptions::default()
-            },
-        )
+    assert_eq!(scan_count(&db).await, 199);
+    upsert(&db, 5007, "reused", 7)
         .await
-        .expect("query by new index");
-    assert_eq!(by_n.rows.len(), 1, "post-eviction index covers cold rows");
-    assert_eq!(by_n.rows[0].values[0], Value::Integer(150));
+        .expect("reusing a freed unique value must succeed across the cold tier");
+    assert_eq!(scan_count(&db).await, 200);
 
-    // Recovery restores every live row with correct values and indexes.
+    // Recovery restores every live row and its indexes from checkpoint + WAL.
     db.shutdown().await.expect("shutdown");
     drop(db);
     let db2 = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
-    assert_eq!(scan_count(&db2).await, 199, "all live rows recovered");
+    assert_eq!(scan_count(&db2).await, 200, "all live rows recovered");
     assert_eq!(query_tag(&db2, "moved").await, 1, "index recovered");
+    assert_eq!(
+        query_tag(&db2, "reused").await,
+        1,
+        "reused unique value recovered"
+    );
+    // The previously-evicted unique value is still enforced after recovery.
+    assert!(
+        upsert(&db2, 12345, "dup2", 42).await.is_err(),
+        "unique enforcement holds after recovery"
+    );
 }

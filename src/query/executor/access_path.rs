@@ -167,6 +167,7 @@ pub(crate) fn explain_access_path_for_query(
                 &exec_scope_id,
                 &query.table,
                 table,
+                snapshot.kv_segment_store.as_deref(),
                 predicate,
             )?
         {

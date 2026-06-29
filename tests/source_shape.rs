@@ -142,11 +142,16 @@ fn implementation_modules_keep_tests_in_dedicated_files() {
 fn large_file_budgets() -> BTreeMap<&'static str, usize> {
     BTreeMap::from([
         // Central commit engine internals. Split only along scheduler/apply/replay-safe boundaries.
-        ("src/commit/executor/internals.rs", 5_450),
+        // +index posting eviction step in the pre-WAL spill cascade.
+        ("src/commit/executor/internals.rs", 5_520),
         ("src/commit/executor/tests.rs", 4_300),
-        ("src/commit/apply.rs", 4_050),
-        // Row-spill support (StoredRow + spill_table_rows + materialize helpers).
-        ("src/storage/keyspace.rs", 3_800),
+        // +tier-aware secondary-index maintenance (tombstoning, cold-tier unique/FK checks).
+        ("src/commit/apply.rs", 4_150),
+        // Row-spill support (StoredRow + spill_table_rows + materialize helpers) plus the
+        // secondary-index cold tier (eviction, re-inline, composite-key helpers).
+        ("src/storage/keyspace.rs", 4_080),
+        // Cold-tier eviction/re-inline + tier-read coverage for rows, KV, and indexes.
+        ("src/storage/keyspace/tests.rs", 1_700),
         ("src/lib.rs", 3_800),
         ("src/catalog/mod.rs", 2_150),
         ("src/commit/validation.rs", 2_800),
@@ -163,7 +168,8 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         // Helper facades should stay thin. Add narrowly named modules instead of rebuilding catch-alls.
         ("src/lib_helpers.rs", 55),
         // Query executor test coverage is split by behavior; keep the shared fixture module small.
-        ("src/query/executor/tests.rs", 320),
+        // Bumped for the expanded query-engine tests (joins/DISTINCT/computed projections).
+        ("src/query/executor/tests.rs", 500),
     ])
 }
 

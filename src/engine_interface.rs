@@ -436,11 +436,12 @@ impl AedbInstance {
             )));
         };
 
+        let store = lease.view.keyspace.kv_segment_store.as_deref();
         let pks = if req.prefix.is_empty() {
-            index.scan_prefix_window(None, req.offset, req.limit)
+            index.tier_scan_prefix_window(None, req.offset, req.limit, store)?
         } else {
             let prefix = EncodedKey::from_values(&req.prefix);
-            index.scan_prefix_window(Some(&prefix), req.offset, req.limit)
+            index.tier_scan_prefix_window(Some(&prefix), req.offset, req.limit, store)?
         };
 
         let mut out = Vec::new();
@@ -486,7 +487,7 @@ impl AedbInstance {
         };
 
         let target_pk = EncodedKey::from_values(&[key]);
-        Ok(index.rank_of_pk(&target_pk))
+        index.tier_rank_of_pk(&target_pk, lease.view.keyspace.kv_segment_store.as_deref())
     }
 
     pub async fn processor_pull(
