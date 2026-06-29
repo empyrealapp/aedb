@@ -1105,3 +1105,150 @@ fn distinct_with_computed_projection_over_join() {
     assert_eq!(result.rows.len(), 1);
     assert!(matches!(result.rows[0].values[1], Value::Integer(0)));
 }
+
+#[test]
+fn join_integer_fk_to_u64_primary_key_matches_across_types() {
+    // Regression: joining an `Integer` column to a `U64` *primary key* used to
+    // take the PK-probe fast path, which re-encodes the probe key with the
+    // type-tagged `EncodedKey` (Integer tag != U64 tag) and silently returned
+    // zero matches — disagreeing with the hash-join path. The PK-probe is now
+    // gated on exact column-type equality, so this falls back to the unified
+    // hash join and matches numerically-equal values.
+    let (mut keyspace, mut catalog) = setup();
+    catalog
+        .create_table(
+            "A",
+            "app",
+            "u64_profiles",
+            vec![
+                ColumnDef {
+                    name: "user_id".into(),
+                    col_type: ColumnType::U64,
+                    nullable: false,
+                },
+                ColumnDef {
+                    name: "country".into(),
+                    col_type: ColumnType::Text,
+                    nullable: false,
+                },
+            ],
+            vec!["user_id".into()],
+        )
+        .expect("u64 profiles table");
+    for id in 0u64..50 {
+        keyspace.upsert_row(
+            "A",
+            "app",
+            "u64_profiles",
+            vec![Value::U64(id)],
+            Row::from_values(vec![Value::U64(id), Value::Text("US".into())]),
+            1,
+        );
+    }
+
+    let snapshot = keyspace.snapshot();
+    // `users.id` is Integer; `u64_profiles.user_id` is the U64 primary key.
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["u.id", "p.country"])
+            .from("users")
+            .alias("u")
+            .inner_join("u64_profiles", "u.id", "user_id")
+            .with_last_join_alias("p")
+            .limit(1000),
+    )
+    .expect("cross-type pk join");
+    assert_eq!(
+        result.rows.len(),
+        50,
+        "Integer FK should match numerically-equal U64 primary keys"
+    );
+}
+
+#[test]
+fn hash_join_on_float_column_does_not_match_nan_to_nan() {
+    // Regression: NaN never equals anything (SQL three-valued logic), but the
+    // single-column hash join keyed NaN rows by `join_key` (no post-match
+    // re-check), so two NaN-keyed rows spuriously matched. NaN keys are now
+    // excluded from the probe map, matching `value_compare`'s NaN = no-match.
+    let (mut keyspace, mut catalog) = setup();
+    for table in ["fa", "fb"] {
+        catalog
+            .create_table(
+                "A",
+                "app",
+                table,
+                vec![
+                    ColumnDef {
+                        name: "id".into(),
+                        col_type: ColumnType::Integer,
+                        nullable: false,
+                    },
+                    ColumnDef {
+                        name: "k".into(),
+                        col_type: ColumnType::Float,
+                        nullable: false,
+                    },
+                ],
+                vec!["id".into()],
+            )
+            .expect("float join table");
+    }
+    // k is NOT the primary key, so the join takes the hash path.
+    keyspace.upsert_row(
+        "A",
+        "app",
+        "fa",
+        vec![Value::Integer(1)],
+        Row::from_values(vec![Value::Integer(1), Value::Float(1.0)]),
+        1,
+    );
+    keyspace.upsert_row(
+        "A",
+        "app",
+        "fa",
+        vec![Value::Integer(2)],
+        Row::from_values(vec![Value::Integer(2), Value::Float(f64::NAN)]),
+        1,
+    );
+    keyspace.upsert_row(
+        "A",
+        "app",
+        "fb",
+        vec![Value::Integer(10)],
+        Row::from_values(vec![Value::Integer(10), Value::Float(1.0)]),
+        1,
+    );
+    keyspace.upsert_row(
+        "A",
+        "app",
+        "fb",
+        vec![Value::Integer(20)],
+        Row::from_values(vec![Value::Integer(20), Value::Float(f64::NAN)]),
+        1,
+    );
+
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["fa.id", "b.id"])
+            .from("fa")
+            .alias("fa")
+            .inner_join("fb", "fa.k", "k")
+            .with_last_join_alias("b")
+            .limit(1000),
+    )
+    .expect("float hash join");
+    // Only the 1.0 == 1.0 pair matches; the NaN rows must not pair up.
+    assert_eq!(
+        result.rows.len(),
+        1,
+        "NaN join keys must not match each other"
+    );
+}

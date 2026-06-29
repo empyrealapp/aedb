@@ -241,3 +241,49 @@ cargo test --release --lib mem_bytes_running_counter_matches_full_walk
 - **Confirmed durability is fine**: nothing important was missing from disk.
 - **Quantified the actual RAM problem**: 45× gap between aedb's counter and resident memory for tables. ~6.9 KB per row of resident overhead. The OOM concern was real, just for different reasons than originally framed.
 - **Diagnostic kit is now permanent**: criterion benches, dhat heap, pprof flamegraph, RAM probe. Future questions answered the same way.
+
+---
+
+## Update 2026-06-29 — the "45× RAM gap" is obsolete; capacity warning added
+
+A follow-up audit re-examined the memory-accounting findings above. The headline
+"45× counter-vs-RSS gap / ~6.9 KB resident per row" figure **no longer reflects
+the engine** and should not be used for capacity planning. It was measured while
+each table kept, per row, *all* of:
+
+- the canonical `rows` `OrdMap`,
+- a redundant second `row_versions` `OrdMap`, and
+- three redundant `HashMap` side-caches (`row_cache`, `row_versions_cache`, `pk_hash`).
+
+Those redundant structures have since been removed (Phase 1 folded versions
+inline into `StoredRow`; the side-caches are gone). A current table row is one
+`OrdMap<EncodedKey, StoredRow>` entry plus its 1:1 secondary-index postings.
+
+The running counter (`Keyspace::mem_bytes`, see `src/storage/keyspace/memory_accounting.rs`)
+now accounts for: row payload + a `×2` structural factor (`row_mem_cost`,
+covering the `im` B-tree node + resident key overhead), secondary-index postings
+/ values / cold-segment metadata / tombstones, KV entries (keys included),
+projections, and namespaces. The `mem_bytes == recompute_memory_bytes_full()`
+parity test keeps the incremental counter and the full walk in lockstep.
+
+Known residual undercount (deliberately not fixed): `table_data_mem_cost`
+iterates `rows.values()`, so the resident `EncodedKey` (primary key) bytes are
+counted only approximately, via the `+32 ×2` structural term in `row_mem_cost`
+rather than the exact key length. Making it exact would require threading the
+key length through ~7 hot-path running-counter sites; the parity invariant makes
+that *correct* but the churn-vs-accuracy tradeoff on the commit hot path is not
+worth it while the structural factor already absorbs typical (small) PK bytes.
+
+**To calibrate for a specific workload/platform**, run `examples/ram_probe.rs`
+(Linux: it reads `/proc/self/statm`) and set `max_memory_estimate_bytes` to your
+real RAM ceiling divided by the measured counter-vs-RSS ratio. The budget is the
+single tuning knob; the counter is a deterministic model, not a measurement.
+
+**New: capacity-pressure warning.** Previously the only memory log fired *after*
+the estimate had already exceeded the budget (i.e. once commits were about to be
+rejected when no spill tier is enabled). `maybe_warn_memory_pressure`
+(`src/commit/executor/internals.rs`) now also emits a rate-limited warning at 90%
+of the budget, and — when no spill/eviction tier is enabled — tells the operator
+that crossing the budget will reject commits and how to avoid it. This is the
+operational safety net for the fact that `table_row_spill_enabled` and the
+`*_segment_eviction_enabled` tiers all default to off.

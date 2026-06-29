@@ -1,6 +1,7 @@
 use crate::catalog::types::{Row, Value};
 use crate::query::error::QueryError;
 use crate::query::plan::{Aggregate, Expr, Order};
+use primitive_types::U256;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -1070,6 +1071,239 @@ fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         (Value::Integer(a), Value::Timestamp(b)) => a.partial_cmp(b),
         (Value::Timestamp(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
         (Value::Float(a), Value::Timestamp(b)) => a.partial_cmp(&(*b as f64)),
+
+        // Wide-integer (U256/I256) cross-type comparisons. Every integer-group
+        // value fits in i128, so we compare magnitudes/sign against an i128
+        // without precision loss (unlike the float arms above). Without these,
+        // `WHERE balance = 5` on a U256 column fell through to `Value::cmp`,
+        // which is kind-ranked and never matches an `Integer`/`U64` literal.
+        (Value::U256(a), Value::U8(b)) => Some(cmp_u256_i128(a, *b as i128)),
+        (Value::U8(a), Value::U256(b)) => Some(cmp_u256_i128(b, *a as i128).reverse()),
+        (Value::U256(a), Value::U64(b)) => Some(cmp_u256_i128(a, *b as i128)),
+        (Value::U64(a), Value::U256(b)) => Some(cmp_u256_i128(b, *a as i128).reverse()),
+        (Value::U256(a), Value::Integer(b)) => Some(cmp_u256_i128(a, *b as i128)),
+        (Value::Integer(a), Value::U256(b)) => Some(cmp_u256_i128(b, *a as i128).reverse()),
+        (Value::U256(a), Value::Timestamp(b)) => Some(cmp_u256_i128(a, *b as i128)),
+        (Value::Timestamp(a), Value::U256(b)) => Some(cmp_u256_i128(b, *a as i128).reverse()),
+
+        (Value::I256(a), Value::U8(b)) => Some(cmp_i256_i128(a, *b as i128)),
+        (Value::U8(a), Value::I256(b)) => Some(cmp_i256_i128(b, *a as i128).reverse()),
+        (Value::I256(a), Value::U64(b)) => Some(cmp_i256_i128(a, *b as i128)),
+        (Value::U64(a), Value::I256(b)) => Some(cmp_i256_i128(b, *a as i128).reverse()),
+        (Value::I256(a), Value::Integer(b)) => Some(cmp_i256_i128(a, *b as i128)),
+        (Value::Integer(a), Value::I256(b)) => Some(cmp_i256_i128(b, *a as i128).reverse()),
+        (Value::I256(a), Value::Timestamp(b)) => Some(cmp_i256_i128(a, *b as i128)),
+        (Value::Timestamp(a), Value::I256(b)) => Some(cmp_i256_i128(b, *a as i128).reverse()),
+
+        (Value::U256(a), Value::I256(b)) => Some(cmp_u256_i256(a, b)),
+        (Value::I256(a), Value::U256(b)) => Some(cmp_u256_i256(b, a).reverse()),
+
+        // NOTE: same-type I256-vs-I256 deliberately falls through to the raw
+        // byte compare in `Value::cmp` below. That order is wrong for signed
+        // two's-complement values (negatives, high byte >= 0x80, sort *after*
+        // positives) — but `EncodedKey` encodes I256 as raw two's-complement
+        // bytes too (unlike Integer/Timestamp, which are sign-flipped), so the
+        // index range-scan path uses the same (buggy) order. Making this arm
+        // sign-aware in isolation would make full-scan and index-accelerated
+        // range queries disagree on negative I256 values. Correctly ordering
+        // signed I256 requires sign-flipping it in `EncodedKey` as well, which
+        // is an on-disk format migration; until then both paths stay aligned.
+        // Equality is unaffected (byte-equal iff value-equal), so the cross-type
+        // arms above still fix `WHERE i256col = <int literal>`.
         _ => Some(left.cmp(right)),
+    }
+}
+
+/// Parse a big-endian unsigned 256-bit value.
+fn u256_be(bytes: &[u8; 32]) -> U256 {
+    U256::from_big_endian(bytes)
+}
+
+/// Decompose a two's-complement I256 into `(is_negative, magnitude)`.
+fn i256_parts(bytes: &[u8; 32]) -> (bool, U256) {
+    let raw = U256::from_big_endian(bytes);
+    if bytes[0] & 0x80 != 0 {
+        // Negative: magnitude = (~raw + 1) mod 2^256.
+        (true, (!raw).overflowing_add(U256::one()).0)
+    } else {
+        (false, raw)
+    }
+}
+
+/// Compare a U256 (always >= 0) against a signed i128.
+fn cmp_u256_i128(u: &[u8; 32], n: i128) -> Ordering {
+    if n < 0 {
+        return Ordering::Greater;
+    }
+    u256_be(u).cmp(&U256::from(n as u128))
+}
+
+/// Compare an I256 against a signed i128.
+fn cmp_i256_i128(i: &[u8; 32], n: i128) -> Ordering {
+    let (neg, mag) = i256_parts(i);
+    match (neg, n < 0) {
+        (false, false) => mag.cmp(&U256::from(n as u128)),
+        // Both negative: the larger magnitude is the smaller value.
+        (true, true) => mag.cmp(&U256::from(n.unsigned_abs())).reverse(),
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+    }
+}
+
+/// Compare a U256 against an I256.
+fn cmp_u256_i256(u: &[u8; 32], i: &[u8; 32]) -> Ordering {
+    let (neg, mag) = i256_parts(i);
+    if neg {
+        Ordering::Greater
+    } else {
+        u256_be(u).cmp(&mag)
+    }
+}
+
+/// Largest i128 magnitude that an I256 can hold and still fit, for join-key
+/// normalization. Returns `None` when the value is out of `i128` range.
+pub(crate) fn i256_to_i128(bytes: &[u8; 32]) -> Option<i128> {
+    let (neg, mag) = i256_parts(bytes);
+    let m: u128 = u128::try_from(mag).ok()?;
+    if neg {
+        // -(2^127) is representable as i128::MIN; guard that boundary.
+        if m == (i128::MAX as u128) + 1 {
+            Some(i128::MIN)
+        } else {
+            i128::try_from(m).ok().map(|v| -v)
+        }
+    } else {
+        i128::try_from(m).ok()
+    }
+}
+
+/// U256 as i128 when it fits (for join-key normalization).
+pub(crate) fn u256_to_i128(bytes: &[u8; 32]) -> Option<i128> {
+    let m: u128 = u128::try_from(u256_be(bytes)).ok()?;
+    i128::try_from(m).ok()
+}
+
+#[cfg(test)]
+mod wide_int_compare_tests {
+    use super::{i256_to_i128, u256_to_i128, value_compare};
+    use crate::catalog::types::Value;
+    use primitive_types::U256;
+    use std::cmp::Ordering;
+
+    fn to_be(v: U256) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        v.to_big_endian(&mut out);
+        out
+    }
+
+    fn u256(v: u128) -> Value {
+        Value::U256(to_be(U256::from(v)))
+    }
+
+    fn i256(v: i128) -> Value {
+        // Two's-complement big-endian encoding of a signed 256-bit value.
+        let mag = U256::from(v.unsigned_abs());
+        let raw = if v < 0 {
+            (!mag).overflowing_add(U256::one()).0
+        } else {
+            mag
+        };
+        Value::I256(to_be(raw))
+    }
+
+    #[test]
+    fn u256_compares_numerically_with_integers() {
+        assert_eq!(
+            value_compare(&u256(5), &Value::Integer(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            value_compare(&u256(5), &Value::U64(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            value_compare(&u256(5), &Value::U8(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            value_compare(&u256(10), &Value::Integer(5)),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            value_compare(&Value::Integer(5), &u256(10)),
+            Some(Ordering::Less)
+        );
+        // U256 is always >= 0, so it outranks any negative integer.
+        assert_eq!(
+            value_compare(&u256(0), &Value::Integer(-1)),
+            Some(Ordering::Greater)
+        );
+        // Beyond i128/u128 range, still orders correctly against small ints.
+        let huge = Value::U256(to_be(U256::MAX));
+        assert_eq!(
+            value_compare(&huge, &Value::Integer(1)),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn i256_compares_numerically_with_integers_and_sign() {
+        assert_eq!(
+            value_compare(&i256(5), &Value::Integer(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            value_compare(&i256(-5), &Value::Integer(-5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            value_compare(&i256(-5), &Value::Integer(5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            value_compare(&i256(-10), &Value::Integer(-5)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            value_compare(&Value::Integer(-5), &i256(-10)),
+            Some(Ordering::Greater)
+        );
+    }
+
+    #[test]
+    fn i256_same_type_equality_holds_ordering_matches_index() {
+        // Same-type I256 equality is exact (the cross-type finding relies on it).
+        assert_eq!(value_compare(&i256(7), &i256(7)), Some(Ordering::Equal));
+        assert_eq!(value_compare(&i256(-5), &i256(-5)), Some(Ordering::Equal));
+        // Ordering deliberately stays byte-order (== `Value::cmp`, == EncodedKey
+        // index order) so full-scan and index-accelerated range queries agree.
+        // Raw two's-complement sorts negatives after positives; correcting that
+        // needs an EncodedKey format migration (see compare_values NOTE). What
+        // matters here is that the predicate path agrees with `Value::cmp` (and
+        // hence the index), not that it is signed-correct.
+        assert_eq!(
+            value_compare(&i256(-1), &i256(1)),
+            Some(i256(-1).cmp(&i256(1)))
+        );
+    }
+
+    #[test]
+    fn u256_vs_i256() {
+        assert_eq!(value_compare(&u256(5), &i256(5)), Some(Ordering::Equal));
+        assert_eq!(value_compare(&u256(5), &i256(-5)), Some(Ordering::Greater));
+        assert_eq!(value_compare(&i256(-5), &u256(0)), Some(Ordering::Less));
+    }
+
+    #[test]
+    fn to_i128_round_trips() {
+        if let Value::U256(b) = u256(42) {
+            assert_eq!(u256_to_i128(&b), Some(42));
+        }
+        if let Value::I256(b) = i256(-42) {
+            assert_eq!(i256_to_i128(&b), Some(-42));
+        }
+        // Out of range returns None.
+        let huge = to_be(U256::MAX);
+        assert_eq!(u256_to_i128(&huge), None);
     }
 }
