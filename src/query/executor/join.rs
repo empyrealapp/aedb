@@ -7,7 +7,7 @@ use super::{
 };
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
-use crate::catalog::types::{Row, Value};
+use crate::catalog::types::{ColumnType, Row, Value};
 use crate::query::error::QueryError;
 use crate::query::operators::{
     AggregateOperator, CompiledExpr, Operator, ScanOperator, compile_expr,
@@ -103,6 +103,13 @@ pub(super) fn execute_join_query(
         .iter()
         .map(|c| format!("{base_alias}.{}", c.name))
         .collect();
+    // Column types tracked in lockstep with `columns` so the PK-probe fast path
+    // can be gated on exact left/right type equality (see `can_probe_right_primary_key`).
+    let mut column_types: Vec<ColumnType> = base_schema
+        .columns
+        .iter()
+        .map(|c| c.col_type.clone())
+        .collect();
     let base_count = snapshot
         .table(&base_ns_project, &base_ns_scope, &base_table)
         .map(|t| t.rows.len())
@@ -179,6 +186,8 @@ pub(super) fn execute_join_query(
                 .iter()
                 .map(|c| format!("{join_alias}.{}", c.name)),
         );
+        let mut next_column_types = column_types.clone();
+        next_column_types.extend(join_schema.columns.iter().map(|c| c.col_type.clone()));
         // A single-column equality ON can use the optimized single-column path
         // (including the PK-probe fast path); composite/non-equi/boolean ON falls
         // to the general executor.
@@ -251,8 +260,21 @@ pub(super) fn execute_join_query(
                     (Some(left_idx), Some(right_idx))
                 }
             };
+            // The PK-probe fast path re-encodes the left value with `EncodedKey`
+            // and looks it up in the right table's primary-key map. `EncodedKey`
+            // is type-tagged (Integer != U64 even for equal numbers), so this is
+            // only correct when the two columns share an exact type. On a type
+            // mismatch we fall through to the hash-join path, whose `join_key`
+            // unifies numerically-equal values across integer/float types.
+            let join_key_types_match = match (left_idx, right_idx) {
+                (Some(li), Some(ri)) => {
+                    column_types.get(li) == join_schema.columns.get(ri).map(|c| &c.col_type)
+                }
+                _ => false,
+            };
             let can_probe_right_primary_key =
                 matches!(join.join_type, JoinType::Inner | JoinType::Left)
+                    && join_key_types_match
                     && right_idx
                         .map(|idx| is_single_column_primary_key_join(join_schema, idx))
                         .unwrap_or(false);
@@ -325,12 +347,11 @@ pub(super) fn execute_join_query(
                         // Hash join for non-PK equality predicates.
                         let mut right_map: HashMap<JoinKey, Vec<&Row>> = HashMap::new();
                         for right in &join_rows {
-                            // SQL three-valued logic: NULL never equals NULL, so a NULL
-                            // join key can never match. Excluding NULL keys from the
-                            // probe map makes NULL-keyed left rows fall through to the
-                            // outer-join null-extension branch instead of spuriously
-                            // matching other NULL-keyed right rows.
-                            if matches!(right.values[right_idx], Value::Null) {
+                            // SQL three-valued logic: NULL/NaN never equal anything,
+                            // so excluding them from the probe map makes such-keyed
+                            // left rows fall through to the outer-join null-extension
+                            // branch instead of spuriously matching another such row.
+                            if is_unjoinable_hash_key(&right.values[right_idx]) {
                                 continue;
                             }
                             right_map
@@ -361,10 +382,10 @@ pub(super) fn execute_join_query(
                         materialize_table_rows(snapshot, join_table, join_filter.as_ref())?;
                     let mut left_map: HashMap<JoinKey, Vec<&Row>> = HashMap::new();
                     for left in &rows {
-                        // NULL never equals NULL (see the inner/left hash-join note):
-                        // keep NULL keys out of the probe map so NULL-keyed right rows
-                        // fall through to right-join null-extension.
-                        if matches!(left.values[left_idx], Value::Null) {
+                        // NULL/NaN never equal anything (see the inner/left hash-join
+                        // note): keep them out of the probe map so such-keyed right
+                        // rows fall through to right-join null-extension.
+                        if is_unjoinable_hash_key(&left.values[left_idx]) {
                             continue;
                         }
                         left_map
@@ -393,6 +414,7 @@ pub(super) fn execute_join_query(
             });
         }
         columns = next_columns;
+        column_types = next_column_types;
     }
 
     if let Some(predicate) = &query.predicate {
@@ -1046,18 +1068,47 @@ fn combined_value<'a>(left: &'a Row, right: &'a Row, left_len: usize, idx: usize
 /// representation so cross-type equi joins match consistently with
 /// [`value_compare`]. Other value types key by themselves. (Float-to-integer
 /// equality is unified for comparisons but not in the hash-join key.)
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 enum JoinKey {
     Int(i128),
     Other(Value),
 }
 
+/// Values that can never satisfy a hash-join equality, mirroring SQL three-valued
+/// logic: NULL never equals anything, and neither does NaN (`value_compare`
+/// returns `None` for both). The single-column hash join trusts `join_key`
+/// equality directly — unlike the composite-ON path, it has no post-match
+/// `value_compare` re-check — so these keys must be excluded from the probe map.
+/// They then fall through to the outer-join null-extension branch instead of
+/// spuriously matching another NULL/NaN-keyed row.
+fn is_unjoinable_hash_key(value: &Value) -> bool {
+    matches!(value, Value::Null) || matches!(value, Value::Float(f) if f.is_nan())
+}
+
 fn join_key(value: &Value) -> JoinKey {
+    // 2^53: above this an f64 can no longer represent every integer, so the
+    // Float<->Integer mapping stops being bijective. We only fold Floats into
+    // the integer bucket within this range, where it is provably consistent
+    // with `value_compare`'s numeric equality. Larger floats stay `Other`.
+    const F64_EXACT_INT_LIMIT: f64 = 9_007_199_254_740_992.0;
     match value {
         Value::U8(x) => JoinKey::Int(*x as i128),
         Value::U64(x) => JoinKey::Int(*x as i128),
         Value::Integer(x) => JoinKey::Int(*x as i128),
         Value::Timestamp(x) => JoinKey::Int(*x as i128),
+        Value::Float(x) if x.fract() == 0.0 && x.abs() < F64_EXACT_INT_LIMIT => {
+            JoinKey::Int(*x as i128)
+        }
+        // Wide integers fold into the shared integer bucket when they fit, so a
+        // U256/I256 column hash-joins against an Integer/U64 column the same way
+        // `value_compare` matches them. Out-of-range values stay `Other` (they
+        // can only equal another identical wide value, handled by byte equality).
+        Value::U256(b) => crate::query::operators::u256_to_i128(b)
+            .map(JoinKey::Int)
+            .unwrap_or_else(|| JoinKey::Other(value.clone())),
+        Value::I256(b) => crate::query::operators::i256_to_i128(b)
+            .map(JoinKey::Int)
+            .unwrap_or_else(|| JoinKey::Other(value.clone())),
         other => JoinKey::Other(other.clone()),
     }
 }
@@ -1373,4 +1424,48 @@ fn push_nulls_with_right(out: &mut Vec<Row>, null_count: usize, right: &Row) {
     values.extend(std::iter::repeat_n(Value::Null, null_count));
     values.extend_from_slice(&right.values);
     out.push(Row { values });
+}
+
+#[cfg(test)]
+mod join_key_tests {
+    use super::{JoinKey, join_key};
+    use crate::catalog::types::Value;
+    use primitive_types::U256;
+
+    fn to_be(v: U256) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        v.to_big_endian(&mut out);
+        out
+    }
+
+    #[test]
+    fn integer_types_share_a_bucket() {
+        assert_eq!(join_key(&Value::Integer(5)), join_key(&Value::U64(5)));
+        assert_eq!(join_key(&Value::Integer(5)), join_key(&Value::U8(5)));
+        assert_eq!(join_key(&Value::Integer(5)), join_key(&Value::Timestamp(5)));
+    }
+
+    #[test]
+    fn integer_valued_float_matches_integer() {
+        // Regression: a hash equi-join on a Float column vs an Integer column
+        // must match numerically-equal values, like `value_compare` does.
+        assert_eq!(join_key(&Value::Float(5.0)), join_key(&Value::Integer(5)));
+        // Non-integer floats stay distinct from integers.
+        assert_ne!(join_key(&Value::Float(5.5)), join_key(&Value::Integer(5)));
+        // Beyond 2^53 the f64<->int mapping is no longer exact: stay `Other`.
+        let big = 9_007_199_254_740_993.0_f64; // 2^53 + 1, not exactly representable
+        assert!(matches!(join_key(&Value::Float(big)), JoinKey::Other(_)));
+    }
+
+    #[test]
+    fn wide_integers_fold_into_shared_bucket_when_in_range() {
+        assert_eq!(
+            join_key(&Value::U256(to_be(U256::from(7u8)))),
+            join_key(&Value::Integer(7))
+        );
+        // Out-of-range U256 stays Other and only matches identical wide values.
+        let huge = Value::U256(to_be(U256::MAX));
+        assert!(matches!(join_key(&huge), JoinKey::Other(_)));
+        assert_eq!(join_key(&huge), join_key(&Value::U256(to_be(U256::MAX))));
+    }
 }

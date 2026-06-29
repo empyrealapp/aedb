@@ -2,8 +2,8 @@ use crate::backup::{
     BACKUP_ARCHIVE_CHUNK_BYTES, BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES,
     BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE, BACKUP_ARCHIVE_ENTRY_FILE, BACKUP_ARCHIVE_MAGIC,
     BackupManifest, MAX_BACKUP_ARCHIVE_PATH_BYTES, MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES,
-    extract_backup_archive, resolve_backup_output_path, sha256_file_hex, validate_backup_manifest,
-    verify_backup_files, write_backup_archive,
+    MAX_CHUNKED_FILE_BYTES, extract_backup_archive, resolve_backup_output_path, sha256_file_hex,
+    validate_backup_manifest, verify_backup_files, write_backup_archive,
 };
 use crate::error::AedbError;
 use std::collections::BTreeMap;
@@ -211,4 +211,28 @@ fn backup_output_path_rejects_symlinked_parent() {
     let err = resolve_backup_output_path(dir.path(), "wal_tail/segment_1.aedbwal")
         .expect_err("must reject symlinked output parent");
     assert!(matches!(err, AedbError::Validation(_)));
+}
+
+#[test]
+fn backup_archive_rejects_oversized_chunked_file_length() {
+    // A chunked entry's `file_len` is an attacker-controlled u64; without the
+    // absolute cap a tiny archive could declare a huge length and exhaust the
+    // disk on restore. The cap is enforced before any chunk is read or written.
+    let archive_path = tempfile::NamedTempFile::new().expect("archive");
+    let out_dir = tempfile::tempdir().expect("out");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(BACKUP_ARCHIVE_MAGIC);
+    bytes.push(0); // flags: unencrypted
+    bytes.extend_from_slice(&[0u8; 16]); // salt
+    bytes.push(BACKUP_ARCHIVE_ENTRY_CHUNKED_FILE);
+    bytes.extend_from_slice(&(8u32).to_le_bytes());
+    bytes.extend_from_slice(b"file.bin");
+    bytes.extend_from_slice(&(MAX_CHUNKED_FILE_BYTES + 1).to_le_bytes());
+    std::fs::write(archive_path.path(), &bytes).expect("write malformed archive");
+    let err = extract_backup_archive(archive_path.path(), out_dir.path(), None)
+        .expect_err("oversized chunked file length must be rejected");
+    assert!(
+        format!("{err}").contains("oversized file length"),
+        "unexpected error: {err}"
+    );
 }

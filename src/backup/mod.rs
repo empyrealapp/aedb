@@ -23,6 +23,17 @@ const MAX_BACKUP_ARCHIVE_PATH_BYTES: u32 = 4_096;
 const MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const BACKUP_ARCHIVE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const BACKUP_ARCHIVE_CHUNKED_FILE_THRESHOLD_BYTES: u64 = 8 * 1024 * 1024;
+/// Absolute upper bound on the declared decompressed size (`file_len`) of a
+/// single chunked archive entry. Unlike the legacy path (capped at
+/// `MAX_BACKUP_ARCHIVE_PAYLOAD_BYTES` via `decoder.take`), the chunked path's
+/// `file_len` is an attacker-controlled `u64` with no cap, so a tiny but
+/// highly-compressible archive could declare a huge length and exhaust the disk
+/// on restore. A ratio-based bound is unsafe here because `write_backup_archive`
+/// legitimately produces highly-compressible entries (e.g. zero-padded WAL
+/// segments), so the extract path must accept any ratio it emits. This absolute
+/// cap is sized far beyond any realistic single backup file while still bounding
+/// the unbounded-`u64` case.
+const MAX_CHUNKED_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024; // 1 TiB
 const BACKUP_ARCHIVE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Upper bound on zstd worker threads used while compressing archive payloads.
@@ -464,6 +475,11 @@ fn extract_chunked_archive_file<R: Read>(
     encryption_key: Option<&[u8; 32]>,
 ) -> Result<(), AedbError> {
     let file_len = read_u64(reader)?;
+    if file_len > MAX_CHUNKED_FILE_BYTES {
+        return Err(AedbError::Validation(
+            "chunked backup archive entry declares an oversized file length".into(),
+        ));
+    }
     let out = resolve_backup_output_path(dir, rel)?;
     let mut file =
         BufWriter::with_capacity(BACKUP_ARCHIVE_IO_BUFFER_BYTES, fs::File::create(&out)?);

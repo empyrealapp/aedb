@@ -47,7 +47,53 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tracing::warn;
 
 const MEMORY_ESTIMATE_INTERVAL_MICROS: u64 = 250_000;
+/// High-water fraction of `max_memory_estimate_bytes` at which we warn operators
+/// *before* the budget is fully consumed, leaving time to react.
+const MEMORY_PRESSURE_WARN_FRACTION: f64 = 0.90;
 const SINGLE_REQUEST_PARALLEL_APPLY_MUTATION_THRESHOLD: usize = 1024;
+
+/// Rate-limited keyspace memory-pressure reporting, shared by the serial and
+/// parallel commit paths. At most one warning per `MEMORY_ESTIMATE_INTERVAL_MICROS`:
+/// "exceeded" once over budget, or an earlier "approaching budget" warning at
+/// `MEMORY_PRESSURE_WARN_FRACTION` whose guidance depends on whether a
+/// spill/eviction tier is enabled (without one, crossing the budget rejects commits).
+fn maybe_warn_memory_pressure(state: &mut ExecutorState) {
+    let now = now_micros();
+    if now.saturating_sub(state.last_memory_estimate_micros) < MEMORY_ESTIMATE_INTERVAL_MICROS {
+        return;
+    }
+    state.last_memory_estimate_micros = now;
+    let budget = state.config.max_memory_estimate_bytes;
+    if budget == 0 {
+        return;
+    }
+    let mem_estimate = state.keyspace.estimate_memory_bytes();
+    if mem_estimate > budget {
+        warn!(
+            mem_estimate,
+            max_memory_estimate_bytes = budget,
+            "aedb memory estimate exceeded threshold"
+        );
+        return;
+    }
+    if (mem_estimate as f64) >= (budget as f64) * MEMORY_PRESSURE_WARN_FRACTION {
+        let spill_enabled = state.config.table_row_spill_enabled
+            || state.config.table_row_segment_eviction_enabled
+            || state.config.index_segment_eviction_enabled;
+        let guidance = if spill_enabled {
+            "spill/eviction will engage under further memory pressure"
+        } else {
+            "no spill/eviction enabled: commits will be rejected once the budget is exceeded — raise max_memory_estimate_bytes or enable table_row_spill_enabled / *_segment_eviction_enabled"
+        };
+        warn!(
+            mem_estimate,
+            max_memory_estimate_bytes = budget,
+            used_fraction = mem_estimate as f64 / budget as f64,
+            spill_enabled,
+            "aedb keyspace memory approaching budget: {guidance}"
+        );
+    }
+}
 
 #[derive(Clone, Default)]
 pub(super) struct ParallelMergeTargets {
@@ -2786,20 +2832,7 @@ fn finalize_committed_epoch(
         state.last_full_snapshot_micros = now_micros();
     }
 
-    let now_micros = now_micros();
-    if now_micros.saturating_sub(state.last_memory_estimate_micros)
-        >= MEMORY_ESTIMATE_INTERVAL_MICROS
-    {
-        state.last_memory_estimate_micros = now_micros;
-        let mem_estimate = state.keyspace.estimate_memory_bytes();
-        if mem_estimate > state.config.max_memory_estimate_bytes {
-            warn!(
-                mem_estimate,
-                max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
-                "aedb memory estimate exceeded threshold"
-            );
-        }
-    }
+    maybe_warn_memory_pressure(state);
     if let Some(reason) = state.wal.should_rotate()
         && let Err(err) = state.wal.rotate()
     {
@@ -3206,20 +3239,7 @@ fn finalize_inline_kv_committed_epoch(
         state.last_full_snapshot_micros = now_micros();
     }
 
-    let now_micros = now_micros();
-    if now_micros.saturating_sub(state.last_memory_estimate_micros)
-        >= MEMORY_ESTIMATE_INTERVAL_MICROS
-    {
-        state.last_memory_estimate_micros = now_micros;
-        let mem_estimate = state.keyspace.estimate_memory_bytes();
-        if mem_estimate > state.config.max_memory_estimate_bytes {
-            warn!(
-                mem_estimate,
-                max_memory_estimate_bytes = state.config.max_memory_estimate_bytes,
-                "aedb memory estimate exceeded threshold"
-            );
-        }
-    }
+    maybe_warn_memory_pressure(state);
     if let Some(reason) = state.wal.should_rotate()
         && let Err(err) = state.wal.rotate()
     {
