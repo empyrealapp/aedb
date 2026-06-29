@@ -10,6 +10,7 @@ use crate::storage::keyspace::KeyspaceSnapshot;
 mod access_path;
 mod aggregate;
 mod composite_index;
+mod computed;
 mod cursor;
 mod execution_setup;
 mod index_diagnostics;
@@ -166,6 +167,13 @@ fn execute_query_with_options_capturing_signed(
     let options = execution_setup.options;
     let cursor_state = execution_setup.cursor_state;
 
+    if query.distinct && cursor_state.is_some() {
+        return Err(QueryError::InvalidQuery {
+            reason: "DISTINCT cannot be combined with cursor pagination".into(),
+        });
+    }
+    computed::validate_computed(&query)?;
+
     if !query.joins.is_empty() {
         // Join paths fall back to coarse table-range capture: record each
         // touched table as a full structural-version-bounded range so the
@@ -208,22 +216,35 @@ fn execute_query_with_options_capturing_signed(
         })?;
     let table = snapshot.table(&exec_project_id, &exec_scope_id, &query.table);
     let mut materialized_seq = None;
-    if let Some(result) = try_primary_key_point_query(PrimaryKeyPointQueryRequest {
-        snapshot,
-        schema,
-        project_id: &exec_project_id,
-        scope_id: &exec_scope_id,
-        query: &query,
-        cursor_state: &cursor_state,
-        snapshot_seq,
-        read_set: read_set.as_deref_mut(),
-    })? {
+    // The point-lookup fast path projects directly; skip it when the output needs
+    // computed columns or DISTINCT handling so those run through the pipeline.
+    if !query.distinct
+        && query.computed.is_empty()
+        && let Some(result) = try_primary_key_point_query(PrimaryKeyPointQueryRequest {
+            snapshot,
+            schema,
+            project_id: &exec_project_id,
+            scope_id: &exec_scope_id,
+            query: &query,
+            cursor_state: &cursor_state,
+            snapshot_seq,
+            read_set: read_set.as_deref_mut(),
+        })?
+    {
         return Ok(result);
     }
     validate_query(schema, &query)?;
 
     let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
     let page_window = compute_page_window(&query, &cursor_state, max_scan_rows)?;
+    // DISTINCT must see every candidate row before deduplicating, so the row
+    // source and pipeline are left unbounded (offset/limit are applied after
+    // dedup, in the DISTINCT branch below).
+    let (source_offset, source_limit) = if query.distinct {
+        (0usize, usize::MAX)
+    } else {
+        (page_window.row_offset_count, page_window.page_read_limit)
+    };
 
     let mut has_residual_filter = query.predicate.is_some();
     let estimated_rows: usize;
@@ -262,8 +283,8 @@ fn execute_query_with_options_capturing_signed(
                 query: &query,
                 table,
                 predicate,
-                offset: page_window.row_offset_count,
-                limit: page_window.page_read_limit,
+                offset: source_offset,
+                limit: source_limit,
                 has_cursor: cursor_state.is_some(),
             })
     {
@@ -293,6 +314,7 @@ fn execute_query_with_options_capturing_signed(
         Box::new(materialized.into_iter())
     } else if let (Some(predicate), Some(table)) = (&query.predicate, table) {
         let candidate_limit = if cursor_state.is_none()
+            && !query.distinct
             && query.order_by.is_empty()
             && query.aggregates.is_empty()
             && query.having.is_none()
@@ -313,7 +335,23 @@ fn execute_query_with_options_capturing_signed(
         match indexed_pks {
             Some(indexed) => {
                 has_residual_filter = !indexed.predicate_exact;
-                let pks = indexed.pks;
+                let mut pks = indexed.pks;
+                // Deep-OFFSET fast path: when the index lookup fully satisfies the
+                // predicate and nothing downstream reorders the rows (no ORDER BY,
+                // GROUP BY, aggregates, HAVING, or cursor — all implied by
+                // `candidate_limit`/`group_by` here), the row-source order is the
+                // output order. We can drop the first `offset` primary keys before
+                // materializing, avoiding the cost of paging in rows only to skip
+                // them. `candidate_limit` already bounded `pks` to `offset+page+1`.
+                if indexed.predicate_exact
+                    && candidate_limit.is_some()
+                    && query.group_by.is_empty()
+                    && page_window.row_offset_count > 0
+                {
+                    let skip = page_window.row_offset_count.min(pks.len());
+                    pks.drain(0..skip);
+                    row_source_applies_offset = true;
+                }
                 if let Some(collector) = read_set.as_deref_mut() {
                     collector.record_touched_pks(
                         snapshot,
@@ -369,8 +407,8 @@ fn execute_query_with_options_capturing_signed(
             schema,
             query: &query,
             table,
-            offset: page_window.row_offset_count,
-            limit: page_window.page_read_limit,
+            offset: source_offset,
+            limit: source_limit,
             has_cursor: cursor_state.is_some(),
         })
     {
@@ -446,6 +484,50 @@ fn execute_query_with_options_capturing_signed(
     let mut root = pipeline.root;
     let selected_indices = pipeline.selected_indices;
     let row_columns = pipeline.row_columns;
+    // Computed projections are evaluated against the full (pre-projection) row
+    // layout and appended after the selected columns.
+    let compiled_computed = computed::compile_computed(&query.computed, &row_columns)?;
+
+    if query.distinct {
+        // Drain the (bounded) row source, project, then deduplicate the output
+        // rows before applying offset/limit. Cursor pagination is rejected above.
+        let mut seen: std::collections::HashSet<Vec<crate::catalog::types::Value>> =
+            std::collections::HashSet::new();
+        let mut distinct_rows: Vec<Row> = Vec::new();
+        while let Some(row) = root.next() {
+            let base: Vec<crate::catalog::types::Value> = match &selected_indices {
+                Some(selected) => selected
+                    .iter()
+                    .map(|idx| row.values[*idx].clone())
+                    .collect(),
+                None => row.values.clone(),
+            };
+            let projected = computed::append_computed(base, &compiled_computed, &row);
+            if seen.insert(projected.values.clone()) {
+                distinct_rows.push(projected);
+            }
+        }
+        let rows_examined = root.rows_examined();
+        let mut sliced: Vec<Row> = distinct_rows
+            .into_iter()
+            .skip(page_window.row_offset_count)
+            .collect();
+        let has_more = sliced.len() > page_window.effective_page_size;
+        if has_more {
+            sliced.truncate(page_window.effective_page_size);
+        }
+        let split_budget = query.limit.unwrap_or(max_scan_rows);
+        let split_recommended = compute_split_recommended(rows_examined, split_budget);
+        return Ok(QueryResult {
+            rows: sliced,
+            rows_examined,
+            truncated: has_more,
+            cursor: None,
+            snapshot_seq,
+            materialized_seq,
+            split_recommended,
+        });
+    }
 
     let sort_indices: Vec<(usize, crate::query::plan::Order)> = if !query.order_by.is_empty() {
         query
@@ -497,18 +579,34 @@ fn execute_query_with_options_capturing_signed(
         sliced.truncate(page_window.effective_page_size);
     }
     let cursor_last_row = sliced.last().cloned();
-    let sliced: Vec<Row> = if let Some(selected) = &selected_indices {
-        sliced
-            .into_iter()
-            .map(|row| Row {
-                values: selected
-                    .iter()
-                    .map(|idx| row.values[*idx].clone())
-                    .collect(),
-            })
-            .collect()
+    let sliced: Vec<Row> = if compiled_computed.is_empty() {
+        if let Some(selected) = &selected_indices {
+            sliced
+                .into_iter()
+                .map(|row| Row {
+                    values: selected
+                        .iter()
+                        .map(|idx| row.values[*idx].clone())
+                        .collect(),
+                })
+                .collect()
+        } else {
+            sliced
+        }
     } else {
         sliced
+            .into_iter()
+            .map(|row| {
+                let base: Vec<crate::catalog::types::Value> = match &selected_indices {
+                    Some(selected) => selected
+                        .iter()
+                        .map(|idx| row.values[*idx].clone())
+                        .collect(),
+                    None => row.values.clone(),
+                };
+                computed::append_computed(base, &compiled_computed, &row)
+            })
+            .collect()
     };
     let returned_rows = sliced.len();
     let remaining_limit_after_page = compute_remaining_limit_after_page(
@@ -550,6 +648,7 @@ fn execute_query_with_options_capturing_signed(
 
 fn query_requires_full_evaluation(query: &Query, has_cursor: bool) -> bool {
     has_cursor
+        || query.distinct
         || !query.group_by.is_empty()
         || !query.aggregates.is_empty()
         || query.having.is_some()

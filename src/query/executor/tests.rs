@@ -4,7 +4,7 @@ use crate::catalog::namespace_key;
 use crate::catalog::schema::{ColumnDef, IndexType};
 use crate::catalog::types::{ColumnType, Row, Value};
 use crate::query::error::QueryError;
-use crate::query::plan::{Aggregate, Expr, Order, Query, QueryOptions, col, lit};
+use crate::query::plan::{Aggregate, Expr, Order, Query, QueryOptions, ScalarExpr, col, lit};
 use crate::storage::index::extract_index_key_encoded;
 use crate::storage::keyspace::{Keyspace, SecondaryIndex};
 
@@ -311,4 +311,171 @@ fn having_filters_post_aggregation() {
             .iter()
             .all(|r| matches!(r.values[1], Value::Integer(v) if v > 1))
     );
+}
+
+#[test]
+fn distinct_dedupes_projected_rows() {
+    // users.age = 18 + (id % 50) over 100 ids => 50 distinct ages, each twice.
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["age"]).from("users").distinct().limit(1000),
+    )
+    .expect("distinct");
+    assert_eq!(result.rows.len(), 50);
+    let mut ages: Vec<Value> = result.rows.iter().map(|r| r.values[0].clone()).collect();
+    ages.sort();
+    ages.dedup();
+    assert_eq!(ages.len(), 50, "rows must be unique");
+}
+
+#[test]
+fn distinct_applies_offset_and_limit_after_dedup() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["age"])
+            .from("users")
+            .order_by("age", Order::Asc)
+            .distinct()
+            .limit(10)
+            .offset(5),
+    )
+    .expect("distinct page");
+    assert_eq!(result.rows.len(), 10);
+    // 50 distinct ages 18..=67 sorted; offset 5 => first is 23.
+    assert!(matches!(result.rows[0].values[0], Value::Integer(23)));
+    assert!(result.truncated);
+}
+
+#[test]
+fn distinct_rejects_cursor_pagination() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    // Obtain a real cursor from a first (non-distinct) page.
+    let first = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .order_by("id", Order::Asc)
+            .limit(5),
+        &QueryOptions::default(),
+        1,
+        10_000,
+        None,
+    )
+    .expect("first page");
+    let options = QueryOptions {
+        cursor: first.cursor,
+        ..QueryOptions::default()
+    };
+    let err = execute_query_with_options(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .order_by("id", Order::Asc)
+            .distinct()
+            .limit(5),
+        &options,
+        1,
+        10_000,
+        None,
+    )
+    .expect_err("distinct + cursor must be rejected");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+}
+
+#[test]
+fn computed_projection_appends_arithmetic_column() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id", "age"])
+            .from("users")
+            .where_(col("id").eq(lit(0)))
+            .compute(
+                "age_plus_10",
+                ScalarExpr::col("age").add(ScalarExpr::lit(10i64)),
+            ),
+    )
+    .expect("computed projection");
+
+    assert_eq!(result.rows.len(), 1);
+    // [id = 0, age = 18, age_plus_10 = 28]
+    assert_eq!(result.rows[0].values.len(), 3);
+    assert!(matches!(result.rows[0].values[2], Value::Integer(28)));
+}
+
+#[test]
+fn computed_projection_rejected_with_aggregates() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let err = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["count_star"])
+            .from("users")
+            .aggregate(Aggregate::Count)
+            .compute("bad", ScalarExpr::col("age").add(ScalarExpr::lit(1i64))),
+    )
+    .expect_err("computed + aggregate must be rejected");
+    assert!(matches!(err, QueryError::InvalidQuery { .. }));
+}
+
+#[test]
+fn computed_division_and_null_semantics() {
+    let (keyspace, catalog) = setup();
+    let snapshot = keyspace.snapshot();
+    let result = execute_query(
+        &snapshot,
+        &catalog,
+        "A",
+        "app",
+        Query::select(&["id"])
+            .from("users")
+            .where_(col("id").eq(lit(0)))
+            .compute("exact", ScalarExpr::lit(10i64).div(ScalarExpr::lit(2i64)))
+            .compute("inexact", ScalarExpr::lit(10i64).div(ScalarExpr::lit(3i64)))
+            .compute(
+                "div_zero",
+                ScalarExpr::lit(10i64).div(ScalarExpr::lit(0i64)),
+            )
+            .compute(
+                "null_operand",
+                ScalarExpr::col("email").add(ScalarExpr::lit(1i64)),
+            ),
+    )
+    .expect("division semantics");
+
+    assert_eq!(result.rows.len(), 1);
+    let v = &result.rows[0].values;
+    // [id, exact, inexact, div_zero, null_operand]
+    assert!(matches!(v[1], Value::Integer(5)), "exact int division");
+    assert!(
+        matches!(v[2], Value::Float(f) if (f - 10.0 / 3.0).abs() < 1e-9),
+        "inexact division is float"
+    );
+    assert!(matches!(v[3], Value::Null), "division by zero is null");
+    // id 0 has a NULL email, so arithmetic on it is NULL.
+    assert!(matches!(v[4], Value::Null), "null operand propagates");
 }

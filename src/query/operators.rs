@@ -962,6 +962,15 @@ pub fn eval_compiled_expr_public(expr: &CompiledExpr, row: &Row) -> bool {
     eval_compiled_expr(expr, row)
 }
 
+/// Cross-type-aware comparison of two values, returning `None` when either is
+/// NULL or the types are not comparable. This is the same coercion `WHERE`
+/// filters use (e.g. `U8`/`U64`/`Integer`/`Timestamp`/`Float` compare
+/// numerically across types), exposed so the join executor can share identical
+/// equality/ordering semantics.
+pub(crate) fn value_compare(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    compare_values(left, right)
+}
+
 fn find_col_idx(columns: &[String], col: &str, table: &str) -> Result<usize, QueryError> {
     columns
         .iter()

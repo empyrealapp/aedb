@@ -85,6 +85,63 @@ impl Expr {
     }
 }
 
+/// Arithmetic operator for a computed projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// A scalar expression over a row's columns, used for computed projections
+/// (`SELECT a + b AS total`). Supports column references, literals, and binary
+/// arithmetic.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ScalarExpr {
+    Column(String),
+    Literal(Value),
+    Binary(Box<ScalarExpr>, ArithOp, Box<ScalarExpr>),
+}
+
+impl ScalarExpr {
+    pub fn col(name: &str) -> ScalarExpr {
+        ScalarExpr::Column(name.to_string())
+    }
+
+    pub fn lit<T: IntoQueryValue>(value: T) -> ScalarExpr {
+        ScalarExpr::Literal(value.into_query_value())
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(self, rhs: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary(Box::new(self), ArithOp::Add, Box::new(rhs))
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn sub(self, rhs: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary(Box::new(self), ArithOp::Sub, Box::new(rhs))
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn mul(self, rhs: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary(Box::new(self), ArithOp::Mul, Box::new(rhs))
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn div(self, rhs: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary(Box::new(self), ArithOp::Div, Box::new(rhs))
+    }
+}
+
+/// A computed output column: a scalar expression and its output alias. Computed
+/// columns are appended after the `select` columns in the result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComputedColumn {
+    pub expr: ScalarExpr,
+    pub alias: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub select: Vec<String>,
@@ -99,6 +156,10 @@ pub struct Query {
     pub aggregates: Vec<Aggregate>,
     pub having: Option<Expr>,
     pub use_index: Option<String>,
+    /// When true, deduplicate the projected output rows (`SELECT DISTINCT`).
+    pub distinct: bool,
+    /// Computed output columns, appended after the `select` columns.
+    pub computed: Vec<ComputedColumn>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +170,68 @@ pub enum JoinType {
     Cross,
 }
 
+/// Comparison operator for a column-to-column join condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+/// A join condition (`ON ...`) over two columns, one from each side of the
+/// join. Unlike [`Expr`] (which only models `column OP value`), this compares a
+/// left column against a right column, enabling composite keys (an `And` of
+/// equalities) and non-equi joins (`Lt`/`Gt`/...). Column names are
+/// alias-qualified (`alias.column`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinCond {
+    Compare {
+        left: String,
+        op: CompareOp,
+        right: String,
+    },
+    And(Box<JoinCond>, Box<JoinCond>),
+    Or(Box<JoinCond>, Box<JoinCond>),
+    Not(Box<JoinCond>),
+}
+
+impl JoinCond {
+    /// Equality join condition `left = right`.
+    pub fn on(left: &str, right: &str) -> Self {
+        JoinCond::Compare {
+            left: left.to_string(),
+            op: CompareOp::Eq,
+            right: right.to_string(),
+        }
+    }
+
+    /// Arbitrary comparison join condition `left <op> right` (e.g. for
+    /// range/non-equi joins).
+    pub fn compare(left: &str, op: CompareOp, right: &str) -> Self {
+        JoinCond::Compare {
+            left: left.to_string(),
+            op,
+            right: right.to_string(),
+        }
+    }
+
+    pub fn and(self, rhs: JoinCond) -> JoinCond {
+        JoinCond::And(Box::new(self), Box::new(rhs))
+    }
+
+    pub fn or(self, rhs: JoinCond) -> JoinCond {
+        JoinCond::Or(Box::new(self), Box::new(rhs))
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn not(self) -> JoinCond {
+        JoinCond::Not(Box::new(self))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JoinSpec {
     pub table: String,
@@ -116,6 +239,9 @@ pub struct JoinSpec {
     pub join_type: JoinType,
     pub left_column: Option<String>,
     pub right_column: Option<String>,
+    /// General join condition. When set, takes precedence over
+    /// `left_column`/`right_column` and supports composite/non-equi predicates.
+    pub on: Option<JoinCond>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,6 +306,8 @@ impl Query {
             aggregates: Vec::new(),
             having: None,
             use_index: None,
+            distinct: false,
+            computed: Vec::new(),
         }
     }
 
@@ -200,6 +328,7 @@ impl Query {
             join_type: JoinType::Inner,
             left_column: Some(left_column.to_string()),
             right_column: Some(right_column.to_string()),
+            on: None,
         });
         self
     }
@@ -211,6 +340,7 @@ impl Query {
             join_type: JoinType::Left,
             left_column: Some(left_column.to_string()),
             right_column: Some(right_column.to_string()),
+            on: None,
         });
         self
     }
@@ -222,6 +352,7 @@ impl Query {
             join_type: JoinType::Right,
             left_column: Some(left_column.to_string()),
             right_column: Some(right_column.to_string()),
+            on: None,
         });
         self
     }
@@ -233,6 +364,44 @@ impl Query {
             join_type: JoinType::Cross,
             left_column: None,
             right_column: None,
+            on: None,
+        });
+        self
+    }
+
+    /// Join `table` using a general [`JoinCond`] (composite or non-equi).
+    pub fn inner_join_on(mut self, table: &str, on: JoinCond) -> Self {
+        self.joins.push(JoinSpec {
+            table: table.to_string(),
+            alias: None,
+            join_type: JoinType::Inner,
+            left_column: None,
+            right_column: None,
+            on: Some(on),
+        });
+        self
+    }
+
+    pub fn left_join_on(mut self, table: &str, on: JoinCond) -> Self {
+        self.joins.push(JoinSpec {
+            table: table.to_string(),
+            alias: None,
+            join_type: JoinType::Left,
+            left_column: None,
+            right_column: None,
+            on: Some(on),
+        });
+        self
+    }
+
+    pub fn right_join_on(mut self, table: &str, on: JoinCond) -> Self {
+        self.joins.push(JoinSpec {
+            table: table.to_string(),
+            alias: None,
+            join_type: JoinType::Right,
+            left_column: None,
+            right_column: None,
+            on: Some(on),
         });
         self
     }
@@ -281,6 +450,23 @@ impl Query {
 
     pub fn use_index(mut self, index_name: &str) -> Self {
         self.use_index = Some(index_name.to_string());
+        self
+    }
+
+    /// Deduplicate the projected output rows (`SELECT DISTINCT`). Cannot be
+    /// combined with cursor pagination.
+    pub fn distinct(mut self) -> Self {
+        self.distinct = true;
+        self
+    }
+
+    /// Append a computed output column (`expr AS alias`) after the `select`
+    /// columns. Not supported with aggregates.
+    pub fn compute(mut self, alias: &str, expr: ScalarExpr) -> Self {
+        self.computed.push(ComputedColumn {
+            expr,
+            alias: alias.to_string(),
+        });
         self
     }
 }

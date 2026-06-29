@@ -44,7 +44,10 @@ pub(super) fn build_operator_pipeline(
         match stage {
             ExecutionStage::Scan => {}
             ExecutionStage::Limit => {
+                // DISTINCT deduplicates before applying limit, so the stream must
+                // not be limited here.
                 if cursor_absent
+                    && !query.distinct
                     && query.order_by.is_empty()
                     && query.aggregates.is_empty()
                     && query.having.is_none()
@@ -76,7 +79,8 @@ pub(super) fn build_operator_pipeline(
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let top_k_limit = if cursor_absent {
+                // DISTINCT needs every row before dedup, so no top-k truncation.
+                let top_k_limit = if cursor_absent && !query.distinct {
                     Some(row_source_window_limit)
                 } else {
                     None
