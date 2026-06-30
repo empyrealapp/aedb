@@ -986,7 +986,7 @@ fn kv_prefix_scans_are_lexicographically_bounded() {
     assert_eq!(rows[0].0, b"ob:a:1".to_vec());
     assert_eq!(rows[1].0, b"ob:a:2".to_vec());
 
-    let refs = ks.kv_scan_prefix_ref("p", "app", b"ob:", 10);
+    let refs = ks.kv_scan_prefix("p", "app", b"ob:", 10);
     assert_eq!(refs.len(), 3);
     assert!(refs.iter().all(|(k, _)| k.starts_with(b"ob:")));
 }

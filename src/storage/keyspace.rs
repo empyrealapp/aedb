@@ -2845,33 +2845,6 @@ impl Keyspace {
         )
     }
 
-    pub fn kv_scan_prefix_ref(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        prefix: &[u8],
-        limit: usize,
-    ) -> Vec<(Vec<u8>, KvEntry)> {
-        self.kv_scan_prefix(project_id, scope_id, prefix, limit)
-    }
-
-    pub fn kv_visit_prefix_ref<F>(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        prefix: &[u8],
-        limit: usize,
-        mut visitor: F,
-    ) where
-        F: FnMut(&[u8], &KvEntry) -> bool,
-    {
-        for (key, entry) in self.kv_scan_prefix(project_id, scope_id, prefix, limit) {
-            if !visitor(key.as_slice(), &entry) {
-                break;
-            }
-        }
-    }
-
     /// Convenience range scan for tests and in-memory-only callers.
     ///
     /// # Panics
