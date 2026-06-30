@@ -3342,7 +3342,6 @@ fn is_read_set_conflict_error(err: &AedbError) -> bool {
     }
 }
 
-
 fn plan_lifecycle_outbox_events_for_classified_mutations(
     catalog: &Catalog,
     mutations: &[Mutation],

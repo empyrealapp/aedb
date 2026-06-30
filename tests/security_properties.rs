@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -14,6 +13,7 @@ use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::offline;
 use aedb::permission::{CallerContext, Permission};
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Query};
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -227,7 +227,12 @@ async fn security_stale_table_preflight_plan_cannot_overwrite_row() {
     );
 
     let rows = db
-        .query("p", "app", Query::select(&["*"]).from("state").limit(10))
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["*"]).from("state").limit(10),
+            QueryOptions::default(),
+        )
         .await
         .expect("query state");
     assert_eq!(rows.rows.len(), 1);

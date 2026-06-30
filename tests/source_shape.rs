@@ -160,7 +160,7 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/order_book.rs", 2_200),
         ("src/commit/executor/mod.rs", 1_900),
         ("src/lib_tests/auth.rs", 4_400),
-        ("src/lib_tests/query_api.rs", 2_200),
+        ("src/lib_tests/query_api.rs", 2_240),
         ("src/lib_tests/commit_ops.rs", 1_750),
         ("src/api/order_book_api.rs", 1_610),
         ("src/api/kv_api.rs", 1_550),

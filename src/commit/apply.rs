@@ -1,7 +1,7 @@
 use crate::catalog::namespace_key;
-use crate::catalog::{AUTHZ_AUDIT_TABLE, Catalog, EVENT_OUTBOX_TABLE, SYSTEM_SCOPE_ID};
 use crate::catalog::schema::{Constraint, ForeignKeyAction, TableSchema};
 use crate::catalog::types::{Row, Value};
+use crate::catalog::{AUTHZ_AUDIT_TABLE, Catalog, EVENT_OUTBOX_TABLE, SYSTEM_SCOPE_ID};
 use crate::commit::ReadByteBudget;
 use crate::commit::row_byte_size;
 use crate::commit::tx::{AssertionActual, ReadAssertion};
@@ -1306,7 +1306,6 @@ pub fn apply_mutation_trusted_if_eligible(
         _ => None,
     }
 }
-
 
 struct AuthzAuditContext<'a> {
     action: &'a str,

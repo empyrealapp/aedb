@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -52,7 +51,7 @@ async fn setup_accounts_table(db: &AedbInstance) {
 
 async fn get_balance(db: &AedbInstance, account_id: i64) -> u64 {
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["balance"])

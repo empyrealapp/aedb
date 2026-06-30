@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -117,7 +116,7 @@ async fn setup_betting_schema(db: &AedbInstance) {
 
 async fn get_event_stake(db: &AedbInstance, event_id: i64) -> u64 {
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["current_stake"])
@@ -143,7 +142,7 @@ async fn get_event_stake(db: &AedbInstance, event_id: i64) -> u64 {
 
 async fn get_event_status(db: &AedbInstance, event_id: i64) -> String {
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["status"])
@@ -300,7 +299,7 @@ async fn test_concurrent_bets_with_event_limit() {
 
     // Verify: Bet records exist for successful bets
     let bet_count = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["id"]).from("bets").limit(100),

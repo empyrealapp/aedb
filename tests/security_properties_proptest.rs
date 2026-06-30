@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::{ColumnDef, IndexType};
@@ -11,6 +10,7 @@ use aedb::offline;
 use aedb::order_book::{
     ExecInstruction, OrderRequest, OrderSide, OrderType, SelfTradePrevention, TimeInForce,
 };
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Query};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
@@ -192,20 +192,20 @@ proptest! {
             prop_assert!(kv.is_none());
 
             let by_pk = db
-                .query(
+                .query_no_auth(
                     "p",
                     "app",
                     Query::select(&["id", "owner", "amount"])
                         .from("ledger")
                         .where_(aedb::query::plan::Expr::Eq("id".into(), Value::Integer(table_id)))
                         .limit(1),
-                )
+                 QueryOptions::default())
                 .await
                 .expect("query table by pk");
             prop_assert!(by_pk.rows.is_empty());
 
             let by_index = db
-                .query(
+                .query_no_auth(
                     "p",
                     "app",
                     Query::select(&["id", "owner", "amount"])
@@ -215,7 +215,7 @@ proptest! {
                             Value::Text("alice".into()),
                         ))
                         .limit(10),
-                )
+                 QueryOptions::default())
                 .await
                 .expect("query table by index");
             prop_assert!(by_index.rows.is_empty());

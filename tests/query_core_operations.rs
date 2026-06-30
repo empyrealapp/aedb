@@ -1,9 +1,9 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{Aggregate, Expr, Order, Query};
 use tempfile::tempdir;
 
@@ -71,7 +71,7 @@ async fn integration_query_core_operations_filter_order_limit_aggregate_and_dele
     }
 
     let filtered = db
-        .query(
+        .query_no_auth(
             "qcore",
             "app",
             Query::select(&["id", "amount"])
@@ -82,6 +82,7 @@ async fn integration_query_core_operations_filter_order_limit_aggregate_and_dele
                 )
                 .order_by("amount", Order::Desc)
                 .limit(2),
+            QueryOptions::default(),
         )
         .await
         .expect("filtered query");
@@ -92,7 +93,7 @@ async fn integration_query_core_operations_filter_order_limit_aggregate_and_dele
     assert_eq!(filtered.rows[1].values[1], Value::Integer(90));
 
     let grouped = db
-        .query(
+        .query_no_auth(
             "qcore",
             "app",
             Query::select(&["category", "sum_amount", "count_star"])
@@ -103,6 +104,7 @@ async fn integration_query_core_operations_filter_order_limit_aggregate_and_dele
                 .aggregate(Aggregate::Count)
                 .having(Expr::Eq("category".into(), Value::Text("books".into())))
                 .order_by("category", Order::Asc),
+            QueryOptions::default(),
         )
         .await
         .expect("grouped query");
@@ -121,13 +123,14 @@ async fn integration_query_core_operations_filter_order_limit_aggregate_and_dele
     .expect("delete order");
 
     let deleted = db
-        .query(
+        .query_no_auth(
             "qcore",
             "app",
             Query::select(&["id"])
                 .from("orders")
                 .where_(Expr::Eq("id".into(), Value::Integer(2)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("post delete query");

@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::backup::{
     load_backup_manifest, sha256_file_hex, verify_backup_files, write_backup_manifest,
@@ -9,6 +8,7 @@ use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::tx::{TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::{KvU64MissingPolicy, KvU64OverflowPolicy, Mutation};
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Query};
 use aedb::recovery::recover_with_config;
 use aedb::wal::frame::{FrameError, FrameReader};
@@ -75,12 +75,13 @@ async fn assert_parallel_e2e_state(db: &AedbInstance, expected_rows: usize) {
     assert_eq!(counter_value, expected_rows as u64);
 
     let rows = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"])
                 .from("events")
                 .limit(expected_rows + 1),
+            QueryOptions::default(),
         )
         .await
         .expect("query events");

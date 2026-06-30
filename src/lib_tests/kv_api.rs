@@ -171,10 +171,11 @@ async fn kv_projection_table_materializes_kv_state() {
     let mut projected = None;
     for _ in 0..25 {
         let result = db
-            .query(
+            .query_no_auth(
                 "p",
                 "app",
                 Query::select(&["*"]).from(KV_INDEX_TABLE).limit(10),
+                QueryOptions::default(),
             )
             .await
             .expect("query projection table");
@@ -1294,13 +1295,14 @@ async fn transaction_envelope_can_commit_table_kv_and_integer_atomically() {
     );
 
     let row = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["amount", "status"])
                 .from("ledger")
                 .where_(Expr::Eq("id".into(), Value::Integer(1)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("query ledger row");
@@ -1340,13 +1342,14 @@ async fn transaction_envelope_can_commit_table_kv_and_integer_atomically() {
     );
 
     let stable_row = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["amount", "status"])
                 .from("ledger")
                 .where_(Expr::Eq("id".into(), Value::Integer(1)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("query stable row");
@@ -1483,7 +1486,7 @@ async fn memory_limit_is_enforced_before_wal_commit() {
     );
 
     let rows = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"]).from("items").limit(10),
@@ -1584,7 +1587,7 @@ async fn row_spill_lets_table_grow_beyond_memory_budget_and_persists() {
 
     // Every row is readable, including cold rows paged back in from disk.
     let rows = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "blob"]).from("items").limit(1000),
@@ -1600,7 +1603,7 @@ async fn row_spill_lets_table_grow_beyond_memory_budget_and_persists() {
     // Spilled-row payloads survive recovery.
     let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let recovered = reopened
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "blob"]).from("items").limit(1000),

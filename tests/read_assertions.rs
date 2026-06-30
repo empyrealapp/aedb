@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -8,6 +7,7 @@ use aedb::commit::tx::{
 };
 use aedb::commit::validation::{CompareOp, Mutation};
 use aedb::error::AedbError;
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Expr, Query};
 use tempfile::tempdir;
 
@@ -447,10 +447,11 @@ async fn integration_failed_assertion_is_logged_to_system_audit_table() {
     .expect("failed assertion must block all mutations");
 
     let audit = db
-        .query(
+        .query_no_auth(
             "_system",
             "app",
             Query::select(&["*"]).from("assertion_audit").limit(20),
+            QueryOptions::default(),
         )
         .await
         .expect("query assertion audit");

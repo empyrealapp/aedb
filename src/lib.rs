@@ -12,7 +12,6 @@ pub mod error;
 pub mod faults;
 mod lib_helpers;
 #[cfg(test)]
-#[allow(deprecated)]
 mod lib_tests;
 pub mod locks;
 pub mod manifest;
@@ -151,7 +150,6 @@ pub struct AedbInstance {
     /// instance is dropped, after its GC thread is joined).
     _dir_lock: fs::File,
 }
-
 
 struct ReadPhaseLogSettings {
     enabled: bool,

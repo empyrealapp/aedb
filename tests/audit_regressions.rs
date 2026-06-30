@@ -1,6 +1,5 @@
 //! Regression tests for correctness bugs found during the security/correctness
 //! audit. Each test fails against the pre-fix code and passes after the fix.
-#![allow(deprecated)]
 
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
@@ -77,12 +76,13 @@ async fn hash_index_range_predicate_returns_all_matching_rows() {
     }
 
     let gt = db
-        .query(
+        .query_no_auth(
             "hx",
             "app",
             Query::select(&["id", "score"])
                 .from("items")
                 .where_(Expr::Gt("score".into(), Value::Integer(10))),
+            QueryOptions::default(),
         )
         .await
         .expect("range query on hash index");
@@ -101,12 +101,13 @@ async fn hash_index_range_predicate_returns_all_matching_rows() {
 
     // Equality on the same Hash index must still work (point lookup is valid).
     let eq = db
-        .query(
+        .query_no_auth(
             "hx",
             "app",
             Query::select(&["id"])
                 .from("items")
                 .where_(Expr::Eq("score".into(), Value::Integer(7))),
+            QueryOptions::default(),
         )
         .await
         .expect("eq query on hash index");
@@ -166,7 +167,7 @@ async fn equi_join_null_keys_do_not_match() {
         .expect("r2");
 
     let joined = db
-        .query_with_options(
+        .query_no_auth(
             "jn",
             "app",
             Query::select(&["x.id", "y.id"])
@@ -240,7 +241,7 @@ async fn aggregates_handle_floats_and_ignore_nulls() {
     }
 
     let agg = db
-        .query(
+        .query_no_auth(
             "ag",
             "app",
             Query::select(&["*"])
@@ -249,6 +250,7 @@ async fn aggregates_handle_floats_and_ignore_nulls() {
                 .aggregate(Aggregate::Avg("amount".into()))
                 .aggregate(Aggregate::Min("opt".into()))
                 .aggregate(Aggregate::Max("opt".into())),
+            QueryOptions::default(),
         )
         .await
         .expect("aggregate query");

@@ -1194,10 +1194,11 @@ async fn authz_grant_revoke_events_are_persisted_in_system_audit_table() {
     .expect("transfer policy");
 
     let audit = db
-        .query(
+        .query_no_auth(
             "_system",
             "app",
             Query::select(&["*"]).from("authz_audit").limit(20),
+            QueryOptions::default(),
         )
         .await
         .expect("audit query");
@@ -1984,7 +1985,12 @@ async fn secure_mode_requires_authenticated_apis() {
     assert!(matches!(spoof_err, AedbError::PermissionDenied(_)));
 
     let qerr = db
-        .query("p", "app", Query::select(&["*"]).from("users").limit(1))
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["*"]).from("users").limit(1),
+            QueryOptions::default(),
+        )
         .await
         .expect_err("anonymous query must fail");
     assert!(matches!(qerr, QueryError::PermissionDenied { .. }));
@@ -3266,7 +3272,7 @@ async fn delete_where_respects_row_level_read_policy() {
     .expect("delete visible rows only");
 
     let remaining = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "owner"]).from("items").limit(10),
@@ -3781,16 +3787,17 @@ async fn secure_mode_rejects_all_public_no_auth_read_escape_hatches() {
         .expect("open secure");
 
     let cases = [
-        db.query(
+        db.query_no_auth(
             "secret_project",
             "app",
             Query::select(&["*"]).from("secret_table").limit(1),
+            QueryOptions::default(),
         )
         .await
         .err()
         .map(|err| err.to_string())
         .expect("query should deny"),
-        db.query_with_options(
+        db.query_no_auth(
             "secret_project",
             "app",
             Query::select(&["*"]).from("secret_table").limit(1),
@@ -3800,10 +3807,12 @@ async fn secure_mode_rejects_all_public_no_auth_read_escape_hatches() {
         .err()
         .map(|err| err.to_string())
         .expect("query_with_options should deny"),
-        db.query_with_read_set(
+        db.query_with_options_capturing_as(
+            None,
             "secret_project",
             "app",
             Query::select(&["*"]).from("secret_table").limit(1),
+            QueryOptions::default(),
         )
         .await
         .err()

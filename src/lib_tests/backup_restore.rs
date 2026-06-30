@@ -6,6 +6,7 @@ use super::{
     reclaim_eligible_wal_segments,
 };
 use crate::catalog::SYSTEM_PROJECT_ID;
+use crate::query::plan::QueryOptions;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -695,12 +696,13 @@ async fn checkpoint_now_enables_clean_restart() {
 
     let reopened = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     let rows = reopened
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["*"])
                 .from("users")
                 .where_(Expr::Eq("id".into(), Value::Integer(5))),
+            QueryOptions::default(),
         )
         .await
         .expect("query");
@@ -1715,10 +1717,11 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
     // Restore from the checkpoint and confirm every spilled row round-tripped.
     let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let rows = reopened
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "blob"]).from("items").limit(1000),
+            QueryOptions::default(),
         )
         .await
         .expect("query after restore");
@@ -1729,12 +1732,13 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
     );
 
     let one = reopened
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "blob"])
                 .from("items")
                 .where_(Expr::Eq("id".into(), Value::Integer(42))),
+            QueryOptions::default(),
         )
         .await
         .expect("point query after restore");

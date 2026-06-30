@@ -7,13 +7,13 @@
 //! path stays focused on rows, keys, indexes, and constraints.
 
 use super::now_micros;
+use crate::catalog::schema::{ColumnDef, TableSchema};
+use crate::catalog::types::ColumnType;
 use crate::catalog::{
     ASSERTION_AUDIT_TABLE, AUTHZ_AUDIT_TABLE, Catalog, EVENT_OUTBOX_TABLE, LIFECYCLE_OUTBOX_TABLE,
     REACTIVE_PROCESSOR_CHECKPOINTS_TABLE, REACTIVE_PROCESSOR_DLQ_TABLE,
     REACTIVE_PROCESSOR_REGISTRY_TABLE, SYSTEM_SCOPE_ID, namespace_key,
 };
-use crate::catalog::schema::{ColumnDef, TableSchema};
-use crate::catalog::types::ColumnType;
 use crate::error::AedbError;
 
 pub(super) fn ensure_internal_audit_schema_for_upsert(

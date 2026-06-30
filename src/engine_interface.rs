@@ -15,7 +15,6 @@ use crate::{catalog::Catalog, catalog::schema::TableSchema};
 use std::collections::HashMap;
 use std::ops::Bound;
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectBatch {
     pub preconditions: Vec<EffectPrecondition>,
