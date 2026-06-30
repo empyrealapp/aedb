@@ -70,6 +70,25 @@ proptest! {
 }
 
 #[test]
+fn value_order_is_type_strict_by_design() {
+    use std::cmp::Ordering;
+    // Distinct numeric kinds are ordered by kind, not by numeric value. This is
+    // intentional: a cross-type numeric order can't stay transitive once Float
+    // is involved (see the `impl Ord for Value` doc). Strong column typing means
+    // a single column never mixes kinds, so this is never asked across types in
+    // practice. Query-time cross-type numeric equality lives in `compare_values`.
+    assert_ne!(Value::Integer(5), Value::U64(5));
+    assert_eq!(
+        Value::Integer(5).cmp(&Value::U64(5)),
+        // Integer (rank 4) sorts after U64 (rank 3) regardless of magnitude.
+        Ordering::Greater
+    );
+    // Same-kind comparisons remain by content.
+    assert_eq!(Value::U64(5), Value::U64(5));
+    assert!(Value::Integer(-1) < Value::Integer(0));
+}
+
+#[test]
 fn i256_orders_negatives_before_positives() {
     let neg_one = Value::I256([0xFF; 32]); // -1
     let mut neg_two = [0xFFu8; 32];

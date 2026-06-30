@@ -215,6 +215,25 @@ impl PartialOrd for Value {
     }
 }
 
+/// `Value`'s `Ord`/`Eq`/`Hash` are a *type-strict* total order: values are first
+/// ranked by kind (see [`Value::kind_rank`]) and only compared by content within
+/// the same kind. This is deliberate, not a missing cross-type unification:
+///
+/// - It is a sound total order, which `OrdMap`/`BTreeMap` keys and sort/dedup
+///   depend on. A cross-type numeric order (treating `Integer(5) == U64(5)`)
+///   cannot be made transitive once `Float` is involved — above 2^53, distinct
+///   integers map to the same `f64`, so `i1 < i2` yet `f(i1) == f(i2)` breaks
+///   antisymmetry/transitivity and would corrupt those structures.
+/// - Columns are strongly typed (see `validate.rs`), so a single column never
+///   holds mixed `Value` kinds; this strict order is never asked to compare
+///   across types in practice.
+/// - Query-time *numeric* cross-type equality/ordering (e.g. `WHERE i256col =
+///   <int literal>`) is handled separately and correctly by
+///   `crate::query::operators::compare_values`, which is not bound by the total
+///   order's transitivity requirement.
+///
+/// Index/key ordering is driven by `EncodedKey`'s own type-tagged byte encoding,
+/// not by this impl.
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         let rank_cmp = self.kind_rank().cmp(&other.kind_rank());
@@ -235,7 +254,11 @@ impl Ord for Value {
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
-            _ => Ordering::Equal,
+            // `kind_rank` is a bijection over the variants and equal ranks were
+            // required above, so both sides are necessarily the same variant.
+            // A silent `Ordering::Equal` here would let a future variant slip
+            // through and corrupt sort/dedup; fail loudly instead.
+            _ => unreachable!("equal kind_rank implies identical Value variant"),
         }
     }
 }
