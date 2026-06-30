@@ -4,10 +4,21 @@ use serde::{Deserialize, Serialize};
 /// Identifies an AEDB manifest file. Equal to the WAL segment magic (`"AEDB"`).
 pub const MANIFEST_MAGIC: u32 = 0x4145_4442;
 
-/// Current manifest on-disk format version. Bump when the manifest layout
+/// Current manifest on-disk format version. Bump when the on-disk format
 /// changes in a way older readers cannot tolerate; gate behaviour on
 /// [`Manifest::feature_flags`] for additive, backward-compatible changes.
-pub const MANIFEST_FORMAT_VERSION: u16 = 1;
+///
+/// History:
+/// - `1`: first versioned header.
+/// - `2`: `EncodedKey` sign-flips I256 so signed 256-bit keys sort correctly.
+///   Keys persisted by older builds use the previous (raw two's-complement)
+///   ordering, so pre-`2` databases are refused rather than read with a mix of
+///   orderings. (Early-beta clean break; no in-place migration.)
+pub const MANIFEST_FORMAT_VERSION: u16 = 2;
+
+/// Oldest on-disk format version this build can read. Databases older than this
+/// (including legacy pre-header manifests) are refused on load.
+pub const MIN_SUPPORTED_FORMAT_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentMeta {
@@ -49,19 +60,35 @@ impl Manifest {
         self.format_version = MANIFEST_FORMAT_VERSION;
     }
 
-    /// Validate the format header after load. Accepts legacy manifests
-    /// (`magic == 0`), rejects a wrong magic or a future format version this
-    /// build cannot understand.
+    /// Validate the format header after load. Rejects a wrong magic, a format
+    /// version newer than this build understands, and any version older than
+    /// [`MIN_SUPPORTED_FORMAT_VERSION`] (including legacy pre-header manifests,
+    /// `magic == 0`), whose on-disk key ordering this build cannot interpret.
     pub fn validate_header(&self) -> Result<(), crate::error::AedbError> {
         if self.magic == 0 {
-            // Legacy manifest written before headers existed.
-            return Ok(());
+            // Legacy manifest written before headers existed; its keys predate
+            // the signed-I256 encoding and cannot be read by this build.
+            return Err(crate::error::AedbError::Unavailable {
+                message: format!(
+                    "legacy database predates on-disk format version {MIN_SUPPORTED_FORMAT_VERSION} \
+                     and must be recreated"
+                ),
+            });
         }
         if self.magic != MANIFEST_MAGIC {
             return Err(crate::error::AedbError::IntegrityError {
                 message: format!(
                     "manifest magic mismatch: expected {MANIFEST_MAGIC:#010x}, found {:#010x}",
                     self.magic
+                ),
+            });
+        }
+        if self.format_version < MIN_SUPPORTED_FORMAT_VERSION {
+            return Err(crate::error::AedbError::Unavailable {
+                message: format!(
+                    "database on-disk format version {} is older than the minimum supported {} \
+                     and must be recreated",
+                    self.format_version, MIN_SUPPORTED_FORMAT_VERSION
                 ),
             });
         }

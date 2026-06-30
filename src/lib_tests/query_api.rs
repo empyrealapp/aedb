@@ -53,12 +53,13 @@ async fn api_open_commit_query_shutdown() {
     .expect("insert");
 
     let result = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["*"])
                 .from("users")
                 .where_(Expr::Eq("id".into(), Value::Integer(1))),
+            QueryOptions::default(),
         )
         .await
         .expect("query");
@@ -258,7 +259,7 @@ async fn async_projection_index_reports_materialized_seq() {
     let mut observed = None;
     for _ in 0..20 {
         let q = db
-            .query_with_options(
+            .query_no_auth(
                 "p",
                 "app",
                 Query::select(&["*"]).from("users"),
@@ -1257,7 +1258,12 @@ async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_path
             Value::Text("8a25f1bc-ea96-48d0-8535-47b784a2df1d".into()),
         ));
     let pre_index_result = db
-        .query("p", project_scope_id, query.clone())
+        .query_no_auth(
+            "p",
+            project_scope_id,
+            query.clone(),
+            QueryOptions::default(),
+        )
         .await
         .expect("eq query without index");
     assert_eq!(pre_index_result.rows.len(), 2);
@@ -1294,7 +1300,12 @@ async fn non_pk_text_eq_regression_in_project_scope_indexed_and_non_indexed_path
     .expect("user_id index");
 
     let indexed_result = db
-        .query("p", project_scope_id, query.clone())
+        .query_no_auth(
+            "p",
+            project_scope_id,
+            query.clone(),
+            QueryOptions::default(),
+        )
         .await
         .expect("eq query with index");
     assert_eq!(indexed_result.rows.len(), 2);
@@ -1446,11 +1457,11 @@ async fn uuid_text_equality_parity_between_primary_key_and_secondary_index_paths
             ));
 
         let pk_result = db
-            .query("p", "app", pk_query.clone())
+            .query_no_auth("p", "app", pk_query.clone(), QueryOptions::default())
             .await
             .expect("pk query");
         let secondary_result = db
-            .query("p", "app", secondary_query.clone())
+            .query_no_auth("p", "app", secondary_query.clone(), QueryOptions::default())
             .await
             .expect("secondary query");
         assert_eq!(pk_result.rows.len(), 1);
@@ -1542,12 +1553,13 @@ async fn u8_column_type_supports_write_read_and_indexed_equality() {
     .expect("seed u8 row");
 
     let without_index = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "level"])
                 .from("levels")
                 .where_(Expr::Eq("level".into(), Value::Integer(7))),
+            QueryOptions::default(),
         )
         .await
         .expect("u8 equality via integer literal");
@@ -1568,12 +1580,13 @@ async fn u8_column_type_supports_write_read_and_indexed_equality() {
     .expect("create u8 index");
 
     let with_index = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "level"])
                 .from("levels")
                 .where_(Expr::Eq("level".into(), Value::U8(7))),
+            QueryOptions::default(),
         )
         .await
         .expect("u8 equality with index");
@@ -1632,12 +1645,13 @@ async fn u64_column_type_supports_write_read_and_indexed_equality() {
     .expect("seed u64 row");
 
     let without_index = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "balance"])
                 .from("balances_u64")
                 .where_(Expr::Eq("balance".into(), Value::Integer(7))),
+            QueryOptions::default(),
         )
         .await
         .expect("u64 equality via integer literal");
@@ -1658,12 +1672,13 @@ async fn u64_column_type_supports_write_read_and_indexed_equality() {
     .expect("create u64 index");
 
     let with_index = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "balance"])
                 .from("balances_u64")
                 .where_(Expr::Eq("balance".into(), Value::U64(7))),
+            QueryOptions::default(),
         )
         .await
         .expect("u64 equality with index");
@@ -1881,7 +1896,7 @@ async fn insert_batch_rejects_duplicate_primary_keys_within_same_batch() {
     assert!(matches!(err, AedbError::DuplicatePK { .. }));
 
     let rows = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "name"]).from("users").limit(10),
@@ -1947,7 +1962,7 @@ async fn delete_where_respects_scan_budget() {
 
     for id in 1_i64..=5_i64 {
         let row = db
-            .query_with_options(
+            .query_no_auth(
                 "p",
                 "app",
                 Query::select(&["id"])

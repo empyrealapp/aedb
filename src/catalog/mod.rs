@@ -2083,6 +2083,20 @@ pub fn namespace_key(project_id: &str, scope_id: &str) -> String {
 pub const DEFAULT_SCOPE_ID: &str = "app";
 pub const KV_INDEX_TABLE: &str = "__kv_index";
 pub const SYSTEM_PROJECT_ID: &str = "_system";
+
+// Canonical names for engine-internal system tables, kept here (next to
+// SYSTEM_PROJECT_ID) so the commit/apply/engine/lib layers share one source of
+// truth instead of each redefining them. All live under SYSTEM_PROJECT_ID /
+// SYSTEM_SCOPE_ID.
+/// Reserved scope id for engine-internal system tables.
+pub(crate) const SYSTEM_SCOPE_ID: &str = "app";
+pub(crate) const AUTHZ_AUDIT_TABLE: &str = "authz_audit";
+pub(crate) const ASSERTION_AUDIT_TABLE: &str = "assertion_audit";
+pub(crate) const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
+pub(crate) const EVENT_OUTBOX_TABLE: &str = "event_outbox";
+pub(crate) const REACTIVE_PROCESSOR_CHECKPOINTS_TABLE: &str = "reactive_processor_checkpoints";
+pub(crate) const REACTIVE_PROCESSOR_REGISTRY_TABLE: &str = "reactive_processor_registry";
+pub(crate) const REACTIVE_PROCESSOR_DLQ_TABLE: &str = "reactive_processor_dead_letters";
 const NAMESPACE_KEY_SEPARATOR: &str = "::";
 const MAX_IDENTIFIER_LEN: usize = 128;
 

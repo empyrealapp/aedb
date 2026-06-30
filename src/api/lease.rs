@@ -185,7 +185,7 @@ impl AedbInstance {
         for _ in 0..MAX_CAS_RETRIES {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let entry = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let entry = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
             let mut stored = decode(entry.as_ref());
             let now = crate::system_now_micros();
 
@@ -300,7 +300,7 @@ impl AedbInstance {
         for _ in 0..MAX_CAS_RETRIES {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let entry = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let entry = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
             let mut stored = decode(entry.as_ref());
             if stored.fencing_token != fencing_token {
                 return Ok(RenewOutcome::LeaseLost);
@@ -374,7 +374,7 @@ impl AedbInstance {
         for _ in 0..MAX_CAS_RETRIES {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let entry = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let entry = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
             let mut stored = decode(entry.as_ref());
             if stored.fencing_token != fencing_token {
                 return Ok(()); // already taken over; nothing to release.
@@ -459,7 +459,7 @@ impl AedbInstance {
         for _ in 0..MAX_CAS_RETRIES {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let entry = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let entry = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
             let stored = decode(entry.as_ref());
             let now = crate::system_now_micros();
             if stored.fencing_token != fencing_token || stored.lease_until_micros <= now {
@@ -544,7 +544,7 @@ impl AedbInstance {
         let Some(entry) = lease
             .view
             .keyspace
-            .kv_get(project_id, scope_id, &lease_key(name))
+            .try_kv_get(project_id, scope_id, &lease_key(name))?
         else {
             return Ok(None);
         };

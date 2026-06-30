@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::KV_INDEX_TABLE;
 use aedb::catalog::types::Value;
@@ -6,6 +5,7 @@ use aedb::commit::validation::Mutation;
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
 use aedb::query::plan::Query;
+use aedb::query::plan::QueryOptions;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -27,10 +27,11 @@ async fn kv_projection_table_materializes_kv_state() {
     let mut projected = None;
     for _ in 0..25 {
         let result = db
-            .query(
+            .query_no_auth(
                 "p",
                 "app",
                 Query::select(&["*"]).from(KV_INDEX_TABLE).limit(10),
+                QueryOptions::default(),
             )
             .await
             .expect("query projection table");

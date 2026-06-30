@@ -12,7 +12,6 @@ pub mod error;
 pub mod faults;
 mod lib_helpers;
 #[cfg(test)]
-#[allow(deprecated)]
 mod lib_tests;
 pub mod locks;
 pub mod manifest;
@@ -50,6 +49,13 @@ use crate::catalog::namespace_key;
 use crate::catalog::schema::{AsyncIndexDef, IndexDef, TableSchema};
 use crate::catalog::types::{Row, Value};
 use crate::catalog::{DdlOperation, ResourceType};
+// Re-export the crate-wide system-table constants (canonically defined in
+// `catalog`) at the root so the `api` modules can keep referencing them as
+// `crate::*` without each redefining them.
+pub(crate) use crate::catalog::{
+    EVENT_OUTBOX_TABLE, LIFECYCLE_OUTBOX_TABLE, REACTIVE_PROCESSOR_CHECKPOINTS_TABLE,
+    REACTIVE_PROCESSOR_DLQ_TABLE, REACTIVE_PROCESSOR_REGISTRY_TABLE, SYSTEM_SCOPE_ID,
+};
 use crate::checkpoint::retention::{merge_retained_checkpoints, prune_superseded_checkpoint_files};
 use crate::checkpoint::writer::write_checkpoint_with_key;
 use crate::commit::action::{ActionCommitOutcome, ActionCommitResult, ActionEnvelopeRequest};
@@ -144,13 +150,6 @@ pub struct AedbInstance {
     /// instance is dropped, after its GC thread is joined).
     _dir_lock: fs::File,
 }
-
-const SYSTEM_SCOPE_ID: &str = "app";
-const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
-const EVENT_OUTBOX_TABLE: &str = "event_outbox";
-const REACTIVE_PROCESSOR_CHECKPOINTS_TABLE: &str = "reactive_processor_checkpoints";
-const REACTIVE_PROCESSOR_REGISTRY_TABLE: &str = "reactive_processor_registry";
-const REACTIVE_PROCESSOR_DLQ_TABLE: &str = "reactive_processor_dead_letters";
 
 struct ReadPhaseLogSettings {
     enabled: bool,

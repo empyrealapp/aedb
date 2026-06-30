@@ -1,9 +1,9 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::{ColumnDef, IndexType};
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{Expr, Order, Query};
 use tempfile::tempdir;
 
@@ -83,13 +83,14 @@ async fn integration_multi_index_queries_with_sort_directions_use_index_paths() 
     }
 
     let asc = db
-        .query(
+        .query_no_auth(
             "int",
             "app",
             Query::select(&["id", "rank"])
                 .from("users")
                 .where_(Expr::Eq("rank".into(), Value::Integer(7)))
                 .order_by("id", Order::Asc),
+            QueryOptions::default(),
         )
         .await
         .expect("asc query");
@@ -107,13 +108,14 @@ async fn integration_multi_index_queries_with_sort_directions_use_index_paths() 
     }
 
     let desc = db
-        .query(
+        .query_no_auth(
             "int",
             "app",
             Query::select(&["id", "rank"])
                 .from("users")
                 .where_(Expr::Eq("rank".into(), Value::Integer(7)))
                 .order_by("id", Order::Desc),
+            QueryOptions::default(),
         )
         .await
         .expect("desc query");
@@ -272,7 +274,7 @@ async fn integration_join_and_upsert_with_multiple_indexes() {
     }
 
     let joined = db
-        .query(
+        .query_no_auth(
             "int",
             "app",
             Query::select(&["u.username", "o.amount"])
@@ -282,6 +284,7 @@ async fn integration_join_and_upsert_with_multiple_indexes() {
                 .with_last_join_alias("o")
                 .where_(Expr::Eq("o.status".into(), Value::Text("open".into())))
                 .order_by("o.amount", Order::Desc),
+            QueryOptions::default(),
         )
         .await
         .expect("join query");
@@ -322,13 +325,14 @@ async fn integration_join_and_upsert_with_multiple_indexes() {
     .expect("pk upsert alice");
 
     let alice_by_pk = db
-        .query(
+        .query_no_auth(
             "int",
             "app",
             Query::select(&["id", "username", "rank"])
                 .from("users")
                 .where_(Expr::Eq("id".into(), Value::Integer(1)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("alice by pk");
@@ -338,13 +342,14 @@ async fn integration_join_and_upsert_with_multiple_indexes() {
     assert_eq!(alice_by_pk.rows[0].values[2], Value::Integer(77));
 
     let bob_by_pk = db
-        .query(
+        .query_no_auth(
             "int",
             "app",
             Query::select(&["id", "username", "rank"])
                 .from("users")
                 .where_(Expr::Eq("id".into(), Value::Integer(2)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("bob by pk");
@@ -369,7 +374,7 @@ async fn integration_join_and_upsert_with_multiple_indexes() {
     .expect("close order 3");
 
     let joined_after = db
-        .query(
+        .query_no_auth(
             "int",
             "app",
             Query::select(&["u.username", "o.amount"])
@@ -379,6 +384,7 @@ async fn integration_join_and_upsert_with_multiple_indexes() {
                 .with_last_join_alias("o")
                 .where_(Expr::Eq("o.status".into(), Value::Text("open".into())))
                 .order_by("o.amount", Order::Desc),
+            QueryOptions::default(),
         )
         .await
         .expect("join after update");

@@ -8,6 +8,7 @@ use super::{
 use crate::commit::tx::ReadSet;
 use crate::commit::validation::{CompareOp, KvU256OverflowPolicy};
 use crate::preflight::PreflightResult;
+use crate::query::plan::QueryOptions;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -1223,24 +1224,26 @@ async fn multi_update_transaction_envelope_updates_table_and_kv() {
     );
 
     let acct1 = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])
                 .from("accounts")
                 .where_(Expr::Eq("id".into(), Value::Integer(1)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("query account1");
     let acct2 = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])
                 .from("accounts")
                 .where_(Expr::Eq("id".into(), Value::Integer(2)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("query account2");

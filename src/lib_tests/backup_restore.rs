@@ -6,6 +6,7 @@ use super::{
     reclaim_eligible_wal_segments,
 };
 use crate::catalog::SYSTEM_PROJECT_ID;
+use crate::query::plan::QueryOptions;
 use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -695,12 +696,13 @@ async fn checkpoint_now_enables_clean_restart() {
 
     let reopened = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("reopen");
     let rows = reopened
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["*"])
                 .from("users")
                 .where_(Expr::Eq("id".into(), Value::Integer(5))),
+            QueryOptions::default(),
         )
         .await
         .expect("query");
@@ -1582,6 +1584,9 @@ async fn strict_restore_rejects_older_backup_version() {
 
     let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
         .expect("manifest");
+    // An older major.minor line (0.2.x) predates the signed-I256 key encoding
+    // introduced in 0.3.0, so its keys are unreadable by this build — restore
+    // must refuse it outright as incompatible.
     manifest.aedb_version = "0.2.0".into();
     crate::backup::write_backup_manifest(backup_dir.path(), &manifest, config.hmac_key())
         .expect("rewrite manifest");
@@ -1594,7 +1599,7 @@ async fn strict_restore_rejects_older_backup_version() {
         None,
     )
     .expect_err("strict restore must reject older backup version");
-    assert!(format!("{err}").contains("matching AEDB patch version"));
+    assert!(format!("{err}").contains("incompatible AEDB version"));
 }
 
 #[tokio::test]
@@ -1712,10 +1717,11 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
     // Restore from the checkpoint and confirm every spilled row round-tripped.
     let reopened = AedbInstance::open_anonymous(config, dir.path()).expect("reopen");
     let rows = reopened
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "blob"]).from("items").limit(1000),
+            QueryOptions::default(),
         )
         .await
         .expect("query after restore");
@@ -1726,12 +1732,13 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
     );
 
     let one = reopened
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "blob"])
                 .from("items")
                 .where_(Expr::Eq("id".into(), Value::Integer(42))),
+            QueryOptions::default(),
         )
         .await
         .expect("point query after restore");

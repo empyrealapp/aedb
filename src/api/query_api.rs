@@ -20,55 +20,6 @@ use crate::{
 use std::time::Instant;
 
 impl AedbInstance {
-    #[deprecated(
-        since = "0.1.0",
-        note = "use query_with_options_as for authenticated reads, or query_no_auth when anonymous reads are intentional"
-    )]
-    pub async fn query(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        query: Query,
-    ) -> Result<QueryResult, QueryError> {
-        if self.require_authenticated_calls {
-            return Err(QueryError::PermissionDenied {
-                permission: "authenticated caller required in secure mode".into(),
-                scope: "anonymous".into(),
-            });
-        }
-        self.query_with_options_as(None, project_id, scope_id, query, QueryOptions::default())
-            .await
-    }
-
-    /// Run a query and capture the read-set it touched (point keys and key
-    /// ranges with row versions). Used by reactive subscriptions to drive
-    /// per-query invalidation. The query semantics mirror [`Self::query`].
-    #[deprecated(
-        since = "0.1.0",
-        note = "use query_with_options_capturing_as for authenticated reads; this method is anonymous"
-    )]
-    pub async fn query_with_read_set(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        query: Query,
-    ) -> Result<(QueryResult, ReadSet), QueryError> {
-        if self.require_authenticated_calls {
-            return Err(QueryError::PermissionDenied {
-                permission: "authenticated caller required in secure mode".into(),
-                scope: "anonymous".into(),
-            });
-        }
-        self.query_with_options_capturing_as(
-            None,
-            project_id,
-            scope_id,
-            query,
-            QueryOptions::default(),
-        )
-        .await
-    }
-
     /// Run a query with caller context + options and capture the read-set it
     /// touched. Mirrors [`Self::query_with_options_as`].
     pub async fn query_with_options_capturing_as(
@@ -158,27 +109,6 @@ impl AedbInstance {
             });
         }
         self.query_unchecked(project_id, scope_id, query, options)
-            .await
-    }
-
-    #[deprecated(
-        since = "0.1.0",
-        note = "use query_with_options_as for authenticated reads, or query_no_auth when anonymous reads are intentional"
-    )]
-    pub async fn query_with_options(
-        &self,
-        project_id: &str,
-        scope_id: &str,
-        query: Query,
-        options: QueryOptions,
-    ) -> Result<QueryResult, QueryError> {
-        if self.require_authenticated_calls {
-            return Err(QueryError::PermissionDenied {
-                permission: "authenticated caller required in secure mode".into(),
-                scope: "anonymous".into(),
-            });
-        }
-        self.query_with_options_as(None, project_id, scope_id, query, options)
             .await
     }
 

@@ -184,6 +184,23 @@ impl Value {
     }
 }
 
+/// Order two big-endian two's-complement 256-bit signed integers.
+///
+/// A raw byte compare is wrong for signed values: negatives (high bit set) would
+/// sort *after* positives. We branch on the sign bit; within the same sign an
+/// unsigned byte compare already yields the correct signed order (e.g. for two
+/// negatives, `-1 = 0xFF..FF` compares greater than `-2 = 0xFF..FE`, and `-1 >
+/// -2`). This mirrors the sign-flipped I256 encoding in
+/// [`crate::storage::encoded_key`] so the in-memory order and the index
+/// range-scan order agree.
+fn cmp_i256_be(a: &[u8; 32], b: &[u8; 32]) -> Ordering {
+    match (a[0] & 0x80 != 0, b[0] & 0x80 != 0) {
+        (false, true) => Ordering::Greater,
+        (true, false) => Ordering::Less,
+        _ => a.cmp(b),
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -198,6 +215,25 @@ impl PartialOrd for Value {
     }
 }
 
+/// `Value`'s `Ord`/`Eq`/`Hash` are a *type-strict* total order: values are first
+/// ranked by kind (see `kind_rank`) and only compared by content within
+/// the same kind. This is deliberate, not a missing cross-type unification:
+///
+/// - It is a sound total order, which `OrdMap`/`BTreeMap` keys and sort/dedup
+///   depend on. A cross-type numeric order (treating `Integer(5) == U64(5)`)
+///   cannot be made transitive once `Float` is involved — above 2^53, distinct
+///   integers map to the same `f64`, so `i1 < i2` yet `f(i1) == f(i2)` breaks
+///   antisymmetry/transitivity and would corrupt those structures.
+/// - Columns are strongly typed (see `validate.rs`), so a single column never
+///   holds mixed `Value` kinds; this strict order is never asked to compare
+///   across types in practice.
+/// - Query-time *numeric* cross-type equality/ordering (e.g. `WHERE i256col =
+///   <int literal>`) is handled separately and correctly by
+///   `crate::query::operators::compare_values`, which is not bound by the total
+///   order's transitivity requirement.
+///
+/// Index/key ordering is driven by `EncodedKey`'s own type-tagged byte encoding,
+/// not by this impl.
 impl Ord for Value {
     fn cmp(&self, other: &Self) -> Ordering {
         let rank_cmp = self.kind_rank().cmp(&other.kind_rank());
@@ -212,13 +248,17 @@ impl Ord for Value {
             (Value::U64(a), Value::U64(b)) => a.cmp(b),
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
             (Value::U256(a), Value::U256(b)) => a.cmp(b),
-            (Value::I256(a), Value::I256(b)) => a.cmp(b),
+            (Value::I256(a), Value::I256(b)) => cmp_i256_be(a, b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
             (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Json(a), Value::Json(b)) => a.cmp(b),
             (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
-            _ => Ordering::Equal,
+            // `kind_rank` is a bijection over the variants and equal ranks were
+            // required above, so both sides are necessarily the same variant.
+            // A silent `Ordering::Equal` here would let a future variant slip
+            // through and corrupt sort/dedup; fail loudly instead.
+            _ => unreachable!("equal kind_rank implies identical Value variant"),
         }
     }
 }

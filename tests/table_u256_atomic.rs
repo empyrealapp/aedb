@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -83,7 +82,7 @@ async fn integration_table_u256_atomic_inc_dec_and_underflow() {
     .expect("dec");
 
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])
@@ -440,7 +439,7 @@ async fn integration_envelope_reverts_when_condition_fails() {
     assert!(matches!(err, AedbError::AssertionFailed { .. }));
 
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])
@@ -467,7 +466,7 @@ async fn integration_envelope_reverts_when_condition_fails() {
     );
 
     let row2 = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])
@@ -579,7 +578,7 @@ async fn integration_table_u256_overflow_rejected() {
 
     // Verify balance unchanged after overflow rejection
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])
@@ -618,7 +617,7 @@ async fn integration_table_u256_overflow_rejected() {
     .expect("increment within bounds should succeed");
 
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["balance"])

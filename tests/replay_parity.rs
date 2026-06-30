@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 mod common;
 
 use aedb::AedbInstance;
@@ -34,13 +33,14 @@ fn u256_from_be(bytes: &[u8; 32]) -> u64 {
 /// Read every `accounts` balance ordered by id, as plain u64s, for parity comparison.
 async fn read_account_balances(db: &AedbInstance, count: i64) -> Vec<u64> {
     let result = db
-        .query(
+        .query_no_auth(
             PROJECT,
             SCOPE,
             Query::select(&["id", "balance"])
                 .from("accounts")
                 .order_by("id", Order::Asc)
                 .limit(count as usize + 1),
+            QueryOptions::default(),
         )
         .await
         .expect("query account balances");
@@ -63,13 +63,14 @@ fn rows_signature(result: &QueryResult) -> Vec<Vec<Value>> {
 async fn projected_kv_signature(db: &AedbInstance) -> Vec<Vec<Value>> {
     for _ in 0..25 {
         let result = db
-            .query(
+            .query_no_auth(
                 PROJECT,
                 SCOPE,
                 Query::select(&["project_id", "scope_id", "key", "value"])
                     .from(KV_INDEX_TABLE)
                     .order_by("key", Order::Asc)
                     .limit(10),
+                QueryOptions::default(),
             )
             .await
             .expect("query kv projection");
@@ -214,18 +215,19 @@ async fn replay_parity_covers_async_indexes_kv_projection_outbox_reactive_and_id
         .expect("first idempotent commit");
 
     let live_users = db
-        .query(
+        .query_no_auth(
             PROJECT,
             SCOPE,
             Query::select(&["id", "name", "points"])
                 .from("users")
                 .order_by("id", Order::Asc)
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("live users");
     let live_async = db
-        .query_with_options(
+        .query_no_auth(
             PROJECT,
             SCOPE,
             Query::select(&["id", "name", "points"])
@@ -245,12 +247,13 @@ async fn replay_parity_covers_async_indexes_kv_projection_outbox_reactive_and_id
         .await
         .expect("live event stream");
     let live_lifecycle_count = db
-        .query(
+        .query_no_auth(
             "_system",
             SCOPE,
             Query::select(&[])
                 .from("lifecycle_outbox")
                 .aggregate(Aggregate::Count),
+            QueryOptions::default(),
         )
         .await
         .expect("live lifecycle count");
@@ -265,18 +268,19 @@ async fn replay_parity_covers_async_indexes_kv_projection_outbox_reactive_and_id
 
     let recovered = AedbInstance::open_anonymous(config, &data_dir).expect("reopen");
     let recovered_users = recovered
-        .query(
+        .query_no_auth(
             PROJECT,
             SCOPE,
             Query::select(&["id", "name", "points"])
                 .from("users")
                 .order_by("id", Order::Asc)
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("recovered users");
     let recovered_async = recovered
-        .query_with_options(
+        .query_no_auth(
             PROJECT,
             SCOPE,
             Query::select(&["id", "name", "points"])
@@ -296,12 +300,13 @@ async fn replay_parity_covers_async_indexes_kv_projection_outbox_reactive_and_id
         .await
         .expect("recovered event stream");
     let recovered_lifecycle_count = recovered
-        .query(
+        .query_no_auth(
             "_system",
             SCOPE,
             Query::select(&[])
                 .from("lifecycle_outbox")
                 .aggregate(Aggregate::Count),
+            QueryOptions::default(),
         )
         .await
         .expect("recovered lifecycle count");

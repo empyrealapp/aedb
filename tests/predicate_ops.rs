@@ -1,10 +1,10 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::Mutation;
 use aedb::config::AedbConfig;
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Expr, Query};
 use tempfile::tempdir;
 
@@ -71,7 +71,7 @@ async fn delete_where_deletes_matching_rows_with_limit() {
     assert!(result.is_some());
 
     let remaining = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"])
@@ -79,6 +79,7 @@ async fn delete_where_deletes_matching_rows_with_limit() {
                 .where_(Expr::Eq("status".into(), Value::Text("revoked".into())))
                 .order_by("id", aedb::query::plan::Order::Asc)
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("query");
@@ -118,7 +119,7 @@ async fn update_where_updates_matching_rows() {
     assert!(result.is_some());
 
     let revoked = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"])
@@ -126,6 +127,7 @@ async fn update_where_updates_matching_rows() {
                 .where_(Expr::Eq("status".into(), Value::Text("revoked".into())))
                 .order_by("id", aedb::query::plan::Order::Asc)
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("query");
@@ -160,13 +162,14 @@ async fn commit_many_atomic_applies_mutation_set() {
     assert!(result.commit_seq > 0);
 
     let all = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"])
                 .from("users")
                 .order_by("id", aedb::query::plan::Order::Asc)
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("query");

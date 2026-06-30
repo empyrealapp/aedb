@@ -1,10 +1,10 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
 use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::{Mutation, TableUpdateExpr};
 use aedb::config::AedbConfig;
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{Expr, Query};
 use tempfile::tempdir;
 
@@ -98,12 +98,13 @@ async fn update_where_expr_supports_add_and_coalesce() {
     .expect("second coalesce");
 
     let row = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["attempts", "lease_owner"])
                 .from("jobs")
                 .where_(Expr::Eq("id".into(), Value::Integer(1))),
+            QueryOptions::default(),
         )
         .await
         .expect("query");

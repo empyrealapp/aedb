@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::backup::sha256_file_hex;
 use aedb::catalog::DdlOperation;
@@ -11,6 +10,7 @@ use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode};
 use aedb::error::AedbError;
 use aedb::manifest::atomic::{load_manifest_signed, write_manifest_atomic_signed};
 use aedb::manifest::schema::{Manifest, SegmentMeta};
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Expr, Query};
 use aedb::recovery::recover_with_config;
 use std::collections::HashMap;
@@ -164,13 +164,14 @@ async fn assert_a17_cycle_row(dir: &Path, writer_config: &AedbConfig, cycle: u64
     let verify = AedbInstance::open_anonymous(writer_config.clone(), dir)
         .unwrap_or_else(|e| panic!("reopen verify failed at cycle {cycle}: {e}"));
     let row = verify
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id", "value"])
                 .from("a17_cycles")
                 .where_(Expr::Eq("id".into(), Value::Integer(cycle_i64)))
                 .limit(1),
+            QueryOptions::default(),
         )
         .await
         .expect("query cycle row");
@@ -554,7 +555,7 @@ async fn crash_matrix_reactive_processor_dlq_survives_crash_recovery() {
 
     let db2 = reopen_after_simulated_crash(config, dir.path()).await;
     let dlq = db2
-        .query(
+        .query_no_auth(
             aedb::catalog::SYSTEM_PROJECT_ID,
             "app",
             Query::select(&["processor_name", "event_key", "attempts"])
@@ -564,6 +565,7 @@ async fn crash_matrix_reactive_processor_dlq_survives_crash_recovery() {
                     Value::Text("dlq_after_crash".into()),
                 ))
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("query dlq after reopen");
@@ -1028,12 +1030,13 @@ async fn crash_matrix_a17b_thousand_crash_cycles_preserve_state() {
     let final_db =
         AedbInstance::open_anonymous(writer_config.clone(), dir.path()).expect("final open");
     let final_rows = final_db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"])
                 .from("a17_cycles")
                 .limit(usize::try_from(cycles).expect("cycles fit usize")),
+            QueryOptions::default(),
         )
         .await
         .expect("final query");

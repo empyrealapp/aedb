@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::{ColumnDef, IndexType};
@@ -137,7 +136,7 @@ async fn read_account_balance_at_seq(
     seq: u64,
 ) -> i64 {
     let result = db
-        .query_with_options(
+        .query_no_auth(
             project_id,
             "app",
             Query::select(&["id", "balance"])
@@ -162,12 +161,13 @@ async fn count_rows_bounded(
     table_name: &str,
     expected_max_rows: usize,
 ) -> usize {
-    db.query(
+    db.query_no_auth(
         project_id,
         scope_id,
         Query::select(&["*"])
             .from(table_name)
             .limit(expected_max_rows.saturating_add(1)),
+        QueryOptions::default(),
     )
     .await
     .expect("count query")
@@ -375,12 +375,13 @@ async fn arcana_l1_balance_conservation_under_load() {
     }
 
     let accounts = db
-        .query(
+        .query_no_auth(
             "l1",
             "app",
             Query::select(&["id", "balance"])
                 .from("accounts")
                 .limit(ACCOUNTS),
+            QueryOptions::default(),
         )
         .await
         .expect("accounts query");
@@ -518,7 +519,7 @@ async fn stress_read_under_write() {
     let db = writer.await.expect("join");
     for _ in 0..100 {
         let _ = db
-            .query(
+            .query_no_auth(
                 "p",
                 "app",
                 Query::select(&["*"]).from("users").where_(Expr::Between(
@@ -526,6 +527,7 @@ async fn stress_read_under_write() {
                     Value::Integer(30),
                     Value::Integer(40),
                 )),
+                QueryOptions::default(),
             )
             .await
             .expect("query");
@@ -589,13 +591,14 @@ async fn stress_multi_project_isolation() {
     for p in 0..scaled(5) {
         let project = format!("p{p}");
         let result = db
-            .query(
+            .query_no_auth(
                 &project,
                 "app",
                 Query::select(&["*"])
                     .from("t0")
                     .where_(Expr::Eq("value".into(), Value::Integer(p as i64)))
                     .limit(scaled(500)),
+                QueryOptions::default(),
             )
             .await
             .expect("query");
@@ -651,10 +654,11 @@ async fn stress_large_state_checkpoint_recovery() {
 
     let reopened = AedbInstance::open_anonymous(stress_config(), dir.path()).expect("reopen");
     let rows = reopened
-        .query(
+        .query_no_auth(
             "bulk",
             "app",
             Query::select(&["*"]).from("payloads").limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("query");
@@ -907,12 +911,13 @@ async fn stress_effective_tps_independent_scopes() {
     for project_idx in 0..project_count {
         let project_id = format!("{PROJECT_PREFIX}-{project_idx}");
         let accounts = db
-            .query(
+            .query_no_auth(
                 &project_id,
                 "app",
                 Query::select(&["id", "balance"])
                     .from("accounts")
                     .limit(accounts_per_scope),
+                QueryOptions::default(),
             )
             .await
             .expect("accounts verify query");
@@ -950,12 +955,13 @@ async fn stress_effective_tps_independent_scopes() {
     for project_idx in 0..project_count {
         let project_id = format!("{PROJECT_PREFIX}-{project_idx}");
         let accounts = reopened
-            .query(
+            .query_no_auth(
                 &project_id,
                 "app",
                 Query::select(&["id", "balance"])
                     .from("accounts")
                     .limit(accounts_per_scope),
+                QueryOptions::default(),
             )
             .await
             .expect("reopen accounts verify");
@@ -1171,13 +1177,14 @@ async fn stress_mixed_ops_independent_scopes() {
                         .max(1);
                     let id = i64::try_from(state % max_id).expect("id fits");
                     let point = db
-                        .query(
+                        .query_no_auth(
                             &project_id,
                             "app",
                             Query::select(&["id", "value"])
                                 .from("items")
                                 .where_(col("id").eq(lit(id)))
                                 .limit(1),
+                            QueryOptions::default(),
                         )
                         .await
                         .expect("point query");
@@ -1186,13 +1193,14 @@ async fn stress_mixed_ops_independent_scopes() {
 
                     let tag = i64::try_from((state >> 8) % 100).expect("tag fits");
                     let _ = db
-                        .query(
+                        .query_no_auth(
                             &project_id,
                             "app",
                             Query::select(&["id", "tag"])
                                 .from("items")
                                 .where_(col("tag").eq(lit(tag)))
                                 .limit(20),
+                            QueryOptions::default(),
                         )
                         .await
                         .expect("index query");
@@ -1228,12 +1236,13 @@ async fn stress_mixed_ops_independent_scopes() {
         let expected_rows =
             seed_rows + inserts_by_scope[project_idx].load(Ordering::Relaxed) as usize;
         let rows = db
-            .query(
+            .query_no_auth(
                 &project_id,
                 "app",
                 Query::select(&["id"])
                     .from("items")
                     .limit(expected_rows.saturating_add(1)),
+                QueryOptions::default(),
             )
             .await
             .expect("mixed verify query")
@@ -1537,13 +1546,14 @@ async fn stress_realistic_user_load_multi_scope_tps() {
                         let max_id = next_row_by_scope[scope_slot].load(Ordering::Relaxed).max(1);
                         let id = i64::try_from(state % max_id).expect("id fits");
                         let point = db
-                            .query(
+                            .query_no_auth(
                                 &project_id,
                                 &scope_id,
                                 Query::select(&["id", "value"])
                                     .from("items")
                                     .where_(col("id").eq(lit(id)))
                                     .limit(1),
+                                QueryOptions::default(),
                             )
                             .await
                             .expect("table point read");
@@ -1552,13 +1562,14 @@ async fn stress_realistic_user_load_multi_scope_tps() {
                     } else if op < 75 {
                         let tag = i64::try_from((state >> 8) % 100).expect("tag fits");
                         let _ = db
-                            .query(
+                            .query_no_auth(
                                 &project_id,
                                 &scope_id,
                                 Query::select(&["id", "tag"])
                                     .from("items")
                                     .where_(col("tag").eq(lit(tag)))
                                     .limit(20),
+                                QueryOptions::default(),
                             )
                             .await
                             .expect("table index query");
@@ -1612,12 +1623,13 @@ async fn stress_realistic_user_load_multi_scope_tps() {
         let expected_rows =
             seed_rows + row_inserts_by_scope[scope_slot].load(Ordering::Relaxed) as usize;
         let rows = db
-            .query(
+            .query_no_auth(
                 project_id,
                 scope_id,
                 Query::select(&["id"])
                     .from("items")
                     .limit(expected_rows.saturating_add(1)),
+                QueryOptions::default(),
             )
             .await
             .expect("row count verify")

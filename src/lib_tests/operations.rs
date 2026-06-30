@@ -528,7 +528,7 @@ async fn queries_reject_oversized_in_lists_and_like_patterns() {
     .await;
 
     let oversized_in = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["id"]).from("items").where_(Expr::In(
@@ -544,7 +544,7 @@ async fn queries_reject_oversized_in_lists_and_like_patterns() {
     );
 
     let oversized_like = db
-        .query_with_options(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["name"])

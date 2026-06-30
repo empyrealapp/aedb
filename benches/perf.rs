@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -288,13 +287,14 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
                     next_query_id = 1;
                 }
                 let _ = seed_db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("id").eq(lit(id)))
                             .limit(1),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("point query");
@@ -306,13 +306,14 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = seed_db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("age").eq(lit(25_i64)))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("index query");
@@ -383,10 +384,11 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = seed_db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"]).from(TABLE_NAME).limit(100),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("scan query");
@@ -398,13 +400,14 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = seed_db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "age"])
                             .from(TABLE_NAME)
                             .order_by("age", Order::Asc)
                             .limit(100),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("ordered query");
@@ -456,7 +459,7 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = seed_db
-                    .query_with_options(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["u.id", "p.country"])
@@ -481,7 +484,7 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let first = seed_db
-                    .query_with_options(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["u.id", "p.country"])
@@ -499,7 +502,7 @@ fn bench_aedb_hot_paths(c: &mut Criterion) {
                     .await
                     .expect("first page");
                 let _ = seed_db
-                    .query_with_options(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["u.id", "p.country"])
@@ -573,13 +576,14 @@ fn bench_index_predicate_shapes(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("age").eq(lit(25_i64)))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("index eq query");
@@ -591,13 +595,14 @@ fn bench_index_predicate_shapes(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("age").in_(vec![lit(25_i64), lit(26_i64), lit(27_i64)]))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("index in query");
@@ -609,13 +614,14 @@ fn bench_index_predicate_shapes(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("name").like(lit("user-12%")))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("index like exact prefix query");
@@ -627,13 +633,14 @@ fn bench_index_predicate_shapes(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("name").like(lit("user-1%7%")))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("index like residual query");
@@ -645,13 +652,14 @@ fn bench_index_predicate_shapes(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from("partial_users")
                             .where_(col("age").eq(lit(25_i64)))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("partial index query");
@@ -663,13 +671,14 @@ fn bench_index_predicate_shapes(c: &mut Criterion) {
         b.iter(|| {
             rt.block_on(async {
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from("composite_users")
                             .where_(col("age").eq(lit(25_i64)))
                             .limit(20),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("composite index query");
@@ -700,13 +709,14 @@ fn bench_end_to_end_bootstrap(c: &mut Criterion) {
                 .await
                 .expect("upsert");
                 let _ = db
-                    .query(
+                    .query_no_auth(
                         PROJECT_ID,
                         SCOPE_ID,
                         Query::select(&["id", "name"])
                             .from(TABLE_NAME)
                             .where_(col("id").eq(lit(1_i64)))
                             .limit(1),
+                        QueryOptions::default(),
                     )
                     .await
                     .expect("query");

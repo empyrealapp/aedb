@@ -505,7 +505,7 @@ async fn reactive_processor_scheduler_dead_letters_after_retry_exhaustion() {
     }
 
     let dlq = db
-        .query(
+        .query_no_auth(
             SYSTEM_PROJECT_ID,
             "app",
             Query::select(&["processor_name", "event_key", "attempts"])
@@ -515,6 +515,7 @@ async fn reactive_processor_scheduler_dead_letters_after_retry_exhaustion() {
                     Value::Text("dlq_processor".into()),
                 ))
                 .limit(10),
+            QueryOptions::default(),
         )
         .await
         .expect("query dlq");

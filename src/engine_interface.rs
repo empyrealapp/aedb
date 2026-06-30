@@ -1,5 +1,8 @@
 use crate::catalog::types::{Row, Value};
-use crate::catalog::{SYSTEM_PROJECT_ID, namespace_key};
+use crate::catalog::{
+    EVENT_OUTBOX_TABLE, REACTIVE_PROCESSOR_CHECKPOINTS_TABLE, SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID,
+    namespace_key,
+};
 use crate::commit::tx::{
     ReadAssertion, ReadKey, ReadSet, ReadSetEntry, TransactionEnvelope, WriteClass, WriteIntent,
 };
@@ -11,10 +14,6 @@ use crate::{AedbInstance, CommitResult, EventOutboxRecord};
 use crate::{catalog::Catalog, catalog::schema::TableSchema};
 use std::collections::HashMap;
 use std::ops::Bound;
-
-const SYSTEM_SCOPE_ID: &str = "app";
-const EVENT_OUTBOX_TABLE: &str = "event_outbox";
-const REACTIVE_PROCESSOR_CHECKPOINTS_TABLE: &str = "reactive_processor_checkpoints";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectBatch {

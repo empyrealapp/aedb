@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::schema::IndexType;
 use aedb::catalog::types::{ColumnType, Row, Value};
@@ -6,6 +5,7 @@ use aedb::commit::validation::Mutation;
 use aedb::config::AedbConfig;
 use aedb::declarative::TableMigrationBuilder;
 use aedb::declarative::{AsyncIndexSpec, IndexSpec, MigrationSpec, SchemaMigrationPlan, TableSpec};
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{Expr, Query};
 use tempfile::tempdir;
 
@@ -76,7 +76,10 @@ async fn declarative_migration_plan_runs_end_to_end() {
     let q = Query::select(&["id"])
         .from("sessions")
         .where_(Expr::Eq("user_id".into(), Value::Text("u1".into())));
-    let result = db.query("p", "auth", q).await.expect("query");
+    let result = db
+        .query_no_auth("p", "auth", q, QueryOptions::default())
+        .await
+        .expect("query");
     assert_eq!(result.rows.len(), 1);
 }
 

@@ -458,7 +458,8 @@ impl AedbInstance {
 
             // Idempotency short-circuit against committed state.
             if let Some(idem) = &spec.options.idempotency_key
-                && let Some(entry) = view.kv_get(project_id, scope_id, &idem_key(queue, idem))
+                && let Some(entry) =
+                    view.try_kv_get(project_id, scope_id, &idem_key(queue, idem))?
             {
                 let task_id = String::from_utf8_lossy(&entry.value).into_owned();
                 return Ok(EnqueueOutcome {
@@ -601,7 +602,7 @@ impl AedbInstance {
             };
             let id = String::from_utf8_lossy(&ready_entry.value).into_owned();
             let pk = primary_key(queue, &id);
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 // Dangling index entry; clean it up and retry.
                 let env = self.envelope(
                     caller.clone(),
@@ -674,7 +675,7 @@ impl AedbInstance {
             };
             let id = String::from_utf8_lossy(&sched_entry.value).into_owned();
             let pk = primary_key(queue, &id);
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 let env = self.envelope(
                     caller.clone(),
                     vec![del_mut(project_id, scope_id, sched_k)],
@@ -737,7 +738,7 @@ impl AedbInstance {
             };
             let id = String::from_utf8_lossy(&inflight_entry.value).into_owned();
             let pk = primary_key(queue, &id);
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 let env = self.envelope(
                     caller.clone(),
                     vec![del_mut(project_id, scope_id, inflight_k)],
@@ -882,7 +883,7 @@ impl AedbInstance {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
             let view = &lease.view.keyspace;
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 return Ok(FencedCommit::LeaseLost);
             };
             let task = decode_task(&primary)?;
@@ -983,7 +984,7 @@ impl AedbInstance {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
             let view = &lease.view.keyspace;
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 return Ok(FencedCommit::LeaseLost);
             };
             let mut task = decode_task(&primary)?;
@@ -1104,7 +1105,7 @@ impl AedbInstance {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
             let view = &lease.view.keyspace;
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 return Ok(FencedCommit::LeaseLost);
             };
             let mut task = decode_task(&primary)?;
@@ -1187,7 +1188,7 @@ impl AedbInstance {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
             let view = &lease.view.keyspace;
-            let Some(primary) = view.kv_get(project_id, scope_id, &pk) else {
+            let Some(primary) = view.try_kv_get(project_id, scope_id, &pk)? else {
                 return Ok(false);
             };
             let task = decode_task(&primary)?;
@@ -1235,7 +1236,7 @@ impl AedbInstance {
             lease
                 .view
                 .keyspace
-                .kv_get(project_id, scope_id, &primary_key(queue, task_id))
+                .try_kv_get(project_id, scope_id, &primary_key(queue, task_id))?
         else {
             return Ok(None);
         };
@@ -1297,11 +1298,12 @@ impl AedbInstance {
         let queue = &spec.queue;
         // Load (once per commit) the counter cursor for this queue.
         if !plan.counters.contains_key(queue) {
-            let entry = view.kv_get(project_id, scope_id, &counter_key(queue));
+            let entry = view.try_kv_get(project_id, scope_id, &counter_key(queue))?;
             let next_seq = entry
                 .as_ref()
                 .and_then(|e| e.value.get(..8))
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
                 .unwrap_or(0);
             plan.counters.insert(
                 queue.clone(),

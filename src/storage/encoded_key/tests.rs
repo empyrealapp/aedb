@@ -19,6 +19,38 @@ fn u64_order_is_preserved() {
     assert!(b < c);
 }
 
+/// Build a big-endian two's-complement I256 from a signed i128.
+fn i256(n: i128) -> Value {
+    let mut bytes = [0u8; 32];
+    let be = n.to_be_bytes(); // 16 bytes
+    // Sign-extend into the upper 16 bytes.
+    let fill = if n < 0 { 0xFF } else { 0x00 };
+    bytes[..16].iter_mut().for_each(|b| *b = fill);
+    bytes[16..].copy_from_slice(&be);
+    Value::I256(bytes)
+}
+
+#[test]
+fn i256_signed_order_is_preserved() {
+    // Negatives must sort before positives, and within each sign correctly.
+    let values = [
+        i256(i128::MIN),
+        i256(-1_000_000),
+        i256(-2),
+        i256(-1),
+        i256(0),
+        i256(1),
+        i256(2),
+        i256(1_000_000),
+        i256(i128::MAX),
+    ];
+    for window in values.windows(2) {
+        let lo = EncodedKey::from_single(&window[0]);
+        let hi = EncodedKey::from_single(&window[1]);
+        assert!(lo < hi, "expected {:?} < {:?}", window[0], window[1]);
+    }
+}
+
 #[test]
 fn composite_order_is_lexicographic() {
     let a = EncodedKey::from_values(&[Value::Integer(1), Value::Text("a".into())]);

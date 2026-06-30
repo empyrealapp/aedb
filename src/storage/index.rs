@@ -26,10 +26,8 @@ fn index_posting_cost(pk: &EncodedKey) -> i64 {
 impl SecondaryIndex {
     /// Inserts a posting, returning the signed change in this index's resident
     /// memory cost so callers can keep the keyspace `mem_bytes` running counter
-    /// in lockstep with [`secondary_index_mem_cost`]. The math here must mirror
+    /// in lockstep with `secondary_index_mem_cost`. The math here must mirror
     /// that function exactly.
-    ///
-    /// [`secondary_index_mem_cost`]: crate::storage::keyspace::memory_accounting::secondary_index_mem_cost
     pub fn insert(&mut self, key: EncodedKey, pk: EncodedKey) -> i64 {
         match &mut self.store {
             SecondaryIndexStore::BTree(entries) => {
@@ -70,10 +68,9 @@ impl SecondaryIndex {
     }
 
     /// Removes a posting, returning the signed change in this index's resident
-    /// memory cost (always `<= 0`). Mirrors [`insert`] / [`secondary_index_mem_cost`].
+    /// memory cost (always `<= 0`). Mirrors [`insert`] / `secondary_index_mem_cost`.
     ///
     /// [`insert`]: SecondaryIndex::insert
-    /// [`secondary_index_mem_cost`]: crate::storage::keyspace::memory_accounting::secondary_index_mem_cost
     pub fn remove(&mut self, key: &EncodedKey, pk: &EncodedKey) -> i64 {
         match &mut self.store {
             SecondaryIndexStore::BTree(entries) => {

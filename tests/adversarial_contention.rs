@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -379,7 +378,7 @@ async fn test_read_set_conflict_under_write_load() {
         tasks.spawn(async move {
             for _ in 0..5 {
                 let _ = db
-                    .query_with_options(
+                    .query_no_auth(
                         "casino",
                         "app",
                         Query::select(&["balance"])
@@ -528,7 +527,7 @@ async fn test_high_concurrency_stress() {
 
     for i in 0..20 {
         let row = db
-            .query_with_options(
+            .query_no_auth(
                 "casino",
                 "app",
                 Query::select(&["balance"])

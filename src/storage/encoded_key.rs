@@ -69,7 +69,14 @@ fn encode_value(v: &Value, out: &mut SmallVec<[u8; 64]>) {
         }
         Value::I256(bytes) => {
             out.push(0x13);
-            out.extend_from_slice(bytes);
+            // Sign-flip the most significant bit so two's-complement values sort
+            // in signed order (negatives before positives) under the unsigned
+            // byte compare this key uses, mirroring Integer/Timestamp above and
+            // `Value`'s signed I256 ordering. Without this, negatives (high bit
+            // set) would sort after positives and disagree with `compare_values`.
+            let mut flipped = *bytes;
+            flipped[0] ^= 0x80;
+            out.extend_from_slice(&flipped);
         }
         Value::Text(s) => {
             out.push(0x14);

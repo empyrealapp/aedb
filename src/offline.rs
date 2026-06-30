@@ -202,7 +202,7 @@ pub struct DatabaseVerificationReport {
 ///    CRC32C + truncated-frame detection), verifies the manifest HMAC, walks
 ///    the segment hash chain, and loads/decrypts checkpoints. A failure here
 ///    means on-disk bytes are corrupt or tampered.
-/// 2. **Logical layer** — [`check_invariants`] over the recovered state:
+/// 2. **Logical layer** — `check_invariants` over the recovered state:
 ///    secondary-index ↔ row consistency, foreign-key referential integrity,
 ///    catalog/object references, and row-version cardinality.
 ///

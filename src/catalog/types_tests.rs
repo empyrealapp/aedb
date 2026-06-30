@@ -52,6 +52,56 @@ proptest! {
         let decoded_cmp = a2.cmp(&b2);
         prop_assert_eq!(orig, decoded_cmp);
     }
+
+    /// `Value::cmp` (full-scan order) must agree with the `EncodedKey` byte order
+    /// (index range-scan order) for I256, including negatives. This invariant
+    /// keeps the scan and index paths consistent.
+    #[test]
+    fn i256_value_order_matches_encoded_key_order(
+        a in prop::array::uniform32(any::<u8>()),
+        b in prop::array::uniform32(any::<u8>()),
+    ) {
+        use crate::storage::encoded_key::EncodedKey;
+        let (va, vb) = (Value::I256(a), Value::I256(b));
+        let value_cmp = va.cmp(&vb);
+        let key_cmp = EncodedKey::from_single(&va).cmp(&EncodedKey::from_single(&vb));
+        prop_assert_eq!(value_cmp, key_cmp);
+    }
+}
+
+#[test]
+fn value_order_is_type_strict_by_design() {
+    use std::cmp::Ordering;
+    // Distinct numeric kinds are ordered by kind, not by numeric value. This is
+    // intentional: a cross-type numeric order can't stay transitive once Float
+    // is involved (see the `impl Ord for Value` doc). Strong column typing means
+    // a single column never mixes kinds, so this is never asked across types in
+    // practice. Query-time cross-type numeric equality lives in `compare_values`.
+    assert_ne!(Value::Integer(5), Value::U64(5));
+    assert_eq!(
+        Value::Integer(5).cmp(&Value::U64(5)),
+        // Integer (rank 4) sorts after U64 (rank 3) regardless of magnitude.
+        Ordering::Greater
+    );
+    // Same-kind comparisons remain by content.
+    assert_eq!(Value::U64(5), Value::U64(5));
+    assert!(Value::Integer(-1) < Value::Integer(0));
+}
+
+#[test]
+fn i256_orders_negatives_before_positives() {
+    let neg_one = Value::I256([0xFF; 32]); // -1
+    let mut neg_two = [0xFFu8; 32];
+    neg_two[31] = 0xFE; // -2
+    let neg_two = Value::I256(neg_two);
+    let zero = Value::I256([0x00; 32]);
+    let mut one = [0x00u8; 32];
+    one[31] = 0x01;
+    let one = Value::I256(one);
+
+    assert!(neg_two < neg_one, "-2 < -1");
+    assert!(neg_one < zero, "-1 < 0");
+    assert!(zero < one, "0 < 1");
 }
 
 #[test]

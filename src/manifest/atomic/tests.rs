@@ -49,9 +49,11 @@ fn manifest_roundtrip_and_prev_fallback() {
 }
 
 #[test]
-fn legacy_manifest_without_header_still_loads() {
+fn legacy_manifest_without_header_is_rejected() {
     let dir = tempdir().expect("temp");
     // A manifest written before format headers existed: no magic/version fields.
+    // Its keys predate the signed-I256 encoding, so this build must refuse it
+    // rather than read it with a mix of orderings.
     let legacy = br#"{
         "durable_seq": 5,
         "visible_seq": 5,
@@ -61,10 +63,36 @@ fn legacy_manifest_without_header_still_loads() {
     }"#;
     std::fs::write(dir.path().join("manifest.json"), legacy).expect("write legacy");
 
-    let loaded = load_manifest(dir.path()).expect("legacy manifest loads");
-    assert_eq!(loaded.durable_seq, 5);
-    assert_eq!(loaded.magic, 0, "legacy magic defaults to 0");
-    assert_eq!(loaded.format_version, 0, "legacy version defaults to 0");
+    let err = load_manifest(dir.path()).expect_err("legacy manifest rejected");
+    assert!(
+        matches!(err, crate::error::AedbError::Unavailable { .. }),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn manifest_older_than_minimum_supported_version_is_rejected() {
+    let dir = tempdir().expect("temp");
+    // A correctly-headed v1 manifest: predates the signed-I256 key encoding.
+    let v1 = format!(
+        r#"{{
+        "magic": {},
+        "format_version": 1,
+        "feature_flags": 0,
+        "durable_seq": 1,
+        "visible_seq": 1,
+        "active_segment_seq": 2,
+        "checkpoints": [],
+        "segments": []
+    }}"#,
+        crate::manifest::schema::MANIFEST_MAGIC
+    );
+    std::fs::write(dir.path().join("manifest.json"), v1).expect("write v1");
+    let err = load_manifest(dir.path()).expect_err("v1 manifest rejected");
+    assert!(
+        matches!(err, crate::error::AedbError::Unavailable { .. }),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]
@@ -138,7 +166,7 @@ fn manifest_hmac_sign_and_verify() {
 fn signed_manifest_loads_previous_copy_when_primary_hmac_is_newer_than_manifest() {
     let dir = tempdir().expect("temp");
     let key = b"super-secret-key";
-    let m2 = Manifest {
+    let mut m2 = Manifest {
         durable_seq: 2,
         visible_seq: 2,
         active_segment_seq: 2,
@@ -146,7 +174,10 @@ fn signed_manifest_loads_previous_copy_when_primary_hmac_is_newer_than_manifest(
         segments: vec![],
         ..Default::default()
     };
-    let m3 = Manifest {
+    // The prev copy is written manually below, so stamp the current format header
+    // (the real write path does this) or load would reject it as too old.
+    m2.stamp_current_header();
+    let mut m3 = Manifest {
         durable_seq: 3,
         visible_seq: 3,
         active_segment_seq: 3,
@@ -154,6 +185,7 @@ fn signed_manifest_loads_previous_copy_when_primary_hmac_is_newer_than_manifest(
         segments: vec![],
         ..Default::default()
     };
+    m3.stamp_current_header();
     write_manifest_atomic_signed(&m2, dir.path(), Some(key)).expect("write signed");
     let m2_bytes = serde_json::to_vec_pretty(&m2).expect("serialize m2");
     let m3_bytes = serde_json::to_vec_pretty(&m3).expect("serialize m3");

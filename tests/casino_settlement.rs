@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -87,7 +86,7 @@ async fn setup_settlement_schema(db: &AedbInstance) {
 
 async fn get_balance(db: &AedbInstance, account_id: i64) -> u64 {
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["balance"])
@@ -206,7 +205,7 @@ async fn test_settlement_atomicity_large_batch() {
 
     // Verify: All winners marked as settled
     let settled_count = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["id"])
@@ -358,7 +357,7 @@ async fn test_settlement_prevents_concurrent_ops() {
 
     // Verify: All winners settled
     let settled_count = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["id"])

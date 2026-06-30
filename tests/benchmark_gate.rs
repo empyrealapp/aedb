@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::backup::{extract_backup_archive, sha256_file_hex, write_backup_archive};
 use aedb::catalog::DdlOperation;
@@ -8,6 +7,7 @@ use aedb::commit::tx::{ReadSet, TransactionEnvelope, WriteClass, WriteIntent};
 use aedb::commit::validation::Mutation;
 use aedb::config::{AedbConfig, DurabilityMode, RecoveryMode, StorageMode};
 use aedb::permission::{CallerContext, Permission};
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Expr, Query, col, lit};
 use aedb::storage::page_store::PagedStore;
 use std::sync::Arc;
@@ -258,13 +258,14 @@ async fn benchmark_gate_doc_matrix() {
         .await
         .expect("mixed commit kv set2");
         let _ = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id"])
                     .from(TABLE_NAME)
                     .where_(col("id").eq(lit(10_000 + i)))
                     .limit(1),
+                QueryOptions::default(),
             )
             .await
             .expect("mixed commit point query");
@@ -525,13 +526,14 @@ async fn benchmark_index_predicate_shapes() {
     for _ in 0..120 {
         let t0 = Instant::now();
         let eq = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id", "name"])
                     .from(TABLE_NAME)
                     .where_(col("age").eq(lit(25_i64)))
                     .limit(20),
+                QueryOptions::default(),
             )
             .await
             .expect("eq index query");
@@ -540,13 +542,14 @@ async fn benchmark_index_predicate_shapes() {
 
         let t0 = Instant::now();
         let in_rows = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id", "name"])
                     .from(TABLE_NAME)
                     .where_(col("age").in_(vec![lit(25_i64), lit(26_i64), lit(27_i64)]))
                     .limit(20),
+                QueryOptions::default(),
             )
             .await
             .expect("in index query");
@@ -555,13 +558,14 @@ async fn benchmark_index_predicate_shapes() {
 
         let t0 = Instant::now();
         let like_exact = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id", "name"])
                     .from(TABLE_NAME)
                     .where_(col("name").like(lit("user-12%")))
                     .limit(20),
+                QueryOptions::default(),
             )
             .await
             .expect("like exact query");
@@ -570,13 +574,14 @@ async fn benchmark_index_predicate_shapes() {
 
         let t0 = Instant::now();
         let like_residual = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id", "name"])
                     .from(TABLE_NAME)
                     .where_(col("name").like(lit("user-1%7%")))
                     .limit(20),
+                QueryOptions::default(),
             )
             .await
             .expect("like residual query");
@@ -590,13 +595,14 @@ async fn benchmark_index_predicate_shapes() {
 
         let t0 = Instant::now();
         let partial = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id", "name"])
                     .from("partial_users")
                     .where_(col("age").eq(lit(25_i64)))
                     .limit(20),
+                QueryOptions::default(),
             )
             .await
             .expect("partial index query");
@@ -605,13 +611,14 @@ async fn benchmark_index_predicate_shapes() {
 
         let t0 = Instant::now();
         let composite = db
-            .query(
+            .query_no_auth(
                 PROJECT_ID,
                 SCOPE_ID,
                 Query::select(&["id", "name"])
                     .from("composite_users")
                     .where_(col("age").eq(lit(25_i64)))
                     .limit(20),
+                QueryOptions::default(),
             )
             .await
             .expect("composite index query");

@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -6,6 +5,7 @@ use aedb::catalog::types::{ColumnType, Row, Value};
 use aedb::commit::validation::{KvU64MutatorOp, KvU256MutatorOp, Mutation};
 use aedb::config::AedbConfig;
 use aedb::error::AedbError;
+use aedb::query::plan::QueryOptions;
 use aedb::query::plan::{ConsistencyMode, Query};
 use tempfile::tempdir;
 
@@ -156,7 +156,7 @@ async fn compare_and_dec_u256_enforces_expected_seq_and_updates_value() {
     assert!(matches!(stale, AedbError::AssertionFailed { .. }));
 
     let result = db
-        .query(
+        .query_no_auth(
             "p",
             "app",
             Query::select(&["amount"])
@@ -165,6 +165,7 @@ async fn compare_and_dec_u256_enforces_expected_seq_and_updates_value() {
                     "id".into(),
                     Value::Text("acct".into()),
                 )),
+            QueryOptions::default(),
         )
         .await
         .expect("query balance");

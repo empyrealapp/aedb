@@ -1,4 +1,3 @@
-#![allow(deprecated)]
 use aedb::AedbInstance;
 use aedb::catalog::DdlOperation;
 use aedb::catalog::schema::ColumnDef;
@@ -80,7 +79,7 @@ async fn test_u256_boundary_values() {
 
     // Verify balance is now MAX
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["balance"])
@@ -205,7 +204,7 @@ async fn test_balance_wrapping_attack_prevention() {
 
     // Verify: Balance unchanged
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["balance"])
@@ -245,7 +244,7 @@ async fn test_balance_wrapping_attack_prevention() {
     .expect("valid increment should succeed");
 
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["balance"])
@@ -307,7 +306,7 @@ async fn test_large_value_precision() {
 
         // Read back and verify exact value
         let row = db
-            .query_with_options(
+            .query_no_auth(
                 "casino",
                 "app",
                 Query::select(&["balance"])
@@ -418,7 +417,7 @@ async fn test_concurrent_boundary_operations() {
 
     // Verify: Final balance doesn't exceed MAX
     let row = db
-        .query_with_options(
+        .query_no_auth(
             "casino",
             "app",
             Query::select(&["balance"])

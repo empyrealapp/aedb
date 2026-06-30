@@ -14,7 +14,10 @@ use super::{
 };
 use crate::catalog::schema::TableSchema;
 use crate::catalog::types::{Row, Value};
-use crate::catalog::{Catalog, SYSTEM_PROJECT_ID, namespace_key};
+use crate::catalog::{
+    ASSERTION_AUDIT_TABLE, Catalog, LIFECYCLE_OUTBOX_TABLE, SYSTEM_PROJECT_ID, SYSTEM_SCOPE_ID,
+    namespace_key,
+};
 use crate::commit::apply::{apply_mutation, apply_mutation_trusted_if_eligible};
 use crate::commit::assertions::validate_assertions;
 use crate::commit::tx::{
@@ -3339,11 +3342,6 @@ fn is_read_set_conflict_error(err: &AedbError) -> bool {
     }
 }
 
-const ASSERTION_AUDIT_TABLE: &str = "assertion_audit";
-const ASSERTION_AUDIT_SCOPE_ID: &str = "app";
-const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
-const LIFECYCLE_OUTBOX_SCOPE_ID: &str = "app";
-
 fn plan_lifecycle_outbox_events_for_classified_mutations(
     catalog: &Catalog,
     mutations: &[Mutation],
@@ -3391,7 +3389,7 @@ fn build_lifecycle_outbox_mutation(
     let ts_micros = now_micros();
     Ok(Mutation::Upsert {
         project_id: SYSTEM_PROJECT_ID.to_string(),
-        scope_id: LIFECYCLE_OUTBOX_SCOPE_ID.to_string(),
+        scope_id: SYSTEM_SCOPE_ID.to_string(),
         table_name: LIFECYCLE_OUTBOX_TABLE.to_string(),
         primary_key: vec![Value::Integer(lifecycle_commit_seq as i64)],
         row: Row::from_values(vec![
@@ -3433,7 +3431,7 @@ fn build_assertion_audit_commit(
     let commit_seq = *next_seq;
     let mutations = vec![Mutation::Upsert {
         project_id: SYSTEM_PROJECT_ID.to_string(),
-        scope_id: ASSERTION_AUDIT_SCOPE_ID.to_string(),
+        scope_id: SYSTEM_SCOPE_ID.to_string(),
         table_name: ASSERTION_AUDIT_TABLE.to_string(),
         primary_key: vec![Value::Integer(commit_seq as i64)],
         row: Row::from_values(vec![
