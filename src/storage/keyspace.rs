@@ -2492,6 +2492,12 @@ impl Keyspace {
             .kv
     }
 
+    /// Convenience KV read for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing value-store or segment read fails. Prefer the
+    /// `try_kv_get` twin in fallible (production) contexts so a disk error
+    /// surfaces as an `AedbError` instead of crashing the process.
     pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
         self.try_kv_get(project_id, scope_id, key)
             .expect("persistent value store read failed")
@@ -2789,6 +2795,11 @@ impl Keyspace {
         removed
     }
 
+    /// Convenience prefix scan for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing read fails. Prefer the `try_kv_scan_prefix` twin in
+    /// fallible (production) contexts.
     pub fn kv_scan_prefix(
         &self,
         project_id: &str,
@@ -2861,6 +2872,11 @@ impl Keyspace {
         }
     }
 
+    /// Convenience range scan for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing read fails. Prefer the `try_kv_scan_range` twin in
+    /// fallible (production) contexts.
     pub fn kv_scan_range(
         &self,
         project_id: &str,
@@ -3351,6 +3367,11 @@ impl Keyspace {
         Ok(())
     }
 
+    /// Convenience KV-version read for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing read fails. Prefer the `try_kv_version` twin in
+    /// fallible (production) contexts.
     pub fn kv_version(&self, project_id: &str, scope_id: &str, key: &[u8]) -> u64 {
         self.try_kv_version(project_id, scope_id, key)
             .expect("KV segment read failed")
@@ -3387,6 +3408,11 @@ impl Keyspace {
         Ok(version)
     }
 
+    /// Convenience max-version range read for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing read fails. Prefer the `try_max_kv_version_in_range`
+    /// twin in fallible (production) contexts.
     pub fn max_kv_version_in_range(
         &self,
         project_id: &str,
@@ -3624,6 +3650,12 @@ impl KeyspaceSnapshot {
         )
     }
 
+    /// Convenience KV read for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing value-store or segment read fails. Prefer the
+    /// `try_kv_get` twin in fallible (production) contexts so a disk error
+    /// surfaces as an `AedbError` instead of crashing the process.
     pub fn kv_get(&self, project_id: &str, scope_id: &str, key: &[u8]) -> Option<KvEntry> {
         self.try_kv_get(project_id, scope_id, key)
             .expect("persistent value store read failed")
@@ -3670,6 +3702,11 @@ impl KeyspaceSnapshot {
             .transpose()
     }
 
+    /// Convenience prefix scan for tests and in-memory-only callers.
+    ///
+    /// # Panics
+    /// Panics if a backing read fails. Prefer the `try_kv_scan_prefix` twin in
+    /// fallible (production) contexts.
     pub fn kv_scan_prefix(
         &self,
         project_id: &str,

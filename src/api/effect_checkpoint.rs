@@ -107,7 +107,7 @@ impl AedbInstance {
         for _ in 0..MAX_CAS_RETRIES {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let existing = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let existing = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
 
             let (assertion, next, claim) = match existing.as_ref().map(decode_stored) {
                 Some(Ok(stored)) if stored.status == STATUS_COMMITTED => {
@@ -254,7 +254,7 @@ impl AedbInstance {
         for _ in 0..MAX_CAS_RETRIES {
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let existing = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let existing = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
 
             let (created_at, attempts, assertion) = match existing.as_ref().map(decode_stored) {
                 Some(Ok(stored)) if stored.status == STATUS_COMMITTED => {
@@ -379,7 +379,7 @@ impl AedbInstance {
             }
         }
         let key = checkpoint_key(dedupe_key);
-        let Some(entry) = lease.view.keyspace.kv_get(project_id, scope_id, &key) else {
+        let Some(entry) = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)? else {
             return Ok(None);
         };
         let stored = decode_stored(&entry)

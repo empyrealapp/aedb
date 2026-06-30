@@ -149,7 +149,8 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/commit/apply.rs", 4_150),
         // Row-spill support (StoredRow + spill_table_rows + materialize helpers) plus the
         // secondary-index cold tier (eviction, re-inline, composite-key helpers).
-        ("src/storage/keyspace.rs", 4_080),
+        // +`# Panics` docs steering the convenience KV reads to their `try_` twins.
+        ("src/storage/keyspace.rs", 4_100),
         // Cold-tier eviction/re-inline + tier-read coverage for rows, KV, and indexes.
         ("src/storage/keyspace/tests.rs", 1_700),
         ("src/lib.rs", 3_800),

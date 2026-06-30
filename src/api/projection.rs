@@ -203,10 +203,11 @@ impl AedbInstance {
             ));
         }
         let lease = self.acquire_snapshot(consistency).await?;
-        let entry = lease
-            .view
-            .keyspace
-            .kv_get(project_id, scope_id, &view_key(view, entity_key));
+        let entry =
+            lease
+                .view
+                .keyspace
+                .try_kv_get(project_id, scope_id, &view_key(view, entity_key))?;
         Ok(entry.map(|e| String::from_utf8_lossy(&e.value).into_owned()))
     }
 
@@ -354,7 +355,7 @@ impl AedbInstance {
             }
             let lease = self.acquire_snapshot(ConsistencyMode::AtLatest).await?;
             let base_seq = lease.view.seq;
-            let existing = lease.view.keyspace.kv_get(project_id, scope_id, &key);
+            let existing = lease.view.keyspace.try_kv_get(project_id, scope_id, &key)?;
 
             let mut stored = match existing.as_ref() {
                 Some(entry) => serde_json::from_slice::<StoredSeries>(&entry.value)
@@ -432,10 +433,11 @@ impl AedbInstance {
             return Ok(Vec::new());
         }
         let lease = self.acquire_snapshot(consistency).await?;
-        let Some(entry) = lease
-            .view
-            .keyspace
-            .kv_get(project_id, scope_id, &series_key(series))
+        let Some(entry) =
+            lease
+                .view
+                .keyspace
+                .try_kv_get(project_id, scope_id, &series_key(series))?
         else {
             return Ok(Vec::new());
         };

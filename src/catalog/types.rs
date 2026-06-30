@@ -216,7 +216,7 @@ impl PartialOrd for Value {
 }
 
 /// `Value`'s `Ord`/`Eq`/`Hash` are a *type-strict* total order: values are first
-/// ranked by kind (see [`Value::kind_rank`]) and only compared by content within
+/// ranked by kind (see `kind_rank`) and only compared by content within
 /// the same kind. This is deliberate, not a missing cross-type unification:
 ///
 /// - It is a sound total order, which `OrdMap`/`BTreeMap` keys and sort/dedup
