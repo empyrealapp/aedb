@@ -1098,18 +1098,9 @@ fn compare_values(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
         (Value::U256(a), Value::I256(b)) => Some(cmp_u256_i256(a, b)),
         (Value::I256(a), Value::U256(b)) => Some(cmp_u256_i256(b, a).reverse()),
 
-        // NOTE: same-type I256-vs-I256 deliberately falls through to the raw
-        // byte compare in `Value::cmp` below. That order is wrong for signed
-        // two's-complement values (negatives, high byte >= 0x80, sort *after*
-        // positives) — but `EncodedKey` encodes I256 as raw two's-complement
-        // bytes too (unlike Integer/Timestamp, which are sign-flipped), so the
-        // index range-scan path uses the same (buggy) order. Making this arm
-        // sign-aware in isolation would make full-scan and index-accelerated
-        // range queries disagree on negative I256 values. Correctly ordering
-        // signed I256 requires sign-flipping it in `EncodedKey` as well, which
-        // is an on-disk format migration; until then both paths stay aligned.
-        // Equality is unaffected (byte-equal iff value-equal), so the cross-type
-        // arms above still fix `WHERE i256col = <int literal>`.
+        // Same-type I256-vs-I256 falls through to `Value::cmp`, which orders
+        // I256 sign-aware (negatives before positives). `EncodedKey` sign-flips
+        // I256 to match, so the full-scan and index range-scan paths agree.
         _ => Some(left.cmp(right)),
     }
 }
