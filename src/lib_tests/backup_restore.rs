@@ -1582,6 +1582,9 @@ async fn strict_restore_rejects_older_backup_version() {
 
     let mut manifest = crate::backup::load_backup_manifest(backup_dir.path(), config.hmac_key())
         .expect("manifest");
+    // An older major.minor line (0.2.x) predates the signed-I256 key encoding
+    // introduced in 0.3.0, so its keys are unreadable by this build — restore
+    // must refuse it outright as incompatible.
     manifest.aedb_version = "0.2.0".into();
     crate::backup::write_backup_manifest(backup_dir.path(), &manifest, config.hmac_key())
         .expect("rewrite manifest");
@@ -1594,7 +1597,7 @@ async fn strict_restore_rejects_older_backup_version() {
         None,
     )
     .expect_err("strict restore must reject older backup version");
-    assert!(format!("{err}").contains("matching AEDB patch version"));
+    assert!(format!("{err}").contains("incompatible AEDB version"));
 }
 
 #[tokio::test]
