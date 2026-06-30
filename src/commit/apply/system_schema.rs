@@ -7,13 +7,11 @@
 //! path stays focused on rows, keys, indexes, and constraints.
 
 use super::now_micros;
-use super::{
-    ASSERTION_AUDIT_TABLE, AUTHZ_AUDIT_TABLE, EVENT_OUTBOX_TABLE, LIFECYCLE_OUTBOX_TABLE,
+use crate::catalog::{
+    ASSERTION_AUDIT_TABLE, AUTHZ_AUDIT_TABLE, Catalog, EVENT_OUTBOX_TABLE, LIFECYCLE_OUTBOX_TABLE,
     REACTIVE_PROCESSOR_CHECKPOINTS_TABLE, REACTIVE_PROCESSOR_DLQ_TABLE,
-    REACTIVE_PROCESSOR_REGISTRY_TABLE, SYSTEM_SCOPE_ID,
+    REACTIVE_PROCESSOR_REGISTRY_TABLE, SYSTEM_SCOPE_ID, namespace_key,
 };
-use crate::catalog::Catalog;
-use crate::catalog::namespace_key;
 use crate::catalog::schema::{ColumnDef, TableSchema};
 use crate::catalog::types::ColumnType;
 use crate::error::AedbError;

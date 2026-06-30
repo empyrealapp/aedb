@@ -1,5 +1,5 @@
-use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
+use crate::catalog::{AUTHZ_AUDIT_TABLE, Catalog, EVENT_OUTBOX_TABLE, SYSTEM_SCOPE_ID};
 use crate::catalog::schema::{Constraint, ForeignKeyAction, TableSchema};
 use crate::catalog::types::{Row, Value};
 use crate::commit::ReadByteBudget;
@@ -1307,14 +1307,6 @@ pub fn apply_mutation_trusted_if_eligible(
     }
 }
 
-const AUTHZ_AUDIT_TABLE: &str = "authz_audit";
-const ASSERTION_AUDIT_TABLE: &str = "assertion_audit";
-const LIFECYCLE_OUTBOX_TABLE: &str = "lifecycle_outbox";
-const EVENT_OUTBOX_TABLE: &str = "event_outbox";
-const REACTIVE_PROCESSOR_CHECKPOINTS_TABLE: &str = "reactive_processor_checkpoints";
-const REACTIVE_PROCESSOR_REGISTRY_TABLE: &str = "reactive_processor_registry";
-const REACTIVE_PROCESSOR_DLQ_TABLE: &str = "reactive_processor_dead_letters";
-const SYSTEM_SCOPE_ID: &str = "app";
 
 struct AuthzAuditContext<'a> {
     action: &'a str,
