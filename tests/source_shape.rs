@@ -146,7 +146,8 @@ fn large_file_budgets() -> BTreeMap<&'static str, usize> {
         ("src/commit/executor/internals.rs", 5_520),
         ("src/commit/executor/tests.rs", 4_300),
         // +tier-aware secondary-index maintenance (tombstoning, cold-tier unique/FK checks).
-        ("src/commit/apply.rs", 4_150),
+        // System-table schema bootstrap moved to apply/system_schema.rs (budget lowered).
+        ("src/commit/apply.rs", 3_700),
         // Row-spill support (StoredRow + spill_table_rows + materialize helpers) plus the
         // secondary-index cold tier (eviction, re-inline, composite-key helpers).
         // +`# Panics` docs steering the convenience KV reads to their `try_` twins.
