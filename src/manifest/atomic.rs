@@ -235,6 +235,14 @@ fn reconstruct_manifest(dir: &Path) -> Result<Manifest, AedbError> {
             }
         })
         .collect();
+    // Reconstruction rebuilds the manifest with THIS build, so stamp the current
+    // header rather than leaving a bare `format_version == 0`. Note: segments and
+    // checkpoints do not carry the manifest format version, so reconstruction
+    // cannot detect data written by an incompatible older build — a pre-2 (e.g.
+    // 0.2.x, old I256 key ordering) database whose manifest is lost and is then
+    // permissively reconstructed will be read with the current encoding. Such
+    // databases must be recreated (see the v2 clean break), not reconstructed.
+    manifest.stamp_current_header();
     Ok(manifest)
 }
 
