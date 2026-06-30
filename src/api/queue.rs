@@ -1301,7 +1301,8 @@ impl AedbInstance {
             let next_seq = entry
                 .as_ref()
                 .and_then(|e| e.value.get(..8))
-                .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+                .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                .map(u64::from_be_bytes)
                 .unwrap_or(0);
             plan.counters.insert(
                 queue.clone(),

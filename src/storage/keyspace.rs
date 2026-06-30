@@ -1672,7 +1672,8 @@ impl Keyspace {
 
     /// Evict cold secondary-index postings to sorted on-disk segments until the
     /// resident estimate drops to `target_bytes`, mirroring
-    /// [`flush_table_rows_to_segments_to_memory_target`] for index stores.
+    /// [`flush_table_rows_to_segments_to_memory_target`](Self::flush_table_rows_to_segments_to_memory_target)
+    /// for index stores.
     ///
     /// Indexes are ranked by resident posting cost (largest first); for each the
     /// whole resident store is serialized to one segment (composite key
