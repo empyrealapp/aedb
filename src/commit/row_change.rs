@@ -22,6 +22,7 @@ use crate::catalog::schema::TableSchema;
 use crate::catalog::types::{Row, Value};
 use crate::commit::apply::{compile_table_predicate, extract_primary_key_from_row};
 use crate::commit::validation::Mutation;
+use crate::storage::encoded_key::EncodedKey;
 use crate::permission::CallerContext;
 use crate::query::executor::{extract_primary_key_prefix, pk_prefix_scan_bounds};
 use crate::query::operators::eval_compiled_expr_public;
@@ -330,6 +331,42 @@ fn derive_one(
                     new_row: None,
                 });
             }
+        }
+        Mutation::UpdateFields {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            fields,
+        } => {
+            let Some(schema) = schema_for(catalog, project_id, scope_id, table_name) else {
+                return;
+            };
+            let encoded_pk = EncodedKey::from_values(primary_key);
+            let Some(old_row) = pre
+                .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)
+                .ok()
+                .flatten()
+            else {
+                // Row absent pre-apply; the commit will abort, so emit nothing.
+                return;
+            };
+            let mut new_row = old_row.into_owned();
+            for (col, value) in fields {
+                if let Some(i) = schema.columns.iter().position(|c| c.name == *col)
+                    && let Some(slot) = new_row.values.get_mut(i)
+                {
+                    *slot = value.clone();
+                }
+            }
+            out.push(RowChange {
+                project_id: project_id.clone(),
+                scope_id: scope_id.clone(),
+                table_name: table_name.clone(),
+                primary_key: primary_key.clone(),
+                kind: RowChangeKind::Update,
+                new_row: Some(new_row),
+            });
         }
         // KV, counter, order-book, DDL, and table-cell atomic mutations do not
         // produce table row-level changes in this feed.

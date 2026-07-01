@@ -51,6 +51,13 @@ pub(in crate::commit::executor) fn derive_write_partitions_with_fk_expansion(
                 table_name,
                 primary_key,
                 ..
+            }
+            | Mutation::UpdateFields {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                ..
             } => {
                 let ns = namespace_key(project_id, scope_id);
                 if table_supports_row_parallelism(catalog, &ns, table_name) {

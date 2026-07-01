@@ -1154,6 +1154,12 @@ fn hash_scope_shard_key<H: Hasher>(mutations: &[Mutation], state: &mut H) {
             scope_id,
             table_name,
             ..
+        }
+        | Mutation::UpdateFields {
+            project_id,
+            scope_id,
+            table_name,
+            ..
         } => {
             't'.hash(state);
             project_id.hash(state);
@@ -3742,6 +3748,11 @@ fn collect_parallel_merge_targets_if_safe(
                 table_name,
                 primary_key,
                 ..
+            }
+            | Mutation::UpdateFields {
+                table_name,
+                primary_key,
+                ..
             } => {
                 let ns = match &targets.namespace_id {
                     Some(NamespaceId::Project(ns)) => ns.clone(),
@@ -4168,6 +4179,12 @@ pub(super) fn is_parallel_mutation_safe(catalog: &Catalog, mutation: &Mutation) 
             ..
         }
         | Mutation::TableDecU256 {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::UpdateFields {
             project_id,
             scope_id,
             table_name,
@@ -5078,6 +5095,11 @@ pub(super) fn refresh_async_indexes(
                             table_name: mutation_table,
                             ..
                         } | Mutation::UpdateWhereExpr {
+                            project_id,
+                            scope_id,
+                            table_name: mutation_table,
+                            ..
+                        } | Mutation::UpdateFields {
                             project_id,
                             scope_id,
                             table_name: mutation_table,

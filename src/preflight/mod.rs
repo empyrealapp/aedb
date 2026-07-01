@@ -641,6 +641,13 @@ pub fn preflight_plan_with_config(
             scope_id,
             table_name,
             primary_key,
+        }
+        | Mutation::UpdateFields {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            ..
         } => {
             let version = snapshot
                 .table(project_id, scope_id, table_name)

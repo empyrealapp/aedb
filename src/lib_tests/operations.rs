@@ -585,3 +585,193 @@ async fn managed_system_tables_reject_direct_user_mutations() {
         matches!(err, AedbError::Validation(message) if message.contains("managed and read-only"))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Mutation::UpdateFields — primary-key-addressed partial-column update.
+// ---------------------------------------------------------------------------
+
+async fn open_with_entity_table(dir: &std::path::Path) -> AedbInstance {
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "ent",
+        vec![
+            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
+            ColumnDef { name: "x".into(), col_type: ColumnType::Integer, nullable: false },
+            ColumnDef { name: "y".into(), col_type: ColumnType::Integer, nullable: false },
+        ],
+        vec!["id"],
+    )
+    .await;
+    db
+}
+
+async fn read_ent(db: &AedbInstance, id: i64) -> Vec<Value> {
+    let result = db
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["id", "x", "y"]).from("ent").where_(Expr::Eq("id".into(), Value::Integer(id))),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query");
+    result.rows.into_iter().next().expect("row present").values
+}
+
+#[tokio::test]
+async fn update_fields_overwrites_only_named_columns() {
+    let dir = tempdir().expect("temp");
+    let db = open_with_entity_table(dir.path()).await;
+    db.commit(Mutation::Insert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::Integer(10), Value::Integer(20)]),
+    })
+    .await
+    .expect("insert");
+
+    // Update only x; y must be preserved.
+    db.commit(Mutation::UpdateFields {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        fields: vec![("x".into(), Value::Integer(99))],
+    })
+    .await
+    .expect("update fields");
+
+    assert_eq!(
+        read_ent(&db, 1).await,
+        vec![Value::Integer(1), Value::Integer(99), Value::Integer(20)]
+    );
+}
+
+#[tokio::test]
+async fn update_fields_maintains_secondary_index() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "ent",
+        vec![
+            ColumnDef { name: "id".into(), col_type: ColumnType::Integer, nullable: false },
+            ColumnDef { name: "name".into(), col_type: ColumnType::Text, nullable: false },
+        ],
+        vec!["id"],
+    )
+    .await;
+    db.commit_ddl(DdlOperation::CreateIndex {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        index_name: "idx_ent_name".into(),
+        if_not_exists: false,
+        columns: vec!["name".into()],
+        index_type: crate::catalog::schema::IndexType::BTree,
+        partial_filter: None,
+    })
+    .await
+    .expect("index");
+    db.commit(Mutation::Insert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::Text("alice".into())]),
+    })
+    .await
+    .expect("insert");
+
+    db.commit(Mutation::UpdateFields {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        fields: vec![("name".into(), Value::Text("bob".into()))],
+    })
+    .await
+    .expect("update fields");
+
+    // Index lookup by the new value finds the row; the old value does not.
+    let by_bob = db
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["id"]).from("ent").where_(Expr::Eq("name".into(), Value::Text("bob".into()))),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query bob");
+    assert_eq!(by_bob.rows.len(), 1, "index must resolve the updated value");
+
+    let by_alice = db
+        .query_no_auth(
+            "p",
+            "app",
+            Query::select(&["id"]).from("ent").where_(Expr::Eq("name".into(), Value::Text("alice".into()))),
+            QueryOptions::default(),
+        )
+        .await
+        .expect("query alice");
+    assert_eq!(by_alice.rows.len(), 0, "stale index entry for the old value must be gone");
+}
+
+#[tokio::test]
+async fn update_fields_rejects_primary_key_and_unknown_and_missing() {
+    let dir = tempdir().expect("temp");
+    let db = open_with_entity_table(dir.path()).await;
+    db.commit(Mutation::Insert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::Integer(10), Value::Integer(20)]),
+    })
+    .await
+    .expect("insert");
+
+    // Cannot rewrite a primary-key column.
+    db.commit(Mutation::UpdateFields {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        fields: vec![("id".into(), Value::Integer(2))],
+    })
+    .await
+    .expect_err("must reject primary-key column update");
+
+    // Unknown column.
+    db.commit(Mutation::UpdateFields {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(1)],
+        fields: vec![("zzz".into(), Value::Integer(1))],
+    })
+    .await
+    .expect_err("must reject unknown column");
+
+    // Missing row.
+    db.commit(Mutation::UpdateFields {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        primary_key: vec![Value::Integer(404)],
+        fields: vec![("x".into(), Value::Integer(1))],
+    })
+    .await
+    .expect_err("must reject update of a non-existent row");
+}
