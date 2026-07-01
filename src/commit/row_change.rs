@@ -125,9 +125,9 @@ fn resolve_matches(
     let Some(schema) = schema_for(catalog, project_id, scope_id, table_name) else {
         return Vec::new();
     };
-    let Ok(compiled) =
-        compile_table_predicate(catalog, schema, project_id, scope_id, table_name, predicate, caller)
-    else {
+    let Ok(compiled) = compile_table_predicate(
+        catalog, schema, project_id, scope_id, table_name, predicate, caller,
+    ) else {
         return Vec::new();
     };
     let (start, end) = match extract_primary_key_prefix(predicate, &schema.primary_key) {
@@ -239,7 +239,14 @@ fn derive_one(
             limit,
         } => {
             for (pk, _old) in resolve_matches(
-                pre, catalog, project_id, scope_id, table_name, predicate, *limit, caller,
+                pre,
+                catalog,
+                project_id,
+                scope_id,
+                table_name,
+                predicate,
+                *limit,
+                caller,
                 max_scan_rows,
             ) {
                 out.push(RowChange {
@@ -265,7 +272,14 @@ fn derive_one(
                     .and_then(|s| s.columns.iter().position(|c| c.name == name))
             };
             for (pk, old_row) in resolve_matches(
-                pre, catalog, project_id, scope_id, table_name, predicate, *limit, caller,
+                pre,
+                catalog,
+                project_id,
+                scope_id,
+                table_name,
+                predicate,
+                *limit,
+                caller,
                 max_scan_rows,
             ) {
                 let mut new_row = old_row;
@@ -297,7 +311,14 @@ fn derive_one(
             // Post-values require evaluating the update expressions; report the
             // affected primary keys without new column values.
             for (pk, _old) in resolve_matches(
-                pre, catalog, project_id, scope_id, table_name, predicate, *limit, caller,
+                pre,
+                catalog,
+                project_id,
+                scope_id,
+                table_name,
+                predicate,
+                *limit,
+                caller,
                 max_scan_rows,
             ) {
                 out.push(RowChange {

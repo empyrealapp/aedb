@@ -2257,8 +2257,14 @@ fn apply_delete_where_internal(
     };
     // Tier-aware: includes rows in the cold segment tier. `tier_scan_rows`
     // takes the hot-only fast path when no segments are present.
-    let scanned_table =
-        keyspace.tier_scan_rows(project_id, scope_id, table_name, scan_start, scan_end, usize::MAX)?;
+    let scanned_table = keyspace.tier_scan_rows(
+        project_id,
+        scope_id,
+        table_name,
+        scan_start,
+        scan_end,
+        usize::MAX,
+    )?;
     for (scanned_rows, (encoded_pk, row)) in scanned_table.iter().enumerate() {
         ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
         if let Some(budget) = read_bytes.as_deref_mut() {

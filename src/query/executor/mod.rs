@@ -28,7 +28,6 @@ mod read_set;
 mod validate;
 
 pub(crate) use access_path::{AccessPathDiagnostics, explain_access_path_for_query};
-pub(crate) use predicate::extract_primary_key_prefix;
 use cursor::{CursorToken, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor};
 use execution_setup::prepare_execution_setup;
 use indexing::indexed_pks_for_predicate_limited;
@@ -41,6 +40,7 @@ use pagination::{
     compute_page_window, compute_remaining_limit_after_page, compute_split_recommended,
 };
 use point_lookup::{PrimaryKeyPointQueryRequest, try_primary_key_point_query};
+pub(crate) use predicate::extract_primary_key_prefix;
 pub use read_set::ReadSetCollector;
 use validate::validate_query;
 
@@ -401,7 +401,8 @@ fn execute_query_with_options_capturing_signed(
                 // key band instead of the whole table. Rows are returned in
                 // primary-key order — identical to a full scan — so downstream
                 // ordering/pagination is unchanged; this only narrows the source.
-                let pk_prefix = predicate::extract_primary_key_prefix(predicate, &schema.primary_key);
+                let pk_prefix =
+                    predicate::extract_primary_key_prefix(predicate, &schema.primary_key);
                 // Read-set stays coarse (whole-table range) even for a bounded
                 // scan: rows inserted into the band after read must still
                 // invalidate reactive subscribers, and the collector has no

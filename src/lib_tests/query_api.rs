@@ -972,7 +972,9 @@ async fn commit_delta_carries_resolved_row_changes_when_enabled() {
     let mut rx = db.subscribe_commits();
 
     // New row → Insert, with the new values attached.
-    db.commit(upsert("e1", "Pos", r#"{"x":1}"#)).await.expect("insert");
+    db.commit(upsert("e1", "Pos", r#"{"x":1}"#))
+        .await
+        .expect("insert");
     let d = rx.recv().await.expect("delta");
     assert_eq!(d.row_changes.len(), 1);
     assert_eq!(d.row_changes[0].kind, RowChangeKind::Insert);
@@ -980,13 +982,17 @@ async fn commit_delta_carries_resolved_row_changes_when_enabled() {
     assert!(matches!(&d.row_changes[0].new_row, Some(r) if r.values.len() == 4));
 
     // Same PK again → Update.
-    db.commit(upsert("e1", "Pos", r#"{"x":2}"#)).await.expect("update");
+    db.commit(upsert("e1", "Pos", r#"{"x":2}"#))
+        .await
+        .expect("update");
     let d = rx.recv().await.expect("delta");
     assert_eq!(d.row_changes.len(), 1);
     assert_eq!(d.row_changes[0].kind, RowChangeKind::Update);
 
     // A second component so the despawn resolves two rows.
-    db.commit(upsert("e1", "Vel", r#"{"dx":3}"#)).await.expect("insert2");
+    db.commit(upsert("e1", "Vel", r#"{"dx":3}"#))
+        .await
+        .expect("insert2");
     let _ = rx.recv().await.expect("delta");
 
     // Despawn via a PK-prefix predicate → both component rows resolved as Delete.
@@ -1002,7 +1008,11 @@ async fn commit_delta_carries_resolved_row_changes_when_enabled() {
     .expect("despawn");
     let d = rx.recv().await.expect("delta");
     assert_eq!(d.row_changes.len(), 2, "both components resolved");
-    assert!(d.row_changes.iter().all(|c| c.kind == RowChangeKind::Delete));
+    assert!(
+        d.row_changes
+            .iter()
+            .all(|c| c.kind == RowChangeKind::Delete)
+    );
     assert!(d.row_changes.iter().all(|c| c.new_row.is_none()));
 }
 
