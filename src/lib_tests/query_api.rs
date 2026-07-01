@@ -905,6 +905,149 @@ async fn delete_where_primary_key_prefix_despawns_one_entity() {
     assert_eq!(all.rows.len(), 3, "5 seeded − 2 despawned");
 }
 
+/// #3: with `row_change_deltas_enabled`, each broadcast `CommitDelta` carries
+/// resolved row-level changes — insert vs update distinguished, deletes resolved
+/// from a predicate — so a subscription layer can diff without re-querying.
+#[tokio::test]
+async fn commit_delta_carries_resolved_row_changes_when_enabled() {
+    use crate::commit::row_change::RowChangeKind;
+
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        row_change_deltas_enabled: true,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
+    db.create_project("arcana").await.expect("project");
+    db.create_scope("arcana", "app").await.expect("scope");
+    create_table(
+        &db,
+        "arcana",
+        "app",
+        "entities",
+        vec![
+            ColumnDef {
+                name: "instance_id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "entity_id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "component_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "data".into(),
+                col_type: ColumnType::Json,
+                nullable: false,
+            },
+        ],
+        vec!["instance_id", "entity_id", "component_name"],
+    )
+    .await;
+
+    let upsert = |eid: &str, comp: &str, data: &str| Mutation::Upsert {
+        project_id: "arcana".into(),
+        scope_id: "app".into(),
+        table_name: "entities".into(),
+        primary_key: vec![
+            Value::Text("i1".into()),
+            Value::Text(eid.into()),
+            Value::Text(comp.into()),
+        ],
+        row: Row::from_values(vec![
+            Value::Text("i1".into()),
+            Value::Text(eid.into()),
+            Value::Text(comp.into()),
+            Value::Json(data.into()),
+        ]),
+    };
+
+    // Subscribe after DDL so the first delivered delta is our first upsert.
+    let mut rx = db.subscribe_commits();
+
+    // New row → Insert, with the new values attached.
+    db.commit(upsert("e1", "Pos", r#"{"x":1}"#)).await.expect("insert");
+    let d = rx.recv().await.expect("delta");
+    assert_eq!(d.row_changes.len(), 1);
+    assert_eq!(d.row_changes[0].kind, RowChangeKind::Insert);
+    assert_eq!(d.row_changes[0].table_name, "entities");
+    assert!(matches!(&d.row_changes[0].new_row, Some(r) if r.values.len() == 4));
+
+    // Same PK again → Update.
+    db.commit(upsert("e1", "Pos", r#"{"x":2}"#)).await.expect("update");
+    let d = rx.recv().await.expect("delta");
+    assert_eq!(d.row_changes.len(), 1);
+    assert_eq!(d.row_changes[0].kind, RowChangeKind::Update);
+
+    // A second component so the despawn resolves two rows.
+    db.commit(upsert("e1", "Vel", r#"{"dx":3}"#)).await.expect("insert2");
+    let _ = rx.recv().await.expect("delta");
+
+    // Despawn via a PK-prefix predicate → both component rows resolved as Delete.
+    db.commit(Mutation::DeleteWhere {
+        project_id: "arcana".into(),
+        scope_id: "app".into(),
+        table_name: "entities".into(),
+        predicate: Expr::Eq("instance_id".into(), Value::Text("i1".into()))
+            .and(Expr::Eq("entity_id".into(), Value::Text("e1".into()))),
+        limit: None,
+    })
+    .await
+    .expect("despawn");
+    let d = rx.recv().await.expect("delta");
+    assert_eq!(d.row_changes.len(), 2, "both components resolved");
+    assert!(d.row_changes.iter().all(|c| c.kind == RowChangeKind::Delete));
+    assert!(d.row_changes.iter().all(|c| c.new_row.is_none()));
+}
+
+/// #3: when the feature is off (default), deltas carry no row-level changes —
+/// zero overhead, unchanged behavior.
+#[tokio::test]
+async fn commit_delta_row_changes_empty_by_default() {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "t",
+        vec![
+            ColumnDef {
+                name: "id".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "v".into(),
+                col_type: ColumnType::Integer,
+                nullable: false,
+            },
+        ],
+        vec!["id"],
+    )
+    .await;
+    let mut rx = db.subscribe_commits();
+    db.commit(Mutation::Upsert {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "t".into(),
+        primary_key: vec![Value::Integer(1)],
+        row: Row::from_values(vec![Value::Integer(1), Value::Integer(9)]),
+    })
+    .await
+    .expect("upsert");
+    let d = rx.recv().await.expect("delta");
+    assert!(d.row_changes.is_empty());
+}
+
 #[tokio::test]
 async fn list_batch_and_lookup_helpers_work() {
     let dir = tempdir().expect("temp");
