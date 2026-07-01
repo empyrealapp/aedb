@@ -110,6 +110,7 @@ fn upsert_kind(
 /// Resolve the `(primary_key, old_row)` pairs a predicate mutation touches,
 /// mirroring apply exactly: same effective (row-policy-bound) predicate, same
 /// primary-key-prefix scan bounds, same post-filter `limit` counting.
+#[allow(clippy::too_many_arguments)]
 fn resolve_matches(
     pre: &Keyspace,
     catalog: &Catalog,
@@ -269,10 +270,10 @@ fn derive_one(
             ) {
                 let mut new_row = old_row;
                 for (col, value) in updates {
-                    if let Some(i) = column_index(col) {
-                        if let Some(slot) = new_row.values.get_mut(i) {
-                            *slot = value.clone();
-                        }
+                    if let Some(i) = column_index(col)
+                        && let Some(slot) = new_row.values.get_mut(i)
+                    {
+                        *slot = value.clone();
                     }
                 }
                 out.push(RowChange {
