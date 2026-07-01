@@ -300,6 +300,24 @@ impl GlobalUniqueIndexState {
                     },
                 )
             }
+            Mutation::UpdateFields {
+                project_id,
+                scope_id,
+                table_name,
+                ..
+            } => {
+                // A keyed partial update can change a globally-unique-indexed column.
+                // Maintaining the global unique index across a partial merge is not yet
+                // implemented, so conservatively reject it on such tables (the common
+                // case — e.g. ECS entity tables — has no global unique index).
+                if table_has_global_unique_entries(catalog, project_id, scope_id, table_name) {
+                    return Err(AedbError::Validation(
+                        "UpdateFields is not yet supported on tables with global unique indexes"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
             Mutation::Ddl(_) => Ok(()),
             _ => Ok(()),
         }

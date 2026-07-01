@@ -1748,3 +1748,183 @@ async fn checkpoint_and_restore_round_trips_spilled_table_rows() {
         Value::Text(format!("{payload}-42").into())
     );
 }
+
+// ---------------------------------------------------------------------------
+// WriteClass::Volatile — WAL-skipping, checkpoint-only durability.
+// ---------------------------------------------------------------------------
+
+/// A volatile KvSet envelope for project "p", scope "app".
+fn volatile_kv_set(key: &[u8], value: &[u8]) -> TransactionEnvelope {
+    TransactionEnvelope {
+        caller: None,
+        idempotency_key: None,
+        write_class: WriteClass::Volatile,
+        assertions: vec![],
+        read_set: crate::commit::tx::ReadSet::default(),
+        write_intent: WriteIntent {
+            mutations: vec![Mutation::KvSet {
+                project_id: "p".into(),
+                scope_id: "app".into(),
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+        },
+        base_seq: 0,
+    }
+}
+
+/// A volatile commit is immediately visible to readers but does not advance the
+/// durable-seq watermark (it is never written to the WAL).
+#[tokio::test]
+async fn volatile_commit_is_visible_but_not_durable() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Full,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    // In Full mode after a durable commit, durable == visible.
+    let before = db.head_state().await;
+    assert_eq!(before.visible_head_seq, before.durable_head_seq);
+
+    db.commit_envelope(volatile_kv_set(b"pos", b"v1"))
+        .await
+        .expect("volatile commit");
+
+    let after = db.head_state().await;
+    // Visible advanced by exactly the one volatile commit; durable did not move.
+    assert_eq!(after.visible_head_seq, before.visible_head_seq + 1);
+    assert_eq!(after.durable_head_seq, before.durable_head_seq);
+    assert!(after.visible_head_seq > after.durable_head_seq);
+
+    // ...but the write is readable right now.
+    let entry = db
+        .kv_get_no_auth("p", "app", b"pos", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv_get")
+        .expect("present");
+    assert_eq!(entry.value, b"v1".to_vec());
+}
+
+/// A volatile write followed by a durable commit (which advances the durable
+/// horizon past it) is captured by the next checkpoint and survives a restart.
+#[tokio::test]
+async fn volatile_write_anchored_by_later_durable_survives_restart() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Full,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    // durable A, volatile V, then durable B (advances durable past V).
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"durable".to_vec(),
+        value: b"a".to_vec(),
+    })
+    .await
+    .expect("durable A");
+    db.commit_envelope(volatile_kv_set(b"volatile", b"v"))
+        .await
+        .expect("volatile V");
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"anchor".to_vec(),
+        value: b"b".to_vec(),
+    })
+    .await
+    .expect("durable B anchor");
+
+    db.checkpoint_now().await.expect("checkpoint");
+    drop(db);
+
+    let recovered = crate::recovery::recover_with_config(dir.path(), &config).expect("recover");
+    // The volatile write was below the durable horizon when the checkpoint ran,
+    // so it is captured and recovered.
+    assert_eq!(
+        recovered.keyspace.kv_get("p", "app", b"volatile").expect("volatile recovered").value,
+        b"v".to_vec()
+    );
+    assert_eq!(
+        recovered.keyspace.kv_get("p", "app", b"durable").expect("durable recovered").value,
+        b"a".to_vec()
+    );
+}
+
+/// A volatile write made after the last durable commit/checkpoint is held only in
+/// memory and is lost on restart, while durable state is preserved.
+#[tokio::test]
+async fn volatile_write_without_durable_anchor_is_lost_on_restart() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Full,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open_anonymous(config.clone(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    db.commit(Mutation::KvSet {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        key: b"durable".to_vec(),
+        value: b"a".to_vec(),
+    })
+    .await
+    .expect("durable A");
+    db.checkpoint_now().await.expect("checkpoint anchors at durable A");
+
+    // Volatile write happens AFTER the checkpoint's durable horizon.
+    db.commit_envelope(volatile_kv_set(b"volatile", b"v"))
+        .await
+        .expect("volatile V");
+    drop(db);
+
+    let recovered = crate::recovery::recover_with_config(dir.path(), &config).expect("recover");
+    assert!(
+        recovered.keyspace.kv_get("p", "app", b"volatile").is_none(),
+        "volatile write after the durable horizon must not survive restart"
+    );
+    assert_eq!(
+        recovered.keyspace.kv_get("p", "app", b"durable").expect("durable recovered").value,
+        b"a".to_vec()
+    );
+}
+
+/// Requesting Durable finality on a volatile commit must not block (there is no
+/// WAL durability to wait for) — it returns promptly and the write is visible.
+#[tokio::test]
+async fn durable_finality_on_volatile_commit_does_not_block() {
+    let dir = tempdir().expect("temp");
+    let config = AedbConfig {
+        durability_mode: DurabilityMode::Full,
+        ..AedbConfig::default()
+    };
+    let db = AedbInstance::open_anonymous(config, dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+
+    let committed = tokio::time::timeout(
+        Duration::from_secs(5),
+        db.commit_envelope_with_finality(
+            volatile_kv_set(b"pos", b"v1"),
+            crate::CommitFinality::Durable,
+        ),
+    )
+    .await
+    .expect("durable finality on a volatile commit must not hang")
+    .expect("commit");
+    // Durable head is reported but was not required to reach the volatile seq.
+    assert!(committed.commit_seq > 0);
+
+    let entry = db
+        .kv_get_no_auth("p", "app", b"pos", ConsistencyMode::AtLatest)
+        .await
+        .expect("kv_get")
+        .expect("present");
+    assert_eq!(entry.value, b"v1".to_vec());
+}

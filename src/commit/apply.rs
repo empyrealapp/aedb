@@ -308,6 +308,24 @@ pub fn apply_mutation_with_read_budget(
                 read_bytes,
             )?;
         }
+        Mutation::UpdateFields {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            fields,
+        } => {
+            apply_update_fields_internal(
+                catalog,
+                keyspace,
+                &project_id,
+                &scope_id,
+                &table_name,
+                &primary_key,
+                &fields,
+                commit_seq,
+            )?;
+        }
         Mutation::Ddl(op) => {
             prevalidate_ddl_with_data(catalog, keyspace, &op)?;
             catalog.apply_ddl(op.clone())?;
@@ -2376,6 +2394,79 @@ fn apply_update_where_internal(
             commit_seq,
         )?;
     }
+    Ok(())
+}
+
+/// Primary-key-addressed partial-column update. Resolves the row by a direct
+/// `get_row_by_encoded` lookup (no scan), overwrites only the named columns, and
+/// re-applies through the shared upsert machinery so secondary indexes for any
+/// changed indexed column are maintained. The row must already exist.
+#[allow(clippy::too_many_arguments)]
+fn apply_update_fields_internal(
+    catalog: &mut Catalog,
+    keyspace: &mut Keyspace,
+    project_id: &str,
+    scope_id: &str,
+    table_name: &str,
+    primary_key: &[Value],
+    fields: &[(String, Value)],
+    commit_seq: u64,
+) -> Result<(), AedbError> {
+    let ns = namespace_key(project_id, scope_id);
+    let schema = catalog
+        .tables
+        .get(&(ns.clone(), table_name.to_string()))
+        .ok_or_else(|| AedbError::NotFound {
+            resource_type: ErrorResourceType::Table,
+            resource_id: format!("{project_id}.{scope_id}.{table_name}"),
+        })?
+        .clone();
+    let primary_key_indices = primary_key_column_indices(&schema)?;
+    // Resolve field names to column indices; forbid rewriting a primary-key column
+    // (that would move the row to a different key, which this keyed update does not
+    // support — delete + insert instead).
+    let mut update_indices = Vec::with_capacity(fields.len());
+    for (column, value) in fields {
+        let Some(column_index) = schema.columns.iter().position(|c| c.name == *column) else {
+            return Err(AedbError::UnknownColumn {
+                table: table_name.to_string(),
+                column: column.clone(),
+            });
+        };
+        if primary_key_indices.contains(&column_index) {
+            return Err(AedbError::Validation(format!(
+                "UpdateFields cannot modify primary-key column '{column}' of \
+                 {project_id}.{scope_id}.{table_name}"
+            )));
+        }
+        update_indices.push((column_index, value.clone()));
+    }
+    let encoded_pk = EncodedKey::from_values(primary_key);
+    let old_row = keyspace
+        .get_row_by_encoded(project_id, scope_id, table_name, &encoded_pk)?
+        .map(|row| row.into_owned());
+    let Some(old_row) = old_row else {
+        return Err(AedbError::Validation(format!(
+            "UpdateFields target row not found in {project_id}.{scope_id}.{table_name}"
+        )));
+    };
+    let mut next_row = old_row.clone();
+    for (column_index, value) in &update_indices {
+        next_row.values[*column_index] = value.clone();
+    }
+    apply_upsert_once_with_schema_and_old_row(
+        catalog,
+        keyspace,
+        &schema,
+        project_id,
+        scope_id,
+        table_name,
+        primary_key.to_vec(),
+        encoded_pk,
+        Some(old_row),
+        next_row,
+        commit_seq,
+    )?;
     Ok(())
 }
 

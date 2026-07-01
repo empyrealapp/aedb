@@ -206,6 +206,20 @@ pub enum Mutation {
         updates: Vec<(String, TableUpdateExpr)>,
         limit: Option<usize>,
     },
+    /// Primary-key-addressed partial-column update: overwrite only `fields` of the
+    /// single row identified directly by `primary_key`. Unlike [`Mutation::UpdateWhere`]
+    /// (which scans the table and filters by predicate), this is an O(log n) direct
+    /// lookup, and its WAL payload carries only the changed columns rather than the
+    /// whole row — ideal for high-frequency keyed updates (e.g. per-tick ECS entity
+    /// component writes). The row must already exist and `fields` may not target a
+    /// primary-key column.
+    UpdateFields {
+        project_id: String,
+        scope_id: String,
+        table_name: String,
+        primary_key: Vec<Value>,
+        fields: Vec<(String, Value)>,
+    },
     Ddl(DdlOperation),
     KvSet {
         project_id: String,
@@ -524,6 +538,13 @@ impl Mutation {
                 ..
             }
             | Mutation::TableDecU256 {
+                project_id,
+                scope_id,
+                table_name,
+                primary_key,
+                ..
+            }
+            | Mutation::UpdateFields {
                 project_id,
                 scope_id,
                 table_name,
@@ -1003,6 +1024,54 @@ pub fn validate_mutation_with_config(
                 if schema.primary_key.iter().any(|pk| pk == column) {
                     return Err(AedbError::Validation(
                         "update_where cannot modify primary key columns".into(),
+                    ));
+                }
+                let Some(col) = schema.columns.iter().find(|c| c.name == *column) else {
+                    return Err(AedbError::UnknownColumn {
+                        table: schema.table_name.clone(),
+                        column: column.clone(),
+                    });
+                };
+                if !matches!(value, Value::Null) && !value_matches_type(value, &col.col_type) {
+                    return Err(AedbError::TypeMismatch {
+                        table: schema.table_name.clone(),
+                        column: column.clone(),
+                        expected: format!("{:?}", col.col_type),
+                        actual: value_type_name(value).to_string(),
+                    });
+                }
+                if matches!(value, Value::Null) && !col.nullable {
+                    return Err(AedbError::NotNullViolation {
+                        table: schema.table_name.clone(),
+                        column: column.clone(),
+                    });
+                }
+            }
+            Ok(())
+        }
+        Mutation::UpdateFields {
+            project_id,
+            scope_id,
+            table_name,
+            primary_key,
+            fields,
+        } => {
+            ensure_not_managed_table(project_id, table_name)?;
+            let schema = table_schema(catalog, project_id, scope_id, table_name)?;
+            if primary_key.len() != schema.primary_key.len() {
+                return Err(AedbError::Validation(format!(
+                    "update_fields primary-key arity mismatch for {table_name}: expected {}, got {}",
+                    schema.primary_key.len(),
+                    primary_key.len()
+                )));
+            }
+            if fields.is_empty() {
+                return Err(AedbError::Validation("update_fields fields cannot be empty".into()));
+            }
+            for (column, value) in fields {
+                if schema.primary_key.iter().any(|pk| pk == column) {
+                    return Err(AedbError::Validation(
+                        "update_fields cannot modify primary key columns".into(),
                     ));
                 }
                 let Some(col) = schema.columns.iter().find(|c| c.name == *column) else {
@@ -1904,6 +1973,12 @@ pub fn required_permission(mutation: &Mutation) -> Result<Permission, AedbError>
             ..
         }
         | Mutation::TableDecU256 {
+            project_id,
+            scope_id,
+            table_name,
+            ..
+        }
+        | Mutation::UpdateFields {
             project_id,
             scope_id,
             table_name,
