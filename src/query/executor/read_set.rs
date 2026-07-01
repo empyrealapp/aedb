@@ -110,6 +110,43 @@ impl ReadSetCollector {
             structural_version_at_read: structural_version,
         });
     }
+
+    /// Record a read scoped to every row whose primary key begins with `prefix`
+    /// (a leading primary-key-prefix scan). Unlike `record_full_table_scan`, a write
+    /// only invalidates this read if its PK falls within the prefix band — so a
+    /// reactive query over one key band (e.g. one instance's rows in a shared table)
+    /// is not woken by writes to unrelated bands. Used when the executor bounded the
+    /// scan to a PK prefix but could not enumerate exact touched pks (residual filter
+    /// within the band).
+    pub fn record_table_prefix(
+        &mut self,
+        snapshot: &KeyspaceSnapshot,
+        project_id: &str,
+        scope_id: &str,
+        table_name: &str,
+        prefix: Vec<Value>,
+    ) {
+        if prefix.is_empty() {
+            // No prefix pinned → this is a whole-table dependency.
+            self.record_full_table_scan(snapshot, project_id, scope_id, table_name);
+            return;
+        }
+        let table = snapshot.table(project_id, scope_id, table_name);
+        let (max_version, structural_version) = match table {
+            Some(t) => (t.max_version(), t.structural_version),
+            None => (0, 0),
+        };
+        self.set.ranges.push(ReadRangeEntry {
+            range: ReadRange::TablePrefix {
+                project_id: project_id.to_string(),
+                scope_id: scope_id.to_string(),
+                table_name: table_name.to_string(),
+                prefix,
+            },
+            max_version_at_read: max_version,
+            structural_version_at_read: structural_version,
+        });
+    }
 }
 
 fn pk_column_indices_in_schema(schema: &TableSchema) -> Vec<usize> {

@@ -403,17 +403,28 @@ fn execute_query_with_options_capturing_signed(
                 // ordering/pagination is unchanged; this only narrows the source.
                 let pk_prefix =
                     predicate::extract_primary_key_prefix(predicate, &schema.primary_key);
-                // Read-set stays coarse (whole-table range) even for a bounded
-                // scan: rows inserted into the band after read must still
-                // invalidate reactive subscribers, and the collector has no
-                // bounded-range primitive that captures future inserts.
+                // Scope the reactive read-set to the scanned band. A `TablePrefix`
+                // range still invalidates on future inserts into the band (a new row
+                // whose PK begins with the prefix is a TableRow write that the range
+                // matches), but writes to *other* bands (e.g. other instances' rows in
+                // a shared table) no longer wake this subscription. Falls back to a
+                // whole-table range when no prefix is pinned.
                 if let Some(collector) = read_set {
-                    collector.record_full_table_scan(
-                        snapshot,
-                        &exec_project_id,
-                        &exec_scope_id,
-                        &query.table,
-                    );
+                    match &pk_prefix {
+                        Some(prefix) => collector.record_table_prefix(
+                            snapshot,
+                            &exec_project_id,
+                            &exec_scope_id,
+                            &query.table,
+                            prefix.values.clone(),
+                        ),
+                        None => collector.record_full_table_scan(
+                            snapshot,
+                            &exec_project_id,
+                            &exec_scope_id,
+                            &query.table,
+                        ),
+                    }
                 }
                 let (start, end) = match &pk_prefix {
                     Some(prefix) => {

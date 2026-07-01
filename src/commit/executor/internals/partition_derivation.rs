@@ -471,6 +471,12 @@ pub(in crate::commit::executor) fn derive_read_partitions(
                 scope_id,
                 table_name,
                 ..
+            }
+            | ReadRange::TablePrefix {
+                project_id,
+                scope_id,
+                table_name,
+                ..
             } => {
                 let ns = namespace_key(project_id, scope_id);
                 out.insert(table_partition_token(&ns, table_name));
@@ -841,6 +847,25 @@ pub(in crate::commit::executor) fn revalidate_read_set_for_keyspace(
                 ),
                 keyspace.table_structural_version(project_id, scope_id, table_name),
             ),
+            ReadRange::TablePrefix {
+                project_id,
+                scope_id,
+                table_name,
+                prefix,
+            } => {
+                // The prefix band's encoded key bounds — same bounds the scan used.
+                let (start, end) = crate::query::executor::pk_prefix_scan_bounds(prefix);
+                (
+                    keyspace.max_row_version_in_encoded_range(
+                        project_id,
+                        scope_id,
+                        table_name,
+                        start,
+                        end,
+                    ),
+                    keyspace.table_structural_version(project_id, scope_id, table_name),
+                )
+            }
             ReadRange::KvRange {
                 project_id,
                 scope_id,
