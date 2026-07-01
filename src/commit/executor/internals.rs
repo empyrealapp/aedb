@@ -1083,84 +1083,36 @@ fn hash_scope_shard_key<H: Hasher>(mutations: &[Mutation], state: &mut H) {
         return;
     };
     match mutation {
-        Mutation::Insert {
-            project_id,
-            scope_id,
-            table_name,
-            ..
+        Mutation::Insert { project_id, scope_id, table_name, primary_key, .. }
+        | Mutation::Upsert { project_id, scope_id, table_name, primary_key, .. }
+        | Mutation::Delete { project_id, scope_id, table_name, primary_key }
+        | Mutation::TableIncU256 { project_id, scope_id, table_name, primary_key, .. }
+        | Mutation::TableDecU256 { project_id, scope_id, table_name, primary_key, .. }
+        | Mutation::UpdateFields { project_id, scope_id, table_name, primary_key, .. } => {
+            // Keyed row mutations: also fold the leading primary-key component into the
+            // shard key so writes to a shared table spread across ingress
+            // (pre-validation) shards instead of funneling to one. For the ECS
+            // `entities` table (PK = instance_id, entity_id, component_name) the leading
+            // component is instance_id, so each game lands on its own shard while all of
+            // one game's writes stay on the same shard (ordering affinity). Cross-shard
+            // order is irrelevant — the single apply loop assigns commit seqs and
+            // resolves conflicts via the read-set. `Value` isn't `Hash` (it has floats),
+            // so encode the leading component to its canonical key bytes first.
+            't'.hash(state);
+            project_id.hash(state);
+            scope_id.hash(state);
+            table_name.hash(state);
+            if let Some(leading) = primary_key.first() {
+                EncodedKey::from_values(std::slice::from_ref(leading)).as_slice().hash(state);
+            }
         }
-        | Mutation::InsertBatch {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::Upsert {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::UpsertBatch {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::UpsertOnConflict {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::UpsertBatchOnConflict {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::Delete {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::DeleteWhere {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::UpdateWhere {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::UpdateWhereExpr {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::TableIncU256 {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::TableDecU256 {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        }
-        | Mutation::UpdateFields {
-            project_id,
-            scope_id,
-            table_name,
-            ..
-        } => {
+        Mutation::InsertBatch { project_id, scope_id, table_name, .. }
+        | Mutation::UpsertBatch { project_id, scope_id, table_name, .. }
+        | Mutation::UpsertOnConflict { project_id, scope_id, table_name, .. }
+        | Mutation::UpsertBatchOnConflict { project_id, scope_id, table_name, .. }
+        | Mutation::DeleteWhere { project_id, scope_id, table_name, .. }
+        | Mutation::UpdateWhere { project_id, scope_id, table_name, .. }
+        | Mutation::UpdateWhereExpr { project_id, scope_id, table_name, .. } => {
             't'.hash(state);
             project_id.hash(state);
             scope_id.hash(state);

@@ -320,6 +320,54 @@ fn shard_for_envelope_ignores_kv_key_bytes_within_same_scope() {
 }
 
 #[test]
+fn shard_for_envelope_spreads_keyed_rows_by_leading_pk() {
+    fn upsert_env(instance: &str, entity: &str) -> TransactionEnvelope {
+        TransactionEnvelope {
+            caller: None,
+            idempotency_key: None,
+            write_class: WriteClass::Standard,
+            assertions: Vec::new(),
+            read_set: ReadSet::default(),
+            write_intent: WriteIntent {
+                mutations: vec![Mutation::Upsert {
+                    project_id: "arcana".into(),
+                    scope_id: "app".into(),
+                    table_name: "entities".into(),
+                    primary_key: vec![Value::Text(instance.into()), Value::Text(entity.into())],
+                    row: Row::from_values(vec![
+                        Value::Text(instance.into()),
+                        Value::Text(entity.into()),
+                    ]),
+                }],
+            },
+            base_seq: 0,
+        }
+    }
+    let shard_count = 8;
+
+    // Deterministic: same envelope always routes to the same shard.
+    assert_eq!(
+        super::shard_for_envelope(&upsert_env("g1", "e1"), shard_count),
+        super::shard_for_envelope(&upsert_env("g1", "e1"), shard_count),
+    );
+    // Same instance (same leading PK), different entities -> same shard (ordering affinity).
+    assert_eq!(
+        super::shard_for_envelope(&upsert_env("g1", "e1"), shard_count),
+        super::shard_for_envelope(&upsert_env("g1", "e2"), shard_count),
+    );
+    // Many instances writing the same shared table spread across shards instead of
+    // funneling to one (the pre-optimization behavior).
+    let distinct: std::collections::HashSet<usize> = (0..64)
+        .map(|i| super::shard_for_envelope(&upsert_env(&format!("g{i}"), "e1"), shard_count))
+        .collect();
+    assert!(
+        distinct.len() > 1,
+        "keyed row writes to a shared table must spread across ingress shards, got {}",
+        distinct.len()
+    );
+}
+
+#[test]
 fn single_write_partition_token_matches_general_kv_partition_derivation() {
     let mutation = Mutation::KvSet {
         project_id: "p".into(),
