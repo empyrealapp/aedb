@@ -775,3 +775,83 @@ async fn update_fields_rejects_primary_key_and_unknown_and_missing() {
     .await
     .expect_err("must reject update of a non-existent row");
 }
+
+#[tokio::test]
+async fn update_where_leading_pk_prefix_scopes_to_one_instance() {
+    // Mirrors the ECS shared-table layout: composite PK (instance_id, entity_id).
+    // A keyed UpdateWhere(instance_id = X) must update only that instance's rows —
+    // and (post-optimization) scan only its PK-prefix band, not the whole table.
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("p").await.expect("project");
+    db.create_scope("p", "app").await.expect("scope");
+    create_table(
+        &db,
+        "p",
+        "app",
+        "ent",
+        vec![
+            ColumnDef { name: "instance_id".into(), col_type: ColumnType::Text, nullable: false },
+            ColumnDef { name: "entity_id".into(), col_type: ColumnType::Text, nullable: false },
+            ColumnDef { name: "val".into(), col_type: ColumnType::Integer, nullable: false },
+        ],
+        vec!["instance_id", "entity_id"],
+    )
+    .await;
+    for (inst, ent) in [("a", "e1"), ("a", "e2"), ("b", "e1")] {
+        db.commit(Mutation::Insert {
+            project_id: "p".into(),
+            scope_id: "app".into(),
+            table_name: "ent".into(),
+            primary_key: vec![Value::Text(inst.into()), Value::Text(ent.into())],
+            row: Row::from_values(vec![
+                Value::Text(inst.into()),
+                Value::Text(ent.into()),
+                Value::Integer(1),
+            ]),
+        })
+        .await
+        .expect("insert");
+    }
+
+    db.commit(Mutation::UpdateWhere {
+        project_id: "p".into(),
+        scope_id: "app".into(),
+        table_name: "ent".into(),
+        predicate: Expr::Eq("instance_id".into(), Value::Text("a".into())),
+        updates: vec![("val".into(), Value::Integer(99))],
+        limit: None,
+    })
+    .await
+    .expect("update where");
+
+    let rows = |inst: &str, ent: &str| {
+        let db = &db;
+        let inst = inst.to_string();
+        let ent = ent.to_string();
+        async move {
+            db.query_no_auth(
+                "p",
+                "app",
+                Query::select(&["val"]).from("ent").where_(
+                    Expr::Eq("instance_id".into(), Value::Text(inst.into()))
+                        .and(Expr::Eq("entity_id".into(), Value::Text(ent.into()))),
+                ),
+                QueryOptions::default(),
+            )
+            .await
+            .expect("query")
+            .rows
+            .into_iter()
+            .next()
+            .expect("row")
+            .values[0]
+            .clone()
+        }
+    };
+
+    assert_eq!(rows("a", "e1").await, Value::Integer(99));
+    assert_eq!(rows("a", "e2").await, Value::Integer(99));
+    // Instance "b" must be untouched — proves the update didn't spill outside the band.
+    assert_eq!(rows("b", "e1").await, Value::Integer(1));
+}

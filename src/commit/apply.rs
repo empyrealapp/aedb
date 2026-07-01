@@ -2351,14 +2351,16 @@ fn apply_update_where_internal(
         update_indices.push((column_index, value.clone()));
     }
     let mut staged: Vec<Row> = Vec::new();
-    let scanned_table = keyspace.tier_scan_rows(
-        project_id,
-        scope_id,
-        table_name,
-        std::ops::Bound::Unbounded,
-        std::ops::Bound::Unbounded,
-        usize::MAX,
-    )?;
+    // Bound the scan to the leading-PK-prefix band when the predicate pins one
+    // (e.g. `instance_id = X` on a composite-PK table), mirroring DeleteWhere. The
+    // compiled predicate still filters every scanned row, so the update set is
+    // identical — only the scan is narrowed from the whole table to the band.
+    let (scan_start, scan_end) = match extract_primary_key_prefix(predicate, &schema.primary_key) {
+        Some(prefix) => pk_prefix_scan_bounds(&prefix.values),
+        None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+    };
+    let scanned_table =
+        keyspace.tier_scan_rows(project_id, scope_id, table_name, scan_start, scan_end, usize::MAX)?;
     for (scanned_rows, (_, row)) in scanned_table.into_iter().enumerate() {
         ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
         if let Some(budget) = read_bytes.as_deref_mut() {
@@ -2525,14 +2527,15 @@ fn apply_update_where_expr_internal(
         update_indices.push((column_index, resolved));
     }
     let mut staged: Vec<Row> = Vec::new();
-    let scanned_table = keyspace.tier_scan_rows(
-        project_id,
-        scope_id,
-        table_name,
-        std::ops::Bound::Unbounded,
-        std::ops::Bound::Unbounded,
-        usize::MAX,
-    )?;
+    // Bound the scan to the leading-PK-prefix band when the predicate pins one,
+    // mirroring DeleteWhere / UpdateWhere. The predicate still filters within the
+    // band, so the result set is identical — only the scan is narrowed.
+    let (scan_start, scan_end) = match extract_primary_key_prefix(predicate, &schema.primary_key) {
+        Some(prefix) => pk_prefix_scan_bounds(&prefix.values),
+        None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+    };
+    let scanned_table =
+        keyspace.tier_scan_rows(project_id, scope_id, table_name, scan_start, scan_end, usize::MAX)?;
     for (scanned_rows, (_, row)) in scanned_table.into_iter().enumerate() {
         ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
         if let Some(budget) = read_bytes.as_deref_mut() {

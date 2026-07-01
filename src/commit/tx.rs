@@ -45,6 +45,16 @@ pub enum ReadRange {
         start: ReadBound<Vec<crate::catalog::types::Value>>,
         end: ReadBound<Vec<crate::catalog::types::Value>>,
     },
+    /// A read scoped to every row whose primary key begins with `prefix` (a leading
+    /// prefix of the PK). Recorded by bounded primary-key-prefix scans so a reactive
+    /// subscription over one key band (e.g. one instance's rows in a shared table) is
+    /// only invalidated by writes within that band — not by every write to the table.
+    TablePrefix {
+        project_id: String,
+        scope_id: String,
+        table_name: String,
+        prefix: Vec<crate::catalog::types::Value>,
+    },
     KvRange {
         project_id: String,
         scope_id: String,
@@ -287,6 +297,36 @@ fn read_range_intersects_write_key(read: &ReadRange, write: &WriteKey) -> bool {
             },
         ) => rp == wp && rs == ws && rt == wt && ranges_overlap_pk(rstart, rend, wstart, wend),
         (
+            ReadRange::TablePrefix {
+                project_id: rp,
+                scope_id: rs,
+                table_name: rt,
+                prefix,
+            },
+            WriteKey::TableRow {
+                project_id: wp,
+                scope_id: ws,
+                table_name: wt,
+                primary_key,
+            },
+        ) => rp == wp && rs == ws && rt == wt && pk_has_prefix(primary_key, prefix),
+        (
+            // A predicate write (whole-table WriteKey::TableRange) could touch any row,
+            // so conservatively invalidate a prefix read on the same table.
+            ReadRange::TablePrefix {
+                project_id: rp,
+                scope_id: rs,
+                table_name: rt,
+                ..
+            },
+            WriteKey::TableRange {
+                project_id: wp,
+                scope_id: ws,
+                table_name: wt,
+                ..
+            },
+        ) => rp == wp && rs == ws && rt == wt,
+        (
             ReadRange::KvRange {
                 project_id: rp,
                 scope_id: rs,
@@ -319,6 +359,11 @@ fn read_range_intersects_write_key(read: &ReadRange, write: &WriteKey) -> bool {
                 scope_id: rs,
                 ..
             }
+            | ReadRange::TablePrefix {
+                project_id: rp,
+                scope_id: rs,
+                ..
+            }
             | ReadRange::KvRange {
                 project_id: rp,
                 scope_id: rs,
@@ -331,6 +376,12 @@ fn read_range_intersects_write_key(read: &ReadRange, write: &WriteKey) -> bool {
         ) => rp == wp && rs == ws,
         _ => false,
     }
+}
+
+/// True if the full primary key `point` begins with `prefix` (a leading PK prefix).
+fn pk_has_prefix(point: &[Value], prefix: &[Value]) -> bool {
+    point.len() >= prefix.len()
+        && cmp_pk(prefix, &point[..prefix.len()]) == std::cmp::Ordering::Equal
 }
 
 fn pk_in_range(
@@ -620,4 +671,74 @@ pub struct PreflightPlan {
     pub base_seq: u64,
     pub estimated_affected_rows: usize,
     pub errors: Vec<String>,
+}
+
+#[cfg(test)]
+mod table_prefix_tests {
+    use super::*;
+    use crate::catalog::types::Value;
+
+    fn prefix_read(prefix: Vec<Value>) -> ReadSet {
+        ReadSet {
+            points: vec![],
+            ranges: vec![ReadRangeEntry {
+                range: ReadRange::TablePrefix {
+                    project_id: "arcana".into(),
+                    scope_id: "app".into(),
+                    table_name: "entities".into(),
+                    prefix,
+                },
+                max_version_at_read: 0,
+                structural_version_at_read: 0,
+            }],
+        }
+    }
+
+    fn row_write(table: &str, pk: Vec<Value>) -> WriteKey {
+        WriteKey::TableRow {
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+            table_name: table.into(),
+            primary_key: pk,
+        }
+    }
+
+    #[test]
+    fn table_prefix_read_invalidated_only_within_band() {
+        // A reactive read over one instance's rows in the shared entities table.
+        let read = prefix_read(vec![Value::Text("a".into())]);
+
+        // A write to a row in instance "a"'s band wakes it (this also covers a future
+        // insert — the range matches any PK beginning with the prefix, not just rows
+        // that existed at read time).
+        assert!(read.intersects(&[row_write("entities", vec![
+            Value::Text("a".into()),
+            Value::Text("e1".into()),
+        ])]));
+
+        // A write to a *different* instance's band must NOT wake it — this is the whole
+        // point: 5000 games writing the shared table don't cross-invalidate.
+        assert!(!read.intersects(&[row_write("entities", vec![
+            Value::Text("b".into()),
+            Value::Text("e1".into()),
+        ])]));
+
+        // A whole-table predicate write (WriteKey::TableRange) conservatively wakes it.
+        assert!(read.intersects(&[WriteKey::TableRange {
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+            table_name: "entities".into(),
+            start: ReadBound::Unbounded,
+            end: ReadBound::Unbounded,
+        }]));
+
+        // A ScopeAll write (e.g. DDL) wakes it.
+        assert!(read.intersects(&[WriteKey::ScopeAll {
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+        }]));
+
+        // A write to a different table does not.
+        assert!(!read.intersects(&[row_write("other", vec![Value::Text("a".into())])]));
+    }
 }
