@@ -5,6 +5,7 @@ use crate::query::error::QueryError;
 use crate::query::plan::Query;
 use crate::query::plan::QueryOptions;
 use crate::query::planner::build_physical_plan;
+use crate::storage::encoded_key::{EncodedKey, prefix_successor};
 use crate::storage::keyspace::KeyspaceSnapshot;
 
 mod access_path;
@@ -27,6 +28,7 @@ mod read_set;
 mod validate;
 
 pub(crate) use access_path::{AccessPathDiagnostics, explain_access_path_for_query};
+pub(crate) use predicate::extract_primary_key_prefix;
 use cursor::{CursorToken, encode_cursor, extract_pk_key, extract_sort_key, row_after_cursor};
 use execution_setup::prepare_execution_setup;
 use indexing::indexed_pks_for_predicate_limited;
@@ -56,6 +58,21 @@ pub struct QueryResult {
     /// paginated request rather than re-running the same query without a
     /// cursor — useful for soft-fanout and rate-limiting decisions.
     pub split_recommended: bool,
+}
+
+/// Compute the `[start, end)` key bounds for a primary-key prefix range scan.
+/// The band covers every row whose encoded primary key begins with the encoded
+/// `prefix` values. When the encoded prefix has no lexicographic successor (all
+/// trailing `0xFF` bytes), the upper bound is left unbounded.
+pub(crate) fn pk_prefix_scan_bounds(
+    prefix: &[crate::catalog::types::Value],
+) -> (std::ops::Bound<EncodedKey>, std::ops::Bound<EncodedKey>) {
+    let start_key = EncodedKey::from_values(prefix);
+    let end = match prefix_successor(&start_key) {
+        Some(successor) => std::ops::Bound::Excluded(successor),
+        None => std::ops::Bound::Unbounded,
+    };
+    (std::ops::Bound::Included(start_key), end)
 }
 
 pub fn execute_query(
@@ -379,6 +396,16 @@ fn execute_query_with_options_capturing_signed(
                 Box::new(materialized.into_iter())
             }
             None => {
+                // No secondary index matched. If the predicate pins a leading
+                // prefix of the primary key, scan only that contiguous PK-ordered
+                // key band instead of the whole table. Rows are returned in
+                // primary-key order — identical to a full scan — so downstream
+                // ordering/pagination is unchanged; this only narrows the source.
+                let pk_prefix = predicate::extract_primary_key_prefix(predicate, &schema.primary_key);
+                // Read-set stays coarse (whole-table range) even for a bounded
+                // scan: rows inserted into the band after read must still
+                // invalidate reactive subscribers, and the collector has no
+                // bounded-range primitive that captures future inserts.
                 if let Some(collector) = read_set {
                     collector.record_full_table_scan(
                         snapshot,
@@ -387,12 +414,21 @@ fn execute_query_with_options_capturing_signed(
                         &query.table,
                     );
                 }
+                let (start, end) = match &pk_prefix {
+                    Some(prefix) => {
+                        // An exact prefix match needs no residual filter: every
+                        // row in the band satisfies the predicate.
+                        has_residual_filter = !prefix.exact;
+                        pk_prefix_scan_bounds(&prefix.values)
+                    }
+                    None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                };
                 let scanned = snapshot.tier_scan_rows(
                     &exec_project_id,
                     &exec_scope_id,
                     &query.table,
-                    std::ops::Bound::Unbounded,
-                    std::ops::Bound::Unbounded,
+                    start,
+                    end,
                     usize::MAX,
                 )?;
                 estimated_rows = scanned.len();

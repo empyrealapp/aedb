@@ -32,6 +32,12 @@ pub struct VersionStore {
 pub struct CommitDelta {
     pub seq: u64,
     pub mutations: Vec<Mutation>,
+    /// Resolved per-row changes this commit made (which rows in which tables
+    /// were inserted/updated/deleted, with new values where known). Populated on
+    /// the live commit-broadcast path only when `row_change_deltas_enabled` is
+    /// set; otherwise empty. Not used for snapshot reconstruction (that relies
+    /// on `mutations`), so replay/recovery deltas leave it empty.
+    pub row_changes: Vec<crate::commit::row_change::RowChange>,
 }
 
 #[derive(Debug)]

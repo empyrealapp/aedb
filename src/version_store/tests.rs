@@ -19,6 +19,7 @@ fn publish_delta_reuses_shared_arc_instance() {
             key: b"k".to_vec(),
             value: b"v".to_vec(),
         }],
+        row_changes: Vec::new(),
     });
 
     assert!(!store.publish_delta(7, Arc::clone(&delta)));
@@ -40,10 +41,12 @@ fn publish_delta_requests_full_snapshot_after_interval() {
     let first = Arc::new(CommitDelta {
         seq: 1,
         mutations: Vec::new(),
+        row_changes: Vec::new(),
     });
     let second = Arc::new(CommitDelta {
         seq: 2,
         mutations: Vec::new(),
+        row_changes: Vec::new(),
     });
 
     assert!(!store.publish_delta(1, first));
@@ -58,6 +61,7 @@ fn publish_delta_requests_full_snapshot_after_interval() {
     let third = Arc::new(CommitDelta {
         seq: 3,
         mutations: Vec::new(),
+        row_changes: Vec::new(),
     });
     assert!(!store.publish_delta(3, third));
 }
@@ -73,16 +77,19 @@ fn publish_deltas_batches_prune_and_snapshot_interval_accounting() {
     let first = Arc::new(CommitDelta {
         seq: 1,
         mutations: Vec::new(),
+        row_changes: Vec::new(),
     });
     let second = Arc::new(CommitDelta {
         seq: 2,
         mutations: Vec::new(),
+        row_changes: Vec::new(),
     });
     assert!(!store.publish_deltas([(1, first), (2, second)]));
 
     let third = Arc::new(CommitDelta {
         seq: 3,
         mutations: Vec::new(),
+        row_changes: Vec::new(),
     });
     assert!(store.publish_deltas([(3, third)]));
     assert_eq!(store.deltas_since(0, 3).expect("delta range").len(), 3);

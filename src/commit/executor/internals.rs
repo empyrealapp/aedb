@@ -1847,6 +1847,21 @@ pub(super) fn prepare_commit_epoch(
             None
         };
         let can_defer_parallel_apply = deferred_merge_targets.is_some();
+        // Derive row-level changes against the pre-commit keyspace (before any
+        // apply branch mutates it) so the resolved set is independent of the
+        // apply path taken. Only when the feed is enabled and the commit has
+        // table mutations; the result rides the broadcast delta below.
+        let row_changes = if state.config.row_change_deltas_enabled && !is_keyspace_only {
+            crate::commit::row_change::derive_row_changes(
+                &working_keyspace,
+                &working_catalog,
+                &mutations,
+                request.envelope.caller.as_ref(),
+                state.config.max_scan_rows,
+            )
+        } else {
+            Vec::new()
+        };
         if is_cross_partition || requires_coordinator {
             coordinator_apply_attempts = coordinator_apply_attempts.saturating_add(1);
             let partition_order = canonical_partition_order(final_write_partitions.as_ref());
@@ -2048,6 +2063,7 @@ pub(super) fn prepare_commit_epoch(
         let delta = Arc::new(CommitDelta {
             seq: commit_seq,
             mutations,
+            row_changes,
         });
         let deferred_commit_index = sequenced.len();
         if can_defer_parallel_apply {
@@ -2959,6 +2975,7 @@ fn process_inline_kv_set_epoch_fast_path(
         let delta = Arc::new(CommitDelta {
             seq: commit_seq,
             mutations,
+            row_changes: Vec::new(),
         });
         sequenced.push(SequencedCommit {
             request,
@@ -3476,6 +3493,7 @@ fn build_assertion_audit_commit(
         delta: Arc::new(CommitDelta {
             seq: commit_seq,
             mutations,
+            row_changes: Vec::new(),
         }),
     })
 }

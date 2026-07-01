@@ -667,6 +667,244 @@ async fn read_tx_keeps_snapshot_consistency_across_queries() {
     assert_eq!(still_before.rows[0].values[0], Value::Integer(10));
 }
 
+/// Build an ECS-shaped `entities(instance_id, entity_id, component_name, data)`
+/// table with composite PK, seeded across several instances/entities. Returns
+/// the open db in a temp dir kept alive by the returned guard.
+async fn seed_entities() -> (AedbInstance, tempfile::TempDir) {
+    let dir = tempdir().expect("temp");
+    let db = AedbInstance::open_anonymous(AedbConfig::default(), dir.path()).expect("open");
+    db.create_project("arcana").await.expect("project");
+    db.create_scope("arcana", "app").await.expect("scope");
+    create_table(
+        &db,
+        "arcana",
+        "app",
+        "entities",
+        vec![
+            ColumnDef {
+                name: "instance_id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "entity_id".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "component_name".into(),
+                col_type: ColumnType::Text,
+                nullable: false,
+            },
+            ColumnDef {
+                name: "data".into(),
+                col_type: ColumnType::Json,
+                nullable: false,
+            },
+        ],
+        vec!["instance_id", "entity_id", "component_name"],
+    )
+    .await;
+    // Two instances; instance "a" has two entities with two components each,
+    // instance "b" has one entity — enough to prove the prefix band isolates a
+    // single instance and, within it, a single entity.
+    let rows = [
+        ("a", "e1", "Pos", r#"{"x":1}"#),
+        ("a", "e1", "Vel", r#"{"dx":2}"#),
+        ("a", "e2", "Pos", r#"{"x":3}"#),
+        ("a", "e2", "Vel", r#"{"dx":4}"#),
+        ("b", "e1", "Pos", r#"{"x":9}"#),
+    ];
+    for (inst, eid, comp, data) in rows {
+        db.commit(Mutation::Upsert {
+            project_id: "arcana".into(),
+            scope_id: "app".into(),
+            table_name: "entities".into(),
+            primary_key: vec![
+                Value::Text(inst.into()),
+                Value::Text(eid.into()),
+                Value::Text(comp.into()),
+            ],
+            row: Row::from_values(vec![
+                Value::Text(inst.into()),
+                Value::Text(eid.into()),
+                Value::Text(comp.into()),
+                Value::Json(data.into()),
+            ]),
+        })
+        .await
+        .expect("seed row");
+    }
+    (db, dir)
+}
+
+/// #1: a synchronous `ReadTx` handle serves lazy, partial reads via a leading
+/// primary-key prefix, returning rows in deterministic PK order and matching the
+/// async path — without eagerly loading the whole table.
+#[tokio::test]
+async fn read_tx_sync_prefix_query_loads_single_instance() {
+    let (db, _dir) = seed_entities().await;
+    let tx = db
+        .begin_read_tx(ConsistencyMode::AtLatest)
+        .await
+        .expect("read tx");
+
+    // Leading-prefix predicate on `instance_id` → only instance "a" (4 rows).
+    let q = || {
+        Query::select(&["entity_id", "component_name"])
+            .from("entities")
+            .where_(Expr::Eq("instance_id".into(), Value::Text("a".into())))
+    };
+    let sync_res = tx.query_sync("arcana", "app", q()).expect("sync query");
+    assert_eq!(sync_res.rows.len(), 4, "only instance a's rows");
+    // Deterministic PK order: entity_id ascending, then component_name.
+    let ids: Vec<(String, String)> = sync_res
+        .rows
+        .iter()
+        .map(|r| {
+            let Value::Text(e) = &r.values[0] else {
+                panic!("entity_id text")
+            };
+            let Value::Text(c) = &r.values[1] else {
+                panic!("component text")
+            };
+            (e.to_string(), c.to_string())
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            ("e1".into(), "Pos".into()),
+            ("e1".into(), "Vel".into()),
+            ("e2".into(), "Pos".into()),
+            ("e2".into(), "Vel".into()),
+        ]
+    );
+
+    // The sync path matches the async path exactly.
+    let async_res = tx.query("arcana", "app", q()).await.expect("async query");
+    assert_eq!(sync_res.rows, async_res.rows);
+
+    // Two-column prefix isolates a single entity's components.
+    let one_entity = tx
+        .query_sync(
+            "arcana",
+            "app",
+            Query::select(&["component_name"]).from("entities").where_(
+                Expr::Eq("instance_id".into(), Value::Text("a".into()))
+                    .and(Expr::Eq("entity_id".into(), Value::Text("e1".into()))),
+            ),
+        )
+        .expect("entity query");
+    assert_eq!(one_entity.rows.len(), 2);
+
+    // exists_sync short-circuits.
+    assert!(
+        tx.exists_sync(
+            "arcana",
+            "app",
+            Query::select(&["component_name"]).from("entities").where_(
+                Expr::Eq("instance_id".into(), Value::Text("b".into()))
+                    .and(Expr::Eq("entity_id".into(), Value::Text("e1".into()))),
+            ),
+        )
+        .expect("exists")
+    );
+}
+
+/// #1: EXPLAIN reports the bounded key-range access path for a leading-prefix
+/// predicate (exact prefix ⇒ no residual filter), instead of a full scan.
+#[tokio::test]
+async fn explain_reports_primary_key_prefix_scan() {
+    let (db, _dir) = seed_entities().await;
+    let tx = db
+        .begin_read_tx(ConsistencyMode::AtLatest)
+        .await
+        .expect("read tx");
+    let diag = tx
+        .explain(
+            "arcana",
+            "app",
+            Query::select(&["*"])
+                .from("entities")
+                .where_(Expr::Eq("instance_id".into(), Value::Text("a".into()))),
+            QueryOptions::default(),
+        )
+        .expect("explain");
+    assert_eq!(
+        diag.predicate_evaluation_path,
+        PredicateEvaluationPath::PrimaryKeyPrefixScan
+    );
+    // Exact prefix: no residual Filter stage.
+    assert!(!diag.stages.contains(&ExecutionStage::Filter));
+
+    // A gap predicate (`instance_id = a AND component_name = Pos`) still uses the
+    // prefix band on `instance_id`, but keeps a residual filter for the gap.
+    let diag_gap = tx
+        .explain(
+            "arcana",
+            "app",
+            Query::select(&["*"]).from("entities").where_(
+                Expr::Eq("instance_id".into(), Value::Text("a".into()))
+                    .and(Expr::Eq("component_name".into(), Value::Text("Pos".into()))),
+            ),
+            QueryOptions::default(),
+        )
+        .expect("explain gap");
+    assert_eq!(
+        diag_gap.predicate_evaluation_path,
+        PredicateEvaluationPath::PrimaryKeyPrefixScan
+    );
+    assert!(diag_gap.stages.contains(&ExecutionStage::Filter));
+}
+
+/// #1 corollary: a `DeleteWhere` pinning a `(instance_id, entity_id)` PK prefix
+/// (Arcana's entity despawn) removes exactly that entity's component rows.
+#[tokio::test]
+async fn delete_where_primary_key_prefix_despawns_one_entity() {
+    let (db, _dir) = seed_entities().await;
+    db.commit(Mutation::DeleteWhere {
+        project_id: "arcana".into(),
+        scope_id: "app".into(),
+        table_name: "entities".into(),
+        predicate: Expr::Eq("instance_id".into(), Value::Text("a".into()))
+            .and(Expr::Eq("entity_id".into(), Value::Text("e1".into()))),
+        limit: None,
+    })
+    .await
+    .expect("despawn");
+
+    let tx = db
+        .begin_read_tx(ConsistencyMode::AtLatest)
+        .await
+        .expect("read tx");
+    // a/e1 gone (2 rows), a/e2 intact (2 rows), b untouched (1 row).
+    let remaining_a = tx
+        .query_sync(
+            "arcana",
+            "app",
+            Query::select(&["entity_id"])
+                .from("entities")
+                .where_(Expr::Eq("instance_id".into(), Value::Text("a".into()))),
+        )
+        .expect("remaining a");
+    assert_eq!(remaining_a.rows.len(), 2);
+    assert!(
+        remaining_a
+            .rows
+            .iter()
+            .all(|r| r.values[0] == Value::Text("e2".into()))
+    );
+    let all = tx
+        .query_sync(
+            "arcana",
+            "app",
+            Query::select(&["*"]).from("entities").limit(100),
+        )
+        .expect("all");
+    assert_eq!(all.rows.len(), 3, "5 seeded − 2 despawned");
+}
+
 #[tokio::test]
 async fn list_batch_and_lookup_helpers_work() {
     let dir = tempdir().expect("temp");

@@ -18,6 +18,7 @@ use crate::order_book::{
     apply_set_instrument_halted, u256_from_be,
 };
 use crate::permission::{CallerContext, Permission};
+use crate::query::executor::{extract_primary_key_prefix, pk_prefix_scan_bounds};
 use crate::query::operators::{compile_expr, eval_compiled_expr_public};
 use crate::query::plan::Expr;
 use crate::storage::encoded_key::EncodedKey;
@@ -1712,7 +1713,10 @@ fn apply_upsert_once_with_schema_and_old_row(
     Ok(())
 }
 
-fn extract_primary_key_from_row(schema: &TableSchema, row: &Row) -> Result<Vec<Value>, AedbError> {
+pub(crate) fn extract_primary_key_from_row(
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<Vec<Value>, AedbError> {
     let indices = primary_key_column_indices(schema)?;
     extract_primary_key_from_row_with_indices(row, schema, &indices)
 }
@@ -2241,16 +2245,20 @@ fn apply_delete_where_internal(
         catalog, &schema, project_id, scope_id, table_name, predicate, caller,
     )?;
     let mut to_delete: Vec<EncodedKey> = Vec::new();
+    // If the predicate pins a leading prefix of the primary key (e.g. deleting
+    // every component row of one entity from a composite-PK table), scan only
+    // that contiguous PK-ordered key band instead of the whole table. Every
+    // scanned row is still checked against the compiled predicate, so a
+    // non-exact prefix just filters within the smaller band — the delete set is
+    // identical, only the scan is bounded.
+    let (scan_start, scan_end) = match extract_primary_key_prefix(predicate, &schema.primary_key) {
+        Some(prefix) => pk_prefix_scan_bounds(&prefix.values),
+        None => (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+    };
     // Tier-aware: includes rows in the cold segment tier. `tier_scan_rows`
     // takes the hot-only fast path when no segments are present.
-    let scanned_table = keyspace.tier_scan_rows(
-        project_id,
-        scope_id,
-        table_name,
-        std::ops::Bound::Unbounded,
-        std::ops::Bound::Unbounded,
-        usize::MAX,
-    )?;
+    let scanned_table =
+        keyspace.tier_scan_rows(project_id, scope_id, table_name, scan_start, scan_end, usize::MAX)?;
     for (scanned_rows, (encoded_pk, row)) in scanned_table.iter().enumerate() {
         ensure_mutation_scan_budget(scanned_rows + 1, scan_budget)?;
         if let Some(budget) = read_bytes.as_deref_mut() {
@@ -2482,7 +2490,7 @@ fn ensure_mutation_scan_budget(
     Ok(())
 }
 
-fn compile_table_predicate(
+pub(crate) fn compile_table_predicate(
     catalog: &Catalog,
     schema: &TableSchema,
     project_id: &str,

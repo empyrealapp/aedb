@@ -2,6 +2,7 @@ pub mod action;
 pub mod apply;
 pub mod assertions;
 pub mod executor;
+pub mod row_change;
 pub mod tx;
 pub mod validation;
 
