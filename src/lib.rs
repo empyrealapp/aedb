@@ -1003,6 +1003,11 @@ pub struct QueryDiagnostics {
 pub enum PredicateEvaluationPath {
     None,
     PrimaryKeyEqLookup,
+    /// A predicate pinning a leading prefix of the primary key was served by a
+    /// bounded range scan over the contiguous, PK-ordered key band (rather than
+    /// a full table scan). A residual filter may still apply for any constraint
+    /// beyond the pinned prefix.
+    PrimaryKeyPrefixScan,
     SecondaryIndexLookup,
     AsyncIndexProjection,
     FullScanFilter,
@@ -3464,6 +3469,75 @@ impl ReadTx<'_> {
             &result,
         );
         result
+    }
+
+    /// Synchronous twin of [`Self::query`]. Runs entirely on the calling thread
+    /// against this handle's pinned MVCC snapshot — no async runtime or `.await`
+    /// required.
+    ///
+    /// A `ReadTx` is acquired once (via [`AedbInstance::begin_read_tx`]) and then
+    /// serves repeatable, point-in-time reads. This lets a *synchronous* caller —
+    /// e.g. a tree-walking interpreter that cannot `.await` mid-evaluation — issue
+    /// lazy, partial reads (fetching only what each query needs) instead of
+    /// eagerly loading an entire table up front. Deterministic primary-key
+    /// ordering is preserved, identical to [`Self::query`].
+    pub fn query_sync(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+    ) -> Result<QueryResult, QueryError> {
+        self.query_with_options_sync(project_id, scope_id, query, QueryOptions::default())
+    }
+
+    /// Synchronous twin of [`Self::query_with_options`]. See [`Self::query_sync`].
+    pub fn query_with_options_sync(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+        mut options: QueryOptions,
+    ) -> Result<QueryResult, QueryError> {
+        self.db.normalize_query_cursor_options(&mut options)?;
+        options.consistency = ConsistencyMode::AtSeq(self.lease.view.seq);
+        let started = Instant::now();
+        let table = query.table.clone();
+        let result = execute_query_against_view(
+            QueryExecutionContext {
+                view: &self.lease.view,
+                project_id,
+                scope_id,
+                options: &options,
+                caller: self.caller.as_ref(),
+                max_scan_rows: self.db._config.max_scan_rows,
+                cursor_signing_key: self.db._config.cursor_signing_key(),
+            },
+            query,
+        );
+        let mut result = result?;
+        self.db.sign_query_result_cursor(&mut result)?;
+        let result = Ok(result);
+        self.db.emit_query_telemetry(
+            started,
+            project_id,
+            scope_id,
+            &table,
+            self.lease.view.seq,
+            &result,
+        );
+        result
+    }
+
+    /// Synchronous twin of [`Self::exists`]. See [`Self::query_sync`].
+    pub fn exists_sync(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        mut query: Query,
+    ) -> Result<bool, QueryError> {
+        query.limit = Some(1);
+        let result = self.query_sync(project_id, scope_id, query)?;
+        Ok(!result.rows.is_empty())
     }
 
     pub async fn query_batch(

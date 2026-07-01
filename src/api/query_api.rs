@@ -112,6 +112,37 @@ impl AedbInstance {
             .await
     }
 
+    /// Convenience anonymous query with default [`QueryOptions`].
+    ///
+    /// Ergonomic entry point for embedding consumers that run un-authenticated
+    /// reads (e.g. an app storage layer built on top of AEDB). Delegates to
+    /// [`Self::query_no_auth`], so it is likewise unavailable in secure mode.
+    /// Prefer [`Self::query_with_options_as`] when a caller identity is
+    /// required, or [`Self::begin_read_tx`] for a repeatable point-in-time
+    /// snapshot serving many reads.
+    pub async fn query(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+    ) -> Result<QueryResult, QueryError> {
+        self.query_no_auth(project_id, scope_id, query, QueryOptions::default())
+            .await
+    }
+
+    /// Convenience anonymous query with explicit [`QueryOptions`]. See
+    /// [`Self::query`].
+    pub async fn query_with_options(
+        &self,
+        project_id: &str,
+        scope_id: &str,
+        query: Query,
+        options: QueryOptions,
+    ) -> Result<QueryResult, QueryError> {
+        self.query_no_auth(project_id, scope_id, query, options)
+            .await
+    }
+
     pub async fn query_with_options_as(
         &self,
         caller: Option<&CallerContext>,

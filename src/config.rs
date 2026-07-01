@@ -87,6 +87,12 @@ pub struct AedbConfig {
     pub parallel_worker_threads: usize,
     pub coordinator_locking_enabled: bool,
     pub global_unique_index_enabled: bool,
+    /// When enabled, each broadcast `CommitDelta` carries resolved row-level
+    /// changes (`CommitDelta::row_changes`) derived from the pre-commit state,
+    /// so subscription layers can compute per-row diffs without re-querying.
+    /// Off by default: derivation adds a bounded pre-commit read per committed
+    /// table transaction, paid only when a consumer needs the feed.
+    pub row_change_deltas_enabled: bool,
     pub partition_lock_timeout_ms: u64,
     pub epoch_apply_timeout_ms: u64,
     pub max_versions: usize,
@@ -201,6 +207,7 @@ impl Default for AedbConfig {
                 .unwrap_or(4),
             coordinator_locking_enabled: true,
             global_unique_index_enabled: true,
+            row_change_deltas_enabled: false,
             partition_lock_timeout_ms: 5_000,
             epoch_apply_timeout_ms: 10_000,
             max_versions: 1024,

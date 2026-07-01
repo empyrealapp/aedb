@@ -4,7 +4,7 @@ use super::ordered_scan::{
     OrderedPredicateIndexSelectionRequest, ordered_index_selection_for_query,
     ordered_predicate_index_selection_name_for_query,
 };
-use super::predicate::extract_primary_key_values;
+use super::predicate::{extract_primary_key_prefix, extract_primary_key_values};
 use crate::catalog::Catalog;
 use crate::catalog::namespace_key;
 use crate::query::error::QueryError;
@@ -160,6 +160,12 @@ pub(crate) fn explain_access_path_for_query(
             ));
         }
 
+        // A predicate pinning a leading prefix of the primary key can be served
+        // by a bounded key-range scan. Secondary indexes are still preferred (a
+        // selective index beats a prefix band), so this is only reported when no
+        // index applies — mirroring the executor's row-source selection.
+        let pk_prefix = extract_primary_key_prefix(predicate, &schema.primary_key);
+
         if let Some(table) = table
             && let Some(indexed) = indexed_pks_for_predicate_with_trace(
                 catalog,
@@ -171,37 +177,62 @@ pub(crate) fn explain_access_path_for_query(
                 predicate,
             )?
         {
+            trace.extend(indexed.plan_trace);
             if !indexed.selected_indexes.is_empty() {
                 selected_indexes.extend(indexed.selected_indexes.clone());
-                predicate_evaluation_path = crate::PredicateEvaluationPath::SecondaryIndexLookup;
-            } else {
-                predicate_evaluation_path = crate::PredicateEvaluationPath::FullScanFilter;
+                if indexed.predicate_exact {
+                    trace.push(
+                        "index lookup fully satisfies predicate; no residual filter needed"
+                            .to_string(),
+                    );
+                } else {
+                    trace.push(
+                        "residual predicate is evaluated on rows returned by index lookup"
+                            .to_string(),
+                    );
+                }
+                let diagnostics = AccessPathDiagnostics::new(
+                    selected_indexes,
+                    crate::PredicateEvaluationPath::SecondaryIndexLookup,
+                    trace,
+                );
+                return Ok(if indexed.predicate_exact {
+                    diagnostics
+                } else {
+                    diagnostics.with_residual_filter_required()
+                });
             }
-            trace.extend(indexed.plan_trace);
-            if matches!(
-                predicate_evaluation_path,
-                crate::PredicateEvaluationPath::FullScanFilter
-            ) {
+            if let Some(prefix) = &pk_prefix {
                 trace.push(
-                    "no matching secondary index; evaluating predicate during table scan"
+                    "no matching secondary index; primary-key prefix bounded key-range scan"
                         .to_string(),
                 );
-            } else if indexed.predicate_exact {
-                trace.push(
-                    "index lookup fully satisfies predicate; no residual filter needed".to_string(),
-                );
-            } else {
-                trace.push(
-                    "residual predicate is evaluated on rows returned by index lookup".to_string(),
-                );
+                return Ok(AccessPathDiagnostics::new(
+                    selected_indexes,
+                    crate::PredicateEvaluationPath::PrimaryKeyPrefixScan,
+                    trace,
+                )
+                .with_residual_filter_if(!prefix.exact));
             }
-            let diagnostics =
-                AccessPathDiagnostics::new(selected_indexes, predicate_evaluation_path, trace);
-            return Ok(if indexed.predicate_exact {
-                diagnostics
-            } else {
-                diagnostics.with_residual_filter_required()
-            });
+            trace.push(
+                "no matching secondary index; evaluating predicate during table scan".to_string(),
+            );
+            return Ok(AccessPathDiagnostics::new(
+                selected_indexes,
+                crate::PredicateEvaluationPath::FullScanFilter,
+                trace,
+            )
+            .with_residual_filter_required());
+        }
+
+        if let Some(prefix) = &pk_prefix {
+            trace.push("primary-key prefix predicate; bounded key-range scan".to_string());
+            return Ok(AccessPathDiagnostics::new(
+                selected_indexes,
+                crate::PredicateEvaluationPath::PrimaryKeyPrefixScan,
+                trace,
+            )
+            .with_residual_filter_if(!prefix.exact));
         }
 
         trace.push("predicate not indexable for current schema/index set".to_string());
