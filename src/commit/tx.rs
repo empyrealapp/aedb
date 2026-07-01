@@ -522,6 +522,31 @@ pub enum WriteClass {
     Economic,
     #[default]
     Standard,
+    /// Applied to the in-memory keyspace (so it is immediately visible to readers)
+    /// but **never written to the WAL**, and it does not advance the durable-seq
+    /// watermark.
+    ///
+    /// Persistence: a checkpoint is anchored to the durable horizon, so volatile
+    /// writes are captured by a checkpoint only once a *durable* commit advances
+    /// the durable seq past them. Volatile writes made after the most recent
+    /// durable commit are held purely in memory and are lost on any crash/restart.
+    /// In effect a program "anchors" accumulated volatile state by emitting a
+    /// durable commit (e.g. a lifecycle/heartbeat write) before the next checkpoint.
+    ///
+    /// Intended for high-frequency, regenerable state (e.g. an ECS simulation's
+    /// per-tick entity writes) where paying WAL fsync + replay cost per tick is
+    /// wasteful and losing the tail window since the last durable anchor is
+    /// acceptable. Requesting [`CommitFinality::Durable`] on a volatile commit is a
+    /// no-op — there is no WAL durability to wait for.
+    Volatile,
+}
+
+impl WriteClass {
+    /// Whether commits of this class skip the WAL and persist only via checkpoints.
+    #[inline]
+    pub fn is_volatile(self) -> bool {
+        matches!(self, WriteClass::Volatile)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

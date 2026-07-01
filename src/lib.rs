@@ -1803,8 +1803,15 @@ impl AedbInstance {
         envelope: TransactionEnvelope,
         finality: CommitFinality,
     ) -> Result<CommitResult, AedbError> {
+        // A volatile commit is never written to the WAL, so the durable-seq
+        // watermark will never reach its commit_seq. Waiting for durable finality
+        // would block forever; volatile durability is defined by checkpoints, not
+        // the log, so treat any requested finality as already satisfied.
+        let volatile = envelope.write_class.is_volatile();
         let mut result = self.commit_envelope(envelope).await?;
-        self.enforce_finality(&mut result, finality).await?;
+        if !volatile {
+            self.enforce_finality(&mut result, finality).await?;
+        }
         Ok(result)
     }
 

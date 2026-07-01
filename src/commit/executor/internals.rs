@@ -2182,15 +2182,30 @@ pub(super) fn prepare_commit_epoch(
             (None, Some(_)) => false,
             (None, None) => false,
         };
-        let (seq, ts, payload_type, payload) = if next_is_user {
+        let (seq, ts, payload_type, payload, volatile) = if next_is_user {
             let c = &sequenced[user_idx];
             user_idx += 1;
-            (c.seq, c.commit_ts_micros, c.payload_type, &c.payload)
+            (
+                c.seq,
+                c.commit_ts_micros,
+                c.payload_type,
+                &c.payload,
+                c.request.envelope.write_class.is_volatile(),
+            )
         } else {
+            // Internal (system-emitted) commits are always durable.
             let c = &internal_sequenced[internal_idx];
             internal_idx += 1;
-            (c.seq, c.commit_ts_micros, c.payload_type, &c.payload)
+            (c.seq, c.commit_ts_micros, c.payload_type, &c.payload, false)
         };
+        if volatile {
+            // Volatile commits are already applied to the working keyspace (so they
+            // are visible and will be captured by the next checkpoint) but are never
+            // persisted to the WAL. Skip the frame and its batch-size accounting; the
+            // durable-seq watermark in `finalize_committed_epoch` likewise advances
+            // only to the last non-volatile commit.
+            continue;
+        }
         let payload_size_bytes = payload.len();
         wal_payload_size_bytes = wal_payload_size_bytes.saturating_add(payload_size_bytes);
         wal_frames.push(PendingFrame {
@@ -2790,39 +2805,58 @@ fn finalize_committed_epoch(
     }
     state.current_seq = last_seq;
     state.visible_head_seq = last_seq;
-    match state.config.durability_mode {
-        DurabilityMode::Full => {
-            state.durable_head_seq = last_seq;
-            state.pending_batch_bytes = 0;
-            state.pending_batch_max_seq = state.durable_head_seq;
-        }
-        DurabilityMode::Batch => {
-            if requires_sync {
-                state.durable_head_seq = last_seq;
+    // The durable-seq watermark must never include volatile commits: they are
+    // applied in-memory (already reflected in `visible_head_seq` above) but were
+    // skipped when building the WAL frames, so they are not recoverable from the
+    // log. Advance durability bookkeeping only to the last non-volatile commit;
+    // internal (system) commits are always durable. If this epoch was entirely
+    // volatile, leave the durable watermark and pending batch untouched.
+    let last_durable_user_seq = sequenced
+        .iter()
+        .rev()
+        .find(|c| !c.request.envelope.write_class.is_volatile())
+        .map(|c| c.seq);
+    let last_durable_seq = match (last_durable_user_seq, internal_sequenced.last().map(|c| c.seq)) {
+        (Some(u), Some(i)) => Some(u.max(i)),
+        (Some(u), None) => Some(u),
+        (None, Some(i)) => Some(i),
+        (None, None) => None,
+    };
+    if let Some(last_durable_seq) = last_durable_seq {
+        match state.config.durability_mode {
+            DurabilityMode::Full => {
+                state.durable_head_seq = last_durable_seq;
                 state.pending_batch_bytes = 0;
                 state.pending_batch_max_seq = state.durable_head_seq;
-            } else {
-                state.pending_batch_bytes = state
-                    .pending_batch_bytes
-                    .saturating_add(wal_payload_size_bytes);
-                state.pending_batch_max_seq = last_seq;
-                if state.pending_batch_bytes >= state.config.batch_max_bytes {
-                    let sync_started = Instant::now();
-                    if state.keyspace.sync_persistent_value_store().is_ok()
-                        && state.wal.sync_active().is_ok()
-                    {
-                        wal_sync_ops = wal_sync_ops.saturating_add(1);
-                        wal_sync_micros = wal_sync_micros
-                            .saturating_add(sync_started.elapsed().as_micros() as u64);
-                        sync_executed = true;
-                        state.durable_head_seq = state.pending_batch_max_seq;
-                        state.pending_batch_bytes = 0;
-                        state.pending_batch_max_seq = state.durable_head_seq;
+            }
+            DurabilityMode::Batch => {
+                if requires_sync {
+                    state.durable_head_seq = last_durable_seq;
+                    state.pending_batch_bytes = 0;
+                    state.pending_batch_max_seq = state.durable_head_seq;
+                } else {
+                    state.pending_batch_bytes = state
+                        .pending_batch_bytes
+                        .saturating_add(wal_payload_size_bytes);
+                    state.pending_batch_max_seq = last_durable_seq;
+                    if state.pending_batch_bytes >= state.config.batch_max_bytes {
+                        let sync_started = Instant::now();
+                        if state.keyspace.sync_persistent_value_store().is_ok()
+                            && state.wal.sync_active().is_ok()
+                        {
+                            wal_sync_ops = wal_sync_ops.saturating_add(1);
+                            wal_sync_micros = wal_sync_micros
+                                .saturating_add(sync_started.elapsed().as_micros() as u64);
+                            sync_executed = true;
+                            state.durable_head_seq = state.pending_batch_max_seq;
+                            state.pending_batch_bytes = 0;
+                            state.pending_batch_max_seq = state.durable_head_seq;
+                        }
                     }
                 }
             }
+            DurabilityMode::OsBuffered => {}
         }
-        DurabilityMode::OsBuffered => {}
     }
     debug_assert!(
         state.durable_head_seq <= state.visible_head_seq,
